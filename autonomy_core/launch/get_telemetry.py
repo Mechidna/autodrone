@@ -7,6 +7,7 @@ class GetTelemetry:
     def __init__(self):
         # Initialize timestamps to 0 so they print immediately the first time
         self.last_vel_time = 0
+        self.last_vel_time = 0
         self.last_rpy_time = 0
         init_position = (0.0, 0.0, 0.0)
         init_velocity = (0.0, 0.0, 0.0)
@@ -21,22 +22,23 @@ class GetTelemetry:
 
     def telemetry_pos(self, position, start_position):
         # Position is usually printed once at the start, so no timer needed here
-        self.p0 = {
-            "x": float(start_position[0]),
-            "y": float(start_position[1]),
-            "z": float(start_position[2])
-        }
-        current_time = time.time()
         self.pos = {
             "x": float(position[0]),
             "y": float(position[1]),
-            "z": float(position[2])
+            "z": float(position[2]),
         }
         if start_position is not None:
-            self._print_vel(start_position, prefix="Initial Vel")
+            self.p0 = {
+                "x": float(start_position[0]),
+                "y": float(start_position[1]),
+                "z": float(start_position[2]),
+            }
+        current_time = time.time()
+        if start_position is not None:
+            self._print_pos(start_position, prefix="Initial Pos")
         elif current_time - self.last_vel_time >= 1.0:
-            self._print_pos(position, prefix="Live Vel")
-            self.last_vel_time = current_time
+            self._print_pos(position, prefix="Live Pos")
+            self.last_pos_time = current_time
 
     def telemetry_vel(self, velocity, start_velocity):
         current_time = time.time()
