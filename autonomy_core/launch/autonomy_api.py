@@ -54,6 +54,7 @@ class AutonomyAPI:
         if not isinstance(perception, dict):
             print("No detection")
             return None
+        print("SEE THIS LINE --- t = ",perception["t"])
         ## yaw debugging
         t_cam = np.asarray(perception["t"], dtype=float).reshape(3, )
         yaw_enu = float(current_state["yaw"])  # you already pass ENU yaw in
@@ -72,8 +73,9 @@ class AutonomyAPI:
         R_fake[:, 1] = np.array([0.0, 0.0, 1.0], dtype=float)  # up
         perception["R"] = R_fake
         ##
+        print("ENU OF T --- t = ",perception["t"])
         plan = self.path_planner.plan(perception)
-        self.path_visualizer.visualize(plan)
+        # self.path_visualizer.visualize(plan)
         if plan is None:
             print("No path planning")
             return None

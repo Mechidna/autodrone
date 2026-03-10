@@ -33,8 +33,8 @@ class GatePerception:
     def process(self, frame, camera_matrix, dist_coeffs):
 
         # Show grayscale image
-        cv2.imshow("Gray", frame)
-        cv2.waitKey(1)
+        # cv2.imshow("Gray", frame)
+        # cv2.waitKey(1)
         corners = self.detect_gate(frame)
 
         if corners is None:
@@ -88,8 +88,8 @@ class GatePerception:
             2
         )
 
-        cv2.imshow("Detection", debug)
-        cv2.waitKey(1)
+        # cv2.imshow("Detection", debug)
+        # cv2.waitKey(1)
 
         # Print pose
 
@@ -122,7 +122,7 @@ class GatePerception:
         mask_closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
         mask_opened = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, k, iterations=1)
 
-        cv2.imshow("Full_Orange_Mask", mask_opened)
+        # cv2.imshow("Full_Orange_Mask", mask_opened)
 
         # Find contours on the COLOR mask (not grayscale edges)
         contours, _ = cv2.findContours(mask_opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)

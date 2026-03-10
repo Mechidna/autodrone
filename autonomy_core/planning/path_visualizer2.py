@@ -1,7 +1,7 @@
 import random
 import time
 import numpy as np
-from autonomy_core.planning.test import GateTrajectoryPlanner
+from autonomy_core.planning.path_planner import GateTrajectoryPlanner
 import matplotlib.pyplot as plt
 
 # Interactive mode lets figures update without blocking

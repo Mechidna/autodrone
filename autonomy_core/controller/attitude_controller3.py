@@ -178,12 +178,12 @@ class RPGHighLevelTracker:
         thrust_cmd = self.thrust_hover + self.thrust_from_acc_gain * a_cmd_no_g[2]
         thrust_cmd = clamp(thrust_cmd, self.thrust_min, self.thrust_max)
 
-        r1, p1, y1 = rotmat_to_euler_zyx(R_des)
-        r2, p2, y2 = rotmat_to_euler_zyx(R_des.T)
-
-        print("R_des   :", np.degrees([r1, p1, y1]))
-        print("R_des.T :", np.degrees([r2, p2, y2]))
-        print("z_b_des :", z_b_des)
+        # r1, p1, y1 = rotmat_to_euler_zyx(R_des)
+        # r2, p2, y2 = rotmat_to_euler_zyx(R_des.T)
+        #
+        # print("R_des   :", np.degrees([r1, p1, y1]))
+        # print("R_des.T :", np.degrees([r2, p2, y2]))
+        # print("z_b_des :", z_b_des)
 
         debug = {
             "e_p": e_p,
