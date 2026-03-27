@@ -126,8 +126,7 @@ class AutonomyAPI:
         # p1 = np.array([-0.1, 10.0, 1.0], dtype=float)
         p1 = gate_xyz
         v1 = np.array([0.0, 0.0, 0.0], dtype=float)
-        T = 5
-        print("Time Horizon:",T)
+        # T = 5
 
         vel = np.array([
             telemetry.vel["vx"],
@@ -136,7 +135,7 @@ class AutonomyAPI:
         ], dtype=float)
 
         T = self.choose_T(pos, vel, p1, vmax=1.5, amax=1.5)
-
+        print("Time Horizon:",T)
         self.segment_target = p1
         self.segment_duration = T
         self.trajectory_start_time = time.time()
