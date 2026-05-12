@@ -1,0 +1,6 @@
+/autonomy_core.egg-info/
+/venv/
+__pycache__/
+*.pyc
+*.pyo
+*.csv
