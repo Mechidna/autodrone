@@ -378,7 +378,7 @@ async def main():
             if target is None:
                 target = getattr(autonomy, "active_gate", None)
             if target is None and use_perception:
-                target = getattr(autonomy, "perception_hold_position", None)
+                target = getattr(autonomy, "hold_anchor", None)
 
             mode = getattr(autonomy, "mode", None)
 
@@ -441,6 +441,48 @@ async def main():
                 target_retained_after_completion=getattr(autonomy, "target_retained_after_completion", False),
                 next_valid_target_found=getattr(autonomy, "next_valid_target_found", False),
                 valid_candidate_count=getattr(autonomy, "valid_candidate_count", 0),
+                approach_vector=getattr(autonomy, "approach_vector", None),
+                gate_progress_along_approach=getattr(autonomy, "gate_progress_along_approach", float("nan")),
+                gate_lateral_error=getattr(autonomy, "gate_lateral_error", float("nan")),
+                gate_plane_crossed=getattr(autonomy, "gate_plane_crossed", False),
+                near_gate_but_not_crossed=getattr(autonomy, "near_gate_but_not_crossed", False),
+                completion_blocked_reason=getattr(autonomy, "completion_blocked_reason", ""),
+                no_active_target=getattr(autonomy, "no_active_target", False),
+                no_target_control_mode=getattr(autonomy, "no_target_control_mode", ""),
+                hold_anchor_source=getattr(autonomy, "hold_anchor_source", ""),
+                hold_anchor=getattr(autonomy, "hold_anchor", None),
+                velocity_damping_active=getattr(autonomy, "velocity_damping_active", False),
+                completed_gate_reference_blocked=getattr(autonomy, "completed_gate_reference_blocked", False),
+                p_ref_source=getattr(autonomy, "p_ref_source", ""),
+                yaw_hold_value=math.degrees(getattr(autonomy, "yaw_hold_value", float("nan"))),
+                telemetry_yaw_deg=float(getattr(autonomy.telemetry, "rpy", {}).get("yaw", float("nan"))),
+                previous_yaw_cmd_deg=math.degrees(getattr(autonomy, "previous_yaw_cmd_log", float("nan"))),
+                raw_yaw_cmd_deg=math.degrees(getattr(autonomy, "raw_yaw_cmd", float("nan"))),
+                yaw_cmd_after_unwrap_deg=math.degrees(getattr(autonomy, "yaw_cmd_after_unwrap", float("nan"))),
+                yaw_rate_limited=getattr(autonomy, "yaw_rate_limited", False),
+                post_completion_grace_active=getattr(autonomy, "post_completion_grace_active", False),
+                no_target_roll_source=getattr(autonomy, "no_target_roll_source", ""),
+                no_target_pitch_source=getattr(autonomy, "no_target_pitch_source", ""),
+                horizontal_hold_disabled_after_completion=getattr(autonomy, "horizontal_hold_disabled_after_completion", False),
+                track_id=getattr(autonomy, "track_id", None),
+                merged_into_track_id=getattr(autonomy, "merged_into_track_id", None),
+                duplicate_merge_reason=getattr(autonomy, "duplicate_merge_reason", ""),
+                race_order_track_ids=getattr(autonomy, "race_order_track_ids", []),
+                race_order_inserted=getattr(autonomy, "race_order_inserted", False),
+                race_order_rejected_reason=getattr(autonomy, "race_order_rejected_reason", ""),
+                landmark_uncertainty=getattr(autonomy, "landmark_uncertainty", float("nan")),
+                track_observations=getattr(autonomy, "track_observations", 0),
+                completed_unique_gate_count=getattr(autonomy, "completed_unique_gate_count", 0),
+                active_gate_idx_clamped_by_race_gate_count=getattr(autonomy, "active_gate_idx_clamped_by_race_gate_count", False),
+                suspected_duplicate_track=getattr(autonomy, "suspected_duplicate_track", False),
+                committed_track_centers=getattr(autonomy, "committed_track_centers_log", ""),
+                pairwise_committed_track_distances=getattr(autonomy, "pairwise_committed_track_distances", ""),
+                duplicate_radius_used=getattr(autonomy, "duplicate_radius_used", float("nan")),
+                merge_candidate_pairs=getattr(autonomy, "merge_candidate_pairs", ""),
+                merge_blocked_reason=getattr(autonomy, "merge_blocked_reason", ""),
+                rejected_track_temporary_vs_permanent=getattr(autonomy, "rejected_track_temporary_vs_permanent", ""),
+                active_target_admission_status=getattr(autonomy, "active_target_admission_status", ""),
+                race_order_after_merge=getattr(autonomy, "race_order_after_merge", []),
             )
 
             await drone.offboard.set_attitude(

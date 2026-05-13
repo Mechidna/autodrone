@@ -86,6 +86,22 @@ class GateMemory:
         self.stale_time = float(stale_time)
         self.alpha = float(alpha)
         self.max_committed_match_distance = 0.8  # meters (start here)
+        # Approximate physical gate aperture is about 2 m in the simulator's
+        # perception model. Split/offset PnP landmarks for the same visual gate
+        # can land on opposite sides of that aperture, so duplicate suppression
+        # must be wider than raw association while still geometry-only.
+        self.estimated_gate_size = 2.0
+        self.duplicate_merge_radius = max(5.0, 2.5 * self.estimated_gate_size)
+        self.last_merge_event = {
+            "merged": False,
+            "source_id": None,
+            "target_id": None,
+            "reason": "",
+            "distance": float("nan"),
+        }
+        self.last_pairwise_distances = []
+        self.last_merge_candidate_pairs = []
+        self.last_merge_blocked_reason = ""
 
         self._next_id = 0
         self.tracks: List[GateTrack] = []
@@ -170,6 +186,91 @@ class GateMemory:
                 return
 
         tr.committed = True
+
+    def _track_uncertainty(self, tr: GateTrack) -> float:
+        measurements = tr.recent_measurements(20)
+        if len(measurements) <= 1:
+            return float("inf")
+        dists = [self._distance(m, tr.center) for m in measurements]
+        return float(np.sqrt(np.mean(np.square(dists))))
+
+    def merge_track_into(self, source_id: int, target_id: int, reason: str = "duplicate_committed_track"):
+        if source_id == target_id:
+            return None
+
+        source = self.get_track_by_id(source_id)
+        target = self.get_track_by_id(target_id)
+        if source is None or target is None:
+            return None
+
+        source_center = source.center.copy()
+        target_center = target.center.copy()
+        source_weight = max(float(source.hits), 1.0)
+        target_weight = max(float(target.hits), 1.0)
+        target.center = (
+            target.center * target_weight + source.center * source_weight
+        ) / (target_weight + source_weight)
+        target.confidence_sum += source.confidence_sum
+        target.hits += source.hits
+        target.last_seen_time = max(target.last_seen_time, source.last_seen_time)
+        target.committed = target.committed or source.committed
+        target.measurement_history.extend(source.measurement_history)
+        target.recent_errors.extend(source.recent_errors)
+        if len(target.recent_errors) > 30:
+            target.recent_errors = target.recent_errors[-30:]
+
+        self.tracks = [tr for tr in self.tracks if tr.id != source_id]
+        self.last_merge_event = {
+            "merged": True,
+            "source_id": int(source_id),
+            "target_id": int(target_id),
+            "reason": reason,
+            "distance": self._distance(source_center, target_center),
+        }
+        return self.last_merge_event.copy()
+
+    def merge_duplicate_committed_tracks(self, radius: Optional[float] = None):
+        radius = self.duplicate_merge_radius if radius is None else float(radius)
+        self.last_merge_event = {
+            "merged": False,
+            "source_id": None,
+            "target_id": None,
+            "reason": "",
+            "distance": float("nan"),
+        }
+        self.last_pairwise_distances = []
+        self.last_merge_candidate_pairs = []
+        self.last_merge_blocked_reason = "fewer_than_two_committed_tracks"
+
+        committed = self.get_committed_tracks()
+        for i, a in enumerate(committed):
+            for b in committed[i + 1:]:
+                dist = self._distance(a.center, b.center)
+                self.last_pairwise_distances.append((a.id, b.id, dist))
+                if dist >= radius:
+                    self.last_merge_blocked_reason = f"all_pairs_above_radius:{radius:.2f}"
+                    continue
+                self.last_merge_candidate_pairs.append((a.id, b.id, dist))
+                self.last_merge_blocked_reason = ""
+
+                if (a.hits, -a.id) >= (b.hits, -b.id):
+                    target, source = a, b
+                else:
+                    target, source = b, a
+
+                return self.merge_track_into(
+                    source_id=source.id,
+                    target_id=target.id,
+                    reason=f"committed_centers_within:{dist:.2f}",
+                )
+
+        return self.last_merge_event.copy()
+
+    def track_uncertainty(self, track_id: int) -> float:
+        tr = self.get_track_by_id(track_id)
+        if tr is None:
+            return float("nan")
+        return self._track_uncertainty(tr)
 
     def prune(self, now: float):
         kept = []

@@ -24,6 +24,10 @@ def compute_desired_yaw(v_ref, a_ref, last_yaw, eps=1e-3):
     return last_yaw
 
 
+def wrap_pi(angle):
+    return (angle + np.pi) % (2.0 * np.pi) - np.pi
+
+
 @dataclass
 class State:
     pos: np.ndarray
@@ -156,6 +160,48 @@ class AutonomyAPI:
         self.gate_jump_margin = 12.0
         self.perception_hold_position = None
         self.perception_hold_yaw = 0.0
+        self.no_active_target = False
+        self.no_target_control_mode = ""
+        self.hold_anchor_source = ""
+        self.hold_anchor = None
+        self.velocity_damping_active = False
+        self.completed_gate_reference_blocked = False
+        self.p_ref_source = ""
+        self.yaw_hold_value = float("nan")
+        self.no_target_grace_s = 0.75
+        self.post_completion_grace_until = 0.0
+        self.post_completion_grace_active = False
+        self.no_target_roll_source = ""
+        self.no_target_pitch_source = ""
+        self.horizontal_hold_disabled_after_completion = False
+        self.previous_yaw_cmd = None
+        self.previous_yaw_cmd_log = float("nan")
+        self.last_yaw_cmd_time = None
+        self.max_yaw_rate = np.deg2rad(90.0)
+        self.raw_yaw_cmd = float("nan")
+        self.yaw_cmd_after_unwrap = float("nan")
+        self.yaw_rate_limited = False
+        self.track_id = None
+        self.merged_into_track_id = None
+        self.duplicate_merge_reason = ""
+        self.race_order_track_ids = []
+        self.race_order_inserted = False
+        self.race_order_rejected_reason = ""
+        self.landmark_uncertainty = float("nan")
+        self.track_observations = 0
+        self.completed_unique_gate_count = 0
+        self.active_gate_idx_clamped_by_race_gate_count = False
+        self.suspected_duplicate_track = False
+        self.track_id_aliases = {}
+        self.race_accepted_track_ids = []
+        self.committed_track_centers_log = ""
+        self.pairwise_committed_track_distances = ""
+        self.duplicate_radius_used = float("nan")
+        self.merge_candidate_pairs = ""
+        self.merge_blocked_reason = ""
+        self.rejected_track_temporary_vs_permanent = ""
+        self.active_target_admission_status = ""
+        self.race_order_after_merge = []
         self.candidate_track_id = None
         self.candidate_center = None
         self.candidate_order_score = float("nan")
@@ -173,6 +219,17 @@ class AutonomyAPI:
         self.target_retained_after_completion = False
         self.next_valid_target_found = False
         self.valid_candidate_count = 0
+        self.active_target_center = None
+        self.approach_start_position = None
+        self.approach_vector = None
+        self.previous_gate_progress_along_approach = None
+        self.gate_progress_along_approach = float("nan")
+        self.gate_lateral_error = float("nan")
+        self.gate_plane_crossed = False
+        self.near_gate_but_not_crossed = False
+        self.completion_blocked_reason = ""
+        self.gate_pass_radius = 0.75
+        self.gate_progress_threshold = 0.2
 
     # -------------------------------------------------------------------------
     # Time allocation helpers
@@ -324,8 +381,21 @@ class AutonomyAPI:
         )
 
         self.gate_memory.prune(now)
+        merge_event = self.refresh_landmark_merges()
+        if merge_event.get("merged", False) and result is not None:
+            result_track_id = result.get("track_id")
+            if result_track_id == merge_event.get("source_id"):
+                result["track_id"] = merge_event.get("target_id")
+                result["center"] = self.gate_memory.get_track_by_id(result["track_id"]).center.copy()
 
         if result is not None:
+            self.track_id = result.get("track_id")
+            tr = self.gate_memory.get_track_by_id(self.track_id) if self.track_id is not None else None
+            if tr is not None:
+                self.landmark_uncertainty = self.gate_memory.track_uncertainty(tr.id)
+                self.track_observations = tr.hits
+                if result.get("committed_now", False) or result.get("committed", False):
+                    self.accept_track_into_race_order(tr)
             self.last_perception_accepted = bool(result.get("accepted", False))
             self.last_perception_rejection_reason = "" if self.last_perception_accepted else result.get("reason", "")
             print(
@@ -448,6 +518,160 @@ class AutonomyAPI:
 
         return True, ""
 
+    def canonical_track_id(self, track_id):
+        if track_id is None:
+            return None
+        track_id = int(track_id)
+        while track_id in self.track_id_aliases:
+            track_id = int(self.track_id_aliases[track_id])
+        return track_id
+
+    def apply_landmark_merge_event(self, merge_event):
+        self.duplicate_radius_used = self.gate_memory.duplicate_merge_radius
+        self.pairwise_committed_track_distances = ";".join(
+            f"{a}-{b}:{d:.2f}" for a, b, d in self.gate_memory.last_pairwise_distances
+        )
+        self.merge_candidate_pairs = ";".join(
+            f"{a}-{b}:{d:.2f}" for a, b, d in self.gate_memory.last_merge_candidate_pairs
+        )
+        self.merge_blocked_reason = self.gate_memory.last_merge_blocked_reason
+        if not merge_event or not merge_event.get("merged", False):
+            self.merged_into_track_id = None
+            self.duplicate_merge_reason = ""
+            self.suspected_duplicate_track = False
+            return
+
+        source_id = int(merge_event["source_id"])
+        target_id = int(merge_event["target_id"])
+        self.track_id_aliases[source_id] = target_id
+        self.merged_into_track_id = target_id
+        self.duplicate_merge_reason = merge_event.get("reason", "")
+        self.suspected_duplicate_track = True
+
+        source_completed = source_id in self.completed_track_ids_this_cycle
+        self.completed_track_ids_this_cycle.discard(source_id)
+        if source_completed:
+            self.completed_track_ids_this_cycle.add(target_id)
+        self.race_accepted_track_ids = [
+            self.canonical_track_id(tid) for tid in self.race_accepted_track_ids
+        ]
+        deduped = []
+        for tid in self.race_accepted_track_ids:
+            if tid is not None and tid not in deduped:
+                deduped.append(tid)
+        self.race_accepted_track_ids = deduped
+
+        self.race_progression.inferred_order = [
+            self.canonical_track_id(tid) for tid in self.race_progression.inferred_order
+        ]
+        order = []
+        for tid in self.race_progression.inferred_order:
+            if tid is not None and tid not in order:
+                order.append(tid)
+        self.race_progression.inferred_order = order
+        if self.race_progression.cursor > len(order):
+            self.race_progression.cursor = len(order)
+
+        if source_id in self.active_target_track_ids:
+            self.clear_active_perception_target(reason="active_target_merged_duplicate")
+
+    def refresh_landmark_merges(self):
+        merge_event = self.gate_memory.merge_duplicate_committed_tracks()
+        self.apply_landmark_merge_event(merge_event)
+        return merge_event
+
+    def accept_track_into_race_order(self, tr):
+        self.race_order_inserted = False
+        self.race_order_rejected_reason = ""
+        if tr is None or not tr.committed:
+            self.race_order_rejected_reason = "track_not_committed"
+            return False
+
+        track_id = self.canonical_track_id(tr.id)
+        self.track_id = track_id
+        self.landmark_uncertainty = self.gate_memory.track_uncertainty(track_id)
+        canonical_track = self.gate_memory.get_track_by_id(track_id)
+        self.track_observations = 0 if canonical_track is None else canonical_track.hits
+        self.rejected_track_temporary_vs_permanent = ""
+
+        if track_id in self.race_accepted_track_ids:
+            self.active_target_admission_status = "accepted"
+            return True
+
+        if self.track_observations < self.gate_memory.commit_hits:
+            self.race_order_rejected_reason = "insufficient_observations"
+            self.rejected_track_temporary_vs_permanent = "temporary"
+            return False
+
+        if (
+            np.isfinite(self.landmark_uncertainty)
+            and self.landmark_uncertainty > self.gate_memory.duplicate_merge_radius
+        ):
+            self.race_order_rejected_reason = f"landmark_uncertainty_too_high:{self.landmark_uncertainty:.2f}"
+            self.rejected_track_temporary_vs_permanent = "temporary"
+            return False
+
+        if self.race_gate_count is not None and len(self.race_accepted_track_ids) >= self.race_gate_count:
+            self.race_order_rejected_reason = "race_gate_count_reached"
+            self.rejected_track_temporary_vs_permanent = "temporary"
+            return False
+
+        if self.is_near_completed_gate(tr.center, radius=self.gate_memory.duplicate_merge_radius):
+            self.race_order_rejected_reason = "near_completed_unique_gate"
+            self.rejected_track_temporary_vs_permanent = "temporary"
+            self.suspected_duplicate_track = True
+            return False
+
+        duplicate = None
+        for accepted_id in self.race_accepted_track_ids:
+            accepted = self.gate_memory.get_track_by_id(accepted_id)
+            if accepted is None:
+                continue
+            dist = float(np.linalg.norm(tr.center - accepted.center))
+            if dist < self.gate_memory.duplicate_merge_radius:
+                duplicate = accepted
+                break
+        if duplicate is not None:
+            self.gate_memory.merge_track_into(track_id, duplicate.id, reason="race_order_duplicate")
+            self.apply_landmark_merge_event(self.gate_memory.last_merge_event)
+            self.race_order_rejected_reason = "duplicate_of_accepted_race_gate"
+            self.rejected_track_temporary_vs_permanent = "merged"
+            self.suspected_duplicate_track = True
+            return False
+
+        self.race_accepted_track_ids.append(track_id)
+        self.race_progression.sync_committed_tracks([tr])
+        self.race_order_inserted = True
+        self.active_target_admission_status = "accepted"
+        return True
+
+    def refresh_race_order_from_memory(self):
+        self.refresh_landmark_merges()
+        committed_tracks = self.gate_memory.get_committed_tracks()
+        self.committed_track_centers_log = ";".join(
+            f"{tr.id}:{tr.center[0]:.2f},{tr.center[1]:.2f},{tr.center[2]:.2f}:h{tr.hits}"
+            for tr in committed_tracks
+        )
+        for tr in committed_tracks:
+            self.accept_track_into_race_order(tr)
+
+        valid_ids = {tr.id for tr in committed_tracks}
+        order = []
+        for tid in self.race_progression.inferred_order:
+            tid = self.canonical_track_id(tid)
+            if tid is None or tid not in valid_ids:
+                continue
+            if tid not in self.race_accepted_track_ids:
+                continue
+            if tid not in order:
+                order.append(tid)
+        self.race_progression.inferred_order = order
+        if self.race_progression.cursor > len(order):
+            self.race_progression.cursor = len(order)
+        self.race_order_track_ids = self.race_progression.order()
+        self.race_order_after_merge = list(self.race_order_track_ids)
+        return committed_tracks
+
     def clamp_reference_altitude(self, p_ref, v_ref, a_ref):
         self.last_target_z_clamped = False
         if p_ref[2] >= self.safe_min_target_z:
@@ -469,6 +693,71 @@ class AutonomyAPI:
     def get_committed_waypoints(self):
         committed = self.gate_memory.get_committed_centers()
         return [np.asarray(p, dtype=float) for p in committed]
+
+    def set_active_perception_target_geometry(self, center, start_position):
+        if not self.use_perception:
+            return
+
+        center = np.asarray(center, dtype=float).reshape(3)
+        start_position = np.asarray(start_position, dtype=float).reshape(3)
+        approach = center - start_position
+        norm = float(np.linalg.norm(approach))
+
+        self.active_target_center = center.copy()
+        self.approach_start_position = start_position.copy()
+        self.previous_gate_progress_along_approach = None
+        self.gate_progress_along_approach = float("nan")
+        self.gate_lateral_error = float("nan")
+        self.gate_plane_crossed = False
+        self.near_gate_but_not_crossed = False
+        self.completion_blocked_reason = ""
+
+        if norm < 1e-6:
+            self.approach_vector = None
+            return
+
+        self.approach_vector = approach / norm
+
+    def compute_gate_pass_geometry(self, position, target):
+        position = np.asarray(position, dtype=float).reshape(3)
+        target = np.asarray(target, dtype=float).reshape(3)
+
+        if self.approach_vector is None or not np.all(np.isfinite(self.approach_vector)):
+            self.gate_progress_along_approach = float("nan")
+            self.gate_lateral_error = float("nan")
+            self.gate_plane_crossed = False
+            return False, "missing_approach_vector"
+
+        rel = position - target
+        progress = float(np.dot(rel, self.approach_vector))
+        lateral_vec = rel - progress * self.approach_vector
+        lateral_error = float(np.linalg.norm(lateral_vec))
+
+        previous_progress = self.previous_gate_progress_along_approach
+        crossed = previous_progress is not None and previous_progress <= 0.0 <= progress
+
+        self.gate_progress_along_approach = progress
+        self.gate_lateral_error = lateral_error
+        self.gate_plane_crossed = bool(crossed)
+
+        passed_beyond = progress > self.gate_progress_threshold
+        inside_gate_radius = lateral_error < self.gate_pass_radius
+        complete = inside_gate_radius and (passed_beyond or crossed)
+
+        self.previous_gate_progress_along_approach = progress
+
+        if complete:
+            self.near_gate_but_not_crossed = False
+            return True, "crossed_gate_plane" if crossed else "past_gate_center"
+
+        if self.distance_to_active_target <= self.race_progression.pass_radius:
+            self.near_gate_but_not_crossed = True
+            if not inside_gate_radius:
+                return False, f"lateral_error_too_large:{lateral_error:.2f}"
+            return False, f"not_past_gate_plane:{progress:.2f}"
+
+        self.near_gate_but_not_crossed = False
+        return False, "not_near_gate"
 
     def clear_active_perception_target(self, reason=""):
         """
@@ -492,17 +781,22 @@ class AutonomyAPI:
         self.p_ref = None
         self.v_ref = None
         self.a_ref = None
+        self.active_target_center = None
+        self.approach_start_position = None
         pos = np.array([
             self.telemetry.pos["x"],
             self.telemetry.pos["y"],
             self.telemetry.pos["z"],
         ], dtype=float)
         self.perception_hold_position = pos.copy()
-        self.perception_hold_yaw = (
-            self.last_desired_yaw
-            if np.isfinite(self.last_desired_yaw)
-            else float(self.telemetry.rpy["yaw"]) * math.pi / 180.0
-        )
+        telemetry_yaw = float(self.telemetry.rpy["yaw"]) * math.pi / 180.0
+        self.perception_hold_yaw = telemetry_yaw if np.isfinite(telemetry_yaw) else 0.0
+        if reason in ("gate_completed", "completed_target_in_control"):
+            self.post_completion_grace_until = time.time() + self.no_target_grace_s
+            self.post_completion_grace_active = True
+        self.hold_anchor = np.array([pos[0], pos[1], pos[2]], dtype=float)
+        self.hold_anchor_source = "completion_altitude"
+        self.completed_gate_reference_blocked = True
         self.active_target_source = "cleared"
         self.active_target_track_id = None
         self.active_target_cleared = True
@@ -553,8 +847,7 @@ class AutonomyAPI:
             target_gates: list[np.ndarray]
             target_track_ids: list[int]
         """
-        committed_tracks = self.gate_memory.get_committed_tracks()
-        self.race_progression.sync_committed_tracks(committed_tracks)
+        committed_tracks = self.refresh_race_order_from_memory()
         self.race_progression.update_clearance(current_pos, self.gate_memory.get_track_by_id)
         self.target_rejected_completed = False
         self.rejected_wrong_order = False
@@ -601,6 +894,12 @@ class AutonomyAPI:
                 self.target_rejected_completed = True
                 self.rejected_completed_this_lap = True
                 print(f"[TARGET REJECT] reason=already_completed_landmark track_id={tr.id} center={tr.center}")
+                continue
+            if track_id not in self.race_accepted_track_ids:
+                self.last_perception_accepted = False
+                self.last_perception_rejection_reason = "track_not_admitted_to_race"
+                self.active_target_admission_status = "rejected"
+                print(f"[TARGET REJECT] reason=track_not_admitted_to_race track_id={tr.id} center={tr.center}")
                 continue
             valid, reason = self.validate_candidate_target(tr.center, current_pos, track_id=tr.id)
             if not valid:
@@ -673,6 +972,8 @@ class AutonomyAPI:
             self.gate_completion_triggered = False
             self.completion_reason = ""
             self.completed_gate_position = None
+            self.no_active_target = len(self.active_target_gates) == 0
+            self.velocity_damping_active = False
             self.active_gate_idx_before = self.current_gate_idx
             self.race_cursor_before = self.race_progression.cursor
             self.race_cursor_advanced = False
@@ -681,13 +982,16 @@ class AutonomyAPI:
             self.active_target_cleared = False
             self.completed_gate_track_id = None
             self.target_retained_after_completion = False
+            self.gate_plane_crossed = False
+            self.near_gate_but_not_crossed = False
+            self.completion_blocked_reason = ""
 
             target = None
             track_id = None
             if 0 <= self.current_target_idx < len(self.active_target_gates):
                 target = np.asarray(self.active_target_gates[self.current_target_idx], dtype=float).reshape(3)
                 if 0 <= self.current_target_idx < len(self.active_target_track_ids):
-                    track_id = self.active_target_track_ids[self.current_target_idx]
+                    track_id = self.canonical_track_id(self.active_target_track_ids[self.current_target_idx])
                     self.active_target_track_id = track_id
                 self.active_target_source = "active_target_gates"
             elif self.last_valid_target is not None:
@@ -700,14 +1004,12 @@ class AutonomyAPI:
                 self.race_cursor_after = self.race_progression.cursor
                 return False
 
+            self.race_progression.pass_radius = float(threshold)
             self.distance_to_active_target = float(np.linalg.norm(pos - target))
-            if self.distance_to_active_target > threshold:
-                self.active_gate_idx_after = self.current_gate_idx
-                self.race_cursor_after = self.race_progression.cursor
-                return False
 
             if self.is_near_completed_gate(target):
                 self.completion_reason = "already_completed_target"
+                self.completion_blocked_reason = self.completion_reason
                 self.active_gate_idx_after = self.current_gate_idx
                 self.race_cursor_after = self.race_progression.cursor
                 return False
@@ -719,9 +1021,18 @@ class AutonomyAPI:
             )
             if not valid:
                 self.completion_reason = reason
+                self.completion_blocked_reason = reason
                 self.active_gate_idx_after = self.current_gate_idx
                 self.race_cursor_after = self.race_progression.cursor
                 print(f"[GATE COMPLETE REJECT] reason={reason} track_id={track_id} target={target}")
+                return False
+
+            passed_gate, pass_reason = self.compute_gate_pass_geometry(pos, target)
+            if not passed_gate:
+                self.completion_reason = ""
+                self.completion_blocked_reason = pass_reason
+                self.active_gate_idx_after = self.current_gate_idx
+                self.race_cursor_after = self.race_progression.cursor
                 return False
 
             order = self.race_progression.order()
@@ -730,11 +1041,20 @@ class AutonomyAPI:
                 current_sequence_id = order[self.race_progression.cursor]
             if track_id is None or track_id < 0:
                 self.completion_reason = "missing_track_id"
+                self.completion_blocked_reason = self.completion_reason
+                self.active_gate_idx_after = self.current_gate_idx
+                self.race_cursor_after = self.race_progression.cursor
+                return False
+            if self.race_gate_count is not None and self.current_gate_idx >= self.race_gate_count:
+                self.completion_reason = "race_gate_count_reached"
+                self.completion_blocked_reason = self.completion_reason
+                self.active_gate_idx_clamped_by_race_gate_count = True
                 self.active_gate_idx_after = self.current_gate_idx
                 self.race_cursor_after = self.race_progression.cursor
                 return False
             if current_sequence_id != track_id:
                 self.completion_reason = f"cursor_track_mismatch:{current_sequence_id}!={track_id}"
+                self.completion_blocked_reason = self.completion_reason
                 self.active_gate_idx_after = self.current_gate_idx
                 self.race_cursor_after = self.race_progression.cursor
                 print(
@@ -744,11 +1064,11 @@ class AutonomyAPI:
                 return False
 
             self.gate_completion_triggered = True
-            self.completion_reason = "distance_to_active_target"
+            self.completion_reason = pass_reason
+            self.completion_blocked_reason = ""
             self.completed_gate_position = target.copy()
             self.completed_gate_track_id = track_id
 
-            self.race_progression.pass_radius = float(threshold)
             self.completed_track_ids_this_cycle.add(track_id)
             self.completed_gate_positions_this_cycle.append(target.copy())
             self.last_completed_valid_gate_position = target.copy()
@@ -779,8 +1099,14 @@ class AutonomyAPI:
             )
 
             self.completed_gate_events_this_cycle += 1
-            self.current_gate_idx += 1
+            if self.race_gate_count is not None:
+                next_gate_idx = min(self.current_gate_idx + 1, self.race_gate_count)
+                self.active_gate_idx_clamped_by_race_gate_count = next_gate_idx != self.current_gate_idx + 1
+                self.current_gate_idx = next_gate_idx
+            else:
+                self.current_gate_idx += 1
             self.active_gate_idx_advanced = self.current_gate_idx != self.active_gate_idx_before
+            self.completed_unique_gate_count = len(self.completed_track_ids_this_cycle)
             self.completed_landmark_count = len(self.completed_gate_positions_this_cycle)
 
             # A completed perception target must not remain active while the
@@ -844,6 +1170,8 @@ class AutonomyAPI:
             pos,
             max_gates_ahead=1 if not self.use_perception else 3,
         )
+        if self.use_perception:
+            target_track_ids = [self.canonical_track_id(tid) for tid in target_track_ids]
 
         print("=== REPLAN DEBUG ===")
         for tr in self.gate_memory.get_committed_tracks():
@@ -903,6 +1231,7 @@ class AutonomyAPI:
             self.active_target_track_id = target_track_ids[0] if len(target_track_ids) > 0 else None
             self.next_valid_target_found = True
             self.active_target_cleared = False
+            self.set_active_perception_target_geometry(target_gates[0], pos)
 
         times_init = self.allocate_segment_times(
             waypoints,
@@ -977,27 +1306,87 @@ class AutonomyAPI:
     # Control
     # -------------------------------------------------------------------------
 
+    def continuous_yaw_command(self, raw_yaw, fallback_yaw):
+        now = time.time()
+        raw_yaw = float(raw_yaw)
+        if not np.isfinite(raw_yaw):
+            raw_yaw = float(fallback_yaw)
+
+        self.raw_yaw_cmd = raw_yaw
+        self.previous_yaw_cmd_log = (
+            float("nan") if self.previous_yaw_cmd is None else self.previous_yaw_cmd
+        )
+
+        if self.previous_yaw_cmd is None or not np.isfinite(self.previous_yaw_cmd):
+            self.previous_yaw_cmd = raw_yaw
+            self.last_yaw_cmd_time = now
+            self.yaw_cmd_after_unwrap = raw_yaw
+            self.yaw_rate_limited = False
+            return raw_yaw
+
+        dt = now - self.last_yaw_cmd_time if self.last_yaw_cmd_time is not None else 0.02
+        dt = min(max(dt, 1e-3), 0.2)
+        unwrapped = self.previous_yaw_cmd + wrap_pi(raw_yaw - self.previous_yaw_cmd)
+        delta = unwrapped - self.previous_yaw_cmd
+        max_delta = self.max_yaw_rate * dt
+
+        self.yaw_rate_limited = abs(delta) > max_delta
+        if self.yaw_rate_limited:
+            delta = float(np.clip(delta, -max_delta, max_delta))
+
+        limited = self.previous_yaw_cmd + delta
+        self.previous_yaw_cmd = limited
+        self.last_yaw_cmd_time = now
+        self.yaw_cmd_after_unwrap = limited
+        return limited
+
     def hold_no_target_control(self, state, current_yaw_rad):
         """
         Perception-only safety fallback for "no valid next gate".
 
-        It publishes finite references and uses the normal tracker to hold the
-        captured position/yaw, so altitude is feedback-controlled instead of
-        relying on blind hover thrust.
+        It publishes finite references and uses the normal tracker for altitude
+        feedback and horizontal velocity damping without anchoring XY to the
+        completed gate/completion point behind the vehicle.
         """
         if self.perception_hold_position is None:
             self.perception_hold_position = state.pos.copy()
         if not np.isfinite(self.perception_hold_yaw):
             self.perception_hold_yaw = current_yaw_rad
 
+        now = time.time()
+        self.post_completion_grace_active = now < self.post_completion_grace_until
+        hold_z = float(self.perception_hold_position[2])
+        if not np.isfinite(hold_z):
+            hold_z = float(state.pos[2])
+
         self.current_target_gate = None
         self.active_target_track_id = None
-        self.active_target_source = "no_active_target_hold"
+        self.active_target_source = "no_active_target"
+        self.no_active_target = True
+        self.no_target_control_mode = "velocity_damping_altitude_hold"
+        self.hold_anchor_source = "current_xy_completion_altitude"
         self.yaw_target_source = "hold_yaw"
+        self.yaw_hold_value = self.perception_hold_yaw
+        self.completed_gate_reference_blocked = True
 
-        self.p_ref = np.asarray(self.perception_hold_position, dtype=float).copy()
-        self.v_ref = np.zeros(3, dtype=float)
+        self.p_ref = np.array([state.pos[0], state.pos[1], hold_z], dtype=float)
+        if self.post_completion_grace_active:
+            self.v_ref = np.array([state.vel[0], state.vel[1], 0.0], dtype=float)
+            self.no_target_control_mode = "neutral_attitude_altitude_hold"
+            self.p_ref_source = "current_xy_altitude_only_grace"
+            self.no_target_roll_source = "neutral_grace"
+            self.no_target_pitch_source = "neutral_grace"
+            self.horizontal_hold_disabled_after_completion = True
+            self.velocity_damping_active = False
+        else:
+            self.v_ref = np.zeros(3, dtype=float)
+            self.p_ref_source = "current_xy_velocity_damping_altitude_hold"
+            self.no_target_roll_source = "velocity_damping"
+            self.no_target_pitch_source = "velocity_damping"
+            self.horizontal_hold_disabled_after_completion = False
+            self.velocity_damping_active = True
         self.a_ref = np.zeros(3, dtype=float)
+        self.hold_anchor = self.p_ref.copy()
         self.ref_yaw = self.perception_hold_yaw
         self.last_desired_yaw = self.perception_hold_yaw
 
@@ -1005,14 +1394,17 @@ class AutonomyAPI:
             pos=self.p_ref.copy(),
             vel=self.v_ref.copy(),
             acc=self.a_ref.copy(),
-            yaw=self.perception_hold_yaw,
+            yaw=self.continuous_yaw_command(self.perception_hold_yaw, current_yaw_rad),
         )
 
         roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd, dbg = self.tracker.update(state, ref)
         roll_cmd = -roll_cmd
         pitch_cmd = -pitch_cmd
+        if self.post_completion_grace_active:
+            roll_cmd = 0.0
+            pitch_cmd = 0.0
 
-        print("No active perception target; holding position/yaw.")
+        print("No active perception target; damping velocity and holding altitude/yaw.")
         print("state pos:", state.pos)
         print("hold ref pos:", ref.pos)
         print("hold yaw_des:", self.perception_hold_yaw)
@@ -1031,11 +1423,11 @@ class AutonomyAPI:
 
         state = State(
             pos=pos,
-            vel=np.array([
+            vel=np.nan_to_num(np.array([
                 self.telemetry.vel["vx"],
                 self.telemetry.vel["vy"],
                 self.telemetry.vel["vz"]
-            ], dtype=float),
+            ], dtype=float), nan=0.0, posinf=0.0, neginf=0.0),
             yaw=current_yaw_rad,
         )
 
@@ -1053,6 +1445,9 @@ class AutonomyAPI:
         p_ref, v_ref, a_ref = self.planner.sample(self.time_elapsed)
         if self.use_perception:
             p_ref, v_ref, a_ref = self.clamp_reference_altitude(p_ref, v_ref, a_ref)
+            self.no_active_target = False
+            self.velocity_damping_active = False
+            self.p_ref_source = "trajectory"
 
         self.p_ref = np.array(p_ref, dtype=float)
         self.v_ref = np.array(v_ref, dtype=float)
@@ -1084,6 +1479,7 @@ class AutonomyAPI:
         else:
             desired_yaw = compute_desired_yaw(v_ref, a_ref, self.last_desired_yaw)
             self.yaw_target_source = "reference_motion"
+        desired_yaw = self.continuous_yaw_command(desired_yaw, current_yaw_rad)
         self.ref_yaw = desired_yaw
         self.last_desired_yaw = desired_yaw
 
