@@ -272,7 +272,9 @@ class GateMemory:
 
     def get_committed_tracks(self) -> List[GateTrack]:
         out = [tr for tr in self.tracks if tr.committed]
-        out.sort(key=lambda tr: tr.center[1])
+        # Preserve persistent landmark identity. Race ordering is handled by
+        # RaceProgression, not by spatial coordinates.
+        out.sort(key=lambda tr: tr.id)
         return out
 
     def get_committed_centers(self) -> List[np.ndarray]:

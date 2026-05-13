@@ -30,6 +30,11 @@ def rad2deg(x):
     return x * 180.0 / math.pi
 
 
+def hover_command(autonomy):
+    yaw_rad = float(autonomy.telemetry.rpy["yaw"])
+    return 0.0, 0.0, yaw_rad, autonomy.tracker.thrust_hover
+
+
 # -------------------------------------------------
 # ROS2 camera adapter
 # -------------------------------------------------
@@ -136,7 +141,8 @@ async def main():
             print("Connected to drone.")
             break
 
-    autonomy = AutonomyAPI(use_perception=True, race_gate_count=3)
+    use_perception = True
+    autonomy = AutonomyAPI(use_perception=use_perception, race_gate_count=3)
     autonomy.telemetry = telemetry
 
     # -------------------------------------------------
@@ -171,44 +177,51 @@ async def main():
     asyncio.create_task(track_velocity(drone))
     asyncio.create_task(track_orientation(drone))
 
-    # Wait for ROS2 camera + camera_info
-    print("Waiting for camera frame and intrinsics...")
-    while (
-        perception_node.frame is None
-        or perception_node.camera_matrix is None
-        or perception_node.dist_coeffs is None
-    ):
-        await asyncio.sleep(0.05)
+    if use_perception:
+        # Wait for ROS2 camera + camera_info only when perception is active.
+        print("Waiting for camera frame and intrinsics...")
+        while (
+            perception_node.frame is None
+            or perception_node.camera_matrix is None
+            or perception_node.dist_coeffs is None
+        ):
+            await asyncio.sleep(0.05)
 
-    print("Camera data ready.")
+        print("Camera data ready.")
 
     # Let telemetry populate once
     await asyncio.sleep(0.2)
 
-    # -------------------------------------------------
-    # Warm up perception and memory BEFORE arming
-    # -------------------------------------------------
-    print("Warming up perception memory before arming...")
-    warmup_deadline = time.time() + 1.0
+    if use_perception:
+        # -------------------------------------------------
+        # Warm up perception and memory BEFORE arming
+        # -------------------------------------------------
+        print("Warming up perception memory before arming...")
+        warmup_deadline = time.time() + 1.0
 
-    while time.time() < warmup_deadline:
-        frame = perception_node.frame
-        camera_matrix = perception_node.camera_matrix
-        dist_coeffs = perception_node.dist_coeffs
+        while time.time() < warmup_deadline:
+            frame = perception_node.frame
+            camera_matrix = perception_node.camera_matrix
+            dist_coeffs = perception_node.dist_coeffs
 
-        if frame is not None and camera_matrix is not None and dist_coeffs is not None:
-            result = autonomy.update_gate_memory_from_frame(frame, camera_matrix, dist_coeffs)
+            if frame is not None and camera_matrix is not None and dist_coeffs is not None:
+                result = autonomy.update_gate_memory_from_frame(frame, camera_matrix, dist_coeffs)
 
-            if result is not None and result.get("committed_now", False):
-                ok = autonomy.path_plan()
-                if ok:
-                    print("Initial committed gate found; trajectory planned.")
-                    break
+                if result is not None and result.get("committed_now", False):
+                    ok = autonomy.path_plan()
+                    if ok:
+                        print("Initial committed gate found; trajectory planned.")
+                        break
 
-        await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)
 
-    # If no committed gate yet, that's okay.
-    # attitude_control() should fall back to hover-ish neutral command until a plan exists.
+        # If no committed gate yet, that's okay.
+        # attitude_control() should fall back to hover-ish neutral command until a plan exists.
+    else:
+        print("Perception disabled; planning initial trajectory from mock GT gates.")
+        ok = autonomy.path_plan()
+        if not ok:
+            print("Initial mock-gate planning failed; vehicle will hold neutral command.")
 
     # -------------------------------------------------
     # Arm only after perception warmup / initial planning attempt
@@ -250,24 +263,42 @@ async def main():
         return
 
     try:
+        last_loop_time = time.time()
+
         while True:
-            frame = perception_node.frame
-            camera_matrix = perception_node.camera_matrix
-            dist_coeffs = perception_node.dist_coeffs
+            loop_start = time.time()
+            loop_dt = loop_start - last_loop_time
+            last_loop_time = loop_start
 
-            if frame is None or camera_matrix is None or dist_coeffs is None:
-                print("Waiting for camera data...")
-                await asyncio.sleep(0.05)
-                continue
+            mem_result = None
+            replan_requested = False
+            replan_duration = 0.0
+            hold_command = False
+            stale_command_suppressed = False
+            autonomy.last_perception_replan_trigger = False
 
-            # -------------------------------------------------
-            # 1) Update gate memory from current frame
-            # -------------------------------------------------
-            mem_result = autonomy.update_gate_memory_from_frame(
-                frame,
-                camera_matrix,
-                dist_coeffs,
-            )
+            if loop_dt > 0.1:
+                print(f"[WARN] control loop gap {loop_dt:.3f}s; suppressing aggressive command.")
+                stale_command_suppressed = True
+
+            if use_perception:
+                frame = perception_node.frame
+                camera_matrix = perception_node.camera_matrix
+                dist_coeffs = perception_node.dist_coeffs
+
+                if frame is None or camera_matrix is None or dist_coeffs is None:
+                    print("Waiting for camera data...")
+                    await asyncio.sleep(0.05)
+                    continue
+
+                # -------------------------------------------------
+                # 1) Update gate memory from current frame
+                # -------------------------------------------------
+                mem_result = autonomy.update_gate_memory_from_frame(
+                    frame,
+                    camera_matrix,
+                    dist_coeffs,
+                )
 
             # -------------------------------------------------
             # 2) Replan only when it makes sense
@@ -278,28 +309,60 @@ async def main():
             if mem_result is not None and mem_result.get("committed_now", False):
                 print("New committed gate -> replanning.")
                 should_replan = True
+                if use_perception:
+                    autonomy.last_perception_replan_trigger = True
 
             # Current active target passed
             gate_changed = autonomy.advance_gate_if_needed(threshold=1.0)
             if gate_changed:
                 print("Active target advanced -> replanning.")
                 should_replan = True
+                if use_perception:
+                    autonomy.last_perception_replan_trigger = True
 
             # Current trajectory finished
             if autonomy.planner.total_time > 0.0 and autonomy.time_elapsed >= autonomy.planner.total_time:
                 print("Trajectory horizon exhausted -> replanning.")
                 should_replan = True
+                if use_perception:
+                    autonomy.last_perception_replan_trigger = True
 
-            # Avoid absurdly frequent replans
-            if should_replan and (time.time() - autonomy.replan_time > 0.3):
+            # Avoid absurdly frequent replans, except perception gate completion.
+            # Once a perceived landmark is marked complete, the old target must
+            # be replaced immediately so it cannot be tracked again.
+            force_perception_gate_replan = use_perception and gate_changed
+            if should_replan and (
+                force_perception_gate_replan
+                or time.time() - autonomy.replan_time > 0.3
+            ):
+                replan_requested = True
+                hold_command = True
+                replan_started = time.time()
+                print(f"[REPLAN] start t={replan_started:.3f}")
                 ok = autonomy.path_plan()
+                replan_duration = time.time() - replan_started
+                print(
+                    f"[REPLAN] end duration={replan_duration:.3f}s "
+                    f"mode={autonomy.last_plan_mode} "
+                    f"start_gate={autonomy.last_plan_start_gate_idx} "
+                    f"end_gate={autonomy.last_plan_end_gate_idx}"
+                )
                 if not ok:
                     print("Replan requested, but no valid gates available yet.")
 
             # -------------------------------------------------
             # 3) Track current trajectory (or hover if none yet)
             # -------------------------------------------------
-            roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = autonomy.attitude_control()
+            if (
+                (hold_command or stale_command_suppressed)
+                and use_perception
+                and len(getattr(autonomy, "active_target_gates", [])) == 0
+            ):
+                roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = autonomy.attitude_control()
+            elif hold_command or stale_command_suppressed:
+                roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = hover_command(autonomy)
+            else:
+                roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = autonomy.attitude_control()
 
 
             # flight logger
@@ -314,6 +377,8 @@ async def main():
                 target = getattr(autonomy, "target_gate", None)
             if target is None:
                 target = getattr(autonomy, "active_gate", None)
+            if target is None and use_perception:
+                target = getattr(autonomy, "perception_hold_position", None)
 
             mode = getattr(autonomy, "mode", None)
 
@@ -335,6 +400,47 @@ async def main():
                 target=target,
                 mode=mode,
                 active_gate_idx=active_gate_idx,
+                loop_dt=loop_dt,
+                replan_requested=replan_requested,
+                replan_duration=replan_duration,
+                hold_command=hold_command,
+                stale_command_suppressed=stale_command_suppressed,
+                plan_mode=getattr(autonomy, "last_plan_mode", None),
+                plan_start_gate_idx=getattr(autonomy, "last_plan_start_gate_idx", None),
+                plan_end_gate_idx=getattr(autonomy, "last_plan_end_gate_idx", None),
+                raw_gate=getattr(autonomy, "last_raw_gate_center", None),
+                perception_accepted=getattr(autonomy, "last_perception_accepted", False),
+                perception_rejection_reason=getattr(autonomy, "last_perception_rejection_reason", ""),
+                last_valid_target=getattr(autonomy, "last_valid_target", None),
+                target_z_clamped=getattr(autonomy, "last_target_z_clamped", False),
+                perception_replan_trigger=getattr(autonomy, "last_perception_replan_trigger", False),
+                distance_to_active_target=getattr(autonomy, "distance_to_active_target", float("nan")),
+                gate_completion_triggered=getattr(autonomy, "gate_completion_triggered", False),
+                completion_reason=getattr(autonomy, "completion_reason", ""),
+                completed_gate_position=getattr(autonomy, "completed_gate_position", None),
+                active_gate_idx_before=getattr(autonomy, "active_gate_idx_before", None),
+                active_gate_idx_after=getattr(autonomy, "active_gate_idx_after", None),
+                race_cursor_before=getattr(autonomy, "race_cursor_before", None),
+                race_cursor_after=getattr(autonomy, "race_cursor_after", None),
+                active_target_source=getattr(autonomy, "active_target_source", ""),
+                target_rejected_completed=getattr(autonomy, "target_rejected_completed", False),
+                candidate_track_id=getattr(autonomy, "candidate_track_id", None),
+                candidate_center=getattr(autonomy, "candidate_center", None),
+                candidate_order_score=getattr(autonomy, "candidate_order_score", float("nan")),
+                rejected_wrong_order=getattr(autonomy, "rejected_wrong_order", False),
+                rejected_duplicate=getattr(autonomy, "rejected_duplicate", False),
+                rejected_completed_this_lap=getattr(autonomy, "rejected_completed_this_lap", False),
+                race_cursor_advanced=getattr(autonomy, "race_cursor_advanced", False),
+                active_gate_idx_advanced=getattr(autonomy, "active_gate_idx_advanced", False),
+                completed_landmark_count=getattr(autonomy, "completed_landmark_count", 0),
+                lap_reset_triggered=getattr(autonomy, "lap_reset_triggered", False),
+                active_target_cleared=getattr(autonomy, "active_target_cleared", False),
+                active_target_track_id=getattr(autonomy, "active_target_track_id", None),
+                completed_gate_track_id=getattr(autonomy, "completed_gate_track_id", None),
+                yaw_target_source=getattr(autonomy, "yaw_target_source", ""),
+                target_retained_after_completion=getattr(autonomy, "target_retained_after_completion", False),
+                next_valid_target_found=getattr(autonomy, "next_valid_target_found", False),
+                valid_candidate_count=getattr(autonomy, "valid_candidate_count", 0),
             )
 
             await drone.offboard.set_attitude(
