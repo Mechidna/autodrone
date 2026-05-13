@@ -483,6 +483,16 @@ async def main():
                 rejected_track_temporary_vs_permanent=getattr(autonomy, "rejected_track_temporary_vs_permanent", ""),
                 active_target_admission_status=getattr(autonomy, "active_target_admission_status", ""),
                 race_order_after_merge=getattr(autonomy, "race_order_after_merge", []),
+                raw_image_corners=getattr(autonomy, "last_raw_image_corners", None),
+                ordered_image_corners=getattr(autonomy, "last_ordered_image_corners", None),
+                pnp_rvec=getattr(autonomy, "last_pnp_rvec", None),
+                pnp_tvec=getattr(autonomy, "last_pnp_tvec", None),
+                gate_center_camera=getattr(autonomy, "last_gate_center_camera", None),
+                gate_center_body=getattr(autonomy, "last_gate_center_body", None),
+                gate_center_world_debug=getattr(autonomy, "last_gate_center_world_debug", None),
+                gate_normal_world=getattr(autonomy, "last_gate_normal_world", None),
+                detection_drone_pose=getattr(autonomy, "last_detection_drone_pose", None),
+                reprojection_error=getattr(autonomy, "last_reprojection_error", float("nan")),
             )
 
             await drone.offboard.set_attitude(

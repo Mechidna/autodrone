@@ -106,6 +106,13 @@ class GatePerceptionNode:
             return None
 
         gate_world = np.asarray(drone_pos, dtype=float).reshape(3) + R_wb @ gate_body
+        debug = perception.get("debug", {})
+        gate_normal_camera = np.asarray(
+            debug.get("gate_normal_camera", np.array([np.nan, np.nan, np.nan])),
+            dtype=float,
+        ).reshape(3)
+        gate_normal_body = self.R_body_camera @ gate_normal_camera
+        gate_normal_world = R_wb @ gate_normal_body
 
         return {
             "confidence": float(conf),
@@ -113,5 +120,17 @@ class GatePerceptionNode:
             "gate_center_body": gate_body,
             "gate_center_cam": gate_body,
             "gate_center_world": gate_world,
+            "drone_pos": np.asarray(drone_pos, dtype=float).reshape(3),
+            "drone_yaw_rad": float(drone_yaw_rad) if drone_yaw_rad is not None else float(yaw),
+            "gate_normal_camera": gate_normal_camera,
+            "gate_normal_body": gate_normal_body,
+            "gate_normal_world": gate_normal_world,
+            "reprojection_error": float(debug.get("reprojection_error", np.nan)),
+            "raw_corners": debug.get("raw_corners", None),
+            "ordered_corners": debug.get("ordered_corners", None),
+            "rvec": debug.get("rvec", None),
+            "tvec": debug.get("tvec", gate_camera),
+            "pnp_candidates": debug.get("pnp_candidates", []),
+            "chosen_candidate": debug.get("chosen_candidate", None),
             "raw": perception,
         }

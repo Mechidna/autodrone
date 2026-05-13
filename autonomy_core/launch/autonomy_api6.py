@@ -202,6 +202,16 @@ class AutonomyAPI:
         self.rejected_track_temporary_vs_permanent = ""
         self.active_target_admission_status = ""
         self.race_order_after_merge = []
+        self.last_raw_image_corners = None
+        self.last_ordered_image_corners = None
+        self.last_pnp_rvec = None
+        self.last_pnp_tvec = None
+        self.last_gate_center_camera = None
+        self.last_gate_center_body = None
+        self.last_gate_center_world_debug = None
+        self.last_gate_normal_world = None
+        self.last_reprojection_error = float("nan")
+        self.last_detection_drone_pose = None
         self.candidate_track_id = None
         self.candidate_center = None
         self.candidate_order_score = float("nan")
@@ -320,14 +330,18 @@ class AutonomyAPI:
             self.telemetry.pos["z"],
         ], dtype=float)
 
-        drone_yaw_rad = float(self.telemetry.rpy["yaw"]) * np.pi / 180.0
+        drone_rpy_rad = np.array([
+            float(self.telemetry.rpy["roll"]),
+            float(self.telemetry.rpy["pitch"]),
+            float(self.telemetry.rpy["yaw"]),
+        ], dtype=float) * np.pi / 180.0
 
         det = self.perception_node.detect_gate(
             frame=frame,
             camera_matrix=camera_matrix,
             dist_coeffs=dist_coeffs,
             drone_pos=drone_pos,
-            drone_yaw_rad=drone_yaw_rad,
+            drone_rpy_rad=drone_rpy_rad,
         )
 
         now = time.time()
@@ -342,6 +356,23 @@ class AutonomyAPI:
         self.gate_confidence = float(det["confidence"])
         raw_center = np.asarray(det["gate_center_world"], dtype=float).reshape(3)
         self.last_raw_gate_center = raw_center.copy()
+        self.last_raw_image_corners = det.get("raw_corners", None)
+        self.last_ordered_image_corners = det.get("ordered_corners", None)
+        self.last_pnp_rvec = det.get("rvec", None)
+        self.last_pnp_tvec = det.get("tvec", None)
+        self.last_gate_center_camera = det.get("gate_center_camera", None)
+        self.last_gate_center_body = det.get("gate_center_body", None)
+        self.last_gate_center_world_debug = raw_center.copy()
+        self.last_gate_normal_world = det.get("gate_normal_world", None)
+        self.last_reprojection_error = float(det.get("reprojection_error", np.nan))
+        self.last_detection_drone_pose = np.array([
+            drone_pos[0],
+            drone_pos[1],
+            drone_pos[2],
+            drone_rpy_rad[0],
+            drone_rpy_rad[1],
+            drone_rpy_rad[2],
+        ], dtype=float)
 
         valid, reason = self.validate_perception_gate_center(raw_center, drone_pos)
         if not valid:

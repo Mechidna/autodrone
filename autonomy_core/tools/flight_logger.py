@@ -133,6 +133,33 @@ class FlightLogger:
             "rejected_track_temporary_vs_permanent",
             "active_target_admission_status",
             "race_order_after_merge",
+            "raw_image_corners",
+            "ordered_image_corners",
+            "pnp_rvec_x",
+            "pnp_rvec_y",
+            "pnp_rvec_z",
+            "pnp_tvec_x",
+            "pnp_tvec_y",
+            "pnp_tvec_z",
+            "gate_center_camera_x",
+            "gate_center_camera_y",
+            "gate_center_camera_z",
+            "gate_center_body_x",
+            "gate_center_body_y",
+            "gate_center_body_z",
+            "gate_center_world_x",
+            "gate_center_world_y",
+            "gate_center_world_z",
+            "gate_normal_world_x",
+            "gate_normal_world_y",
+            "gate_normal_world_z",
+            "detection_drone_x",
+            "detection_drone_y",
+            "detection_drone_z",
+            "detection_drone_roll_rad",
+            "detection_drone_pitch_rad",
+            "detection_drone_yaw_rad",
+            "reprojection_error",
         ])
 
         self.t0 = time.time()
@@ -164,6 +191,12 @@ class FlightLogger:
             return arr[:3]
 
         return np.array([np.nan, np.nan, np.nan], dtype=float)
+
+    def _flat_string(self, value):
+        if value is None:
+            return ""
+        arr = np.asarray(value, dtype=float).reshape(-1)
+        return " ".join(f"{x:.3f}" for x in arr)
 
     def log(
         self,
@@ -261,6 +294,16 @@ class FlightLogger:
         rejected_track_temporary_vs_permanent="",
         active_target_admission_status="",
         race_order_after_merge=None,
+        raw_image_corners=None,
+        ordered_image_corners=None,
+        pnp_rvec=None,
+        pnp_tvec=None,
+        gate_center_camera=None,
+        gate_center_body=None,
+        gate_center_world_debug=None,
+        gate_normal_world=None,
+        detection_drone_pose=None,
+        reprojection_error=np.nan,
     ):
         now = time.time()
         t = now - self.t0
@@ -285,6 +328,15 @@ class FlightLogger:
         candidate_center = self._vec3(candidate_center)
         approach_vector = self._vec3(approach_vector)
         hold_anchor = self._vec3(hold_anchor)
+        pnp_rvec = self._vec3(pnp_rvec)
+        pnp_tvec = self._vec3(pnp_tvec)
+        gate_center_camera = self._vec3(gate_center_camera)
+        gate_center_body = self._vec3(gate_center_body)
+        gate_center_world_debug = self._vec3(gate_center_world_debug)
+        gate_normal_world = self._vec3(gate_normal_world)
+        detection_pose = np.asarray(detection_drone_pose, dtype=float).reshape(-1) if detection_drone_pose is not None else np.full(6, np.nan)
+        if detection_pose.size < 6:
+            detection_pose = np.full(6, np.nan)
 
         err = p_ref - pos
         err_norm = float(np.linalg.norm(err)) if not np.any(np.isnan(err)) else np.nan
@@ -406,6 +458,33 @@ class FlightLogger:
             rejected_track_temporary_vs_permanent,
             active_target_admission_status,
             "" if race_order_after_merge is None else " ".join(str(x) for x in race_order_after_merge),
+            self._flat_string(raw_image_corners),
+            self._flat_string(ordered_image_corners),
+            pnp_rvec[0],
+            pnp_rvec[1],
+            pnp_rvec[2],
+            pnp_tvec[0],
+            pnp_tvec[1],
+            pnp_tvec[2],
+            gate_center_camera[0],
+            gate_center_camera[1],
+            gate_center_camera[2],
+            gate_center_body[0],
+            gate_center_body[1],
+            gate_center_body[2],
+            gate_center_world_debug[0],
+            gate_center_world_debug[1],
+            gate_center_world_debug[2],
+            gate_normal_world[0],
+            gate_normal_world[1],
+            gate_normal_world[2],
+            detection_pose[0],
+            detection_pose[1],
+            detection_pose[2],
+            detection_pose[3],
+            detection_pose[4],
+            detection_pose[5],
+            reprojection_error,
         ])
 
         self.log_file.flush()

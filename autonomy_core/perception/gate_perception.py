@@ -15,6 +15,7 @@ class GatePerception:
         self.pose_history = deque(maxlen=smoothing_window)
         self.max_failures = max_failures
         self.failure_counter = 0
+        self.last_debug = {}
 
         # Exact 1m square model
         s = gate_size / 2.0
@@ -53,14 +54,33 @@ class GatePerception:
         if pose is None:
             return None
 
-        R_mat, tvec = pose
+        R_mat, tvec, pnp_debug = pose
 
         confidence = self.compute_confidence(ordered)
 
-        R_smooth, t_smooth = self.smooth_pose(
-            R_mat,
-            tvec
+        # Do not smooth camera-frame pose while the camera is moving. Averaging
+        # tvec across frames from different drone poses creates a biased world
+        # landmark after the current drone pose is applied.
+        R_out, t_out = R_mat, tvec
+        reprojection_error = self.compute_reprojection_error(
+            R_out,
+            t_out,
+            camera_matrix,
+            dist_coeffs,
+            ordered,
         )
+        gate_normal_camera = R_out[:, 2].astype(float)
+        gate_normal_camera /= np.linalg.norm(gate_normal_camera) + 1e-12
+        self.last_debug = {
+            "raw_corners": np.asarray(corners, dtype=float).reshape(-1, 2).copy(),
+            "ordered_corners": ordered.copy(),
+            "rvec": pnp_debug["rvec"].copy(),
+            "tvec": np.asarray(t_out, dtype=float).reshape(3).copy(),
+            "reprojection_error": float(reprojection_error),
+            "gate_normal_camera": gate_normal_camera.copy(),
+            "pnp_candidates": pnp_debug["candidates"],
+            "chosen_candidate": int(pnp_debug["chosen_candidate"]),
+        }
 
         # -------- DEBUG DRAW --------
 
@@ -96,14 +116,16 @@ class GatePerception:
         print("\n------ Pose ------")
 
         print("t (meters):")
-        print(t_smooth.flatten())
+        print(t_out.flatten())
 
         print("confidence:", confidence)
+        print("reprojection_error:", reprojection_error)
 
         return {
-            "R": R_smooth,
-            "t": t_smooth,
-            "confidence": confidence
+            "R": R_out,
+            "t": t_out,
+            "confidence": confidence,
+            "debug": self.last_debug.copy(),
         }
 
     # -------------------------------------------------
@@ -257,7 +279,37 @@ class GatePerception:
         rvec = rvecs[best_i]
         tvec = tvecs[best_i]
         R_mat, _ = cv2.Rodrigues(rvec)
-        return R_mat, tvec
+        candidates = []
+        for i, (cand_rvec, cand_tvec) in enumerate(zip(rvecs, tvecs)):
+            cand_R, _ = cv2.Rodrigues(cand_rvec)
+            cand_normal = cand_R[:, 2].astype(float)
+            cand_normal /= np.linalg.norm(cand_normal) + 1e-12
+            candidates.append({
+                "index": int(i),
+                "rvec": np.asarray(cand_rvec, dtype=float).reshape(3),
+                "tvec": np.asarray(cand_tvec, dtype=float).reshape(3),
+                "normal": cand_normal,
+                "error": err_scalar(reprojErrs[i]) if reprojErrs is not None and len(reprojErrs) > i else float("nan"),
+            })
+        return R_mat, tvec, {
+            "rvec": np.asarray(rvec, dtype=float).reshape(3),
+            "tvec": np.asarray(tvec, dtype=float).reshape(3),
+            "chosen_candidate": best_i,
+            "candidates": candidates,
+        }
+
+    def compute_reprojection_error(self, R_mat, tvec, camera_matrix, dist_coeffs, image_points):
+        rvec, _ = cv2.Rodrigues(R_mat)
+        projected, _ = cv2.projectPoints(
+            self.model_points,
+            rvec,
+            tvec,
+            camera_matrix,
+            dist_coeffs,
+        )
+        projected = projected.reshape(-1, 2)
+        image_points = np.asarray(image_points, dtype=float).reshape(-1, 2)
+        return float(np.sqrt(np.mean(np.sum((projected - image_points) ** 2, axis=1))))
 
 
     # -------------------------------------------------
