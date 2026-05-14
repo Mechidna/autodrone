@@ -69,14 +69,22 @@ class GatePerception:
             dist_coeffs,
             ordered,
         )
+        reprojected_corners = self.project_model_points(
+            R_out,
+            t_out,
+            camera_matrix,
+            dist_coeffs,
+        )
         gate_normal_camera = R_out[:, 2].astype(float)
         gate_normal_camera /= np.linalg.norm(gate_normal_camera) + 1e-12
         self.last_debug = {
             "raw_corners": np.asarray(corners, dtype=float).reshape(-1, 2).copy(),
             "ordered_corners": ordered.copy(),
+            "reprojected_corners": reprojected_corners.copy(),
             "rvec": pnp_debug["rvec"].copy(),
             "tvec": np.asarray(t_out, dtype=float).reshape(3).copy(),
             "reprojection_error": float(reprojection_error),
+            "corner_reprojection_error_px": float(reprojection_error),
             "gate_normal_camera": gate_normal_camera.copy(),
             "pnp_candidates": pnp_debug["candidates"],
             "chosen_candidate": int(pnp_debug["chosen_candidate"]),
@@ -299,6 +307,11 @@ class GatePerception:
         }
 
     def compute_reprojection_error(self, R_mat, tvec, camera_matrix, dist_coeffs, image_points):
+        projected = self.project_model_points(R_mat, tvec, camera_matrix, dist_coeffs)
+        image_points = np.asarray(image_points, dtype=float).reshape(-1, 2)
+        return float(np.sqrt(np.mean(np.sum((projected - image_points) ** 2, axis=1))))
+
+    def project_model_points(self, R_mat, tvec, camera_matrix, dist_coeffs):
         rvec, _ = cv2.Rodrigues(R_mat)
         projected, _ = cv2.projectPoints(
             self.model_points,
@@ -307,9 +320,7 @@ class GatePerception:
             camera_matrix,
             dist_coeffs,
         )
-        projected = projected.reshape(-1, 2)
-        image_points = np.asarray(image_points, dtype=float).reshape(-1, 2)
-        return float(np.sqrt(np.mean(np.sum((projected - image_points) ** 2, axis=1))))
+        return projected.reshape(-1, 2).astype(float)
 
 
     # -------------------------------------------------

@@ -177,6 +177,66 @@ class FlightLogger:
             "track_center_after_x",
             "track_center_after_y",
             "track_center_after_z",
+            "raw_corner_0_x",
+            "raw_corner_0_y",
+            "raw_corner_1_x",
+            "raw_corner_1_y",
+            "raw_corner_2_x",
+            "raw_corner_2_y",
+            "raw_corner_3_x",
+            "raw_corner_3_y",
+            "ordered_corner_0_x",
+            "ordered_corner_0_y",
+            "ordered_corner_1_x",
+            "ordered_corner_1_y",
+            "ordered_corner_2_x",
+            "ordered_corner_2_y",
+            "ordered_corner_3_x",
+            "ordered_corner_3_y",
+            "reprojected_corner_0_x",
+            "reprojected_corner_0_y",
+            "reprojected_corner_1_x",
+            "reprojected_corner_1_y",
+            "reprojected_corner_2_x",
+            "reprojected_corner_2_y",
+            "reprojected_corner_3_x",
+            "reprojected_corner_3_y",
+            "corner_reprojection_error_px",
+            "quad_center_x",
+            "quad_center_y",
+            "image_center_x",
+            "image_center_y",
+            "quad_center_offset_x",
+            "quad_center_offset_y",
+            "quad_width_px",
+            "quad_height_px",
+            "quad_aspect_ratio",
+            "quad_area_px",
+            "pnp_candidate_count",
+            "chosen_pnp_candidate",
+            "pnp_candidate_0_error",
+            "pnp_candidate_1_error",
+            "gate_normal_camera_x",
+            "gate_normal_camera_y",
+            "gate_normal_camera_z",
+            "gate_cam_x",
+            "gate_cam_y",
+            "gate_cam_z",
+            "gate_body_x",
+            "gate_body_y",
+            "gate_body_z",
+            "gate_world_x",
+            "gate_world_y",
+            "gate_world_z",
+            "drone_x_at_detection",
+            "drone_y_at_detection",
+            "drone_z_at_detection",
+            "drone_roll_at_detection_deg",
+            "drone_pitch_at_detection_deg",
+            "drone_yaw_at_detection_deg",
+            "transform_source",
+            "camera_to_body_matrix_used",
+            "body_to_world_method_used",
         ])
 
         self.t0 = time.time()
@@ -214,6 +274,19 @@ class FlightLogger:
             return ""
         arr = np.asarray(value, dtype=float).reshape(-1)
         return " ".join(f"{x:.3f}" for x in arr)
+
+    def _corners4(self, value):
+        out = np.full((4, 2), np.nan, dtype=float)
+        if value is None:
+            return out
+        try:
+            arr = np.asarray(value, dtype=float).reshape(-1, 2)
+        except Exception:
+            return out
+        n = min(4, arr.shape[0])
+        if n > 0:
+            out[:n, :] = arr[:n, :]
+        return out
 
     def log(
         self,
@@ -319,8 +392,28 @@ class FlightLogger:
         gate_center_body=None,
         gate_center_world_debug=None,
         gate_normal_world=None,
+        gate_normal_camera=None,
         detection_drone_pose=None,
         reprojection_error=np.nan,
+        reprojected_corners=None,
+        corner_reprojection_error_px=np.nan,
+        quad_center_x=np.nan,
+        quad_center_y=np.nan,
+        image_center_x=np.nan,
+        image_center_y=np.nan,
+        quad_center_offset_x=np.nan,
+        quad_center_offset_y=np.nan,
+        quad_width_px=np.nan,
+        quad_height_px=np.nan,
+        quad_aspect_ratio=np.nan,
+        quad_area_px=np.nan,
+        pnp_candidate_count=0,
+        chosen_pnp_candidate=None,
+        pnp_candidate_0_error=np.nan,
+        pnp_candidate_1_error=np.nan,
+        transform_source="",
+        camera_to_body_matrix_used=None,
+        body_to_world_method_used="",
         image_width=0,
         image_height=0,
         min_corner_x=np.nan,
@@ -364,11 +457,16 @@ class FlightLogger:
         gate_center_body = self._vec3(gate_center_body)
         gate_center_world_debug = self._vec3(gate_center_world_debug)
         gate_normal_world = self._vec3(gate_normal_world)
+        gate_normal_camera = self._vec3(gate_normal_camera)
         track_center_before_update = self._vec3(track_center_before_update)
         track_center_after_update = self._vec3(track_center_after_update)
+        raw_corners = self._corners4(raw_image_corners)
+        ordered_corners = self._corners4(ordered_image_corners)
+        reprojected_corners = self._corners4(reprojected_corners)
         detection_pose = np.asarray(detection_drone_pose, dtype=float).reshape(-1) if detection_drone_pose is not None else np.full(6, np.nan)
         if detection_pose.size < 6:
             detection_pose = np.full(6, np.nan)
+        chosen_pnp_candidate = -1 if chosen_pnp_candidate is None else chosen_pnp_candidate
 
         err = p_ref - pos
         err_norm = float(np.linalg.norm(err)) if not np.any(np.isnan(err)) else np.nan
@@ -534,6 +632,66 @@ class FlightLogger:
             track_center_after_update[0],
             track_center_after_update[1],
             track_center_after_update[2],
+            raw_corners[0, 0],
+            raw_corners[0, 1],
+            raw_corners[1, 0],
+            raw_corners[1, 1],
+            raw_corners[2, 0],
+            raw_corners[2, 1],
+            raw_corners[3, 0],
+            raw_corners[3, 1],
+            ordered_corners[0, 0],
+            ordered_corners[0, 1],
+            ordered_corners[1, 0],
+            ordered_corners[1, 1],
+            ordered_corners[2, 0],
+            ordered_corners[2, 1],
+            ordered_corners[3, 0],
+            ordered_corners[3, 1],
+            reprojected_corners[0, 0],
+            reprojected_corners[0, 1],
+            reprojected_corners[1, 0],
+            reprojected_corners[1, 1],
+            reprojected_corners[2, 0],
+            reprojected_corners[2, 1],
+            reprojected_corners[3, 0],
+            reprojected_corners[3, 1],
+            corner_reprojection_error_px,
+            quad_center_x,
+            quad_center_y,
+            image_center_x,
+            image_center_y,
+            quad_center_offset_x,
+            quad_center_offset_y,
+            quad_width_px,
+            quad_height_px,
+            quad_aspect_ratio,
+            quad_area_px,
+            pnp_candidate_count,
+            chosen_pnp_candidate,
+            pnp_candidate_0_error,
+            pnp_candidate_1_error,
+            gate_normal_camera[0],
+            gate_normal_camera[1],
+            gate_normal_camera[2],
+            gate_center_camera[0],
+            gate_center_camera[1],
+            gate_center_camera[2],
+            gate_center_body[0],
+            gate_center_body[1],
+            gate_center_body[2],
+            gate_center_world_debug[0],
+            gate_center_world_debug[1],
+            gate_center_world_debug[2],
+            detection_pose[0],
+            detection_pose[1],
+            detection_pose[2],
+            math.degrees(detection_pose[3]),
+            math.degrees(detection_pose[4]),
+            math.degrees(detection_pose[5]),
+            transform_source,
+            self._flat_string(camera_to_body_matrix_used),
+            body_to_world_method_used,
         ])
 
         self.log_file.flush()

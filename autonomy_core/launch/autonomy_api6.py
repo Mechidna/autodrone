@@ -204,14 +204,34 @@ class AutonomyAPI:
         self.race_order_after_merge = []
         self.last_raw_image_corners = None
         self.last_ordered_image_corners = None
+        self.last_reprojected_image_corners = None
         self.last_pnp_rvec = None
         self.last_pnp_tvec = None
         self.last_gate_center_camera = None
         self.last_gate_center_body = None
         self.last_gate_center_world_debug = None
+        self.last_gate_normal_camera = None
         self.last_gate_normal_world = None
         self.last_reprojection_error = float("nan")
+        self.last_corner_reprojection_error_px = float("nan")
+        self.last_pnp_candidate_count = 0
+        self.last_chosen_pnp_candidate = None
+        self.last_pnp_candidate_0_error = float("nan")
+        self.last_pnp_candidate_1_error = float("nan")
+        self.last_quad_center_x = float("nan")
+        self.last_quad_center_y = float("nan")
+        self.last_image_center_x = float("nan")
+        self.last_image_center_y = float("nan")
+        self.last_quad_center_offset_x = float("nan")
+        self.last_quad_center_offset_y = float("nan")
+        self.last_quad_width_px = float("nan")
+        self.last_quad_height_px = float("nan")
+        self.last_quad_aspect_ratio = float("nan")
+        self.last_quad_area_px = float("nan")
         self.last_detection_drone_pose = None
+        self.last_transform_source = ""
+        self.last_camera_to_body_matrix_used = None
+        self.last_body_to_world_method_used = ""
         self.image_width = 0
         self.image_height = 0
         self.corner_margin_px = 25.0
@@ -365,6 +385,7 @@ class AutonomyAPI:
             self.last_raw_gate_center = None
             self.last_perception_accepted = False
             self.last_perception_rejection_reason = "no_detection"
+            self.update_quad_debug(None, frame.shape)
             return None
 
         self.gate_confidence = float(det["confidence"])
@@ -372,13 +393,24 @@ class AutonomyAPI:
         self.last_raw_gate_center = raw_center.copy()
         self.last_raw_image_corners = det.get("raw_corners", None)
         self.last_ordered_image_corners = det.get("ordered_corners", None)
+        self.last_reprojected_image_corners = det.get("reprojected_corners", None)
         self.last_pnp_rvec = det.get("rvec", None)
         self.last_pnp_tvec = det.get("tvec", None)
         self.last_gate_center_camera = det.get("gate_center_camera", None)
         self.last_gate_center_body = det.get("gate_center_body", None)
         self.last_gate_center_world_debug = raw_center.copy()
+        self.last_gate_normal_camera = det.get("gate_normal_camera", None)
         self.last_gate_normal_world = det.get("gate_normal_world", None)
         self.last_reprojection_error = float(det.get("reprojection_error", np.nan))
+        self.last_corner_reprojection_error_px = float(det.get("corner_reprojection_error_px", np.nan))
+        pnp_candidates = det.get("pnp_candidates", [])
+        self.last_pnp_candidate_count = len(pnp_candidates) if pnp_candidates is not None else 0
+        self.last_chosen_pnp_candidate = det.get("chosen_candidate", None)
+        self.last_pnp_candidate_0_error = self.pnp_candidate_error(pnp_candidates, 0)
+        self.last_pnp_candidate_1_error = self.pnp_candidate_error(pnp_candidates, 1)
+        self.last_transform_source = det.get("transform_source", "")
+        self.last_camera_to_body_matrix_used = det.get("camera_to_body_matrix_used", None)
+        self.last_body_to_world_method_used = det.get("body_to_world_method_used", "")
         self.last_detection_drone_pose = np.array([
             drone_pos[0],
             drone_pos[1],
@@ -387,6 +419,7 @@ class AutonomyAPI:
             drone_rpy_rad[1],
             drone_rpy_rad[2],
         ], dtype=float)
+        self.update_quad_debug(self.last_ordered_image_corners, frame.shape)
 
         image_valid, image_reason = self.validate_detection_image_bounds(
             det.get("ordered_corners", None),
@@ -526,6 +559,60 @@ class AutonomyAPI:
 
         self.corner_margin_ok = True
         return True, ""
+
+    def update_quad_debug(self, corners, frame_shape):
+        if frame_shape is not None:
+            self.last_image_center_x = 0.5 * float(frame_shape[1] - 1)
+            self.last_image_center_y = 0.5 * float(frame_shape[0] - 1)
+        else:
+            self.last_image_center_x = float("nan")
+            self.last_image_center_y = float("nan")
+
+        self.last_quad_center_x = float("nan")
+        self.last_quad_center_y = float("nan")
+        self.last_quad_center_offset_x = float("nan")
+        self.last_quad_center_offset_y = float("nan")
+        self.last_quad_width_px = float("nan")
+        self.last_quad_height_px = float("nan")
+        self.last_quad_aspect_ratio = float("nan")
+        self.last_quad_area_px = float("nan")
+
+        if corners is None:
+            return
+
+        pts = np.asarray(corners, dtype=float).reshape(-1, 2)
+        if pts.shape[0] != 4 or not np.all(np.isfinite(pts)):
+            return
+
+        center = np.mean(pts, axis=0)
+        self.last_quad_center_x = float(center[0])
+        self.last_quad_center_y = float(center[1])
+        self.last_quad_center_offset_x = self.last_quad_center_x - self.last_image_center_x
+        self.last_quad_center_offset_y = self.last_quad_center_y - self.last_image_center_y
+
+        top_width = float(np.linalg.norm(pts[1] - pts[0]))
+        bottom_width = float(np.linalg.norm(pts[2] - pts[3]))
+        right_height = float(np.linalg.norm(pts[2] - pts[1]))
+        left_height = float(np.linalg.norm(pts[3] - pts[0]))
+        self.last_quad_width_px = 0.5 * (top_width + bottom_width)
+        self.last_quad_height_px = 0.5 * (right_height + left_height)
+        if self.last_quad_height_px > 1e-6:
+            self.last_quad_aspect_ratio = self.last_quad_width_px / self.last_quad_height_px
+        self.last_quad_area_px = float(abs(
+            0.5 * (
+                np.dot(pts[:, 0], np.roll(pts[:, 1], -1))
+                - np.dot(pts[:, 1], np.roll(pts[:, 0], -1))
+            )
+        ))
+
+    @staticmethod
+    def pnp_candidate_error(candidates, index):
+        if candidates is None or len(candidates) <= index:
+            return float("nan")
+        try:
+            return float(candidates[index].get("error", np.nan))
+        except Exception:
+            return float("nan")
 
     def validate_perception_gate_center(self, center, current_pos):
         center = np.asarray(center, dtype=float).reshape(3)
