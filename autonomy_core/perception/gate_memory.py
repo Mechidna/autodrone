@@ -21,13 +21,15 @@ class GateTrack:
     def update(self, measurement: np.ndarray, confidence: float, timestamp: float, alpha: float = 0.35):
         measurement = np.asarray(measurement, dtype=float).reshape(3)
 
-        # exponential smoothing / fusion while still uncommitted
-        self.center = (1.0 - alpha) * self.center + alpha * measurement
-
         self.confidence_sum += float(confidence)
         self.hits += 1
         self.last_seen_time = float(timestamp)
         self.measurement_history.append(measurement.copy())
+        # Robust center for uncommitted tracks: do not let one accepted
+        # measurement pull the candidate center. Boundary/outlier rejection
+        # happens before this; the median handles residual jitter.
+        recent = np.asarray(self.recent_measurements(10), dtype=float)
+        self.center = np.median(recent, axis=0)
 
     def observe_without_moving(self, measurement: np.ndarray, confidence: float, timestamp: float):
         """
@@ -102,6 +104,11 @@ class GateMemory:
         self.last_pairwise_distances = []
         self.last_merge_candidate_pairs = []
         self.last_merge_blocked_reason = ""
+        self.max_candidate_update_innovation = max(2.0, self.commit_radius)
+        self.last_update_innovation = float("nan")
+        self.last_update_accepted = False
+        self.last_track_center_before = None
+        self.last_track_center_after = None
 
         self._next_id = 0
         self.tracks: List[GateTrack] = []
@@ -296,6 +303,10 @@ class GateMemory:
         """
         center = np.asarray(center, dtype=float).reshape(3)
         confidence = float(confidence)
+        self.last_update_innovation = float("nan")
+        self.last_update_accepted = False
+        self.last_track_center_before = None
+        self.last_track_center_after = None
 
         if confidence < self.min_confidence_per_hit:
             return {
@@ -311,9 +322,13 @@ class GateMemory:
         tr = self._find_best_track(center, committed_only=True)
         if tr is not None:
             dist = self._distance(center, tr.center)
+            self.last_update_innovation = dist
+            self.last_track_center_before = tr.center.copy()
             print(f"[ASSOC] trying match: dist={dist:.2f}, track_id={tr.id}")
             if dist < self.max_committed_match_distance:
                 tr.observe_without_moving(center, confidence, timestamp)
+                self.last_update_accepted = True
+                self.last_track_center_after = tr.center.copy()
 
                 if dist > 2.0:
                     print(f"[WARN] large residual on committed track {tr.id}: {dist:.2f} m")
@@ -333,9 +348,24 @@ class GateMemory:
         # 2) Else try matching an uncommitted candidate
         tr = self._find_best_track(center, uncommitted_only=True)
         if tr is not None:
+            innovation = self._distance(center, tr.center)
+            self.last_update_innovation = innovation
+            self.last_track_center_before = tr.center.copy()
+            if innovation > self.max_candidate_update_innovation:
+                self.last_track_center_after = tr.center.copy()
+                return {
+                    "accepted": False,
+                    "reason": f"candidate_update_innovation_too_large:{innovation:.2f}",
+                    "track_id": tr.id,
+                    "committed_now": False,
+                    "committed": tr.committed,
+                    "center": center,
+                }
             committed_before = tr.committed
             tr.update(center, confidence, timestamp, alpha=self.alpha)
             self._maybe_commit(tr)
+            self.last_update_accepted = True
+            self.last_track_center_after = tr.center.copy()
 
             return {
                 "accepted": True,
@@ -359,8 +389,12 @@ class GateMemory:
 
         # 4) Otherwise create a new candidate track
         tr = self._create_track(center, confidence, timestamp)
+        self.last_update_innovation = 0.0
+        self.last_update_accepted = True
+        self.last_track_center_before = center.copy()
         committed_before = tr.committed
         self._maybe_commit(tr)
+        self.last_track_center_after = tr.center.copy()
 
         return {
             "accepted": True,

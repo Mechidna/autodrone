@@ -212,6 +212,20 @@ class AutonomyAPI:
         self.last_gate_normal_world = None
         self.last_reprojection_error = float("nan")
         self.last_detection_drone_pose = None
+        self.image_width = 0
+        self.image_height = 0
+        self.corner_margin_px = 25.0
+        self.min_corner_x = float("nan")
+        self.max_corner_x = float("nan")
+        self.min_corner_y = float("nan")
+        self.max_corner_y = float("nan")
+        self.corner_margin_ok = False
+        self.clipped_detection_rejected = False
+        self.rejected_near_image_edge = False
+        self.track_update_innovation = float("nan")
+        self.track_update_accepted = False
+        self.track_center_before_update = None
+        self.track_center_after_update = None
         self.candidate_track_id = None
         self.candidate_center = None
         self.candidate_order_score = float("nan")
@@ -374,6 +388,24 @@ class AutonomyAPI:
             drone_rpy_rad[2],
         ], dtype=float)
 
+        image_valid, image_reason = self.validate_detection_image_bounds(
+            det.get("ordered_corners", None),
+            frame.shape,
+        )
+        if not image_valid:
+            self.gate_memory.prune(now)
+            self.last_perception_accepted = False
+            self.last_perception_rejection_reason = image_reason
+            print(f"[PERCEPTION REJECT] reason={image_reason} corners={self.last_ordered_image_corners}")
+            return {
+                "accepted": False,
+                "reason": image_reason,
+                "track_id": None,
+                "committed_now": False,
+                "committed": False,
+                "center": raw_center,
+            }
+
         valid, reason = self.validate_perception_gate_center(raw_center, drone_pos)
         if not valid:
             self.gate_memory.prune(now)
@@ -410,6 +442,10 @@ class AutonomyAPI:
             confidence=det["confidence"],
             timestamp=now,
         )
+        self.track_update_innovation = self.gate_memory.last_update_innovation
+        self.track_update_accepted = self.gate_memory.last_update_accepted
+        self.track_center_before_update = self.gate_memory.last_track_center_before
+        self.track_center_after_update = self.gate_memory.last_track_center_after
 
         self.gate_memory.prune(now)
         merge_event = self.refresh_landmark_merges()
@@ -443,6 +479,53 @@ class AutonomyAPI:
                 print(f"    id={tr.id}, center={tr.center}, hits={tr.hits}")
 
         return result
+
+    def validate_detection_image_bounds(self, corners, frame_shape):
+        self.image_height = int(frame_shape[0])
+        self.image_width = int(frame_shape[1])
+        self.min_corner_x = float("nan")
+        self.max_corner_x = float("nan")
+        self.min_corner_y = float("nan")
+        self.max_corner_y = float("nan")
+        self.corner_margin_ok = False
+        self.clipped_detection_rejected = False
+        self.rejected_near_image_edge = False
+
+        if corners is None:
+            return False, "missing_ordered_corners"
+
+        pts = np.asarray(corners, dtype=float).reshape(-1, 2)
+        if pts.shape[0] != 4 or not np.all(np.isfinite(pts)):
+            return False, "invalid_ordered_corners"
+
+        xs = pts[:, 0]
+        ys = pts[:, 1]
+        self.min_corner_x = float(np.min(xs))
+        self.max_corner_x = float(np.max(xs))
+        self.min_corner_y = float(np.min(ys))
+        self.max_corner_y = float(np.max(ys))
+
+        if (
+            self.min_corner_x < 0.0
+            or self.max_corner_x > self.image_width - 1
+            or self.min_corner_y < 0.0
+            or self.max_corner_y > self.image_height - 1
+        ):
+            self.clipped_detection_rejected = True
+            return False, "clipped_detection_rejected"
+
+        margin = float(self.corner_margin_px)
+        if (
+            self.min_corner_x < margin
+            or self.max_corner_x > (self.image_width - 1 - margin)
+            or self.min_corner_y < margin
+            or self.max_corner_y > (self.image_height - 1 - margin)
+        ):
+            self.rejected_near_image_edge = True
+            return False, "rejected_near_image_edge"
+
+        self.corner_margin_ok = True
+        return True, ""
 
     def validate_perception_gate_center(self, center, current_pos):
         center = np.asarray(center, dtype=float).reshape(3)

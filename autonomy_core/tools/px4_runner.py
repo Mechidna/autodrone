@@ -493,6 +493,19 @@ async def main():
                 gate_normal_world=getattr(autonomy, "last_gate_normal_world", None),
                 detection_drone_pose=getattr(autonomy, "last_detection_drone_pose", None),
                 reprojection_error=getattr(autonomy, "last_reprojection_error", float("nan")),
+                image_width=getattr(autonomy, "image_width", 0),
+                image_height=getattr(autonomy, "image_height", 0),
+                min_corner_x=getattr(autonomy, "min_corner_x", float("nan")),
+                max_corner_x=getattr(autonomy, "max_corner_x", float("nan")),
+                min_corner_y=getattr(autonomy, "min_corner_y", float("nan")),
+                max_corner_y=getattr(autonomy, "max_corner_y", float("nan")),
+                corner_margin_ok=getattr(autonomy, "corner_margin_ok", False),
+                clipped_detection_rejected=getattr(autonomy, "clipped_detection_rejected", False),
+                rejected_near_image_edge=getattr(autonomy, "rejected_near_image_edge", False),
+                track_update_innovation=getattr(autonomy, "track_update_innovation", float("nan")),
+                track_update_accepted=getattr(autonomy, "track_update_accepted", False),
+                track_center_before_update=getattr(autonomy, "track_center_before_update", None),
+                track_center_after_update=getattr(autonomy, "track_center_after_update", None),
             )
 
             await drone.offboard.set_attitude(

@@ -160,6 +160,23 @@ class FlightLogger:
             "detection_drone_pitch_rad",
             "detection_drone_yaw_rad",
             "reprojection_error",
+            "image_width",
+            "image_height",
+            "min_corner_x",
+            "max_corner_x",
+            "min_corner_y",
+            "max_corner_y",
+            "corner_margin_ok",
+            "clipped_detection_rejected",
+            "rejected_near_image_edge",
+            "track_update_innovation",
+            "track_update_accepted",
+            "track_center_before_x",
+            "track_center_before_y",
+            "track_center_before_z",
+            "track_center_after_x",
+            "track_center_after_y",
+            "track_center_after_z",
         ])
 
         self.t0 = time.time()
@@ -304,6 +321,19 @@ class FlightLogger:
         gate_normal_world=None,
         detection_drone_pose=None,
         reprojection_error=np.nan,
+        image_width=0,
+        image_height=0,
+        min_corner_x=np.nan,
+        max_corner_x=np.nan,
+        min_corner_y=np.nan,
+        max_corner_y=np.nan,
+        corner_margin_ok=False,
+        clipped_detection_rejected=False,
+        rejected_near_image_edge=False,
+        track_update_innovation=np.nan,
+        track_update_accepted=False,
+        track_center_before_update=None,
+        track_center_after_update=None,
     ):
         now = time.time()
         t = now - self.t0
@@ -334,6 +364,8 @@ class FlightLogger:
         gate_center_body = self._vec3(gate_center_body)
         gate_center_world_debug = self._vec3(gate_center_world_debug)
         gate_normal_world = self._vec3(gate_normal_world)
+        track_center_before_update = self._vec3(track_center_before_update)
+        track_center_after_update = self._vec3(track_center_after_update)
         detection_pose = np.asarray(detection_drone_pose, dtype=float).reshape(-1) if detection_drone_pose is not None else np.full(6, np.nan)
         if detection_pose.size < 6:
             detection_pose = np.full(6, np.nan)
@@ -485,6 +517,23 @@ class FlightLogger:
             detection_pose[4],
             detection_pose[5],
             reprojection_error,
+            image_width,
+            image_height,
+            min_corner_x,
+            max_corner_x,
+            min_corner_y,
+            max_corner_y,
+            bool(corner_margin_ok),
+            bool(clipped_detection_rejected),
+            bool(rejected_near_image_edge),
+            track_update_innovation,
+            bool(track_update_accepted),
+            track_center_before_update[0],
+            track_center_before_update[1],
+            track_center_before_update[2],
+            track_center_after_update[0],
+            track_center_after_update[1],
+            track_center_after_update[2],
         ])
 
         self.log_file.flush()
