@@ -110,6 +110,17 @@ class GatePerceptionNode:
         gate_world = np.asarray(drone_pos,dtype=float).reshape(3) + R_wb @ (camera_pos_body + gate_body)
         # end user fix
         debug = perception.get("debug", {})
+        gate_size_sweep = {}
+        for key, value in debug.get("gate_size_sweep", {}).items():
+            cam = np.asarray(value.get("tvec", np.full(3, np.nan)), dtype=float).reshape(3)
+            body = self.R_body_camera @ cam
+            world = np.asarray(drone_pos, dtype=float).reshape(3) + R_wb @ (camera_pos_body + body)
+            gate_size_sweep[key] = {
+                "camera": cam,
+                "body": body,
+                "world": world,
+                "reprojection_error": float(value.get("reprojection_error", np.nan)),
+            }
         gate_normal_camera = np.asarray(
             debug.get("gate_normal_camera", np.array([np.nan, np.nan, np.nan])),
             dtype=float,
@@ -137,5 +148,6 @@ class GatePerceptionNode:
             "tvec": debug.get("tvec", gate_camera),
             "pnp_candidates": debug.get("pnp_candidates", []),
             "chosen_candidate": debug.get("chosen_candidate", None),
+            "gate_size_sweep": gate_size_sweep,
             "raw": perception,
         }

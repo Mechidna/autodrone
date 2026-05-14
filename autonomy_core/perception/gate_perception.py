@@ -88,6 +88,12 @@ class GatePerception:
             "gate_normal_camera": gate_normal_camera.copy(),
             "pnp_candidates": pnp_debug["candidates"],
             "chosen_candidate": int(pnp_debug["chosen_candidate"]),
+            "gate_size_sweep": self.solve_pnp_gate_size_sweep(
+                ordered,
+                camera_matrix,
+                dist_coeffs,
+                sizes=(1.90, 2.00, 2.10),
+            ),
         }
 
         # -------- DEBUG DRAW --------
@@ -305,6 +311,70 @@ class GatePerception:
             "chosen_candidate": best_i,
             "candidates": candidates,
         }
+
+    @staticmethod
+    def model_points_for_size(gate_size: float):
+        s = float(gate_size) / 2.0
+        return np.array([
+            [-s,  s, 0],
+            [ s,  s, 0],
+            [ s, -s, 0],
+            [-s, -s, 0],
+        ], dtype=np.float32)
+
+    def solve_pnp_gate_size_sweep(self, image_points, camera_matrix, dist_coeffs, sizes=(1.90, 2.00, 2.10)):
+        image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 1, 2)
+        out = {}
+
+        def err_scalar(e):
+            if e is None:
+                return float("nan")
+            return float(np.asarray(e).reshape(-1)[0])
+
+        for size in sizes:
+            key = f"{int(round(float(size) * 100)):03d}"
+            model_points = self.model_points_for_size(size)
+            ok, rvecs, tvecs, reprojErrs = cv2.solvePnPGeneric(
+                model_points,
+                image_points,
+                camera_matrix,
+                dist_coeffs,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE,
+            )
+            if not ok or rvecs is None or len(rvecs) == 0:
+                out[key] = {
+                    "rvec": np.full(3, np.nan, dtype=float),
+                    "tvec": np.full(3, np.nan, dtype=float),
+                    "reprojection_error": float("nan"),
+                    "chosen_candidate": None,
+                    "candidate_count": 0,
+                }
+                continue
+
+            best_i = 0
+            best_score = -1e18
+            for i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
+                R_mat, _ = cv2.Rodrigues(rvec)
+                n = R_mat[:, 2].astype(float)
+                n /= np.linalg.norm(n) + 1e-12
+                e = err_scalar(reprojErrs[i]) if reprojErrs is not None and len(reprojErrs) > i else 0.0
+                tz = float(np.asarray(tvec).reshape(-1)[2])
+                score = (10.0 * n[2]) - e
+                if tz <= 0:
+                    score -= 1e6
+                if score > best_score:
+                    best_score = score
+                    best_i = i
+
+            out[key] = {
+                "rvec": np.asarray(rvecs[best_i], dtype=float).reshape(3),
+                "tvec": np.asarray(tvecs[best_i], dtype=float).reshape(3),
+                "reprojection_error": err_scalar(reprojErrs[best_i]) if reprojErrs is not None and len(reprojErrs) > best_i else float("nan"),
+                "chosen_candidate": int(best_i),
+                "candidate_count": int(len(rvecs)),
+            }
+
+        return out
 
     def compute_reprojection_error(self, R_mat, tvec, camera_matrix, dist_coeffs, image_points):
         projected = self.project_model_points(R_mat, tvec, camera_matrix, dist_coeffs)

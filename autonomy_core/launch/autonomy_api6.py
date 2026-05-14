@@ -60,6 +60,7 @@ class AutonomyAPI:
             os.path.dirname(os.path.dirname(__file__)),
             "debug_frames",
         )
+        self.camera_offset_body = np.array([0.12, 0.03, 0.242], dtype=float)
 
         self.gate_perception = GatePerception() if use_perception else None
         self.perception_node = GatePerceptionNode(self.gate_perception) if use_perception else None
@@ -245,6 +246,8 @@ class AutonomyAPI:
         self.last_transform_source = ""
         self.last_camera_to_body_matrix_used = None
         self.last_body_to_world_method_used = ""
+        self.last_pnp_size_sweep = {}
+        self.reset_transform_validation_debug()
         self.image_width = 0
         self.image_height = 0
         self.corner_margin_px = 25.0
@@ -398,6 +401,7 @@ class AutonomyAPI:
             self.last_raw_gate_center = None
             self.last_perception_accepted = False
             self.last_perception_rejection_reason = "no_detection"
+            self.reset_transform_validation_debug()
             self.update_quad_debug(None, frame.shape)
             return None
 
@@ -424,6 +428,7 @@ class AutonomyAPI:
         self.last_transform_source = det.get("transform_source", "")
         self.last_camera_to_body_matrix_used = det.get("camera_to_body_matrix_used", None)
         self.last_body_to_world_method_used = det.get("body_to_world_method_used", "")
+        self.last_pnp_size_sweep = det.get("gate_size_sweep", {})
         self.last_detection_drone_pose = np.array([
             drone_pos[0],
             drone_pos[1],
@@ -442,6 +447,7 @@ class AutonomyAPI:
             self.gate_memory.prune(now)
             self.last_perception_accepted = False
             self.last_perception_rejection_reason = image_reason
+            self.reset_transform_validation_debug()
             self.save_perception_debug_frame(
                 frame=frame,
                 timestamp=now,
@@ -464,6 +470,7 @@ class AutonomyAPI:
             self.gate_memory.prune(now)
             self.last_perception_accepted = False
             self.last_perception_rejection_reason = reason
+            self.reset_transform_validation_debug()
             self.save_perception_debug_frame(
                 frame=frame,
                 timestamp=now,
@@ -487,6 +494,7 @@ class AutonomyAPI:
             self.last_perception_rejection_reason = "near_completed_landmark_this_lap"
             self.rejected_completed_this_lap = True
             self.target_rejected_completed = True
+            self.reset_transform_validation_debug()
             self.save_perception_debug_frame(
                 frame=frame,
                 timestamp=now,
@@ -532,6 +540,10 @@ class AutonomyAPI:
                     self.accept_track_into_race_order(tr)
             self.last_perception_accepted = bool(result.get("accepted", False))
             self.last_perception_rejection_reason = "" if self.last_perception_accepted else result.get("reason", "")
+            if self.last_perception_accepted:
+                self.compute_transform_validation_debug(drone_pos, drone_rpy_rad)
+            else:
+                self.reset_transform_validation_debug()
             self.save_perception_debug_frame(
                 frame=frame,
                 timestamp=now,
@@ -654,6 +666,101 @@ class AutonomyAPI:
             return float(candidates[index].get("error", np.nan))
         except Exception:
             return float("nan")
+
+    def reset_transform_validation_debug(self):
+        nan3 = np.full(3, np.nan, dtype=float)
+        self.expected_gate_cam = nan3.copy()
+        self.pnp_gate_cam = nan3.copy()
+        self.camera_error = nan3.copy()
+        self.camera_error_norm = float("nan")
+        self.expected_gate_body = nan3.copy()
+        self.pnp_gate_body = nan3.copy()
+        self.body_error = nan3.copy()
+        self.expected_gate_world = nan3.copy()
+        self.pnp_gate_world = nan3.copy()
+        self.world_error = nan3.copy()
+        self.world_error_norm = float("nan")
+        self.pnp_size_190_cam = nan3.copy()
+        self.pnp_size_200_cam = nan3.copy()
+        self.pnp_size_210_cam = nan3.copy()
+        self.pnp_size_190_world = nan3.copy()
+        self.pnp_size_200_world = nan3.copy()
+        self.pnp_size_210_world = nan3.copy()
+        self.pnp_size_190_reproj_error = float("nan")
+        self.pnp_size_200_reproj_error = float("nan")
+        self.pnp_size_210_reproj_error = float("nan")
+        self.pnp_size_190_gt_error = float("nan")
+        self.pnp_size_200_gt_error = float("nan")
+        self.pnp_size_210_gt_error = float("nan")
+
+    def compute_transform_validation_debug(self, drone_pos, drone_rpy_rad):
+        """
+        Debug-only comparison against the known simulator GT gate. This does
+        not feed back into control, target selection, or perception memory.
+        """
+        self.reset_transform_validation_debug()
+
+        if self.perception_node is None or len(self.gt_gates) == 0:
+            return
+
+        gate_idx = int(np.clip(self.current_gate_idx, 0, len(self.gt_gates) - 1))
+        gt_gate_world = np.asarray(self.gt_gates[gate_idx], dtype=float).reshape(3)
+        drone_pos = np.asarray(drone_pos, dtype=float).reshape(3)
+        roll, pitch, yaw = np.asarray(drone_rpy_rad, dtype=float).reshape(3)
+
+        R_wb = self.perception_node._rpy_to_rotmat(float(roll), float(pitch), float(yaw))
+        R_bw = R_wb.T
+        R_body_camera = np.asarray(self.perception_node.R_body_camera, dtype=float).reshape(3, 3)
+        R_camera_body = R_body_camera.T
+
+        expected_body_from_camera = (
+            R_bw @ (gt_gate_world - drone_pos)
+        ) - self.camera_offset_body
+        expected_camera = R_camera_body @ expected_body_from_camera
+
+        self.expected_gate_cam = expected_camera.copy()
+        self.expected_gate_body = expected_body_from_camera.copy()
+        self.expected_gate_world = gt_gate_world.copy()
+
+        self.pnp_gate_cam = self._vec3_for_debug(self.last_gate_center_camera)
+        self.pnp_gate_body = self._vec3_for_debug(self.last_gate_center_body)
+        self.pnp_gate_world = self._vec3_for_debug(self.last_gate_center_world_debug)
+
+        self.camera_error = self.pnp_gate_cam - self.expected_gate_cam
+        self.body_error = self.pnp_gate_body - self.expected_gate_body
+        self.world_error = self.pnp_gate_world - self.expected_gate_world
+        self.camera_error_norm = float(np.linalg.norm(self.camera_error))
+        self.world_error_norm = float(np.linalg.norm(self.world_error))
+        self.update_gate_size_sweep_debug(self.expected_gate_world)
+
+        print(
+            "[TRANSFORM VALIDATION] "
+            f"gt_gate_idx={gate_idx} "
+            f"expected_cam={self.expected_gate_cam} "
+            f"pnp_cam={self.pnp_gate_cam} "
+            f"camera_error={self.camera_error} "
+            f"camera_error_norm={self.camera_error_norm:.3f} "
+            f"world_error_norm={self.world_error_norm:.3f}"
+        )
+
+    def update_gate_size_sweep_debug(self, expected_gate_world):
+        expected_gate_world = np.asarray(expected_gate_world, dtype=float).reshape(3)
+        for key, size_label in (("190", "190"), ("200", "200"), ("210", "210")):
+            entry = self.last_pnp_size_sweep.get(key, {}) if isinstance(self.last_pnp_size_sweep, dict) else {}
+            cam = self._vec3_for_debug(entry.get("camera", None))
+            world = self._vec3_for_debug(entry.get("world", None))
+            setattr(self, f"pnp_size_{size_label}_cam", cam.copy())
+            setattr(self, f"pnp_size_{size_label}_world", world.copy())
+            setattr(
+                self,
+                f"pnp_size_{size_label}_reproj_error",
+                float(entry.get("reprojection_error", np.nan)),
+            )
+            if np.all(np.isfinite(world)) and np.all(np.isfinite(expected_gate_world)):
+                gt_error = float(np.linalg.norm(world - expected_gate_world))
+            else:
+                gt_error = float("nan")
+            setattr(self, f"pnp_size_{size_label}_gt_error", gt_error)
 
     def save_perception_debug_frame(
         self,
