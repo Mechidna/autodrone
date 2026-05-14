@@ -1,6 +1,8 @@
 import numpy as np
 import time
 import math
+import os
+import cv2
 from autonomy_core.planning.minimum_snap_planner_multi_time_optimized import MultiSegmentMinimumSnapPlanner
 from autonomy_core.launch.get_telemetry import GetTelemetry
 from autonomy_core.controller.attitude_controller3 import RPGHighLevelTracker
@@ -45,8 +47,19 @@ class Reference:
 
 
 class AutonomyAPI:
-    def __init__(self, use_perception=False, race_gate_count=None, race_gate_order=None):
+    def __init__(
+        self,
+        use_perception=False,
+        race_gate_count=None,
+        race_gate_order=None,
+        save_perception_debug_frames=True,
+    ):
         self.use_perception = use_perception
+        self.save_perception_debug_frames = bool(save_perception_debug_frames)
+        self.perception_debug_frame_dir = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "debug_frames",
+        )
 
         self.gate_perception = GatePerception() if use_perception else None
         self.perception_node = GatePerceptionNode(self.gate_perception) if use_perception else None
@@ -429,6 +442,13 @@ class AutonomyAPI:
             self.gate_memory.prune(now)
             self.last_perception_accepted = False
             self.last_perception_rejection_reason = image_reason
+            self.save_perception_debug_frame(
+                frame=frame,
+                timestamp=now,
+                track_id=None,
+                accepted=False,
+                rejection_reason=image_reason,
+            )
             print(f"[PERCEPTION REJECT] reason={image_reason} corners={self.last_ordered_image_corners}")
             return {
                 "accepted": False,
@@ -444,6 +464,13 @@ class AutonomyAPI:
             self.gate_memory.prune(now)
             self.last_perception_accepted = False
             self.last_perception_rejection_reason = reason
+            self.save_perception_debug_frame(
+                frame=frame,
+                timestamp=now,
+                track_id=None,
+                accepted=False,
+                rejection_reason=reason,
+            )
             print(f"[PERCEPTION REJECT] reason={reason} raw_center={raw_center}")
             return {
                 "accepted": False,
@@ -460,6 +487,13 @@ class AutonomyAPI:
             self.last_perception_rejection_reason = "near_completed_landmark_this_lap"
             self.rejected_completed_this_lap = True
             self.target_rejected_completed = True
+            self.save_perception_debug_frame(
+                frame=frame,
+                timestamp=now,
+                track_id=None,
+                accepted=False,
+                rejection_reason="near_completed_landmark_this_lap",
+            )
             print(f"[PERCEPTION REJECT] reason=near_completed_landmark_this_lap raw_center={raw_center}")
             return {
                 "accepted": False,
@@ -498,6 +532,13 @@ class AutonomyAPI:
                     self.accept_track_into_race_order(tr)
             self.last_perception_accepted = bool(result.get("accepted", False))
             self.last_perception_rejection_reason = "" if self.last_perception_accepted else result.get("reason", "")
+            self.save_perception_debug_frame(
+                frame=frame,
+                timestamp=now,
+                track_id=result.get("track_id"),
+                accepted=self.last_perception_accepted,
+                rejection_reason=self.last_perception_rejection_reason,
+            )
             print(
                 f"[MEM] reason={result['reason']} "
                 f"track_id={result['track_id']} "
@@ -613,6 +654,176 @@ class AutonomyAPI:
             return float(candidates[index].get("error", np.nan))
         except Exception:
             return float("nan")
+
+    def save_perception_debug_frame(
+        self,
+        frame,
+        timestamp,
+        track_id=None,
+        accepted=False,
+        rejection_reason="",
+    ):
+        if not self.save_perception_debug_frames or frame is None:
+            return None
+
+        try:
+            os.makedirs(self.perception_debug_frame_dir, exist_ok=True)
+        except Exception as exc:
+            print(f"[DEBUG FRAME] could not create debug dir: {exc}")
+            return None
+
+        if len(frame.shape) == 2:
+            canvas = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        else:
+            canvas = frame.copy()
+
+        raw = self._corners_for_debug(self.last_raw_image_corners)
+        ordered = self._corners_for_debug(self.last_ordered_image_corners)
+        reprojected = self._corners_for_debug(self.last_reprojected_image_corners)
+
+        self._draw_debug_corners(canvas, raw, color=(0, 0, 255), prefix="raw", connect=False)
+        self._draw_debug_corners(canvas, ordered, color=(0, 255, 0), prefix="ord", connect=True)
+        self._draw_debug_corners(canvas, reprojected, color=(255, 0, 0), prefix="rep", connect=True, cross=True)
+
+        if np.isfinite(self.last_quad_center_x) and np.isfinite(self.last_quad_center_y):
+            center_pt = (int(round(self.last_quad_center_x)), int(round(self.last_quad_center_y)))
+            cv2.drawMarker(
+                canvas,
+                center_pt,
+                (0, 255, 255),
+                markerType=cv2.MARKER_CROSS,
+                markerSize=18,
+                thickness=2,
+            )
+            cv2.putText(
+                canvas,
+                "quad_center",
+                (center_pt[0] + 6, center_pt[1] - 6),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+        gate_world = self._vec3_for_debug(self.last_gate_center_world_debug)
+        gate_camera = self._vec3_for_debug(self.last_gate_center_camera)
+        pnp_tvec = self._vec3_for_debug(self.last_pnp_tvec)
+        track_label = "none" if track_id is None else str(track_id)
+        active_status = (
+            f"active_track={self.active_target_track_id}"
+            if self.active_target_track_id is not None
+            else "active_track=none"
+        )
+        status = "accepted" if accepted else f"rejected:{rejection_reason}"
+        overlay_lines = [
+            f"{status}",
+            f"track_id={track_label} conf={self.gate_confidence:.3f} reproj={self.last_reprojection_error:.2f}px",
+            f"world=({gate_world[0]:.2f},{gate_world[1]:.2f},{gate_world[2]:.2f})",
+            f"camera=({gate_camera[0]:.2f},{gate_camera[1]:.2f},{gate_camera[2]:.2f})",
+            f"tvec=({pnp_tvec[0]:.2f},{pnp_tvec[1]:.2f},{pnp_tvec[2]:.2f})",
+            f"{active_status} t={timestamp:.3f}",
+        ]
+        self._draw_debug_text_block(canvas, overlay_lines)
+
+        safe_track = "none" if track_id is None else str(track_id)
+        filename = f"frame_{timestamp:.3f}_track_{safe_track}.png"
+        filename = filename.replace(".", "p", 1)
+        path = os.path.join(self.perception_debug_frame_dir, filename)
+        ok = cv2.imwrite(path, canvas)
+        if not ok:
+            print(f"[DEBUG FRAME] cv2.imwrite failed: {path}")
+            return None
+        print(f"[DEBUG FRAME] saved {path}")
+        return path
+
+    @staticmethod
+    def _corners_for_debug(corners):
+        if corners is None:
+            return None
+        try:
+            pts = np.asarray(corners, dtype=float).reshape(-1, 2)
+        except Exception:
+            return None
+        if pts.shape[0] == 0:
+            return None
+        return pts
+
+    @staticmethod
+    def _vec3_for_debug(value):
+        if value is None:
+            return np.full(3, np.nan, dtype=float)
+        try:
+            arr = np.asarray(value, dtype=float).reshape(-1)
+        except Exception:
+            return np.full(3, np.nan, dtype=float)
+        if arr.size < 3:
+            return np.full(3, np.nan, dtype=float)
+        return arr[:3]
+
+    @staticmethod
+    def _draw_debug_corners(canvas, corners, color, prefix, connect=False, cross=False):
+        if corners is None:
+            return
+        pts = []
+        for i, pt in enumerate(corners[:4]):
+            if not np.all(np.isfinite(pt)):
+                continue
+            xy = (int(round(pt[0])), int(round(pt[1])))
+            pts.append(xy)
+            if cross:
+                cv2.drawMarker(
+                    canvas,
+                    xy,
+                    color,
+                    markerType=cv2.MARKER_TILTED_CROSS,
+                    markerSize=12,
+                    thickness=2,
+                )
+            else:
+                cv2.circle(canvas, xy, 4, color, -1)
+            cv2.putText(
+                canvas,
+                f"{prefix}{i}",
+                (xy[0] + 5, xy[1] - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+        if connect and len(pts) >= 2:
+            cv2.polylines(
+                canvas,
+                [np.asarray(pts, dtype=np.int32)],
+                isClosed=len(pts) >= 4,
+                color=color,
+                thickness=2,
+            )
+
+    @staticmethod
+    def _draw_debug_text_block(canvas, lines):
+        line_h = 15
+        width = min(520, max(220, canvas.shape[1] - 20))
+        height = line_h * len(lines) + 8
+        x = 8
+        y_top = max(0, canvas.shape[0] - height - 8)
+        y0 = y_top + 14
+        overlay = canvas.copy()
+        cv2.rectangle(overlay, (0, y_top), (width, y_top + height), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.35, canvas, 0.65, 0.0, canvas)
+        for i, text in enumerate(lines):
+            y = y0 + i * line_h
+            cv2.putText(
+                canvas,
+                text,
+                (x, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
 
     def validate_perception_gate_center(self, center, current_pos):
         center = np.asarray(center, dtype=float).reshape(3)
