@@ -105,7 +105,10 @@ class GatePerceptionNode:
         else:
             return None
 
-        gate_world = np.asarray(drone_pos, dtype=float).reshape(3) + R_wb @ gate_body
+        # user fix due to sdf inspection
+        camera_pos_body = np.array([0.12, 0.03, 0.242])
+        gate_world = np.asarray(drone_pos,dtype=float).reshape(3) + R_wb @ (camera_pos_body + gate_body)
+        # end user fix
         debug = perception.get("debug", {})
         gate_normal_camera = np.asarray(
             debug.get("gate_normal_camera", np.array([np.nan, np.nan, np.nan])),
