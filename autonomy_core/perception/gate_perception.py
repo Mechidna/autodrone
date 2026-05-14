@@ -94,6 +94,11 @@ class GatePerception:
                 dist_coeffs,
                 sizes=(1.90, 2.00, 2.10),
             ),
+            "pnp_formulation_debug": self.solve_pnp_formulation_debug(
+                ordered,
+                camera_matrix,
+                dist_coeffs,
+            ),
         }
 
         # -------- DEBUG DRAW --------
@@ -375,6 +380,122 @@ class GatePerception:
             }
 
         return out
+
+    def solve_pnp_formulation_debug(self, ordered_points, camera_matrix, dist_coeffs):
+        ordered_points = np.asarray(ordered_points, dtype=np.float32).reshape(4, 2)
+        out = []
+
+        solvers = [
+            ("IPPE_SQUARE", cv2.SOLVEPNP_IPPE_SQUARE),
+            ("IPPE", cv2.SOLVEPNP_IPPE),
+            ("ITERATIVE", cv2.SOLVEPNP_ITERATIVE),
+        ]
+        if hasattr(cv2, "SOLVEPNP_SQPNP"):
+            solvers.append(("SQPNP", cv2.SOLVEPNP_SQPNP))
+
+        for solver_name, flag in solvers:
+            result = self.solve_pnp_debug_variant(
+                ordered_points,
+                camera_matrix,
+                dist_coeffs,
+                flag=flag,
+                solver_name=solver_name,
+                order_name="tl_tr_br_bl",
+            )
+            if result is not None:
+                out.append(result)
+
+        permutations = [
+            ("tl_tr_br_bl", [0, 1, 2, 3]),
+            ("tr_br_bl_tl", [1, 2, 3, 0]),
+            ("br_bl_tl_tr", [2, 3, 0, 1]),
+            ("bl_tl_tr_br", [3, 0, 1, 2]),
+            ("tl_bl_br_tr", [0, 3, 2, 1]),
+            ("tr_tl_bl_br", [1, 0, 3, 2]),
+        ]
+        for order_name, idx in permutations:
+            pts = ordered_points[idx]
+            result = self.solve_pnp_debug_variant(
+                pts,
+                camera_matrix,
+                dist_coeffs,
+                flag=cv2.SOLVEPNP_IPPE_SQUARE,
+                solver_name="IPPE_SQUARE",
+                order_name=order_name,
+            )
+            if result is not None:
+                out.append(result)
+
+        return out
+
+    def solve_pnp_debug_variant(self, image_points, camera_matrix, dist_coeffs, flag, solver_name, order_name):
+        image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 1, 2)
+        try:
+            ok, rvecs, tvecs, reprojErrs = cv2.solvePnPGeneric(
+                self.model_points,
+                image_points,
+                camera_matrix,
+                dist_coeffs,
+                flags=flag,
+            )
+        except Exception:
+            return None
+
+        if not ok or rvecs is None or len(rvecs) == 0:
+            return None
+
+        def err_scalar(e):
+            if e is None:
+                return float("nan")
+            return float(np.asarray(e).reshape(-1)[0])
+
+        candidates = []
+        best_i = 0
+        best_score = -1e18
+        for i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
+            R_mat, _ = cv2.Rodrigues(rvec)
+            normal = R_mat[:, 2].astype(float)
+            normal /= np.linalg.norm(normal) + 1e-12
+            err = err_scalar(reprojErrs[i]) if reprojErrs is not None and len(reprojErrs) > i else self.compute_reprojection_error(
+                R_mat,
+                tvec,
+                camera_matrix,
+                dist_coeffs,
+                image_points,
+            )
+            tz = float(np.asarray(tvec).reshape(-1)[2])
+            score = (10.0 * normal[2]) - err
+            if tz <= 0:
+                score -= 1e6
+            if score > best_score:
+                best_score = score
+                best_i = i
+            candidates.append({
+                "index": int(i),
+                "rvec": np.asarray(rvec, dtype=float).reshape(3),
+                "tvec": np.asarray(tvec, dtype=float).reshape(3),
+                "normal": normal.copy(),
+                "error": float(err),
+                "projected_corners": self.project_model_points(
+                    R_mat,
+                    tvec,
+                    camera_matrix,
+                    dist_coeffs,
+                ),
+            })
+
+        chosen = candidates[best_i]
+        return {
+            "solver": solver_name,
+            "order": order_name,
+            "chosen_candidate": int(best_i),
+            "candidate_count": int(len(candidates)),
+            "rvec": chosen["rvec"].copy(),
+            "tvec": chosen["tvec"].copy(),
+            "normal": chosen["normal"].copy(),
+            "reprojection_error": float(chosen["error"]),
+            "candidates": candidates,
+        }
 
     def compute_reprojection_error(self, R_mat, tvec, camera_matrix, dist_coeffs, image_points):
         projected = self.project_model_points(R_mat, tvec, camera_matrix, dist_coeffs)

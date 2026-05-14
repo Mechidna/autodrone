@@ -121,6 +121,39 @@ class GatePerceptionNode:
                 "world": world,
                 "reprojection_error": float(value.get("reprojection_error", np.nan)),
             }
+        pnp_formulation_debug = []
+        for value in debug.get("pnp_formulation_debug", []):
+            cam = np.asarray(value.get("tvec", np.full(3, np.nan)), dtype=float).reshape(3)
+            body = self.R_body_camera @ cam
+            world = np.asarray(drone_pos, dtype=float).reshape(3) + R_wb @ (camera_pos_body + body)
+            candidates = []
+            for cand in value.get("candidates", []):
+                cand_cam = np.asarray(cand.get("tvec", np.full(3, np.nan)), dtype=float).reshape(3)
+                cand_body = self.R_body_camera @ cand_cam
+                cand_world = np.asarray(drone_pos, dtype=float).reshape(3) + R_wb @ (camera_pos_body + cand_body)
+                candidates.append({
+                    "index": int(cand.get("index", -1)),
+                    "camera": cand_cam,
+                    "body": cand_body,
+                    "world": cand_world,
+                    "rvec": np.asarray(cand.get("rvec", np.full(3, np.nan)), dtype=float).reshape(3),
+                    "normal": np.asarray(cand.get("normal", np.full(3, np.nan)), dtype=float).reshape(3),
+                    "error": float(cand.get("error", np.nan)),
+                    "projected_corners": cand.get("projected_corners", None),
+                })
+            pnp_formulation_debug.append({
+                "solver": value.get("solver", ""),
+                "order": value.get("order", ""),
+                "chosen_candidate": value.get("chosen_candidate", None),
+                "candidate_count": int(value.get("candidate_count", 0)),
+                "camera": cam,
+                "body": body,
+                "world": world,
+                "rvec": np.asarray(value.get("rvec", np.full(3, np.nan)), dtype=float).reshape(3),
+                "normal": np.asarray(value.get("normal", np.full(3, np.nan)), dtype=float).reshape(3),
+                "reprojection_error": float(value.get("reprojection_error", np.nan)),
+                "candidates": candidates,
+            })
         gate_normal_camera = np.asarray(
             debug.get("gate_normal_camera", np.array([np.nan, np.nan, np.nan])),
             dtype=float,
@@ -149,5 +182,6 @@ class GatePerceptionNode:
             "pnp_candidates": debug.get("pnp_candidates", []),
             "chosen_candidate": debug.get("chosen_candidate", None),
             "gate_size_sweep": gate_size_sweep,
+            "pnp_formulation_debug": pnp_formulation_debug,
             "raw": perception,
         }

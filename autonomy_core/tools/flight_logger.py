@@ -290,6 +290,36 @@ class FlightLogger:
             "pnp_size_190_gt_error",
             "pnp_size_200_gt_error",
             "pnp_size_210_gt_error",
+            "pnp_solver_used",
+            "pnp_best_debug_solver",
+            "pnp_best_debug_order",
+            "pnp_current_world_error_gt",
+            "pnp_best_world_error_gt",
+            "pnp_current_cam_x",
+            "pnp_current_cam_y",
+            "pnp_current_cam_z",
+            "pnp_best_cam_x",
+            "pnp_best_cam_y",
+            "pnp_best_cam_z",
+            "pnp_current_world_x",
+            "pnp_current_world_y",
+            "pnp_current_world_z",
+            "pnp_best_world_x",
+            "pnp_best_world_y",
+            "pnp_best_world_z",
+            "pnp_current_reproj_error",
+            "pnp_best_reproj_error",
+            "pnp_candidate0_world_x",
+            "pnp_candidate0_world_y",
+            "pnp_candidate0_world_z",
+            "pnp_candidate1_world_x",
+            "pnp_candidate1_world_y",
+            "pnp_candidate1_world_z",
+            "pnp_candidate0_error",
+            "pnp_candidate1_error",
+            "pnp_gt_projected_center_x",
+            "pnp_gt_projected_center_y",
+            "pnp_gt_projected_quad_center_error_px",
         ])
 
         self.t0 = time.time()
@@ -490,6 +520,23 @@ class FlightLogger:
         pnp_size_190_gt_error=np.nan,
         pnp_size_200_gt_error=np.nan,
         pnp_size_210_gt_error=np.nan,
+        pnp_solver_used="",
+        pnp_best_debug_solver="",
+        pnp_best_debug_order="",
+        pnp_current_world_error_gt=np.nan,
+        pnp_best_world_error_gt=np.nan,
+        pnp_current_cam=None,
+        pnp_best_cam=None,
+        pnp_current_world=None,
+        pnp_best_world=None,
+        pnp_current_reproj_error=np.nan,
+        pnp_best_reproj_error=np.nan,
+        pnp_candidate0_world=None,
+        pnp_candidate1_world=None,
+        pnp_candidate0_error=np.nan,
+        pnp_candidate1_error=np.nan,
+        pnp_gt_projected_center=None,
+        pnp_gt_projected_quad_center_error_px=np.nan,
         image_width=0,
         image_height=0,
         min_corner_x=np.nan,
@@ -551,6 +598,15 @@ class FlightLogger:
         pnp_size_190_world = self._vec3(pnp_size_190_world)
         pnp_size_200_world = self._vec3(pnp_size_200_world)
         pnp_size_210_world = self._vec3(pnp_size_210_world)
+        pnp_current_cam = self._vec3(pnp_current_cam)
+        pnp_best_cam = self._vec3(pnp_best_cam)
+        pnp_current_world = self._vec3(pnp_current_world)
+        pnp_best_world = self._vec3(pnp_best_world)
+        pnp_candidate0_world = self._vec3(pnp_candidate0_world)
+        pnp_candidate1_world = self._vec3(pnp_candidate1_world)
+        pnp_gt_projected_center = np.asarray(pnp_gt_projected_center, dtype=float).reshape(-1) if pnp_gt_projected_center is not None else np.full(2, np.nan)
+        if pnp_gt_projected_center.size < 2:
+            pnp_gt_projected_center = np.full(2, np.nan)
         raw_corners = self._corners4(raw_image_corners)
         ordered_corners = self._corners4(ordered_image_corners)
         reprojected_corners = self._corners4(reprojected_corners)
@@ -836,6 +892,36 @@ class FlightLogger:
             pnp_size_190_gt_error,
             pnp_size_200_gt_error,
             pnp_size_210_gt_error,
+            pnp_solver_used,
+            pnp_best_debug_solver,
+            pnp_best_debug_order,
+            pnp_current_world_error_gt,
+            pnp_best_world_error_gt,
+            pnp_current_cam[0],
+            pnp_current_cam[1],
+            pnp_current_cam[2],
+            pnp_best_cam[0],
+            pnp_best_cam[1],
+            pnp_best_cam[2],
+            pnp_current_world[0],
+            pnp_current_world[1],
+            pnp_current_world[2],
+            pnp_best_world[0],
+            pnp_best_world[1],
+            pnp_best_world[2],
+            pnp_current_reproj_error,
+            pnp_best_reproj_error,
+            pnp_candidate0_world[0],
+            pnp_candidate0_world[1],
+            pnp_candidate0_world[2],
+            pnp_candidate1_world[0],
+            pnp_candidate1_world[1],
+            pnp_candidate1_world[2],
+            pnp_candidate0_error,
+            pnp_candidate1_error,
+            pnp_gt_projected_center[0],
+            pnp_gt_projected_center[1],
+            pnp_gt_projected_quad_center_error_px,
         ])
 
         self.log_file.flush()

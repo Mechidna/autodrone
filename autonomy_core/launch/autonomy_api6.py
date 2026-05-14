@@ -247,6 +247,9 @@ class AutonomyAPI:
         self.last_camera_to_body_matrix_used = None
         self.last_body_to_world_method_used = ""
         self.last_pnp_size_sweep = {}
+        self.last_pnp_formulation_debug = []
+        self.last_camera_matrix = None
+        self.last_dist_coeffs = None
         self.reset_transform_validation_debug()
         self.image_width = 0
         self.image_height = 0
@@ -429,6 +432,9 @@ class AutonomyAPI:
         self.last_camera_to_body_matrix_used = det.get("camera_to_body_matrix_used", None)
         self.last_body_to_world_method_used = det.get("body_to_world_method_used", "")
         self.last_pnp_size_sweep = det.get("gate_size_sweep", {})
+        self.last_pnp_formulation_debug = det.get("pnp_formulation_debug", [])
+        self.last_camera_matrix = np.asarray(camera_matrix, dtype=float).copy()
+        self.last_dist_coeffs = np.asarray(dist_coeffs, dtype=float).copy()
         self.last_detection_drone_pose = np.array([
             drone_pos[0],
             drone_pos[1],
@@ -692,6 +698,25 @@ class AutonomyAPI:
         self.pnp_size_190_gt_error = float("nan")
         self.pnp_size_200_gt_error = float("nan")
         self.pnp_size_210_gt_error = float("nan")
+        self.pnp_solver_used = "IPPE_SQUARE"
+        self.pnp_best_debug_solver = ""
+        self.pnp_best_debug_order = ""
+        self.pnp_current_world_error_gt = float("nan")
+        self.pnp_best_world_error_gt = float("nan")
+        self.pnp_current_cam = nan3.copy()
+        self.pnp_best_cam = nan3.copy()
+        self.pnp_current_world = nan3.copy()
+        self.pnp_best_world = nan3.copy()
+        self.pnp_current_reproj_error = float("nan")
+        self.pnp_best_reproj_error = float("nan")
+        self.pnp_candidate0_world = nan3.copy()
+        self.pnp_candidate1_world = nan3.copy()
+        self.pnp_candidate0_error = float("nan")
+        self.pnp_candidate1_error = float("nan")
+        self.pnp_candidate0_projected_corners = None
+        self.pnp_candidate1_projected_corners = None
+        self.pnp_gt_projected_center = np.full(2, np.nan, dtype=float)
+        self.pnp_gt_projected_quad_center_error_px = float("nan")
 
     def compute_transform_validation_debug(self, drone_pos, drone_rpy_rad):
         """
@@ -732,6 +757,8 @@ class AutonomyAPI:
         self.camera_error_norm = float(np.linalg.norm(self.camera_error))
         self.world_error_norm = float(np.linalg.norm(self.world_error))
         self.update_gate_size_sweep_debug(self.expected_gate_world)
+        self.update_pnp_formulation_debug(self.expected_gate_world, self.expected_gate_cam)
+        self.update_gt_projected_center_debug(self.expected_gate_cam)
 
         print(
             "[TRANSFORM VALIDATION] "
@@ -742,6 +769,82 @@ class AutonomyAPI:
             f"camera_error_norm={self.camera_error_norm:.3f} "
             f"world_error_norm={self.world_error_norm:.3f}"
         )
+
+    def update_pnp_formulation_debug(self, expected_gate_world, expected_gate_cam):
+        expected_gate_world = np.asarray(expected_gate_world, dtype=float).reshape(3)
+        expected_gate_cam = np.asarray(expected_gate_cam, dtype=float).reshape(3)
+        self.pnp_current_cam = self.pnp_gate_cam.copy()
+        self.pnp_current_world = self.pnp_gate_world.copy()
+        self.pnp_current_reproj_error = self.last_reprojection_error
+        self.pnp_current_world_error_gt = self.world_error_norm
+
+        current_entry = None
+        best_entry = None
+        best_world_error = float("inf")
+
+        entries = self.last_pnp_formulation_debug
+        if not isinstance(entries, list):
+            entries = []
+
+        for entry in entries:
+            solver = entry.get("solver", "")
+            order = entry.get("order", "")
+            world = self._vec3_for_debug(entry.get("world", None))
+            if not np.all(np.isfinite(world)):
+                continue
+            world_error = float(np.linalg.norm(world - expected_gate_world))
+            cam = self._vec3_for_debug(entry.get("camera", None))
+            camera_error = float(np.linalg.norm(cam - expected_gate_cam)) if np.all(np.isfinite(cam)) else float("nan")
+            entry["world_error_to_expected_gt"] = world_error
+            entry["camera_error_to_expected_gt_camera"] = camera_error
+            if solver == "IPPE_SQUARE" and order == "tl_tr_br_bl" and current_entry is None:
+                current_entry = entry
+            if world_error < best_world_error:
+                best_world_error = world_error
+                best_entry = entry
+
+        if current_entry is not None:
+            candidates = current_entry.get("candidates", [])
+            if len(candidates) > 0:
+                self.pnp_candidate0_world = self._vec3_for_debug(candidates[0].get("world", None))
+                self.pnp_candidate0_error = float(candidates[0].get("error", np.nan))
+                self.pnp_candidate0_projected_corners = candidates[0].get("projected_corners", None)
+            if len(candidates) > 1:
+                self.pnp_candidate1_world = self._vec3_for_debug(candidates[1].get("world", None))
+                self.pnp_candidate1_error = float(candidates[1].get("error", np.nan))
+                self.pnp_candidate1_projected_corners = candidates[1].get("projected_corners", None)
+
+        if best_entry is not None:
+            self.pnp_best_debug_solver = str(best_entry.get("solver", ""))
+            self.pnp_best_debug_order = str(best_entry.get("order", ""))
+            self.pnp_best_cam = self._vec3_for_debug(best_entry.get("camera", None))
+            self.pnp_best_world = self._vec3_for_debug(best_entry.get("world", None))
+            self.pnp_best_reproj_error = float(best_entry.get("reprojection_error", np.nan))
+            self.pnp_best_world_error_gt = float(best_world_error)
+
+    def update_gt_projected_center_debug(self, expected_gate_cam):
+        self.pnp_gt_projected_center = np.full(2, np.nan, dtype=float)
+        self.pnp_gt_projected_quad_center_error_px = float("nan")
+        if self.last_camera_matrix is None:
+            return
+        expected_gate_cam = np.asarray(expected_gate_cam, dtype=float).reshape(3)
+        if not np.all(np.isfinite(expected_gate_cam)):
+            return
+        try:
+            projected, _ = cv2.projectPoints(
+                np.zeros((1, 3), dtype=np.float32),
+                np.zeros(3, dtype=float),
+                expected_gate_cam.reshape(3, 1),
+                self.last_camera_matrix,
+                self.last_dist_coeffs,
+            )
+            pixel = projected.reshape(2)
+        except Exception:
+            return
+        self.pnp_gt_projected_center = pixel.astype(float)
+        if np.isfinite(self.last_quad_center_x) and np.isfinite(self.last_quad_center_y):
+            quad = np.array([self.last_quad_center_x, self.last_quad_center_y], dtype=float)
+            self.pnp_gt_projected_quad_center_error_px = float(np.linalg.norm(pixel - quad))
 
     def update_gate_size_sweep_debug(self, expected_gate_world):
         expected_gate_world = np.asarray(expected_gate_world, dtype=float).reshape(3)
@@ -787,10 +890,14 @@ class AutonomyAPI:
         raw = self._corners_for_debug(self.last_raw_image_corners)
         ordered = self._corners_for_debug(self.last_ordered_image_corners)
         reprojected = self._corners_for_debug(self.last_reprojected_image_corners)
+        candidate0_projected = self._corners_for_debug(self.pnp_candidate0_projected_corners)
+        candidate1_projected = self._corners_for_debug(self.pnp_candidate1_projected_corners)
 
         self._draw_debug_corners(canvas, raw, color=(0, 0, 255), prefix="raw", connect=False)
         self._draw_debug_corners(canvas, ordered, color=(0, 255, 0), prefix="ord", connect=True)
         self._draw_debug_corners(canvas, reprojected, color=(255, 0, 0), prefix="rep", connect=True, cross=True)
+        self._draw_debug_corners(canvas, candidate0_projected, color=(255, 255, 0), prefix="c0", connect=True, cross=True)
+        self._draw_debug_corners(canvas, candidate1_projected, color=(255, 0, 255), prefix="c1", connect=True, cross=True)
 
         if np.isfinite(self.last_quad_center_x) and np.isfinite(self.last_quad_center_y):
             center_pt = (int(round(self.last_quad_center_x)), int(round(self.last_quad_center_y)))
@@ -827,6 +934,8 @@ class AutonomyAPI:
             f"{status}",
             f"track_id={track_label} conf={self.gate_confidence:.3f} reproj={self.last_reprojection_error:.2f}px",
             f"world=({gate_world[0]:.2f},{gate_world[1]:.2f},{gate_world[2]:.2f})",
+            f"curr_gt_err={self.pnp_current_world_error_gt:.2f} best={self.pnp_best_debug_solver}/{self.pnp_best_debug_order}:{self.pnp_best_world_error_gt:.2f}",
+            f"best_world=({self.pnp_best_world[0]:.2f},{self.pnp_best_world[1]:.2f},{self.pnp_best_world[2]:.2f}) reproj={self.pnp_best_reproj_error:.2f}",
             f"camera=({gate_camera[0]:.2f},{gate_camera[1]:.2f},{gate_camera[2]:.2f})",
             f"tvec=({pnp_tvec[0]:.2f},{pnp_tvec[1]:.2f},{pnp_tvec[2]:.2f})",
             f"{active_status} t={timestamp:.3f}",
