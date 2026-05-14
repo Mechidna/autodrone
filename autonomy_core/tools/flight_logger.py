@@ -291,6 +291,14 @@ class FlightLogger:
             "pnp_size_200_gt_error",
             "pnp_size_210_gt_error",
             "pnp_solver_used",
+            "live_solver_name",
+            "live_solver_world_x",
+            "live_solver_world_y",
+            "live_solver_world_z",
+            "live_solver_reproj_error",
+            "ippe_world_error_gt",
+            "iterative_world_error_gt",
+            "pnp_fallback_reason",
             "pnp_best_debug_solver",
             "pnp_best_debug_order",
             "pnp_current_world_error_gt",
@@ -521,6 +529,12 @@ class FlightLogger:
         pnp_size_200_gt_error=np.nan,
         pnp_size_210_gt_error=np.nan,
         pnp_solver_used="",
+        live_solver_name="",
+        live_solver_world=None,
+        live_solver_reproj_error=np.nan,
+        ippe_world_error_gt=np.nan,
+        iterative_world_error_gt=np.nan,
+        pnp_fallback_reason="",
         pnp_best_debug_solver="",
         pnp_best_debug_order="",
         pnp_current_world_error_gt=np.nan,
@@ -598,6 +612,7 @@ class FlightLogger:
         pnp_size_190_world = self._vec3(pnp_size_190_world)
         pnp_size_200_world = self._vec3(pnp_size_200_world)
         pnp_size_210_world = self._vec3(pnp_size_210_world)
+        live_solver_world = self._vec3(live_solver_world)
         pnp_current_cam = self._vec3(pnp_current_cam)
         pnp_best_cam = self._vec3(pnp_best_cam)
         pnp_current_world = self._vec3(pnp_current_world)
@@ -893,6 +908,14 @@ class FlightLogger:
             pnp_size_200_gt_error,
             pnp_size_210_gt_error,
             pnp_solver_used,
+            live_solver_name,
+            live_solver_world[0],
+            live_solver_world[1],
+            live_solver_world[2],
+            live_solver_reproj_error,
+            ippe_world_error_gt,
+            iterative_world_error_gt,
+            pnp_fallback_reason,
             pnp_best_debug_solver,
             pnp_best_debug_order,
             pnp_current_world_error_gt,

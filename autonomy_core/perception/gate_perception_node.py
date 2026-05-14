@@ -181,6 +181,8 @@ class GatePerceptionNode:
             "tvec": debug.get("tvec", gate_camera),
             "pnp_candidates": debug.get("pnp_candidates", []),
             "chosen_candidate": debug.get("chosen_candidate", None),
+            "live_solver_name": debug.get("live_solver_name", ""),
+            "pnp_fallback_reason": debug.get("pnp_fallback_reason", ""),
             "gate_size_sweep": gate_size_sweep,
             "pnp_formulation_debug": pnp_formulation_debug,
             "raw": perception,

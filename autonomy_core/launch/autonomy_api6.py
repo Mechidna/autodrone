@@ -250,6 +250,8 @@ class AutonomyAPI:
         self.last_pnp_formulation_debug = []
         self.last_camera_matrix = None
         self.last_dist_coeffs = None
+        self.last_live_solver_name = ""
+        self.last_pnp_fallback_reason = ""
         self.reset_transform_validation_debug()
         self.image_width = 0
         self.image_height = 0
@@ -435,6 +437,8 @@ class AutonomyAPI:
         self.last_pnp_formulation_debug = det.get("pnp_formulation_debug", [])
         self.last_camera_matrix = np.asarray(camera_matrix, dtype=float).copy()
         self.last_dist_coeffs = np.asarray(dist_coeffs, dtype=float).copy()
+        self.last_live_solver_name = det.get("live_solver_name", "")
+        self.last_pnp_fallback_reason = det.get("pnp_fallback_reason", "")
         self.last_detection_drone_pose = np.array([
             drone_pos[0],
             drone_pos[1],
@@ -698,7 +702,13 @@ class AutonomyAPI:
         self.pnp_size_190_gt_error = float("nan")
         self.pnp_size_200_gt_error = float("nan")
         self.pnp_size_210_gt_error = float("nan")
-        self.pnp_solver_used = "IPPE_SQUARE"
+        self.pnp_solver_used = "SOLVEPNP_ITERATIVE"
+        self.live_solver_name = ""
+        self.live_solver_world = nan3.copy()
+        self.live_solver_reproj_error = float("nan")
+        self.ippe_world_error_gt = float("nan")
+        self.iterative_world_error_gt = float("nan")
+        self.pnp_fallback_reason = ""
         self.pnp_best_debug_solver = ""
         self.pnp_best_debug_order = ""
         self.pnp_current_world_error_gt = float("nan")
@@ -777,6 +787,11 @@ class AutonomyAPI:
         self.pnp_current_world = self.pnp_gate_world.copy()
         self.pnp_current_reproj_error = self.last_reprojection_error
         self.pnp_current_world_error_gt = self.world_error_norm
+        self.live_solver_name = self.last_live_solver_name or "SOLVEPNP_ITERATIVE"
+        self.pnp_solver_used = self.live_solver_name
+        self.live_solver_world = self.pnp_current_world.copy()
+        self.live_solver_reproj_error = self.pnp_current_reproj_error
+        self.pnp_fallback_reason = self.last_pnp_fallback_reason
 
         current_entry = None
         best_entry = None
@@ -799,6 +814,10 @@ class AutonomyAPI:
             entry["camera_error_to_expected_gt_camera"] = camera_error
             if solver == "IPPE_SQUARE" and order == "tl_tr_br_bl" and current_entry is None:
                 current_entry = entry
+            if solver == "IPPE_SQUARE" and order == "tl_tr_br_bl":
+                self.ippe_world_error_gt = world_error
+            if solver == "ITERATIVE" and order == "tl_tr_br_bl":
+                self.iterative_world_error_gt = world_error
             if world_error < best_world_error:
                 best_world_error = world_error
                 best_entry = entry
@@ -933,6 +952,7 @@ class AutonomyAPI:
         overlay_lines = [
             f"{status}",
             f"track_id={track_label} conf={self.gate_confidence:.3f} reproj={self.last_reprojection_error:.2f}px",
+            f"live={self.live_solver_name} fallback={self.pnp_fallback_reason or 'none'}",
             f"world=({gate_world[0]:.2f},{gate_world[1]:.2f},{gate_world[2]:.2f})",
             f"curr_gt_err={self.pnp_current_world_error_gt:.2f} best={self.pnp_best_debug_solver}/{self.pnp_best_debug_order}:{self.pnp_best_world_error_gt:.2f}",
             f"best_world=({self.pnp_best_world[0]:.2f},{self.pnp_best_world[1]:.2f},{self.pnp_best_world[2]:.2f}) reproj={self.pnp_best_reproj_error:.2f}",

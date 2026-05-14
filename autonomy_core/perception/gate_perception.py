@@ -16,6 +16,8 @@ class GatePerception:
         self.max_failures = max_failures
         self.failure_counter = 0
         self.last_debug = {}
+        self.live_solver_name = "SOLVEPNP_ITERATIVE"
+        print("[LIVE PNP] using SOLVEPNP_ITERATIVE")
 
         # Exact 1m square model
         s = gate_size / 2.0
@@ -88,6 +90,8 @@ class GatePerception:
             "gate_normal_camera": gate_normal_camera.copy(),
             "pnp_candidates": pnp_debug["candidates"],
             "chosen_candidate": int(pnp_debug["chosen_candidate"]),
+            "live_solver_name": pnp_debug.get("live_solver_name", "SOLVEPNP_ITERATIVE"),
+            "pnp_fallback_reason": pnp_debug.get("fallback_reason", ""),
             "gate_size_sweep": self.solve_pnp_gate_size_sweep(
                 ordered,
                 camera_matrix,
@@ -252,19 +256,66 @@ class GatePerception:
     def estimate_pose(self, image_points, camera_matrix, dist_coeffs):
         image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 1, 2)
 
+        print("\n------ Perception ------")
+        fallback_reason = ""
+        try:
+            ok, rvec, tvec = cv2.solvePnP(
+                self.model_points,
+                image_points,
+                camera_matrix,
+                dist_coeffs,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+        except Exception as exc:
+            ok = False
+            fallback_reason = f"iterative_exception:{exc}"
+
+        if ok:
+            R_mat, _ = cv2.Rodrigues(rvec)
+            reprojection_error = self.compute_reprojection_error(
+                R_mat,
+                tvec,
+                camera_matrix,
+                dist_coeffs,
+                image_points,
+            )
+            normal = R_mat[:, 2].astype(float)
+            normal /= np.linalg.norm(normal) + 1e-12
+            print("[LIVE PNP] solver=SOLVEPNP_ITERATIVE")
+            print("  iterative t:", np.asarray(tvec, dtype=float).reshape(3))
+            print("  iterative reprojection_error:", reprojection_error)
+            candidate = {
+                "index": 0,
+                "rvec": np.asarray(rvec, dtype=float).reshape(3),
+                "tvec": np.asarray(tvec, dtype=float).reshape(3),
+                "normal": normal,
+                "error": float(reprojection_error),
+            }
+            return R_mat, tvec, {
+                "rvec": np.asarray(rvec, dtype=float).reshape(3),
+                "tvec": np.asarray(tvec, dtype=float).reshape(3),
+                "chosen_candidate": 0,
+                "candidates": [candidate],
+                "live_solver_name": "SOLVEPNP_ITERATIVE",
+                "fallback_reason": "",
+            }
+
+        if not fallback_reason:
+            fallback_reason = "iterative_failed"
+        print(f"[LIVE PNP] ITERATIVE failed; falling back to SOLVEPNP_IPPE_SQUARE reason={fallback_reason}")
+
         ok, rvecs, tvecs, reprojErrs = cv2.solvePnPGeneric(
             self.model_points,
             image_points,
             camera_matrix,
             dist_coeffs,
-            flags=cv2.SOLVEPNP_IPPE_SQUARE
+            flags=cv2.SOLVEPNP_IPPE_SQUARE,
         )
-        print("\n------ Perception ------")
         if not ok or rvecs is None or len(rvecs) == 0:
-            print("solvePnPGeneric returned no solutions")
+            print("fallback solvePnPGeneric returned no solutions")
             return None
 
-        print(f"solvePnPGeneric returned {len(rvecs)} solutions")
+        print(f"fallback solvePnPGeneric returned {len(rvecs)} solutions")
 
         def err_scalar(e):
             if e is None:
@@ -315,6 +366,8 @@ class GatePerception:
             "tvec": np.asarray(tvec, dtype=float).reshape(3),
             "chosen_candidate": best_i,
             "candidates": candidates,
+            "live_solver_name": "SOLVEPNP_IPPE_SQUARE_FALLBACK",
+            "fallback_reason": fallback_reason,
         }
 
     @staticmethod
