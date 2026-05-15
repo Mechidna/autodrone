@@ -124,7 +124,7 @@ class AutonomyAPI:
             max_acc_z_down=2.0,
             thrust_hover=0.74,
             thrust_min=0.60,
-            thrust_max=1.0,
+            thrust_max=0.85,
         )
 
         # Ground-truth gates for planner debugging / fallback
