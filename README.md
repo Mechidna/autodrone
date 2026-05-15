@@ -5,7 +5,7 @@ Trajectory generation and control concepts are partially inspired by published w
 Current control stack uses PX4/MAVSDK position and velocity telemetry for trajectory tracking, with planned acceleration feedforward converted into roll, pitch, yaw, and thrust commands; however, intent is to rely only on attitude and linear velocity telemetries.
 Perception utilizes OpenCV-based image processing: HSV color thresholding, contour extraction, quadrilateral/corner ordering, and planar pose estimation with OpenCV solvePnP using IPPE/ITERATIVE PnP variants.
 
-- ROS 2 Jazzy required for establishing camera node to Gazebo
+- ROS 2 Jazzy required for bridging Gazebo camera node to python via rclpy.
 - Currently tested with Gazebo Sim + PX4 SITL
 - Example launch:
   `PX4_GZ_WORLD=gate_test make px4_sitl gz_x500_mono_cam`
