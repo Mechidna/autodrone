@@ -207,15 +207,33 @@ async def main():
             if frame is not None and camera_matrix is not None and dist_coeffs is not None:
                 result = autonomy.update_gate_memory_from_frame(frame, camera_matrix, dist_coeffs)
 
-                if result is not None and result.get("committed_now", False):
+                gate_ready = (
+                    result is not None
+                    and (
+                        result.get("stable_now", False)
+                        or (
+                            result.get("committed_now", False)
+                            and not getattr(autonomy, "use_lookahead_gate_filter", True)
+                        )
+                    )
+                )
+                if gate_ready:
                     ok = autonomy.path_plan()
                     if ok:
-                        print("Initial committed gate found; trajectory planned.")
+                        print("Initial stable gate found; trajectory planned.")
                         break
 
             await asyncio.sleep(0.05)
 
-        # If no committed gate yet, that's okay.
+        if (
+            len(getattr(autonomy, "active_target_gates", [])) == 0
+            and len(getattr(autonomy, "race_accepted_track_ids", [])) > 0
+        ):
+            ok = autonomy.path_plan()
+            if ok:
+                print("Initial stable gate was already admitted; trajectory planned.")
+
+        # If no stable gate yet, that's okay.
         # attitude_control() should fall back to hover-ish neutral command until a plan exists.
     else:
         print("Perception disabled; planning initial trajectory from mock GT gates.")
@@ -305,12 +323,26 @@ async def main():
             # -------------------------------------------------
             should_replan = False
 
-            # A new stable landmark gate was committed
-            if mem_result is not None and mem_result.get("committed_now", False):
-                print("New committed gate -> replanning.")
+            # A new future gate became usable for perception planning.
+            if mem_result is not None and (
+                mem_result.get("stable_now", False)
+                or (
+                    mem_result.get("committed_now", False)
+                    and not getattr(autonomy, "use_lookahead_gate_filter", True)
+                )
+            ):
+                print("New committed/stable gate -> replanning.")
                 should_replan = True
                 if use_perception:
                     autonomy.last_perception_replan_trigger = True
+
+            if (
+                use_perception
+                and len(getattr(autonomy, "active_target_gates", [])) == 0
+                and len(getattr(autonomy, "race_accepted_track_ids", [])) > 0
+            ):
+                should_replan = True
+                autonomy.last_perception_replan_trigger = True
 
             # Current active target passed
             gate_changed = autonomy.advance_gate_if_needed(threshold=1.0)
@@ -483,6 +515,27 @@ async def main():
                 rejected_track_temporary_vs_permanent=getattr(autonomy, "rejected_track_temporary_vs_permanent", ""),
                 active_target_admission_status=getattr(autonomy, "active_target_admission_status", ""),
                 race_order_after_merge=getattr(autonomy, "race_order_after_merge", []),
+                tentative_track_ids=getattr(autonomy, "tentative_track_ids", []),
+                stable_track_ids=getattr(autonomy, "stable_track_ids", []),
+                race_admitted_track_ids=getattr(autonomy, "race_admitted_track_ids", []),
+                selected_next_gate_track_id=getattr(autonomy, "selected_next_gate_track_id", None),
+                selected_next_gate_stability_score=getattr(autonomy, "selected_next_gate_stability_score", float("nan")),
+                track_hits=getattr(autonomy, "track_observations", 0),
+                track_history_len=getattr(autonomy, "track_history_len", 0),
+                track_filtered_center=getattr(autonomy, "track_filtered_center", None),
+                track_raw_latest_center=getattr(autonomy, "track_raw_latest_center", None),
+                track_center_std=getattr(autonomy, "track_center_std", None),
+                track_center_std_norm=getattr(autonomy, "track_center_std_norm", float("nan")),
+                track_camera_std_norm=getattr(autonomy, "track_camera_std_norm", float("nan")),
+                track_reprojection_error_mean=getattr(autonomy, "track_reprojection_error_mean", float("nan")),
+                track_reprojection_error_median=getattr(autonomy, "track_reprojection_error_median", float("nan")),
+                track_outlier_count=getattr(autonomy, "track_outlier_count", 0),
+                track_inlier_count=getattr(autonomy, "track_inlier_count", 0),
+                track_is_stable=getattr(autonomy, "track_is_stable", False),
+                track_stability_score=getattr(autonomy, "track_stability_score", float("nan")),
+                promotion_reason=getattr(autonomy, "promotion_reason", ""),
+                promotion_blocked_reason=getattr(autonomy, "promotion_blocked_reason", ""),
+                selected_target_source=getattr(autonomy, "selected_target_source", ""),
                 raw_image_corners=getattr(autonomy, "last_raw_image_corners", None),
                 ordered_image_corners=getattr(autonomy, "last_ordered_image_corners", None),
                 pnp_rvec=getattr(autonomy, "last_pnp_rvec", None),

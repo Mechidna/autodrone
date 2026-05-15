@@ -80,6 +80,62 @@ class GatePerceptionNode:
         if not isinstance(perception, dict):
             return None
 
+        return self._perception_to_world_detection(
+            perception=perception,
+            camera_matrix=camera_matrix,
+            dist_coeffs=dist_coeffs,
+            drone_pos=drone_pos,
+            drone_rpy_rad=drone_rpy_rad,
+            drone_yaw_rad=drone_yaw_rad,
+        )
+
+    def detect_gates(
+        self,
+        frame,
+        camera_matrix,
+        dist_coeffs,
+        drone_pos,
+        drone_rpy_rad=None,
+        drone_yaw_rad=None,
+    ):
+        if not hasattr(self.gate_perception, "process_all"):
+            det = self.detect_gate(
+                frame=frame,
+                camera_matrix=camera_matrix,
+                dist_coeffs=dist_coeffs,
+                drone_pos=drone_pos,
+                drone_rpy_rad=drone_rpy_rad,
+                drone_yaw_rad=drone_yaw_rad,
+            )
+            return [] if det is None else [det]
+
+        perceptions = self.gate_perception.process_all(frame, camera_matrix, dist_coeffs)
+        detections = []
+        for perception in perceptions:
+            det = self._perception_to_world_detection(
+                perception=perception,
+                camera_matrix=camera_matrix,
+                dist_coeffs=dist_coeffs,
+                drone_pos=drone_pos,
+                drone_rpy_rad=drone_rpy_rad,
+                drone_yaw_rad=drone_yaw_rad,
+            )
+            if det is not None:
+                detections.append(det)
+        return detections
+
+    def _perception_to_world_detection(
+        self,
+        perception,
+        camera_matrix,
+        dist_coeffs,
+        drone_pos,
+        drone_rpy_rad=None,
+        drone_yaw_rad=None,
+    ):
+        if perception is None or isinstance(perception, str) or not isinstance(perception, dict):
+            return None
+
         conf = perception.get("confidence", None)
         t = perception.get("t", None)
 

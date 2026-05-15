@@ -47,63 +47,10 @@ class GatePerception:
 
         ordered = self.order_corners(corners)
 
-        pose = self.estimate_pose(
-            ordered,
-            camera_matrix,
-            dist_coeffs
-        )
-
-        if pose is None:
+        result = self._estimate_detection_result(corners, ordered, camera_matrix, dist_coeffs)
+        if result is None:
             return None
-
-        R_mat, tvec, pnp_debug = pose
-
-        confidence = self.compute_confidence(ordered)
-
-        # Do not smooth camera-frame pose while the camera is moving. Averaging
-        # tvec across frames from different drone poses creates a biased world
-        # landmark after the current drone pose is applied.
-        R_out, t_out = R_mat, tvec
-        reprojection_error = self.compute_reprojection_error(
-            R_out,
-            t_out,
-            camera_matrix,
-            dist_coeffs,
-            ordered,
-        )
-        reprojected_corners = self.project_model_points(
-            R_out,
-            t_out,
-            camera_matrix,
-            dist_coeffs,
-        )
-        gate_normal_camera = R_out[:, 2].astype(float)
-        gate_normal_camera /= np.linalg.norm(gate_normal_camera) + 1e-12
-        self.last_debug = {
-            "raw_corners": np.asarray(corners, dtype=float).reshape(-1, 2).copy(),
-            "ordered_corners": ordered.copy(),
-            "reprojected_corners": reprojected_corners.copy(),
-            "rvec": pnp_debug["rvec"].copy(),
-            "tvec": np.asarray(t_out, dtype=float).reshape(3).copy(),
-            "reprojection_error": float(reprojection_error),
-            "corner_reprojection_error_px": float(reprojection_error),
-            "gate_normal_camera": gate_normal_camera.copy(),
-            "pnp_candidates": pnp_debug["candidates"],
-            "chosen_candidate": int(pnp_debug["chosen_candidate"]),
-            "live_solver_name": pnp_debug.get("live_solver_name", "SOLVEPNP_ITERATIVE"),
-            "pnp_fallback_reason": pnp_debug.get("fallback_reason", ""),
-            "gate_size_sweep": self.solve_pnp_gate_size_sweep(
-                ordered,
-                camera_matrix,
-                dist_coeffs,
-                sizes=(1.90, 2.00, 2.10),
-            ),
-            "pnp_formulation_debug": self.solve_pnp_formulation_debug(
-                ordered,
-                camera_matrix,
-                dist_coeffs,
-            ),
-        }
+        self.last_debug = result["debug"].copy()
 
         # -------- DEBUG DRAW --------
 
@@ -139,22 +86,111 @@ class GatePerception:
         print("\n------ Pose ------")
 
         print("t (meters):")
-        print(t_out.flatten())
+        print(result["t"].flatten())
 
-        print("confidence:", confidence)
-        print("reprojection_error:", reprojection_error)
+        print("confidence:", result["confidence"])
+        print("reprojection_error:", result["debug"]["reprojection_error"])
 
+        return result
+
+    def process_all(self, frame, camera_matrix, dist_coeffs):
+        corners_list = self.detect_gate_candidates(frame)
+        if len(corners_list) == 0:
+            self.handle_failure()
+            return []
+
+        self.failure_counter = 0
+        detections = []
+        for corners in corners_list:
+            ordered = self.order_corners(corners)
+            result = self._estimate_detection_result(corners, ordered, camera_matrix, dist_coeffs)
+            if result is not None:
+                detections.append(result)
+
+        detections.sort(
+            key=lambda det: (
+                -float(det.get("confidence", 0.0)),
+                float(det.get("debug", {}).get("reprojection_error", np.inf)),
+            )
+        )
+        if detections:
+            self.last_debug = detections[0]["debug"].copy()
+        return detections
+
+    def _estimate_detection_result(self, corners, ordered, camera_matrix, dist_coeffs):
+        pose = self.estimate_pose(
+            ordered,
+            camera_matrix,
+            dist_coeffs
+        )
+
+        if pose is None:
+            return None
+
+        R_mat, tvec, pnp_debug = pose
+        confidence = self.compute_confidence(ordered)
+
+        # Do not smooth camera-frame pose while the camera is moving. Averaging
+        # tvec across frames from different drone poses creates a biased world
+        # landmark after the current drone pose is applied.
+        R_out, t_out = R_mat, tvec
+        reprojection_error = self.compute_reprojection_error(
+            R_out,
+            t_out,
+            camera_matrix,
+            dist_coeffs,
+            ordered,
+        )
+        reprojected_corners = self.project_model_points(
+            R_out,
+            t_out,
+            camera_matrix,
+            dist_coeffs,
+        )
+        gate_normal_camera = R_out[:, 2].astype(float)
+        gate_normal_camera /= np.linalg.norm(gate_normal_camera) + 1e-12
+        debug = {
+            "raw_corners": np.asarray(corners, dtype=float).reshape(-1, 2).copy(),
+            "ordered_corners": ordered.copy(),
+            "reprojected_corners": reprojected_corners.copy(),
+            "rvec": pnp_debug["rvec"].copy(),
+            "tvec": np.asarray(t_out, dtype=float).reshape(3).copy(),
+            "reprojection_error": float(reprojection_error),
+            "corner_reprojection_error_px": float(reprojection_error),
+            "gate_normal_camera": gate_normal_camera.copy(),
+            "pnp_candidates": pnp_debug["candidates"],
+            "chosen_candidate": int(pnp_debug["chosen_candidate"]),
+            "live_solver_name": pnp_debug.get("live_solver_name", "SOLVEPNP_ITERATIVE"),
+            "pnp_fallback_reason": pnp_debug.get("fallback_reason", ""),
+            "gate_size_sweep": self.solve_pnp_gate_size_sweep(
+                ordered,
+                camera_matrix,
+                dist_coeffs,
+                sizes=(1.90, 2.00, 2.10),
+            ),
+            "pnp_formulation_debug": self.solve_pnp_formulation_debug(
+                ordered,
+                camera_matrix,
+                dist_coeffs,
+            ),
+        }
         return {
             "R": R_out,
             "t": t_out,
             "confidence": confidence,
-            "debug": self.last_debug.copy(),
+            "debug": debug,
         }
 
     # -------------------------------------------------
     # Look for holes algorithm
     # -------------------------------------------------
     def detect_gate(self, frame):
+        candidates = self.detect_gate_candidates(frame)
+        if len(candidates) == 0:
+            return None
+        return candidates[0]
+
+    def detect_gate_candidates(self, frame):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
         # --- Orange mask (tune these) ---
@@ -169,13 +205,14 @@ class GatePerception:
 
         # cv2.imshow("Full_Orange_Mask", mask_opened)
 
-        # Find contours on the COLOR mask (not grayscale edges)
-        contours, _ = cv2.findContours(mask_opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Find all orange contour candidates. RETR_EXTERNAL misses future
+        # gates visible through the current gate because those contours can be
+        # nested inside the foreground gate contour in the mask hierarchy.
+        contours, _ = cv2.findContours(mask_opened, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            return None
+            return []
 
-        best_box = None
-        best_area = 0.0
+        candidates = []
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
@@ -193,12 +230,27 @@ class GatePerception:
             if aspect > 1.8:
                 continue
 
-            if area > best_area:
-                best_area = area
-                box = cv2.boxPoints(rect)
-                best_box = box.astype(np.float32)
+            box = cv2.boxPoints(rect)
+            candidates.append((float(area), box.astype(np.float32)))
 
-        return best_box
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        deduped = []
+        for area, box in candidates:
+            center = np.mean(box, axis=0)
+            size = np.ptp(box, axis=0)
+            duplicate = False
+            for kept_area, kept_box in deduped:
+                kept_center = np.mean(kept_box, axis=0)
+                kept_size = np.ptp(kept_box, axis=0)
+                center_close = np.linalg.norm(center - kept_center) < 12.0
+                size_close = np.linalg.norm(size - kept_size) < 20.0
+                if center_close and size_close:
+                    duplicate = True
+                    break
+            if not duplicate:
+                deduped.append((area, box))
+
+        return [box for _, box in deduped]
         #     # --- GEOMETRY ---
         #     peri = cv2.arcLength(cnt, True)
         #     approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)

@@ -53,8 +53,10 @@ class AutonomyAPI:
         race_gate_count=None,
         race_gate_order=None,
         save_perception_debug_frames=True,
+        use_lookahead_gate_filter=True,
     ):
         self.use_perception = use_perception
+        self.use_lookahead_gate_filter = bool(use_lookahead_gate_filter)
         self.save_perception_debug_frames = bool(save_perception_debug_frames)
         self.perception_debug_frame_dir = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
@@ -73,6 +75,7 @@ class AutonomyAPI:
             commit_confidence_sum=2.0,
             stale_time=5.0,
             alpha=0.35,
+            use_lookahead_gate_filter=self.use_lookahead_gate_filter,
         )
 
         self.current_gate_pos = np.array([0.0, 0.0, 0.0], dtype=float)
@@ -174,6 +177,7 @@ class AutonomyAPI:
         self.gate_jump_margin = 12.0
         self.perception_hold_position = None
         self.perception_hold_yaw = 0.0
+        self.has_commanded_yaw_reference = False
         self.no_active_target = False
         self.no_target_control_mode = ""
         self.hold_anchor_source = ""
@@ -216,6 +220,26 @@ class AutonomyAPI:
         self.rejected_track_temporary_vs_permanent = ""
         self.active_target_admission_status = ""
         self.race_order_after_merge = []
+        self.tentative_track_ids = []
+        self.stable_track_ids = []
+        self.race_admitted_track_ids = []
+        self.selected_next_gate_track_id = None
+        self.selected_next_gate_stability_score = float("nan")
+        self.track_history_len = 0
+        self.track_filtered_center = None
+        self.track_raw_latest_center = None
+        self.track_center_std = None
+        self.track_center_std_norm = float("nan")
+        self.track_camera_std_norm = float("nan")
+        self.track_reprojection_error_mean = float("nan")
+        self.track_reprojection_error_median = float("nan")
+        self.track_outlier_count = 0
+        self.track_inlier_count = 0
+        self.track_is_stable = False
+        self.track_stability_score = float("nan")
+        self.promotion_reason = ""
+        self.promotion_blocked_reason = ""
+        self.selected_target_source = ""
         self.last_raw_image_corners = None
         self.last_ordered_image_corners = None
         self.last_reprojected_image_corners = None
@@ -385,13 +409,13 @@ class AutonomyAPI:
             self.telemetry.pos["z"],
         ], dtype=float)
 
-        drone_rpy_rad = np.array([
+        drone_rpy_rad = (np.array([
             float(self.telemetry.rpy["roll"]),
             float(self.telemetry.rpy["pitch"]),
             float(self.telemetry.rpy["yaw"]),
-        ], dtype=float) * np.pi / 180.0
+        ], dtype=float)* np.pi / 180.0)
 
-        det = self.perception_node.detect_gate(
+        detections = self.perception_node.detect_gates(
             frame=frame,
             camera_matrix=camera_matrix,
             dist_coeffs=dist_coeffs,
@@ -401,7 +425,7 @@ class AutonomyAPI:
 
         now = time.time()
 
-        if det is None:
+        if len(detections) == 0:
             self.gate_memory.prune(now)
             self.last_raw_gate_center = None
             self.last_perception_accepted = False
@@ -409,6 +433,8 @@ class AutonomyAPI:
             self.reset_transform_validation_debug()
             self.update_quad_debug(None, frame.shape)
             return None
+
+        det = detections[0]
 
         self.gate_confidence = float(det["confidence"])
         raw_center = np.asarray(det["gate_center_world"], dtype=float).reshape(3)
@@ -526,6 +552,10 @@ class AutonomyAPI:
             center=raw_center,
             confidence=det["confidence"],
             timestamp=now,
+            center_camera=det.get("gate_center_camera", None),
+            reprojection_error=det.get("reprojection_error", np.nan),
+            solver_name=det.get("live_solver_name", ""),
+            active_gate_idx=self.current_gate_idx,
         )
         self.track_update_innovation = self.gate_memory.last_update_innovation
         self.track_update_accepted = self.gate_memory.last_update_accepted
@@ -546,8 +576,14 @@ class AutonomyAPI:
             if tr is not None:
                 self.landmark_uncertainty = self.gate_memory.track_uncertainty(tr.id)
                 self.track_observations = tr.hits
-                if result.get("committed_now", False) or result.get("committed", False):
+                self.update_track_filter_log_fields(tr)
+                if (
+                    result.get("committed_now", False)
+                    or result.get("stable_now", False)
+                    or (result.get("committed", False) and not self.use_lookahead_gate_filter)
+                ):
                     self.accept_track_into_race_order(tr)
+            self.update_gate_filter_summary_logs()
             self.last_perception_accepted = bool(result.get("accepted", False))
             self.last_perception_rejection_reason = "" if self.last_perception_accepted else result.get("reason", "")
             if self.last_perception_accepted:
@@ -566,15 +602,129 @@ class AutonomyAPI:
                 f"track_id={result['track_id']} "
                 f"committed={result['committed']} "
                 f"committed_now={result['committed_now']} "
+                f"stable={result.get('stable', False)} "
+                f"stable_now={result.get('stable_now', False)} "
                 f"center={result['center']}"
             )
 
             committed_tracks = self.gate_memory.get_committed_tracks()
             print("[MEM] committed tracks:")
             for tr in committed_tracks:
-                print(f"    id={tr.id}, center={tr.center}, hits={tr.hits}")
+                print(
+                    f"    id={tr.id}, center={tr.center}, hits={tr.hits}, "
+                    f"stable={tr.is_stable}, score={tr.stability_score:.2f}"
+                )
+
+        supplemental_result = self.add_supplemental_gate_detections(
+            detections[1:],
+            frame_shape=frame.shape,
+            timestamp=now,
+        )
+        if supplemental_result is not None and (
+            supplemental_result.get("stable_now", False)
+            or (
+                supplemental_result.get("committed_now", False)
+                and not self.use_lookahead_gate_filter
+            )
+        ):
+            result = supplemental_result
 
         return result
+
+    def add_supplemental_gate_detections(self, detections, frame_shape, timestamp):
+        selected_result = None
+        for det in detections:
+            raw_center = np.asarray(det["gate_center_world"], dtype=float).reshape(3)
+
+            image_valid, _ = self.validate_detection_image_bounds(
+                det.get("ordered_corners", None),
+                frame_shape,
+            )
+            if not image_valid:
+                continue
+
+            valid, _ = self.validate_perception_gate_center(
+                raw_center,
+                np.asarray(det.get("drone_pos", np.zeros(3)), dtype=float).reshape(3),
+            )
+            if not valid:
+                continue
+
+            if self.is_near_completed_gate(raw_center, radius=self.gate_memory.new_track_block_radius):
+                continue
+
+            result = self.gate_memory.add_detection(
+                center=raw_center,
+                confidence=det["confidence"],
+                timestamp=timestamp,
+                center_camera=det.get("gate_center_camera", None),
+                reprojection_error=det.get("reprojection_error", np.nan),
+                solver_name=det.get("live_solver_name", ""),
+                active_gate_idx=self.current_gate_idx,
+            )
+            tr = self.gate_memory.get_track_by_id(result.get("track_id")) if result is not None else None
+            if tr is not None:
+                self.track_id = tr.id
+                self.landmark_uncertainty = self.gate_memory.track_uncertainty(tr.id)
+                self.track_observations = tr.hits
+                self.update_track_filter_log_fields(tr)
+                if (
+                    result.get("committed_now", False)
+                    or result.get("stable_now", False)
+                    or (result.get("committed", False) and not self.use_lookahead_gate_filter)
+                ):
+                    self.accept_track_into_race_order(tr)
+
+            if result is not None:
+                selected_result = result
+                print(
+                    f"[MEM] supplemental reason={result['reason']} "
+                    f"track_id={result['track_id']} "
+                    f"committed={result['committed']} "
+                    f"stable={result.get('stable', False)}"
+                )
+                if result.get("stable_now", False):
+                    break
+
+        self.update_gate_filter_summary_logs()
+        return selected_result
+
+    def update_track_filter_log_fields(self, tr):
+        self.track_history_len = len(getattr(tr, "obs_history", []))
+        if self.track_history_len > 0:
+            self.track_raw_latest_center = tr.obs_history[-1].center_world.copy()
+        else:
+            self.track_raw_latest_center = None
+        self.track_filtered_center = (
+            tr.filtered_center_world.copy()
+            if getattr(tr, "filtered_center_world", None) is not None
+            else tr.center.copy()
+        )
+        self.track_center_std = np.asarray(getattr(tr, "center_world_std", np.full(3, np.nan)), dtype=float)
+        self.track_center_std_norm = (
+            float(np.linalg.norm(self.track_center_std))
+            if np.all(np.isfinite(self.track_center_std))
+            else float("nan")
+        )
+        camera_std = np.asarray(getattr(tr, "center_camera_std", np.full(3, np.nan)), dtype=float)
+        self.track_camera_std_norm = (
+            float(np.linalg.norm(camera_std))
+            if np.all(np.isfinite(camera_std))
+            else float("nan")
+        )
+        self.track_reprojection_error_mean = float(getattr(tr, "reprojection_error_mean", np.nan))
+        self.track_reprojection_error_median = float(getattr(tr, "reprojection_error_median", np.nan))
+        self.track_outlier_count = int(getattr(tr, "outlier_count", 0))
+        self.track_inlier_count = int(getattr(tr, "inlier_count", 0))
+        self.track_is_stable = bool(getattr(tr, "is_stable", False))
+        self.track_stability_score = float(getattr(tr, "stability_score", np.nan))
+        self.promotion_blocked_reason = getattr(tr, "promotion_blocked_reason", "")
+        self.promotion_reason = "stable" if self.track_is_stable else ""
+
+    def update_gate_filter_summary_logs(self):
+        self.tentative_track_ids = self.gate_memory.tentative_track_ids()
+        self.stable_track_ids = self.gate_memory.stable_track_ids()
+        self.race_admitted_track_ids = list(self.race_accepted_track_ids)
 
     def validate_detection_image_bounds(self, corners, frame_shape):
         self.image_height = int(frame_shape[0])
@@ -942,6 +1092,7 @@ class AutonomyAPI:
         gate_world = self._vec3_for_debug(self.last_gate_center_world_debug)
         gate_camera = self._vec3_for_debug(self.last_gate_center_camera)
         pnp_tvec = self._vec3_for_debug(self.last_pnp_tvec)
+        filtered = self._vec3_for_debug(self.track_filtered_center)
         track_label = "none" if track_id is None else str(track_id)
         active_status = (
             f"active_track={self.active_target_track_id}"
@@ -952,6 +1103,9 @@ class AutonomyAPI:
         overlay_lines = [
             f"{status}",
             f"track_id={track_label} conf={self.gate_confidence:.3f} reproj={self.last_reprojection_error:.2f}px",
+            f"lookahead={'on' if self.use_lookahead_gate_filter else 'off'} tentative={self.tentative_track_ids} stable={self.stable_track_ids} admitted={self.race_accepted_track_ids}",
+            f"filter hits={self.track_observations} hist={self.track_history_len} stable={self.track_is_stable} score={self.track_stability_score:.2f} block={self.promotion_blocked_reason or 'none'}",
+            f"filtered=({filtered[0]:.2f},{filtered[1]:.2f},{filtered[2]:.2f}) std={self.track_center_std_norm:.2f}",
             f"live={self.live_solver_name} fallback={self.pnp_fallback_reason or 'none'}",
             f"world=({gate_world[0]:.2f},{gate_world[1]:.2f},{gate_world[2]:.2f})",
             f"curr_gt_err={self.pnp_current_world_error_gt:.2f} best={self.pnp_best_debug_solver}/{self.pnp_best_debug_order}:{self.pnp_best_world_error_gt:.2f}",
@@ -1235,6 +1389,20 @@ class AutonomyAPI:
             self.race_order_rejected_reason = "track_not_committed"
             return False
 
+        if self.use_lookahead_gate_filter and not getattr(tr, "is_stable", False):
+            self.race_order_rejected_reason = getattr(
+                tr,
+                "promotion_blocked_reason",
+                "track_not_stable",
+            ) or "track_not_stable"
+            self.rejected_track_temporary_vs_permanent = "temporary"
+            self.active_target_admission_status = "pending_stability"
+            print(
+                f"TRACK {tr.id} blocked from promotion: "
+                f"reason={self.race_order_rejected_reason}"
+            )
+            return False
+
         track_id = self.canonical_track_id(tr.id)
         self.track_id = track_id
         self.landmark_uncertainty = self.gate_memory.track_uncertainty(track_id)
@@ -1291,16 +1459,24 @@ class AutonomyAPI:
         self.race_progression.sync_committed_tracks([tr])
         self.race_order_inserted = True
         self.active_target_admission_status = "accepted"
+        self.race_admitted_track_ids = list(self.race_accepted_track_ids)
+        print(
+            f"TRACK {track_id} admitted as future gate "
+            f"idx={len(self.race_accepted_track_ids) - 1}"
+        )
         return True
 
     def refresh_race_order_from_memory(self):
         self.refresh_landmark_merges()
         committed_tracks = self.gate_memory.get_committed_tracks()
+        stable_tracks = self.gate_memory.get_stable_tracks()
+        self.update_gate_filter_summary_logs()
         self.committed_track_centers_log = ";".join(
             f"{tr.id}:{tr.center[0]:.2f},{tr.center[1]:.2f},{tr.center[2]:.2f}:h{tr.hits}"
             for tr in committed_tracks
         )
-        for tr in committed_tracks:
+        tracks_for_admission = stable_tracks if self.use_lookahead_gate_filter else committed_tracks
+        for tr in tracks_for_admission:
             self.accept_track_into_race_order(tr)
 
         valid_ids = {tr.id for tr in committed_tracks}
@@ -1438,7 +1614,7 @@ class AutonomyAPI:
         ], dtype=float)
         self.perception_hold_position = pos.copy()
         telemetry_yaw = float(self.telemetry.rpy["yaw"]) * math.pi / 180.0
-        self.perception_hold_yaw = telemetry_yaw if np.isfinite(telemetry_yaw) else 0.0
+        self.perception_hold_yaw = self.get_perception_yaw_hold_reference(telemetry_yaw)
         if reason in ("gate_completed", "completed_target_in_control"):
             self.post_completion_grace_until = time.time() + self.no_target_grace_s
             self.post_completion_grace_active = True
@@ -1507,6 +1683,9 @@ class AutonomyAPI:
         self.lap_reset_triggered = False
         self.next_valid_target_found = False
         self.valid_candidate_count = 0
+        self.selected_next_gate_track_id = None
+        self.selected_next_gate_stability_score = float("nan")
+        self.selected_target_source = ""
 
         if len(committed_tracks) == 0:
             return np.array([current_pos], dtype=float), [], []
@@ -1529,6 +1708,19 @@ class AutonomyAPI:
                 # Sequence integrity matters more than horizon length. With a
                 # predefined race order, do not skip an unavailable next gate
                 # and accidentally plan to a later gate.
+                break
+            if (
+                self.use_lookahead_gate_filter
+                and not getattr(tr, "is_stable", False)
+                and track_id not in self.race_accepted_track_ids
+            ):
+                self.last_perception_accepted = False
+                self.last_perception_rejection_reason = "track_not_stable"
+                self.active_target_admission_status = "pending_stability"
+                print(
+                    f"[TARGET REJECT] reason=track_not_stable "
+                    f"track_id={tr.id} blocked={getattr(tr, 'promotion_blocked_reason', '')}"
+                )
                 break
             valid, reason = self.validate_planning_target(tr.center)
             if not valid:
@@ -1558,6 +1750,15 @@ class AutonomyAPI:
             target_tracks.append(tr)
             selected_track_ids.add(track_id)
             self.valid_candidate_count += 1
+            if len(target_tracks) == 1:
+                self.selected_next_gate_track_id = tr.id
+                self.selected_next_gate_stability_score = float(getattr(tr, "stability_score", np.nan))
+                self.selected_target_source = "stable_track" if getattr(tr, "is_stable", False) else "race_admitted_track"
+                print(
+                    f"TRACK {tr.id} selected as next target: "
+                    f"score={self.selected_next_gate_stability_score:.2f} "
+                    f"source={self.selected_target_source}"
+                )
             if first_selected_order_idx is None:
                 first_selected_order_idx = order_idx
 
@@ -1572,6 +1773,7 @@ class AutonomyAPI:
         if len(target_gates) > 0:
             self.last_valid_target = target_gates[0].copy()
             self.active_target_source = "memory_track"
+            self.selected_target_source = "stable_track" if getattr(target_tracks[0], "is_stable", False) else "race_admitted_track"
             self.active_target_track_id = target_track_ids[0]
             self.next_valid_target_found = True
 
@@ -1954,6 +2156,29 @@ class AutonomyAPI:
     # Control
     # -------------------------------------------------------------------------
 
+    def get_perception_yaw_hold_reference(self, fallback_yaw):
+        """
+        Return the yaw that perception loss should hold.
+
+        Losing a target should freeze the last commanded yaw reference instead
+        of reseeding the hold yaw from telemetry at the loss instant. Reseeding
+        from telemetry can create an artificial yaw step when perception drops
+        out or when the active target is cleared.
+        """
+        fallback_yaw = float(fallback_yaw)
+        if not np.isfinite(fallback_yaw):
+            fallback_yaw = 0.0
+
+        if self.has_commanded_yaw_reference:
+            for yaw_ref in (self.ref_yaw, self.previous_yaw_cmd, self.last_desired_yaw):
+                if yaw_ref is not None and np.isfinite(yaw_ref):
+                    return float(yaw_ref)
+
+            if np.isfinite(self.perception_hold_yaw):
+                return float(self.perception_hold_yaw)
+
+        return fallback_yaw
+
     def continuous_yaw_command(self, raw_yaw, fallback_yaw):
         now = time.time()
         raw_yaw = float(raw_yaw)
@@ -1970,6 +2195,7 @@ class AutonomyAPI:
             self.last_yaw_cmd_time = now
             self.yaw_cmd_after_unwrap = raw_yaw
             self.yaw_rate_limited = False
+            self.has_commanded_yaw_reference = True
             return raw_yaw
 
         dt = now - self.last_yaw_cmd_time if self.last_yaw_cmd_time is not None else 0.02
@@ -1986,6 +2212,7 @@ class AutonomyAPI:
         self.previous_yaw_cmd = limited
         self.last_yaw_cmd_time = now
         self.yaw_cmd_after_unwrap = limited
+        self.has_commanded_yaw_reference = True
         return limited
 
     def hold_no_target_control(self, state, current_yaw_rad):
@@ -1998,8 +2225,7 @@ class AutonomyAPI:
         """
         if self.perception_hold_position is None:
             self.perception_hold_position = state.pos.copy()
-        if not np.isfinite(self.perception_hold_yaw):
-            self.perception_hold_yaw = current_yaw_rad
+        self.perception_hold_yaw = self.get_perception_yaw_hold_reference(current_yaw_rad)
 
         now = time.time()
         self.post_completion_grace_active = now < self.post_completion_grace_until
@@ -2111,7 +2337,11 @@ class AutonomyAPI:
         else:
             self.current_target_gate = self.current_gate_pos.copy()
 
-        if self.use_perception and self.current_target_gate is not None:
+        if self.use_perception and not self.last_perception_accepted:
+            desired_yaw = self.get_perception_yaw_hold_reference(current_yaw_rad)
+            self.perception_hold_yaw = desired_yaw
+            self.yaw_target_source = "perception_lost_hold_yaw"
+        elif self.use_perception and self.current_target_gate is not None:
             if self.is_near_completed_gate(self.current_target_gate):
                 self.target_retained_after_completion = True
                 self.clear_active_perception_target(reason="completed_target_in_control")
