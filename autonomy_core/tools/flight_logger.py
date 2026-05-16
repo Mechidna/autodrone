@@ -111,6 +111,29 @@ class FlightLogger:
             "yaw_cmd_after_unwrap_deg",
             "yaw_rate_limited",
             "post_completion_grace_active",
+            "next_track_available_after_completion",
+            "skipped_target_clear_after_completion",
+            "next_track_after_completion_id",
+            "next_target_installed_same_cycle",
+            "target_clear_reason",
+            "post_completion_grace_suppressed",
+            "planning_horizon_track_ids",
+            "planning_horizon_waypoint_count",
+            "planning_horizon_waypoints",
+            "passthrough_velocity_enabled",
+            "passthrough_speed_used",
+            "waypoint_velocity_0_x",
+            "waypoint_velocity_0_y",
+            "waypoint_velocity_0_z",
+            "waypoint_velocity_1_x",
+            "waypoint_velocity_1_y",
+            "waypoint_velocity_1_z",
+            "waypoint_velocity_2_x",
+            "waypoint_velocity_2_y",
+            "waypoint_velocity_2_z",
+            "internal_gate_velocity_nonzero",
+            "terminal_velocity_mode",
+            "replan_reason",
             "no_target_roll_source",
             "no_target_pitch_source",
             "horizontal_hold_disabled_after_completion",
@@ -480,6 +503,21 @@ class FlightLogger:
         yaw_cmd_after_unwrap_deg=np.nan,
         yaw_rate_limited=False,
         post_completion_grace_active=False,
+        next_track_available_after_completion=False,
+        skipped_target_clear_after_completion=False,
+        next_track_after_completion_id=None,
+        next_target_installed_same_cycle=False,
+        target_clear_reason="",
+        post_completion_grace_suppressed=False,
+        planning_horizon_track_ids=None,
+        planning_horizon_waypoint_count=0,
+        planning_horizon_waypoints="",
+        passthrough_velocity_enabled=False,
+        passthrough_speed_used=np.nan,
+        waypoint_velocity_log=None,
+        internal_gate_velocity_nonzero=False,
+        terminal_velocity_mode="",
+        replan_reason="",
         no_target_roll_source="",
         no_target_pitch_source="",
         horizontal_hold_disabled_after_completion=False,
@@ -680,6 +718,16 @@ class FlightLogger:
         if detection_pose.size < 6:
             detection_pose = np.full(6, np.nan)
         chosen_pnp_candidate = -1 if chosen_pnp_candidate is None else chosen_pnp_candidate
+        waypoint_velocity_log = (
+            np.asarray(waypoint_velocity_log, dtype=float)
+            if waypoint_velocity_log is not None
+            else np.full((3, 3), np.nan)
+        )
+        if waypoint_velocity_log.shape != (3, 3):
+            padded = np.full((3, 3), np.nan)
+            flat = waypoint_velocity_log.reshape(-1)
+            padded.reshape(-1)[:min(9, flat.size)] = flat[:min(9, flat.size)]
+            waypoint_velocity_log = padded
 
         err = p_ref - pos
         err_norm = float(np.linalg.norm(err)) if not np.any(np.isnan(err)) else np.nan
@@ -779,6 +827,29 @@ class FlightLogger:
             yaw_cmd_after_unwrap_deg,
             bool(yaw_rate_limited),
             bool(post_completion_grace_active),
+            bool(next_track_available_after_completion),
+            bool(skipped_target_clear_after_completion),
+            next_track_after_completion_id,
+            bool(next_target_installed_same_cycle),
+            target_clear_reason,
+            bool(post_completion_grace_suppressed),
+            "" if planning_horizon_track_ids is None else " ".join(str(x) for x in planning_horizon_track_ids),
+            planning_horizon_waypoint_count,
+            planning_horizon_waypoints,
+            bool(passthrough_velocity_enabled),
+            passthrough_speed_used,
+            waypoint_velocity_log[0, 0],
+            waypoint_velocity_log[0, 1],
+            waypoint_velocity_log[0, 2],
+            waypoint_velocity_log[1, 0],
+            waypoint_velocity_log[1, 1],
+            waypoint_velocity_log[1, 2],
+            waypoint_velocity_log[2, 0],
+            waypoint_velocity_log[2, 1],
+            waypoint_velocity_log[2, 2],
+            bool(internal_gate_velocity_nonzero),
+            terminal_velocity_mode,
+            replan_reason,
             no_target_roll_source,
             no_target_pitch_source,
             bool(horizontal_hold_disabled_after_completion),

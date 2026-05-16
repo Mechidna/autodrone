@@ -189,6 +189,23 @@ class AutonomyAPI:
         self.no_target_grace_s = 0.75
         self.post_completion_grace_until = 0.0
         self.post_completion_grace_active = False
+        self.next_track_available_after_completion = False
+        self.skipped_target_clear_after_completion = False
+        self.next_track_after_completion_id = None
+        self.next_target_installed_same_cycle = False
+        self.target_clear_reason = ""
+        self.post_completion_grace_suppressed = False
+        self.use_passthrough_gate_velocities = True
+        self.pass_through_speed = 1.5
+        self.planning_horizon_track_ids = []
+        self.planning_horizon_waypoint_count = 0
+        self.planning_horizon_waypoints = ""
+        self.passthrough_velocity_enabled = False
+        self.passthrough_speed_used = float("nan")
+        self.waypoint_velocity_log = np.full((3, 3), np.nan, dtype=float)
+        self.internal_gate_velocity_nonzero = False
+        self.terminal_velocity_mode = ""
+        self.replan_reason = ""
         self.no_target_roll_source = ""
         self.no_target_pitch_source = ""
         self.horizontal_hold_disabled_after_completion = False
@@ -377,6 +394,32 @@ class AutonomyAPI:
             return np.array([0.0, default_speed, 0.0], dtype=float)
 
         return default_speed * (d / norm_d)
+
+    def compute_passthrough_waypoint_velocities(self, waypoints):
+        waypoints = np.asarray(waypoints, dtype=float)
+        velocities = np.full_like(waypoints, np.nan, dtype=float)
+        self.internal_gate_velocity_nonzero = False
+        self.terminal_velocity_mode = "zero_final_horizon_endpoint"
+
+        if (
+            not self.use_passthrough_gate_velocities
+            or len(waypoints) < 3
+        ):
+            return velocities
+
+        speed = float(self.pass_through_speed)
+        if not np.isfinite(speed) or speed <= 0.0:
+            return velocities
+
+        for i in range(1, len(waypoints) - 1):
+            direction = waypoints[i + 1] - waypoints[i - 1]
+            norm = float(np.linalg.norm(direction))
+            if norm < 1e-6:
+                continue
+            velocities[i] = speed * (direction / norm)
+            self.internal_gate_velocity_nonzero = True
+
+        return velocities
 
     # -------------------------------------------------------------------------
     # Perception / memory
@@ -1594,6 +1637,8 @@ class AutonomyAPI:
         if not self.use_perception:
             return
 
+        self.target_clear_reason = reason
+
         self.active_target_gates = []
         self.active_target_track_ids = []
         self.current_target_idx = 0
@@ -1835,6 +1880,12 @@ class AutonomyAPI:
             self.gate_plane_crossed = False
             self.near_gate_but_not_crossed = False
             self.completion_blocked_reason = ""
+            self.next_track_available_after_completion = False
+            self.skipped_target_clear_after_completion = False
+            self.next_track_after_completion_id = None
+            self.next_target_installed_same_cycle = False
+            self.target_clear_reason = ""
+            self.post_completion_grace_suppressed = False
 
             target = None
             track_id = None
@@ -1959,10 +2010,40 @@ class AutonomyAPI:
             self.completed_unique_gate_count = len(self.completed_track_ids_this_cycle)
             self.completed_landmark_count = len(self.completed_gate_positions_this_cycle)
 
-            # A completed perception target must not remain active while the
-            # stack waits for a valid next gate. Replanning will install the
-            # next target if one passes validation.
-            self.clear_active_perception_target(reason="gate_completed")
+            order_after_completion = self.race_progression.order()
+            if self.race_progression.cursor < len(order_after_completion):
+                self.next_track_after_completion_id = order_after_completion[self.race_progression.cursor]
+                self.next_track_available_after_completion = True
+            else:
+                self.next_track_after_completion_id = None
+                self.next_track_available_after_completion = False
+
+            installed_next_target = False
+            if self.next_track_available_after_completion:
+                installed_next_target = self.path_plan(
+                    replan_reason="gate_completed_next_track_available"
+                )
+                if installed_next_target and len(self.active_target_gates) > 0:
+                    self.active_target_source = "next_track_after_completion"
+                    self.next_target_installed_same_cycle = True
+                    self.skipped_target_clear_after_completion = True
+                    self.target_retained_after_completion = True
+                    self.active_target_cleared = False
+                    self.no_active_target = False
+                    self.completed_gate_reference_blocked = False
+                    self.post_completion_grace_until = 0.0
+                    self.post_completion_grace_active = False
+                    self.post_completion_grace_suppressed = True
+                    print(
+                        "[TARGET ADVANCE] installed next target after completion "
+                        f"track_id={self.active_target_track_id}"
+                    )
+
+            if not installed_next_target:
+                # A completed perception target must not remain active while the
+                # stack waits for a valid next gate. Replanning will install the
+                # next target if one passes validation.
+                self.clear_active_perception_target(reason="gate_completed")
             self.active_gate_idx_after = self.current_gate_idx
             self.race_cursor_after = self.race_progression.cursor
             return True
@@ -1984,7 +2065,7 @@ class AutonomyAPI:
     # Planning
     # -------------------------------------------------------------------------
 
-    def path_plan(self, gate_xyz=None):
+    def path_plan(self, gate_xyz=None, replan_reason="scheduled"):
         """
         Multi-segment path plan:
         current position -> next gates in horizon
@@ -1997,12 +2078,21 @@ class AutonomyAPI:
             excluding only the gates completed in the current cycle.
         """
         plan_start = time.time()
+        self.replan_reason = replan_reason
         self.last_target_z_clamped = False
         self.last_plan_started_at = plan_start
         self.last_plan_mode = "gt_single_gate" if not self.use_perception else "perception_horizon"
         self.last_plan_start_gate_idx = self.current_gate_idx if not self.use_perception else None
         self.last_plan_end_gate_idx = None
         self.replan_time = time.time()
+        self.planning_horizon_track_ids = []
+        self.planning_horizon_waypoint_count = 0
+        self.planning_horizon_waypoints = ""
+        self.passthrough_velocity_enabled = False
+        self.passthrough_speed_used = float("nan")
+        self.waypoint_velocity_log = np.full((3, 3), np.nan, dtype=float)
+        self.internal_gate_velocity_nonzero = False
+        self.terminal_velocity_mode = ""
 
         pos = np.array([
             self.telemetry.pos["x"],
@@ -2073,6 +2163,13 @@ class AutonomyAPI:
             target_track_ids = validated_target_track_ids
             waypoints = np.vstack([pos] + target_gates)
 
+        self.planning_horizon_track_ids = list(target_track_ids)
+        self.planning_horizon_waypoint_count = int(len(waypoints))
+        self.planning_horizon_waypoints = ";".join(
+            f"{i}:{wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f}"
+            for i, wp in enumerate(np.asarray(waypoints, dtype=float))
+        )
+
         self.active_target_gates = [g.copy() for g in target_gates]
         self.active_target_track_ids = list(target_track_ids)
         self.current_target_idx = 0
@@ -2091,12 +2188,25 @@ class AutonomyAPI:
             T_min=1.0,
         )
 
+        waypoint_velocities = None
         if self.use_perception:
-            v_end = self.compute_final_exit_velocity(target_gates, default_speed=2.5)
+            waypoint_velocities = self.compute_passthrough_waypoint_velocities(waypoints)
+            self.passthrough_velocity_enabled = bool(self.use_passthrough_gate_velocities)
+            self.passthrough_speed_used = (
+                float(self.pass_through_speed)
+                if self.passthrough_velocity_enabled
+                else float("nan")
+            )
+            for i in range(min(3, len(waypoint_velocities))):
+                self.waypoint_velocity_log[i] = waypoint_velocities[i]
+            # Keep the current patch conservative: internal gates are pass-through,
+            # but the final known horizon endpoint remains a stop point.
+            v_end = np.zeros(3, dtype=float)
         else:
             # Preset waypoint mode should stop at the active gate. A nonzero
             # exit velocity is what lets the reference continue past the gate.
             v_end = np.zeros(3, dtype=float)
+            self.terminal_velocity_mode = "zero_gt_endpoint"
 
         print("planning waypoint horizon:")
         for i, wp in enumerate(waypoints):
@@ -2111,6 +2221,12 @@ class AutonomyAPI:
         print("initial segment times:", times_init)
         print("initial total horizon:", float(np.sum(times_init)))
         print("terminal v_end:", v_end)
+        print("planning_horizon_track_ids:", self.planning_horizon_track_ids)
+        print("passthrough_velocity_enabled:", self.passthrough_velocity_enabled)
+        print("passthrough_speed_used:", self.passthrough_speed_used)
+        print("waypoint velocities:", waypoint_velocities)
+        print("internal_gate_velocity_nonzero:", self.internal_gate_velocity_nonzero)
+        print("terminal_velocity_mode:", self.terminal_velocity_mode)
 
         # Fixed-time trajectory generation is a small linear solve. The SciPy
         # outer time optimizer caused second-scale offboard loop stalls in
@@ -2125,6 +2241,7 @@ class AutonomyAPI:
             a_end=np.zeros(3, dtype=float),
             j_start=np.zeros(3, dtype=float),
             j_end=np.zeros(3, dtype=float),
+            waypoint_velocities=waypoint_velocities,
         )
 
         print("fixed segment times:", times_opt)

@@ -77,6 +77,7 @@ class MultiSegmentMinimumSnapPlanner:
         a_end: Optional[Sequence[float]] = None,
         j_start: Optional[Sequence[float]] = None,
         j_end: Optional[Sequence[float]] = None,
+        waypoint_velocities: Optional[Sequence[Sequence[float]]] = None,
     ) -> None:
         """
         Build a new multi-segment trajectory through all supplied waypoints.
@@ -133,6 +134,15 @@ class MultiSegmentMinimumSnapPlanner:
         self.j_start = self._vec3_or_zero(j_start)
         self.j_end = self._vec3_or_zero(j_end)
 
+        waypoint_velocities_arr = None
+        if waypoint_velocities is not None:
+            waypoint_velocities_arr = np.asarray(waypoint_velocities, dtype=float)
+            if waypoint_velocities_arr.shape != wp.shape:
+                raise ValueError(
+                    "`waypoint_velocities` must match `waypoints` shape "
+                    f"{wp.shape}, got {waypoint_velocities_arr.shape}"
+                )
+
         self.coeffs = np.zeros((m, 3, self.N_COEFF), dtype=float)
 
         # Solve each axis independently.
@@ -148,6 +158,9 @@ class MultiSegmentMinimumSnapPlanner:
                     [self.v_end[axis], self.a_end[axis], self.j_end[axis]],
                     dtype=float,
                 ),
+                waypoint_velocities=None
+                if waypoint_velocities_arr is None
+                else waypoint_velocities_arr[:, axis],
             )
             self.coeffs[:, axis, :] = coeff_axis
 
@@ -254,6 +267,7 @@ class MultiSegmentMinimumSnapPlanner:
         times: np.ndarray,
         d_start: np.ndarray,  # [v0, a0, j0]
         d_end: np.ndarray,    # [vT, aT, jT]
+        waypoint_velocities: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Solve one axis for all segments at once.
@@ -266,7 +280,13 @@ class MultiSegmentMinimumSnapPlanner:
         n = self.N_COEFF * m
 
         Q = self._build_global_Q(times)
-        A, b = self._build_constraints(waypoints_1d, times, d_start, d_end)
+        A, b = self._build_constraints(
+            waypoints_1d,
+            times,
+            d_start,
+            d_end,
+            waypoint_velocities=waypoint_velocities,
+        )
 
         if A.shape != (n, n):
             raise RuntimeError(
@@ -320,6 +340,7 @@ class MultiSegmentMinimumSnapPlanner:
         times: np.ndarray,
         d_start: np.ndarray,
         d_end: np.ndarray,
+        waypoint_velocities: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Build equality constraints A c = b for one axis.
@@ -362,14 +383,46 @@ class MultiSegmentMinimumSnapPlanner:
             row[last_sl] = self._basis_row(t=T_last, order=deriv_order)
             add_row(row, target)
 
-        # 4) Internal continuity constraints for derivatives 1..6
+        constrained_internal_velocity = set()
+        if waypoint_velocities is not None:
+            waypoint_velocities = np.asarray(waypoint_velocities, dtype=float).reshape(-1)
+            if len(waypoint_velocities) != len(waypoints_1d):
+                raise ValueError(
+                    "`waypoint_velocities` length must match waypoints length "
+                    f"{len(waypoints_1d)}, got {len(waypoint_velocities)}"
+                )
+            constrained_internal_velocity = {
+                i for i in range(1, len(waypoint_velocities) - 1)
+                if np.isfinite(waypoint_velocities[i])
+            }
+
+        # 4) Internal continuity constraints for derivatives 1..6.
+        # If an internal waypoint velocity is specified, replace derivative-1
+        # continuity and derivative-6 continuity at that boundary with explicit
+        # end/start velocity constraints. This keeps the square 8M system while
+        # preserving position and lower-order smoothness through acceleration,
+        # jerk, snap, and crackle.
         #    d^r/dt^r p_k(T_k) = d^r/dt^r p_{k+1}(0)
         for k in range(m - 1):
             T = times[k]
             sl_k = slice(k * self.N_COEFF, (k + 1) * self.N_COEFF)
             sl_k1 = slice((k + 1) * self.N_COEFF, (k + 2) * self.N_COEFF)
+            waypoint_idx = k + 1
+
+            if waypoint_idx in constrained_internal_velocity:
+                target_v = float(waypoint_velocities[waypoint_idx])
+
+                row_end_v = np.zeros(n, dtype=float)
+                row_end_v[sl_k] = self._basis_row(t=T, order=1)
+                add_row(row_end_v, target_v)
+
+                row_start_v = np.zeros(n, dtype=float)
+                row_start_v[sl_k1] = self._basis_row(t=0.0, order=1)
+                add_row(row_start_v, target_v)
 
             for deriv_order in range(1, 7):
+                if waypoint_idx in constrained_internal_velocity and deriv_order in (1, 6):
+                    continue
                 row = np.zeros(n, dtype=float)
                 row[sl_k] = self._basis_row(t=T, order=deriv_order)
                 row[sl_k1] = -self._basis_row(t=0.0, order=deriv_order)
