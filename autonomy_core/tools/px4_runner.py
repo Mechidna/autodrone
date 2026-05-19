@@ -141,7 +141,7 @@ async def main():
             print("Connected to drone.")
             break
 
-    use_perception = True
+    use_perception = False
     autonomy = AutonomyAPI(use_perception=use_perception, race_gate_count=3)
     autonomy.telemetry = telemetry
 
@@ -502,6 +502,16 @@ async def main():
                 planning_horizon_track_ids=getattr(autonomy, "planning_horizon_track_ids", []),
                 planning_horizon_waypoint_count=getattr(autonomy, "planning_horizon_waypoint_count", 0),
                 planning_horizon_waypoints=getattr(autonomy, "planning_horizon_waypoints", ""),
+                future_track_visible_before_completion=getattr(autonomy, "future_track_visible_before_completion", False),
+                future_track_blocked_reason=getattr(autonomy, "future_track_blocked_reason", ""),
+                horizon_build_cursor=getattr(autonomy, "horizon_build_cursor", 0),
+                horizon_available_order=getattr(autonomy, "horizon_available_order", []),
+                horizon_selected_track_ids=getattr(autonomy, "horizon_selected_track_ids", []),
+                horizon_rejected_track_ids=getattr(autonomy, "horizon_rejected_track_ids", []),
+                horizon_rejection_reason=getattr(autonomy, "horizon_rejection_reason", ""),
+                planning_lookahead_track_ids=getattr(autonomy, "planning_lookahead_track_ids", []),
+                planning_lookahead_source=getattr(autonomy, "planning_lookahead_source", ""),
+                planning_lookahead_used=getattr(autonomy, "planning_lookahead_used", False),
                 passthrough_velocity_enabled=getattr(autonomy, "passthrough_velocity_enabled", False),
                 passthrough_speed_used=getattr(autonomy, "passthrough_speed_used", float("nan")),
                 waypoint_velocity_log=getattr(autonomy, "waypoint_velocity_log", None),

@@ -197,9 +197,24 @@ class AutonomyAPI:
         self.post_completion_grace_suppressed = False
         self.use_passthrough_gate_velocities = True
         self.pass_through_speed = 1.5
+        self.use_planning_lookahead_tracks = True
+        self.use_raw_rejected_planning_lookahead = True
+        self.planning_lookahead_min_hits = 2
+        self.raw_planning_lookahead_ttl_s = 1.25
+        self.raw_planning_lookahead_candidates = []
         self.planning_horizon_track_ids = []
         self.planning_horizon_waypoint_count = 0
         self.planning_horizon_waypoints = ""
+        self.future_track_visible_before_completion = False
+        self.future_track_blocked_reason = ""
+        self.horizon_build_cursor = 0
+        self.horizon_available_order = []
+        self.horizon_selected_track_ids = []
+        self.horizon_rejected_track_ids = []
+        self.horizon_rejection_reason = ""
+        self.planning_lookahead_track_ids = []
+        self.planning_lookahead_source = ""
+        self.planning_lookahead_used = False
         self.passthrough_velocity_enabled = False
         self.passthrough_speed_used = float("nan")
         self.waypoint_velocity_log = np.full((3, 3), np.nan, dtype=float)
@@ -421,6 +436,142 @@ class AutonomyAPI:
 
         return velocities
 
+    def remember_raw_planning_lookahead_candidate(self, center, reason, now=None):
+        if not self.use_raw_rejected_planning_lookahead:
+            return
+
+        center = np.asarray(center, dtype=float).reshape(3)
+        if not np.all(np.isfinite(center)):
+            return
+        if self.is_near_completed_gate(center, radius=self.gate_memory.new_track_block_radius):
+            return
+
+        now = time.time() if now is None else float(now)
+        planning_center = center.copy()
+        if planning_center[2] < self.safe_min_target_z:
+            planning_center[2] = self.safe_min_target_z
+        if planning_center[2] > self.safe_max_target_z:
+            planning_center[2] = self.safe_max_target_z
+
+        self.raw_planning_lookahead_candidates.append({
+            "center": planning_center,
+            "raw_center": center.copy(),
+            "time": now,
+            "reason": str(reason or ""),
+        })
+        self.prune_raw_planning_lookahead_candidates(now=now)
+
+    def prune_raw_planning_lookahead_candidates(self, now=None):
+        now = time.time() if now is None else float(now)
+        ttl = float(self.raw_planning_lookahead_ttl_s)
+        self.raw_planning_lookahead_candidates = [
+            c for c in self.raw_planning_lookahead_candidates
+            if now - float(c.get("time", 0.0)) <= ttl
+        ]
+
+    def _planning_target_safe_center(self, center):
+        center = np.asarray(center, dtype=float).reshape(3)
+        if not np.all(np.isfinite(center)):
+            return None, "non_finite_target"
+        safe = center.copy()
+        if safe[2] < self.safe_min_target_z:
+            safe[2] = self.safe_min_target_z
+        if safe[2] > self.safe_max_target_z:
+            safe[2] = self.safe_max_target_z
+        return safe, ""
+
+    def _append_planning_lookahead_targets(
+        self,
+        current_pos,
+        target_gates,
+        target_track_ids,
+        max_gates_ahead,
+        allow_raw_candidates,
+    ):
+        if not self.use_planning_lookahead_tracks:
+            return target_gates, target_track_ids
+
+        remaining = int(max_gates_ahead) - len(target_gates)
+        if remaining <= 0:
+            return target_gates, target_track_ids
+
+        now = time.time()
+        self.prune_raw_planning_lookahead_candidates(now=now)
+        selected_ids = {tid for tid in target_track_ids if tid is not None and tid >= 0}
+        existing_points = [np.asarray(g, dtype=float).reshape(3) for g in target_gates]
+        self.planning_lookahead_track_ids = []
+        lookahead_sources = []
+
+        all_tracks = sorted(self.gate_memory.tracks, key=lambda tr: tr.id)
+        for tr in all_tracks:
+            if remaining <= 0:
+                break
+            track_id = self.canonical_track_id(tr.id)
+            if track_id is None or track_id in selected_ids:
+                continue
+            if track_id in self.completed_track_ids_this_cycle:
+                self.horizon_rejected_track_ids.append(track_id)
+                self.horizon_rejection_reason = "completed_this_lap"
+                continue
+            if tr.hits < self.planning_lookahead_min_hits:
+                self.horizon_rejected_track_ids.append(track_id)
+                self.horizon_rejection_reason = "lookahead_insufficient_hits"
+                continue
+
+            center, reason = self._planning_target_safe_center(tr.center)
+            if center is None:
+                self.horizon_rejected_track_ids.append(track_id)
+                self.horizon_rejection_reason = reason
+                continue
+            if self.is_near_completed_gate(center):
+                self.horizon_rejected_track_ids.append(track_id)
+                self.horizon_rejection_reason = "lookahead_completed_this_lap"
+                continue
+            if any(float(np.linalg.norm(center - p)) < self.gate_memory.commit_radius for p in existing_points):
+                self.horizon_rejected_track_ids.append(track_id)
+                self.horizon_rejection_reason = "lookahead_duplicate_selected"
+                continue
+            if float(np.linalg.norm(center - current_pos)) > self.max_detection_range:
+                self.horizon_rejected_track_ids.append(track_id)
+                self.horizon_rejection_reason = "lookahead_too_far"
+                continue
+
+            target_gates.append(center.copy())
+            target_track_ids.append(track_id)
+            selected_ids.add(track_id)
+            existing_points.append(center.copy())
+            self.planning_lookahead_track_ids.append(track_id)
+            lookahead_sources.append("stable_track" if tr.is_stable else "tentative_track")
+            remaining -= 1
+
+        if allow_raw_candidates and remaining > 0:
+            for candidate in self.raw_planning_lookahead_candidates:
+                if remaining <= 0:
+                    break
+                center, reason = self._planning_target_safe_center(candidate["center"])
+                if center is None:
+                    self.horizon_rejection_reason = reason
+                    continue
+                if self.is_near_completed_gate(center):
+                    self.horizon_rejection_reason = "raw_lookahead_completed_this_lap"
+                    continue
+                if any(float(np.linalg.norm(center - p)) < self.gate_memory.commit_radius for p in existing_points):
+                    self.horizon_rejection_reason = "raw_lookahead_duplicate_selected"
+                    continue
+                if float(np.linalg.norm(center - current_pos)) > self.max_detection_range:
+                    self.horizon_rejection_reason = "raw_lookahead_too_far"
+                    continue
+
+                target_gates.append(center.copy())
+                target_track_ids.append(-1)
+                existing_points.append(center.copy())
+                lookahead_sources.append("raw_rejected_clamped")
+                remaining -= 1
+
+        self.planning_lookahead_used = len(lookahead_sources) > 0
+        self.planning_lookahead_source = " ".join(lookahead_sources)
+        return target_gates, target_track_ids
+
     # -------------------------------------------------------------------------
     # Perception / memory
     # -------------------------------------------------------------------------
@@ -546,6 +697,10 @@ class AutonomyAPI:
 
         valid, reason = self.validate_perception_gate_center(raw_center, drone_pos)
         if not valid:
+            if reason.startswith("z_below_safe_min"):
+                self.future_track_visible_before_completion = True
+                self.future_track_blocked_reason = reason
+                self.remember_raw_planning_lookahead_candidate(raw_center, reason, now=now)
             self.gate_memory.prune(now)
             self.last_perception_accepted = False
             self.last_perception_rejection_reason = reason
@@ -1731,11 +1886,20 @@ class AutonomyAPI:
         self.selected_next_gate_track_id = None
         self.selected_next_gate_stability_score = float("nan")
         self.selected_target_source = ""
+        self.horizon_build_cursor = self.race_progression.cursor
+        self.horizon_available_order = []
+        self.horizon_selected_track_ids = []
+        self.horizon_rejected_track_ids = []
+        self.horizon_rejection_reason = ""
+        self.planning_lookahead_track_ids = []
+        self.planning_lookahead_source = ""
+        self.planning_lookahead_used = False
 
         if len(committed_tracks) == 0:
             return np.array([current_pos], dtype=float), [], []
 
         order = self.race_progression.order()
+        self.horizon_available_order = list(order)
         target_tracks = []
         selected_track_ids = set()
         first_selected_order_idx = None
@@ -1750,6 +1914,8 @@ class AutonomyAPI:
 
             tr = self.gate_memory.get_track_by_id(track_id)
             if tr is None or not tr.committed:
+                self.horizon_rejected_track_ids.append(track_id)
+                self.horizon_rejection_reason = "order_track_not_committed"
                 # Sequence integrity matters more than horizon length. With a
                 # predefined race order, do not skip an unavailable next gate
                 # and accidentally plan to a later gate.
@@ -1762,6 +1928,8 @@ class AutonomyAPI:
                 self.last_perception_accepted = False
                 self.last_perception_rejection_reason = "track_not_stable"
                 self.active_target_admission_status = "pending_stability"
+                self.horizon_rejected_track_ids.append(track_id)
+                self.horizon_rejection_reason = "track_not_stable"
                 print(
                     f"[TARGET REJECT] reason=track_not_stable "
                     f"track_id={tr.id} blocked={getattr(tr, 'promotion_blocked_reason', '')}"
@@ -1771,6 +1939,8 @@ class AutonomyAPI:
             if not valid:
                 self.last_perception_accepted = False
                 self.last_perception_rejection_reason = reason
+                self.horizon_rejected_track_ids.append(track_id)
+                self.horizon_rejection_reason = reason
                 print(f"[TARGET REJECT] reason={reason} track_id={tr.id} center={tr.center}")
                 break
             if self.is_near_completed_gate(tr.center):
@@ -1778,18 +1948,24 @@ class AutonomyAPI:
                 self.last_perception_rejection_reason = "already_completed_landmark"
                 self.target_rejected_completed = True
                 self.rejected_completed_this_lap = True
+                self.horizon_rejected_track_ids.append(track_id)
+                self.horizon_rejection_reason = "already_completed_landmark"
                 print(f"[TARGET REJECT] reason=already_completed_landmark track_id={tr.id} center={tr.center}")
                 continue
             if track_id not in self.race_accepted_track_ids:
                 self.last_perception_accepted = False
                 self.last_perception_rejection_reason = "track_not_admitted_to_race"
                 self.active_target_admission_status = "rejected"
+                self.horizon_rejected_track_ids.append(track_id)
+                self.horizon_rejection_reason = "track_not_admitted_to_race"
                 print(f"[TARGET REJECT] reason=track_not_admitted_to_race track_id={tr.id} center={tr.center}")
                 continue
             valid, reason = self.validate_candidate_target(tr.center, current_pos, track_id=tr.id)
             if not valid:
                 self.last_perception_accepted = False
                 self.last_perception_rejection_reason = reason
+                self.horizon_rejected_track_ids.append(track_id)
+                self.horizon_rejection_reason = reason
                 print(f"[TARGET REJECT] reason={reason} track_id={tr.id} center={tr.center}")
                 continue
             target_tracks.append(tr)
@@ -1807,18 +1983,35 @@ class AutonomyAPI:
             if first_selected_order_idx is None:
                 first_selected_order_idx = order_idx
 
+        target_gates = [tr.center.copy() for tr in target_tracks]
+        target_track_ids = [tr.id for tr in target_tracks]
+
+        target_gates, target_track_ids = self._append_planning_lookahead_targets(
+            current_pos=np.asarray(current_pos, dtype=float).reshape(3),
+            target_gates=target_gates,
+            target_track_ids=target_track_ids,
+            max_gates_ahead=max_gates_ahead,
+            allow_raw_candidates=True,
+        )
+        self.horizon_selected_track_ids = list(target_track_ids)
+
         if len(target_tracks) == 0:
-            return np.array([current_pos], dtype=float), [], []
+            if len(target_gates) == 0:
+                return np.array([current_pos], dtype=float), [], []
 
         if first_selected_order_idx is not None:
             self.race_progression.cursor = first_selected_order_idx
 
-        target_gates = [tr.center.copy() for tr in target_tracks]
-        target_track_ids = [tr.id for tr in target_tracks]
         if len(target_gates) > 0:
             self.last_valid_target = target_gates[0].copy()
             self.active_target_source = "memory_track"
-            self.selected_target_source = "stable_track" if getattr(target_tracks[0], "is_stable", False) else "race_admitted_track"
+            first_track = self.gate_memory.get_track_by_id(target_track_ids[0]) if target_track_ids[0] >= 0 else None
+            if first_track is None or target_track_ids[0] not in self.race_accepted_track_ids:
+                self.selected_target_source = "planning_lookahead"
+            else:
+                self.selected_target_source = (
+                    "stable_track" if getattr(first_track, "is_stable", False) else "race_admitted_track"
+                )
             self.active_target_track_id = target_track_ids[0]
             self.next_valid_target_found = True
 
@@ -2023,21 +2216,31 @@ class AutonomyAPI:
                 installed_next_target = self.path_plan(
                     replan_reason="gate_completed_next_track_available"
                 )
-                if installed_next_target and len(self.active_target_gates) > 0:
-                    self.active_target_source = "next_track_after_completion"
-                    self.next_target_installed_same_cycle = True
-                    self.skipped_target_clear_after_completion = True
-                    self.target_retained_after_completion = True
-                    self.active_target_cleared = False
-                    self.no_active_target = False
-                    self.completed_gate_reference_blocked = False
-                    self.post_completion_grace_until = 0.0
-                    self.post_completion_grace_active = False
-                    self.post_completion_grace_suppressed = True
-                    print(
-                        "[TARGET ADVANCE] installed next target after completion "
-                        f"track_id={self.active_target_track_id}"
-                    )
+            elif self.use_planning_lookahead_tracks:
+                installed_next_target = self.path_plan(
+                    replan_reason="gate_completed_planning_lookahead"
+                )
+
+            if installed_next_target and len(self.active_target_gates) > 0:
+                self.active_target_source = (
+                    "next_track_after_completion"
+                    if self.next_track_available_after_completion
+                    else "planning_lookahead_after_completion"
+                )
+                self.next_target_installed_same_cycle = True
+                self.skipped_target_clear_after_completion = True
+                self.target_retained_after_completion = True
+                self.active_target_cleared = False
+                self.no_active_target = False
+                self.completed_gate_reference_blocked = False
+                self.post_completion_grace_until = 0.0
+                self.post_completion_grace_active = False
+                self.post_completion_grace_suppressed = True
+                print(
+                    "[TARGET ADVANCE] installed target after completion "
+                    f"track_id={self.active_target_track_id} "
+                    f"source={self.active_target_source}"
+                )
 
             if not installed_next_target:
                 # A completed perception target must not remain active while the
@@ -2088,6 +2291,16 @@ class AutonomyAPI:
         self.planning_horizon_track_ids = []
         self.planning_horizon_waypoint_count = 0
         self.planning_horizon_waypoints = ""
+        self.future_track_visible_before_completion = False
+        self.future_track_blocked_reason = ""
+        self.horizon_build_cursor = self.race_progression.cursor
+        self.horizon_available_order = []
+        self.horizon_selected_track_ids = []
+        self.horizon_rejected_track_ids = []
+        self.horizon_rejection_reason = ""
+        self.planning_lookahead_track_ids = []
+        self.planning_lookahead_source = ""
+        self.planning_lookahead_used = False
         self.passthrough_velocity_enabled = False
         self.passthrough_speed_used = float("nan")
         self.waypoint_velocity_log = np.full((3, 3), np.nan, dtype=float)
