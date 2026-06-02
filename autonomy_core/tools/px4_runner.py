@@ -141,7 +141,7 @@ async def main():
             print("Connected to drone.")
             break
 
-    use_perception = False
+    use_perception = True
     autonomy = AutonomyAPI(use_perception=use_perception, race_gate_count=3)
     autonomy.telemetry = telemetry
 

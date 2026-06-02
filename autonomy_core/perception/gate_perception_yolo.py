@@ -2,14 +2,20 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from collections import deque
+from ultralytics import YOLO
 
 
 class GatePerception:
 
     def __init__(self,
-                 gate_size=2.7,
+                 gate_size=1.5,
                  smoothing_window=5,
-                 max_failures=10):
+                 max_failures=10,
+                 yolo_model_path=None,
+                 yolo_conf=0.1,
+                 yolo_imgsz=640,
+                 yolo_device=None,
+                 preprocess_mode="distinctive"):
 
         self.gate_size = gate_size
         self.pose_history = deque(maxlen=smoothing_window)
@@ -17,22 +23,38 @@ class GatePerception:
         self.failure_counter = 0
         self.last_debug = {}
         self.live_solver_name = "SOLVEPNP_ITERATIVE"
+
+        # YOLO pose settings
+        if yolo_model_path is None:
+            raise ValueError(
+                "GatePerception now uses YOLO. Pass yolo_model_path='runs/pose/.../weights/best.pt'"
+            )
+        self.yolo_model_path = str(yolo_model_path)
+        self.yolo_model = YOLO(self.yolo_model_path)
+        self.yolo_conf = float(yolo_conf)
+        self.yolo_imgsz = int(yolo_imgsz)
+        self.yolo_device = yolo_device
+        self.preprocess_mode = preprocess_mode
+        self.corners_are_semantic = True  # YOLO pose outputs TL, TR, BR, BL directly.
+
+        print(f"[YOLO PERCEPTION] model={self.yolo_model_path}")
+        print(f"[YOLO PERCEPTION] preprocess_mode={self.preprocess_mode}, conf={self.yolo_conf}, imgsz={self.yolo_imgsz}")
         print("[LIVE PNP] using SOLVEPNP_ITERATIVE")
 
-        # Square model matching the detected OUTER colored frame.
-        # The SDF gate has a 1.5 m inner opening, 0.6 m frame width,
-        # so the outer colored square is 2.7 m wide/high.
-        # If you later detect the inner opening corners instead, use gate_size=1.5.
+        # TII keypoint labels are inner opening corners, so use the inner opening size.
+        # Competition/spec gate: inner opening = 1.5 m x 1.5 m.
+        # If you switch back to HSV outer-frame contour detection, use gate_size=2.7 instead.
         s = gate_size / 2.0
         self.model_points = np.array([
-            [-s,  s, 0],
-            [ s,  s, 0],
-            [ s, -s, 0],
-            [-s, -s, 0]
+            [-s,  s, 0],  # TL inner corner
+            [ s,  s, 0],  # TR inner corner
+            [ s, -s, 0],  # BR inner corner
+            [-s, -s, 0],  # BL inner corner
         ], dtype=np.float32)
-        # ADD THESE LINES HERE
+
         print("Model points:")
         print(self.model_points)
+
     # -------------------------------------------------
     # Main API
     # -------------------------------------------------
@@ -169,7 +191,7 @@ class GatePerception:
                 ordered,
                 camera_matrix,
                 dist_coeffs,
-                sizes=(2.60, 2.70, 2.80),
+                sizes=(1.40, 1.50, 1.60),
             ),
             "pnp_formulation_debug": self.solve_pnp_formulation_debug(
                 ordered,
@@ -184,6 +206,79 @@ class GatePerception:
             "debug": debug,
         }
 
+
+    # -------------------------------------------------
+    # YOLO preprocessing helpers
+    # -------------------------------------------------
+    @staticmethod
+    def normalize_uint8(x):
+        x = cv2.normalize(x, None, 0, 255, cv2.NORM_MINMAX)
+        return x.astype(np.uint8)
+
+    @staticmethod
+    def make_clahe_gray(img_bgr, clip_limit=2.0):
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+        return clahe.apply(gray)
+
+    def make_color_saliency(self, img_bgr, blur_ksize=41):
+        if blur_ksize % 2 == 0:
+            blur_ksize += 1
+
+        lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+        _, A, B = cv2.split(lab)
+
+        A_blur = cv2.GaussianBlur(A, (blur_ksize, blur_ksize), 0)
+        B_blur = cv2.GaussianBlur(B, (blur_ksize, blur_ksize), 0)
+
+        diff_a = cv2.absdiff(A, A_blur)
+        diff_b = cv2.absdiff(B, B_blur)
+
+        color_diff = cv2.addWeighted(diff_a, 0.5, diff_b, 0.5, 0)
+        return self.normalize_uint8(color_diff)
+
+    def make_local_contrast(self, img_bgr, blur_ksize=41):
+        if blur_ksize % 2 == 0:
+            blur_ksize += 1
+
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
+        contrast = cv2.absdiff(gray, blur)
+        return self.normalize_uint8(contrast)
+
+    def make_pseudo_image(self, img_bgr, mode):
+        """
+        Must match the preprocessing used during training.
+
+        gray_clahe:
+            ch1/ch2/ch3 = CLAHE grayscale
+        no_edge:
+            ch1 = CLAHE grayscale, ch2 = original grayscale, ch3 = LAB color saliency
+        distinctive:
+            ch1 = CLAHE grayscale, ch2 = local contrast, ch3 = LAB color saliency
+        none/raw:
+            original BGR frame
+        """
+        if mode in [None, "none", "raw"]:
+            return img_bgr
+
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        gray_eq = self.make_clahe_gray(img_bgr, clip_limit=2.0)
+
+        if mode == "gray_clahe":
+            return cv2.merge([gray_eq, gray_eq, gray_eq])
+
+        if mode == "no_edge":
+            color_saliency = self.make_color_saliency(img_bgr, blur_ksize=31)
+            return cv2.merge([gray_eq, gray, color_saliency])
+
+        if mode == "distinctive":
+            local_contrast = self.make_local_contrast(img_bgr, blur_ksize=41)
+            color_saliency = self.make_color_saliency(img_bgr, blur_ksize=41)
+            return cv2.merge([gray_eq, local_contrast, color_saliency])
+
+        raise ValueError(f"Unknown preprocess_mode: {mode}")
+
     # -------------------------------------------------
     # Look for holes algorithm
     # -------------------------------------------------
@@ -194,88 +289,98 @@ class GatePerception:
         return candidates[0]
 
     def detect_gate_candidates(self, frame):
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-        # --- Blue gate mask for SDF color #0000B3 ---
-        # #0000B3 is RGB(0, 0, 179). In OpenCV HSV this is approximately
-        # H=120, S=255, V=179. The range below allows lighting/shadow variation.
-        lower_blue = np.array([105, 50, 35], dtype=np.uint8)
-        upper_blue = np.array([130, 255, 255], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower_blue, upper_blue)
-
-        # Clean up mask: fill small gaps / remove noise
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        mask_closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
-        mask_opened = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, k, iterations=1)
-
-        # cv2.imshow("Full_Blue_Mask", mask_opened)
-
-        # Find all blue contour candidates. RETR_EXTERNAL misses future
-        # gates visible through the current gate because those contours can be
-        # nested inside the foreground gate contour in the mask hierarchy.
-        contours, _ = cv2.findContours(mask_opened, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+        """
+        Returns a list of 4-point arrays in TL, TR, BR, BL order.
+        These are YOLO-predicted inner opening corners, not HSV outer-frame corners.
+        """
+        if frame is None:
             return []
 
+        if len(frame.shape) == 2:
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        else:
+            frame_bgr = frame
+
+        yolo_input = self.make_pseudo_image(frame_bgr, self.preprocess_mode)
+
+        # Ultralytics accepts numpy images. Keep verbose=False so the flight loop does not spam.
+        kwargs = dict(
+            source=yolo_input,
+            imgsz=self.yolo_imgsz,
+            conf=self.yolo_conf,
+            verbose=False,
+        )
+        if self.yolo_device is not None:
+            kwargs["device"] = self.yolo_device
+
+        try:
+            result = self.yolo_model.predict(**kwargs)[0]
+        except Exception as exc:
+            print(f"[YOLO PERCEPTION] prediction failed: {exc}")
+            return []
+
+        if result.boxes is None or len(result.boxes) == 0:
+            return []
+        if result.keypoints is None or result.keypoints.data is None:
+            return []
+
+        boxes_xyxy = result.boxes.xyxy.detach().cpu().numpy()
+        boxes_conf = result.boxes.conf.detach().cpu().numpy()
+        keypoints = result.keypoints.data.detach().cpu().numpy()  # shape: N x K x 3
+
         candidates = []
+        h, w = frame_bgr.shape[:2]
 
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 500:
+        for i in range(len(boxes_conf)):
+            if keypoints.shape[1] < 4:
                 continue
 
-            rect = cv2.minAreaRect(cnt)
-            (w, h) = rect[1]
-            if w <= 1 or h <= 1:
+            pts = keypoints[i, :4, :2].astype(np.float32)
+            kconf = keypoints[i, :4, 2].astype(float) if keypoints.shape[2] >= 3 else np.ones(4)
+
+            # Reject broken keypoint sets.
+            if not np.isfinite(pts).all():
+                continue
+            if np.any(pts[:, 0] < -5) or np.any(pts[:, 0] > w + 5):
+                continue
+            if np.any(pts[:, 1] < -5) or np.any(pts[:, 1] > h + 5):
                 continue
 
-            aspect = max(w, h) / (min(w, h) + 1e-6)
-
-            # Gate should be roughly square-ish (tune range as needed)
-            if aspect > 1.8:
+            # Very low keypoint confidence means the box may be okay but corners are not.
+            mean_kconf = float(np.mean(kconf))
+            if mean_kconf < 0.10:
                 continue
 
-            box = cv2.boxPoints(rect)
-            candidates.append((float(area), box.astype(np.float32)))
+            area = abs(cv2.contourArea(pts))
+            if area < 50:
+                continue
+
+            # Score by bbox confidence, keypoint confidence, and keypoint quad area.
+            score = float(boxes_conf[i]) + 0.25 * mean_kconf + min(area / 40000.0, 1.0) * 0.10
+
+            candidates.append((score, float(boxes_conf[i]), mean_kconf, pts))
 
         candidates.sort(key=lambda item: item[0], reverse=True)
+
+        # De-duplicate similar detections.
         deduped = []
-        for area, box in candidates:
-            center = np.mean(box, axis=0)
-            size = np.ptp(box, axis=0)
+        for score, box_conf, mean_kconf, pts in candidates:
+            center = np.mean(pts, axis=0)
+            size = np.ptp(pts, axis=0)
             duplicate = False
-            for kept_area, kept_box in deduped:
-                kept_center = np.mean(kept_box, axis=0)
-                kept_size = np.ptp(kept_box, axis=0)
+            for kept_score, kept_box_conf, kept_mean_kconf, kept_pts in deduped:
+                kept_center = np.mean(kept_pts, axis=0)
+                kept_size = np.ptp(kept_pts, axis=0)
                 center_close = np.linalg.norm(center - kept_center) < 12.0
                 size_close = np.linalg.norm(size - kept_size) < 20.0
                 if center_close and size_close:
                     duplicate = True
                     break
             if not duplicate:
-                deduped.append((area, box))
+                deduped.append((score, box_conf, mean_kconf, pts))
 
-        return [box for _, box in deduped]
-        #     # --- GEOMETRY ---
-        #     peri = cv2.arcLength(cnt, True)
-        #     approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
-        #
-        #     # Accept a wider range of "rectangles" (3 to 10 points) just to get a hit
-        #     if 3 <= len(approx) <= 10:
-        #         child_idx = hierarchy[i][2]
-        #         if child_idx != -1:
-        #             child_cnt = contours[child_idx]
-        #             child_peri = cv2.arcLength(child_cnt, True)
-        #             child_approx = cv2.approxPolyDP(child_cnt, 0.02 * child_peri, True)
-        #             if len(child_approx) >= 4:
-        #                 return child_approx.reshape(-1, 2)
-        #
-        #         if area > max_area:
-        #             max_area = area
-        #             best_candidate = approx.reshape(-1, 2)
-        #
-        # cv2.waitKey(1)
-        # return best_candidate
+        return [pts for _, _, _, pts in deduped]
+
     # -------------------------------------------------
     # Correct Corner Ordering
     # -------------------------------------------------
@@ -283,6 +388,11 @@ class GatePerception:
         pts = np.asarray(corners, dtype=np.float32)
         if pts.shape[0] < 4:
             return None
+
+        # YOLO pose labels already provide semantic order: TL, TR, BR, BL.
+        # Do not reorder using sum/diff, because that can scramble keypoint identity.
+        if getattr(self, "corners_are_semantic", False) and pts.shape[0] == 4:
+            return pts.astype(np.float32)
 
         # If more than 4 points, take convex hull then approximate to 4
         if pts.shape[0] > 4:

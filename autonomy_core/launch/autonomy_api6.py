@@ -6,7 +6,7 @@ import cv2
 from autonomy_core.planning.minimum_snap_planner_multi_time_optimized import MultiSegmentMinimumSnapPlanner
 from autonomy_core.launch.get_telemetry import GetTelemetry
 from autonomy_core.controller.attitude_controller3 import RPGHighLevelTracker
-from autonomy_core.perception.gate_perception import GatePerception
+from autonomy_core.perception.gate_perception_yolo import GatePerception
 from autonomy_core.perception.gate_perception_node import GatePerceptionNode
 from autonomy_core.perception.gate_memory import GateMemory
 from autonomy_core.launch.race_progression import RaceProgression
@@ -64,18 +64,29 @@ class AutonomyAPI:
         )
         self.camera_offset_body = np.array([0.12, 0.03, 0.242], dtype=float)
 
-        self.gate_perception = GatePerception() if use_perception else None
+        self.gate_perception = GatePerception(
+            gate_size=1.5,
+            yolo_model_path="/home/paolo/datasets/drone-racing-dataset/runs/pose/tii_gate_pose_distinctive_10e/weights/best.pt",
+            preprocess_mode="distinctive",
+            yolo_conf=0.1,
+            yolo_imgsz=640,
+            yolo_device=0,
+        ) if use_perception else None
         self.perception_node = GatePerceptionNode(self.gate_perception) if use_perception else None
         self.gate_memory = GateMemory(
-            association_radius=2.0,
-            commit_radius=2.0,
+            association_radius=1.5,
+            commit_radius=1.5,
             new_track_block_radius=4.5,
-            min_confidence_per_hit=0.5,
-            commit_hits=3,
-            commit_confidence_sum=2.0,
-            stale_time=5.0,
+            min_confidence_per_hit=0.25,
+            commit_hits=4,
+            commit_confidence_sum=1.2,
+            stale_time=3.0,
             alpha=0.35,
             use_lookahead_gate_filter=self.use_lookahead_gate_filter,
+            min_hits_for_stable=6,
+            max_center_std_for_stable=0.45,
+            max_camera_std_for_stable=0.45,
+            max_reprojection_error_for_stable=5.0,
         )
 
         self.current_gate_pos = np.array([0.0, 0.0, 0.0], dtype=float)
@@ -197,9 +208,9 @@ class AutonomyAPI:
         self.post_completion_grace_suppressed = False
         self.use_passthrough_gate_velocities = True
         self.pass_through_speed = 1.5
-        self.use_planning_lookahead_tracks = True
-        self.use_raw_rejected_planning_lookahead = True
-        self.planning_lookahead_min_hits = 2
+        self.use_planning_lookahead_tracks = False
+        self.use_raw_rejected_planning_lookahead = False
+        self.planning_lookahead_min_hits = 6
         self.raw_planning_lookahead_ttl_s = 1.25
         self.raw_planning_lookahead_candidates = []
         self.planning_horizon_track_ids = []
@@ -632,6 +643,19 @@ class AutonomyAPI:
 
         self.gate_confidence = float(det["confidence"])
         raw_center = np.asarray(det["gate_center_world"], dtype=float).reshape(3)
+        reproj = float(det.get("reprojection_error", np.nan))
+        if np.isfinite(reproj) and reproj > 6.0:
+            self.gate_memory.prune(now)
+            self.last_perception_accepted = False
+            self.last_perception_rejection_reason = f"reprojection_error_high:{reproj:.2f}"
+            return {
+                "accepted": False,
+                "reason": self.last_perception_rejection_reason,
+                "track_id": None,
+                "committed_now": False,
+                "committed": False,
+                "center": raw_center,
+            }
         self.last_raw_gate_center = raw_center.copy()
         self.last_raw_image_corners = det.get("raw_corners", None)
         self.last_ordered_image_corners = det.get("ordered_corners", None)

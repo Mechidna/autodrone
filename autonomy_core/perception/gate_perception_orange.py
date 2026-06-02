@@ -7,7 +7,7 @@ from collections import deque
 class GatePerception:
 
     def __init__(self,
-                 gate_size=2.7,
+                 gate_size=2.0,
                  smoothing_window=5,
                  max_failures=10):
 
@@ -19,10 +19,7 @@ class GatePerception:
         self.live_solver_name = "SOLVEPNP_ITERATIVE"
         print("[LIVE PNP] using SOLVEPNP_ITERATIVE")
 
-        # Square model matching the detected OUTER colored frame.
-        # The SDF gate has a 1.5 m inner opening, 0.6 m frame width,
-        # so the outer colored square is 2.7 m wide/high.
-        # If you later detect the inner opening corners instead, use gate_size=1.5.
+        # Exact 1m square model
         s = gate_size / 2.0
         self.model_points = np.array([
             [-s,  s, 0],
@@ -169,7 +166,7 @@ class GatePerception:
                 ordered,
                 camera_matrix,
                 dist_coeffs,
-                sizes=(2.60, 2.70, 2.80),
+                sizes=(1.90, 2.00, 2.10),
             ),
             "pnp_formulation_debug": self.solve_pnp_formulation_debug(
                 ordered,
@@ -196,21 +193,19 @@ class GatePerception:
     def detect_gate_candidates(self, frame):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        # --- Blue gate mask for SDF color #0000B3 ---
-        # #0000B3 is RGB(0, 0, 179). In OpenCV HSV this is approximately
-        # H=120, S=255, V=179. The range below allows lighting/shadow variation.
-        lower_blue = np.array([105, 50, 35], dtype=np.uint8)
-        upper_blue = np.array([130, 255, 255], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower_blue, upper_blue)
+        # --- Orange mask (tune these) ---
+        lower_orange = np.array([5, 80, 80])
+        upper_orange = np.array([30, 255, 255])
+        mask = cv2.inRange(hsv, lower_orange, upper_orange)
 
         # Clean up mask: fill small gaps / remove noise
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         mask_closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
         mask_opened = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, k, iterations=1)
 
-        # cv2.imshow("Full_Blue_Mask", mask_opened)
+        # cv2.imshow("Full_Orange_Mask", mask_opened)
 
-        # Find all blue contour candidates. RETR_EXTERNAL misses future
+        # Find all orange contour candidates. RETR_EXTERNAL misses future
         # gates visible through the current gate because those contours can be
         # nested inside the foreground gate contour in the mask hierarchy.
         contours, _ = cv2.findContours(mask_opened, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
