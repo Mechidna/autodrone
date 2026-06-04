@@ -14,6 +14,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
 from sensor_msgs.msg import Image, CameraInfo
+from tf2_msgs.msg import TFMessage
 from cv_bridge import CvBridge
 
 from mavsdk import System
@@ -28,6 +29,21 @@ from flight_logger import FlightLogger
 # Shared telemetry object
 # -------------------------------------------------
 telemetry = GetTelemetry()
+CAMERA_OFFSET_BODY = np.array([0.12, 0.03, 0.242], dtype=float)
+GAZEBO_DYNAMIC_POSE_TOPIC = "/world/gate_test_1500mm_blue/dynamic_pose/info"
+GAZEBO_MODEL_NAME = "x500_mono_cam_0"
+GAZEBO_POSE_SOURCE = "gazebo_dynamic_pose_x500_mono_cam_0"
+
+
+def rotate_vector_by_quaternion(quat_xyzw, vector):
+    x, y, z, w = np.asarray(quat_xyzw, dtype=float).reshape(4)
+    q_vec = np.array([x, y, z], dtype=float)
+    vector = np.asarray(vector, dtype=float).reshape(3)
+    return (
+        vector
+        + 2.0 * w * np.cross(q_vec, vector)
+        + 2.0 * np.cross(q_vec, np.cross(q_vec, vector))
+    )
 
 
 def rad2deg(x):
@@ -74,6 +90,12 @@ class PerceptionNode(Node):
             self.camera_info_callback,
             camera_info_qos,
         )
+        self.create_subscription(
+            TFMessage,
+            GAZEBO_DYNAMIC_POSE_TOPIC,
+            self.gazebo_pose_callback,
+            qos_profile_sensor_data,
+        )
 
         self.get_logger().info("PerceptionNode started.")
 
@@ -99,6 +121,57 @@ class PerceptionNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to convert image: {e}")
 
+    def gazebo_pose_callback(self, msg: TFMessage):
+        if self.raw_dataset_saver is None:
+            return
+
+        if len(msg.transforms) == 0:
+            print("[RAW DATASET WARN] Gazebo dynamic pose TFMessage has no transforms; falling back to MAVSDK metadata.")
+            self.raw_dataset_saver.latest_gazebo_pose = None
+            return
+
+        selected_transform = None
+        selection_method = "child_frame_id"
+        for transform in msg.transforms:
+            if transform.child_frame_id != GAZEBO_MODEL_NAME:
+                continue
+            selected_transform = transform
+            break
+
+        if selected_transform is None:
+            selected_transform = msg.transforms[0]
+            selection_method = "fallback_transforms_0"
+
+        translation = selected_transform.transform.translation
+        rotation = selected_transform.transform.rotation
+        stamp = selected_transform.header.stamp
+        model_pos_world = np.array([
+            translation.x,
+            translation.y,
+            translation.z,
+        ], dtype=float)
+        model_quat_world = np.array([
+            rotation.x,
+            rotation.y,
+            rotation.z,
+            rotation.w,
+        ], dtype=float)
+        camera_pos_world = (
+            model_pos_world
+            + rotate_vector_by_quaternion(model_quat_world, CAMERA_OFFSET_BODY)
+        )
+
+        self.raw_dataset_saver.update_gazebo_pose(
+            model_pos_world=model_pos_world,
+            model_quat_world=model_quat_world,
+            camera_pos_world=camera_pos_world,
+            camera_quat_world=model_quat_world.copy(),
+            ros_stamp_sec=int(stamp.sec),
+            ros_stamp_nanosec=int(stamp.nanosec),
+            wall_time=time.time(),
+            selection_method=selection_method,
+        )
+
 
 def ros_spin_thread(node):
     rclpy.spin(node)
@@ -115,6 +188,7 @@ class RawDatasetFrameSaver:
         self.last_saved_image_stamp = None
         self.saved_image_hash_poses = {}
         self.telemetry_ready = False
+        self.latest_gazebo_pose = None
         self.frame_idx = 0
 
         if self.enabled:
@@ -146,6 +220,28 @@ class RawDatasetFrameSaver:
             or not np.allclose(previous_rpy, current_rpy, atol=atol, rtol=0.0)
         )
 
+    def update_gazebo_pose(
+        self,
+        model_pos_world,
+        model_quat_world,
+        camera_pos_world,
+        camera_quat_world,
+        ros_stamp_sec,
+        ros_stamp_nanosec,
+        wall_time,
+        selection_method,
+    ):
+        self.latest_gazebo_pose = {
+            "gazebo_model_pos_world": self._json_list(model_pos_world),
+            "gazebo_model_quat_world": self._json_list(model_quat_world),
+            "gazebo_camera_pos_world": self._json_list(camera_pos_world),
+            "gazebo_camera_quat_world": self._json_list(camera_quat_world),
+            "gazebo_pose_ros_stamp_sec": int(ros_stamp_sec),
+            "gazebo_pose_ros_stamp_nanosec": int(ros_stamp_nanosec),
+            "gazebo_pose_wall_time": float(wall_time),
+            "gazebo_pose_selection_method": str(selection_method),
+        }
+
     def maybe_save_from_callback(self, frame, camera_matrix, dist_coeffs, telemetry_obj, image_stamp):
         if (
             not self.enabled
@@ -174,6 +270,39 @@ class RawDatasetFrameSaver:
         metadata_path = os.path.join(self.metadata_dir, metadata_filename)
 
         image_height, image_width = frame.shape[:2]
+        gazebo_pose = self.latest_gazebo_pose
+        if gazebo_pose is None:
+            gazebo_metadata = {
+                "gazebo_model_pos_world": None,
+                "gazebo_model_quat_world": None,
+                "gazebo_camera_pos_world": None,
+                "gazebo_camera_quat_world": None,
+                "gazebo_pose_ros_stamp_sec": None,
+                "gazebo_pose_ros_stamp_nanosec": None,
+                "gazebo_pose_wall_time": None,
+                "gazebo_pose_selection_method": None,
+                "pose_source": None,
+                "gazebo_pose_age_s": None,
+            }
+        else:
+            gazebo_pose_age_s = now - float(gazebo_pose["gazebo_pose_wall_time"])
+            if gazebo_pose_age_s > 0.05:
+                print(
+                    "[RAW DATASET WARN] stale Gazebo pose "
+                    f"age={gazebo_pose_age_s:.3f}s image_stamp={stamp}"
+                )
+            gazebo_metadata = {
+                "gazebo_model_pos_world": gazebo_pose["gazebo_model_pos_world"],
+                "gazebo_model_quat_world": gazebo_pose["gazebo_model_quat_world"],
+                "gazebo_camera_pos_world": gazebo_pose["gazebo_camera_pos_world"],
+                "gazebo_camera_quat_world": gazebo_pose["gazebo_camera_quat_world"],
+                "gazebo_pose_ros_stamp_sec": gazebo_pose["gazebo_pose_ros_stamp_sec"],
+                "gazebo_pose_ros_stamp_nanosec": gazebo_pose["gazebo_pose_ros_stamp_nanosec"],
+                "gazebo_pose_wall_time": gazebo_pose["gazebo_pose_wall_time"],
+                "gazebo_pose_selection_method": gazebo_pose["gazebo_pose_selection_method"],
+                "pose_source": GAZEBO_POSE_SOURCE,
+                "gazebo_pose_age_s": float(gazebo_pose_age_s),
+            }
         drone_pos = [
             self._telemetry_float(telemetry_obj.pos, "x"),
             self._telemetry_float(telemetry_obj.pos, "y"),
@@ -199,6 +328,7 @@ class RawDatasetFrameSaver:
             "image_height": int(image_height),
             "image_hash_md5": image_hash_md5,
         }
+        metadata.update(gazebo_metadata)
 
         if not cv2.imwrite(image_path, frame):
             print(f"[RAW DATASET] failed to write image: {image_path}")
@@ -220,6 +350,12 @@ class RawDatasetFrameSaver:
 
         if self.frame_idx % 50 == 0:
             print(f"[RAW DATASET] saved {self.frame_idx} frames")
+            print(
+                "[RAW DATASET] gazebo pose "
+                f"selection={metadata.get('gazebo_pose_selection_method')} "
+                f"model_pos={metadata.get('gazebo_model_pos_world')} "
+                f"age_s={metadata.get('gazebo_pose_age_s')}"
+            )
 
         return image_path, metadata_path
 

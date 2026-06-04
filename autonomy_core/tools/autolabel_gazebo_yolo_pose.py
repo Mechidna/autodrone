@@ -12,12 +12,22 @@ import numpy as np
 DEFAULT_CAPTURE_ROOT = "~/datasets/gazebo_gate_capture"
 DEFAULT_OUTPUT_ROOT = "~/datasets/gazebo_gate_yolo_pose"
 
-GATE_CENTERS_WORLD = (
+GATE_CENTERS_WORLD_MAVSDK = (
     np.array([0.0, 8.0, 1.5], dtype=float),
     np.array([0.8, 16.0, 1.5], dtype=float),
     np.array([-0.8, 24.0, 1.5], dtype=float),
 )
-GATE_YAWS_RAD = (0.0, 0.0, 0.0)
+GATE_CENTERS_WORLD_GAZEBO = (
+    np.array([8.0, 0.0, 1.35], dtype=float),
+    np.array([16.0, 0.8, 1.35], dtype=float),
+    np.array([24.0, -0.8, 1.35], dtype=float),
+)
+GATE_YAWS_RAD_MAVSDK = (0.0, 0.0, 0.0)
+GATE_YAWS_RAD_GAZEBO = (
+    np.pi / 2.0,
+    np.pi / 2.0,
+    np.pi / 2.0,
+)
 INNER_OPENING_M = 1.5
 CAMERA_OFFSET_BODY = np.array([0.12, 0.03, 0.242], dtype=float)
 ROLL_SIGN = -1.0
@@ -58,6 +68,20 @@ def rpy_to_rotmat(roll: float, pitch: float, yaw: float) -> np.ndarray:
     ], dtype=float)
 
 
+def quaternion_to_rotmat(quat_xyzw) -> np.ndarray:
+    x, y, z, w = np.asarray(quat_xyzw, dtype=float).reshape(4)
+    norm = np.linalg.norm([x, y, z, w])
+    if norm <= 0.0:
+        return np.eye(3, dtype=float)
+    x, y, z, w = x / norm, y / norm, z / norm, w / norm
+
+    return np.array([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+    ], dtype=float)
+
+
 def gate_inner_corners_world(center_world: np.ndarray, gate_yaw_rad: float) -> np.ndarray:
     center_world = np.asarray(center_world, dtype=float).reshape(3)
     half = INNER_OPENING_M / 2.0
@@ -92,6 +116,120 @@ def world_to_camera(points_world, drone_pos, drone_rpy_rad):
     return points_camera
 
 
+def gazebo_world_to_camera_body(
+    points_world,
+    camera_pos_world,
+    camera_quat_world,
+    gazebo_rotation_mode="direct",
+):
+    points_world = np.asarray(points_world, dtype=float).reshape(-1, 3)
+    camera_pos_world = np.asarray(camera_pos_world, dtype=float).reshape(3)
+    r_wc = quaternion_to_rotmat(camera_quat_world)
+
+    rel_world = points_world - camera_pos_world
+    if gazebo_rotation_mode == "transpose":
+        points_cam_body = (r_wc.T @ rel_world.T).T
+    elif gazebo_rotation_mode == "direct":
+        points_cam_body = (r_wc @ rel_world.T).T
+    else:
+        raise ValueError(f"Unsupported gazebo_rotation_mode: {gazebo_rotation_mode}")
+
+    return points_cam_body
+
+
+def gazebo_body_to_camera_optical(points_body, gazebo_optical_mode="current"):
+    points_body = np.asarray(points_body, dtype=float).reshape(-1, 3)
+    if gazebo_optical_mode in ("current", "flip_y"):
+        points_camera = (R_BODY_CAMERA.T @ points_body.T).T
+        if gazebo_optical_mode == "flip_y":
+            points_camera[:, 1] *= -1.0
+    elif gazebo_optical_mode == "physical":
+        points_camera = np.column_stack([
+            points_body[:, 1],
+            -points_body[:, 2],
+            points_body[:, 0],
+        ])
+    elif gazebo_optical_mode == "physical_minus_y":
+        points_camera = np.column_stack([
+            -points_body[:, 1],
+            -points_body[:, 2],
+            points_body[:, 0],
+        ])
+    else:
+        raise ValueError(f"Unsupported gazebo_optical_mode: {gazebo_optical_mode}")
+
+    return points_camera
+
+
+def gazebo_world_to_camera(
+    points_world,
+    camera_pos_world,
+    camera_quat_world,
+    gazebo_rotation_mode="direct",
+    gazebo_optical_mode="current",
+):
+    points_body = gazebo_world_to_camera_body(
+        points_world,
+        camera_pos_world,
+        camera_quat_world,
+        gazebo_rotation_mode=gazebo_rotation_mode,
+    )
+    return gazebo_body_to_camera_optical(points_body, gazebo_optical_mode=gazebo_optical_mode)
+
+
+def metadata_has_gazebo_pose(metadata):
+    return (
+        metadata.get("gazebo_camera_pos_world") is not None
+        and metadata.get("gazebo_camera_quat_world") is not None
+    )
+
+
+def metadata_world_to_camera(
+    points_world,
+    metadata,
+    gazebo_rotation_mode="direct",
+    gazebo_optical_mode="current",
+):
+    if metadata_has_gazebo_pose(metadata):
+        return gazebo_world_to_camera(
+            points_world,
+            metadata["gazebo_camera_pos_world"],
+            metadata["gazebo_camera_quat_world"],
+            gazebo_rotation_mode=gazebo_rotation_mode,
+            gazebo_optical_mode=gazebo_optical_mode,
+        )
+
+    return world_to_camera(
+        points_world,
+        metadata["drone_pos"],
+        metadata["drone_rpy_rad"],
+    )
+
+
+def metadata_pose_source(metadata):
+    return "gazebo" if metadata_has_gazebo_pose(metadata) else "mavsdk"
+
+
+def metadata_gate_centers_frame(metadata):
+    return "gazebo" if metadata_has_gazebo_pose(metadata) else "mavsdk"
+
+
+def metadata_gate_centers(metadata):
+    if metadata_has_gazebo_pose(metadata):
+        return GATE_CENTERS_WORLD_GAZEBO
+    return GATE_CENTERS_WORLD_MAVSDK
+
+
+def metadata_gate_yaws(metadata):
+    if metadata_has_gazebo_pose(metadata):
+        return GATE_YAWS_RAD_GAZEBO
+    return GATE_YAWS_RAD_MAVSDK
+
+
+def gate_right_axis(gate_yaw_rad):
+    return np.array([np.cos(gate_yaw_rad), np.sin(gate_yaw_rad), 0.0], dtype=float)
+
+
 def project_camera_points(points_camera, camera_matrix, dist_coeffs):
     points_camera = np.asarray(points_camera, dtype=float).reshape(-1, 3)
     camera_matrix = np.asarray(camera_matrix, dtype=float).reshape(3, 3)
@@ -105,6 +243,18 @@ def project_camera_points(points_camera, camera_matrix, dist_coeffs):
         dist_coeffs,
     )
     return image_points.reshape(-1, 2)
+
+
+def order_points_tl_tr_br_bl(points_image):
+    points_image = np.asarray(points_image, dtype=float).reshape(4, 2)
+    by_y = points_image[np.argsort(points_image[:, 1])]
+    top = by_y[:2]
+    bottom = by_y[2:]
+    top = top[np.argsort(top[:, 0])]
+    bottom = bottom[np.argsort(bottom[:, 0])]
+    tl, tr = top
+    bl, br = bottom
+    return np.array([tl, tr, br, bl], dtype=float)
 
 
 def inside_image(points_image, width, height):
@@ -152,6 +302,16 @@ def load_metadata(path):
         "dist_coeffs": np.asarray(metadata.get("dist_coeffs", [0, 0, 0, 0, 0]), dtype=float).reshape(-1, 1),
         "image_width": int(metadata["image_width"]),
         "image_height": int(metadata["image_height"]),
+        "gazebo_camera_pos_world": (
+            np.asarray(metadata["gazebo_camera_pos_world"], dtype=float).reshape(3)
+            if metadata.get("gazebo_camera_pos_world") is not None
+            else None
+        ),
+        "gazebo_camera_quat_world": (
+            np.asarray(metadata["gazebo_camera_quat_world"], dtype=float).reshape(4)
+            if metadata.get("gazebo_camera_quat_world") is not None
+            else None
+        ),
     }
 
 
@@ -211,12 +371,18 @@ def write_yaml(output_root):
     return yaml_path
 
 
-def print_first_frame_debug(metadata, candidates, selected_gate_idx):
+def print_first_frame_debug(metadata, candidates, selected_gate_idx, gazebo_rotation_mode, gazebo_optical_mode):
     raw_roll, raw_pitch, raw_yaw = np.asarray(metadata["drone_rpy_rad"], dtype=float).reshape(3)
     corrected_roll = ROLL_SIGN * float(raw_roll)
     corrected_pitch = PITCH_SIGN * float(raw_pitch)
     corrected_yaw = YAW_SIGN * float(raw_yaw) + YAW_OFFSET_RAD
     print("[AUTOLABEL DEBUG] first processed frame")
+    print(f"[AUTOLABEL DEBUG] pose_source_used={metadata_pose_source(metadata)}")
+    print(f"[AUTOLABEL DEBUG] gazebo_rotation_mode={gazebo_rotation_mode}")
+    print(f"[AUTOLABEL DEBUG] gazebo_optical_mode={gazebo_optical_mode}")
+    print(f"[AUTOLABEL DEBUG] gate_centers_frame={metadata_gate_centers_frame(metadata)}")
+    print(f"[AUTOLABEL DEBUG] camera_pos_world={metadata.get('gazebo_camera_pos_world')}")
+    print(f"[AUTOLABEL DEBUG] camera_quat_world={metadata.get('gazebo_camera_quat_world')}")
     print(
         "[AUTOLABEL DEBUG] raw_rpy_deg="
         f"[{np.degrees(raw_roll):.3f}, {np.degrees(raw_pitch):.3f}, {np.degrees(raw_yaw):.3f}]"
@@ -231,15 +397,32 @@ def print_first_frame_debug(metadata, candidates, selected_gate_idx):
     for candidate in candidates:
         gate_idx = candidate["gate_idx"]
         depth = candidate["mean_depth"]
+        center = np.asarray(candidate["gate_center_world"], dtype=float)
+        right_axis = np.asarray(candidate["gate_right_axis_world"], dtype=float)
         corners = np.asarray(candidate["corners_image"], dtype=float)
+        center_text = np.array2string(center, precision=3, suppress_small=False)
+        right_axis_text = np.array2string(right_axis, precision=3, suppress_small=False)
         corners_text = np.array2string(corners, precision=2, suppress_small=False)
         status = "accepted" if candidate["accepted"] else f"rejected:{candidate['reason']}"
         print(
             f"[AUTOLABEL DEBUG] gate={gate_idx} "
+            f"gate_center_world={center_text} "
+            f"gate_yaw_rad={candidate['gate_yaw_rad']:.6f} "
+            f"gate_right_axis_world={right_axis_text} "
             f"mean_camera_depth={depth:.3f} "
             f"status={status} "
             f"projected_corners_px={corners_text}"
         )
+        if gate_idx == 0:
+            points_body = candidate.get("points_body", None)
+            points_camera = candidate.get("points_camera", None)
+            if points_body is not None:
+                body_text = np.array2string(np.asarray(points_body, dtype=float), precision=3, suppress_small=False)
+                print(f"[AUTOLABEL DEBUG] gate=0 points_body={body_text}")
+            if points_camera is not None:
+                camera_text = np.array2string(np.asarray(points_camera, dtype=float), precision=3, suppress_small=False)
+                print(f"[AUTOLABEL DEBUG] gate=0 points_camera={camera_text}")
+            print(f"[AUTOLABEL DEBUG] gate=0 projected_pixels={corners_text}")
 
     if selected_gate_idx is None:
         print("[AUTOLABEL DEBUG] selected_gate=None")
@@ -247,7 +430,7 @@ def print_first_frame_debug(metadata, candidates, selected_gate_idx):
         print(f"[AUTOLABEL DEBUG] selected_gate={selected_gate_idx}")
 
 
-def print_frame_summary_debug(frame_name, metadata, labels):
+def print_frame_summary_debug(frame_name, metadata, labels, gazebo_rotation_mode, gazebo_optical_mode):
     raw_roll, raw_pitch, raw_yaw = np.asarray(metadata["drone_rpy_rad"], dtype=float).reshape(3)
     corrected_roll = ROLL_SIGN * float(raw_roll)
     corrected_pitch = PITCH_SIGN * float(raw_pitch)
@@ -269,6 +452,12 @@ def print_frame_summary_debug(frame_name, metadata, labels):
 
     print(
         f"[AUTOLABEL DEBUG] frame={frame_name} "
+        f"pose_source={metadata_pose_source(metadata)} "
+        f"gazebo_rotation_mode={gazebo_rotation_mode} "
+        f"gazebo_optical_mode={gazebo_optical_mode} "
+        f"gate_centers_frame={metadata_gate_centers_frame(metadata)} "
+        f"camera_pos_world={metadata.get('gazebo_camera_pos_world')} "
+        f"camera_quat_world={metadata.get('gazebo_camera_quat_world')} "
         f"raw_rpy_deg=[{np.degrees(raw_roll):.3f}, {np.degrees(raw_pitch):.3f}, {np.degrees(raw_yaw):.3f}] "
         f"corrected_rpy_deg=[{np.degrees(corrected_roll):.3f}, "
         f"{np.degrees(corrected_pitch):.3f}, {np.degrees(corrected_yaw):.3f}] "
@@ -278,19 +467,42 @@ def print_frame_summary_debug(frame_name, metadata, labels):
     )
 
 
-def build_labels(metadata, label_all_visible_gates=False, debug=False):
+def build_labels(
+    metadata,
+    label_all_visible_gates=False,
+    order_image_corners=True,
+    gazebo_rotation_mode="direct",
+    gazebo_optical_mode="current",
+    debug=False,
+):
     width = int(metadata["image_width"])
     height = int(metadata["image_height"])
     labels = []
     candidates = []
+    gate_centers = metadata_gate_centers(metadata)
+    gate_yaws = metadata_gate_yaws(metadata)
 
-    for gate_idx, (center, yaw) in enumerate(zip(GATE_CENTERS_WORLD, GATE_YAWS_RAD)):
+    for gate_idx, (center, yaw) in enumerate(zip(gate_centers, gate_yaws)):
         corners_world = gate_inner_corners_world(center, yaw)
-        corners_camera = world_to_camera(
-            corners_world,
-            metadata["drone_pos"],
-            metadata["drone_rpy_rad"],
-        )
+        points_body = None
+        if metadata_has_gazebo_pose(metadata):
+            points_body = gazebo_world_to_camera_body(
+                corners_world,
+                metadata["gazebo_camera_pos_world"],
+                metadata["gazebo_camera_quat_world"],
+                gazebo_rotation_mode=gazebo_rotation_mode,
+            )
+            corners_camera = gazebo_body_to_camera_optical(
+                points_body,
+                gazebo_optical_mode=gazebo_optical_mode,
+            )
+        else:
+            corners_camera = metadata_world_to_camera(
+                corners_world,
+                metadata,
+                gazebo_rotation_mode=gazebo_rotation_mode,
+                gazebo_optical_mode=gazebo_optical_mode,
+            )
         mean_depth = float(np.mean(corners_camera[:, 2]))
         accepted = True
         reason = ""
@@ -305,6 +517,8 @@ def build_labels(metadata, label_all_visible_gates=False, debug=False):
                 metadata["camera_matrix"],
                 metadata["dist_coeffs"],
             )
+            if order_image_corners:
+                corners_image = order_points_tl_tr_br_bl(corners_image)
 
             if not inside_image(corners_image, width, height):
                 accepted = False
@@ -312,6 +526,11 @@ def build_labels(metadata, label_all_visible_gates=False, debug=False):
 
         candidate = {
             "gate_idx": gate_idx,
+            "gate_center_world": np.asarray(center, dtype=float).reshape(3),
+            "gate_yaw_rad": float(yaw),
+            "gate_right_axis_world": gate_right_axis(float(yaw)),
+            "points_body": points_body,
+            "points_camera": corners_camera.copy(),
             "corners_image": corners_image,
             "mean_depth": mean_depth,
             "accepted": accepted,
@@ -334,7 +553,13 @@ def build_labels(metadata, label_all_visible_gates=False, debug=False):
         selected_gate_idx = "all_visible"
 
     if debug:
-        print_first_frame_debug(metadata, candidates, selected_gate_idx)
+        print_first_frame_debug(
+            metadata,
+            candidates,
+            selected_gate_idx,
+            gazebo_rotation_mode,
+            gazebo_optical_mode,
+        )
 
     return labels
 
@@ -376,10 +601,19 @@ def process_dataset(args):
         labels = build_labels(
             metadata,
             label_all_visible_gates=args.label_all_visible_gates,
+            order_image_corners=not args.no_image_order_corners,
+            gazebo_rotation_mode=args.gazebo_rotation_mode,
+            gazebo_optical_mode=args.gazebo_optical_mode,
             debug=(processed == 0),
         )
         if processed < 10:
-            print_frame_summary_debug(metadata["image_filename"], metadata, labels)
+            print_frame_summary_debug(
+                metadata["image_filename"],
+                metadata,
+                labels,
+                args.gazebo_rotation_mode,
+                args.gazebo_optical_mode,
+            )
         processed += 1
         labeled_gates += len(labels)
 
@@ -427,6 +661,17 @@ def parse_args():
     parser.add_argument("--preview-only", action="store_true")
     parser.add_argument("--max-preview", type=int, default=50)
     parser.add_argument("--label-all-visible-gates", action="store_true")
+    parser.add_argument("--no-image-order-corners", action="store_true")
+    parser.add_argument(
+        "--gazebo-rotation-mode",
+        choices=("transpose", "direct"),
+        default="direct",
+    )
+    parser.add_argument(
+        "--gazebo-optical-mode",
+        choices=("current", "flip_y", "physical", "physical_minus_y"),
+        default="current",
+    )
     return parser.parse_args()
 
 
