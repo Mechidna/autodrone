@@ -7,7 +7,7 @@ from collections import deque
 class GatePerception:
 
     def __init__(self,
-                 gate_size=2.7,
+                 gate_size=1.5,
                  smoothing_window=5,
                  max_failures=10):
 

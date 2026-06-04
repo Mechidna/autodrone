@@ -65,7 +65,7 @@ class AutonomyAPI:
         self.camera_offset_body = np.array([0.12, 0.03, 0.242], dtype=float)
 
         self.gate_perception = GatePerception(
-            gate_size=1.5,
+            gate_size=1.75,
             yolo_model_path="/home/paolo/datasets/drone-racing-dataset/runs/pose/tii_gate_pose_distinctive_10e/weights/best.pt",
             preprocess_mode="distinctive",
             yolo_conf=0.1,
@@ -77,7 +77,7 @@ class AutonomyAPI:
             association_radius=1.5,
             commit_radius=1.5,
             new_track_block_radius=4.5,
-            min_confidence_per_hit=0.25,
+            min_confidence_per_hit=0.2,
             commit_hits=4,
             commit_confidence_sum=1.2,
             stale_time=3.0,
@@ -208,7 +208,7 @@ class AutonomyAPI:
         self.post_completion_grace_suppressed = False
         self.use_passthrough_gate_velocities = True
         self.pass_through_speed = 1.5
-        self.use_planning_lookahead_tracks = False
+        self.use_planning_lookahead_tracks = True
         self.use_raw_rejected_planning_lookahead = False
         self.planning_lookahead_min_hits = 6
         self.raw_planning_lookahead_ttl_s = 1.25
@@ -2692,9 +2692,12 @@ class AutonomyAPI:
             self.current_target_gate = self.current_gate_pos.copy()
 
         if self.use_perception and not self.last_perception_accepted:
-            desired_yaw = self.get_perception_yaw_hold_reference(current_yaw_rad)
+            # desired_yaw = self.get_perception_yaw_hold_reference(current_yaw_rad)
+            # self.perception_hold_yaw = desired_yaw
+            # self.yaw_target_source = "perception_lost_hold_yaw"
+            desired_yaw = np.pi / 2.0
             self.perception_hold_yaw = desired_yaw
-            self.yaw_target_source = "perception_lost_hold_yaw"
+            self.yaw_target_source = "perception_lost_hold_yaw_plus_y"
         elif self.use_perception and self.current_target_gate is not None:
             if self.is_near_completed_gate(self.current_target_gate):
                 self.target_retained_after_completion = True
@@ -2704,7 +2707,7 @@ class AutonomyAPI:
             to_target = np.asarray(self.current_target_gate[:2], dtype=float) - state.pos[:2]
             if np.linalg.norm(to_target) > 1e-3:
                 desired_yaw = np.arctan2(to_target[1], to_target[0])
-                self.yaw_target_source = "active_target"
+                self.yaw_target_source = "active_target_camera_axis"
             else:
                 desired_yaw = compute_desired_yaw(v_ref, a_ref, self.last_desired_yaw)
                 self.yaw_target_source = "reference_motion"
