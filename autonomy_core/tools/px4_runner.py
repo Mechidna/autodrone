@@ -1,9 +1,13 @@
 # px4_runner.py
 import asyncio
+import hashlib
+import json
 import math
+import os
 import threading
 import time
 
+import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -39,10 +43,12 @@ def hover_command(autonomy):
 # ROS2 camera adapter
 # -------------------------------------------------
 class PerceptionNode(Node):
-    def __init__(self):
+    def __init__(self, raw_dataset_saver=None, telemetry_obj=None):
         super().__init__("perception_adapter_node")
 
         self.bridge = CvBridge()
+        self.raw_dataset_saver = raw_dataset_saver
+        self.telemetry = telemetry_obj
 
         self.frame = None
         self.camera_matrix = None
@@ -79,14 +85,143 @@ class PerceptionNode(Node):
 
     def image_callback(self, msg: Image):
         try:
-            self.frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            self.frame = frame
             self.last_frame_time = time.time()
+            if self.raw_dataset_saver is not None and self.telemetry is not None:
+                self.raw_dataset_saver.maybe_save_from_callback(
+                    frame,
+                    self.camera_matrix,
+                    self.dist_coeffs,
+                    self.telemetry,
+                    msg.header.stamp,
+                )
         except Exception as e:
             self.get_logger().error(f"Failed to convert image: {e}")
 
 
 def ros_spin_thread(node):
     rclpy.spin(node)
+
+
+class RawDatasetFrameSaver:
+    def __init__(self, enabled=True, capture_hz=5.0, root_dir="~/datasets/gazebo_gate_capture"):
+        self.enabled = bool(enabled)
+        self.capture_period_s = 1.0 / float(capture_hz) if float(capture_hz) > 0.0 else 0.0
+        self.root_dir = os.path.expanduser(root_dir)
+        self.images_dir = os.path.join(self.root_dir, "images")
+        self.metadata_dir = os.path.join(self.root_dir, "metadata")
+        self.next_capture_time = 0.0
+        self.last_saved_image_stamp = None
+        self.saved_image_hash_poses = {}
+        self.telemetry_ready = False
+        self.frame_idx = 0
+
+        if self.enabled:
+            os.makedirs(self.images_dir, exist_ok=True)
+            os.makedirs(self.metadata_dir, exist_ok=True)
+            print(
+                f"[RAW DATASET] saving raw frames at {float(capture_hz):.2f} Hz "
+                f"to {self.root_dir}"
+            )
+
+    @staticmethod
+    def _json_list(value):
+        return np.asarray(value, dtype=float).tolist()
+
+    @staticmethod
+    def _telemetry_float(container, key):
+        return float(container[key])
+
+    @staticmethod
+    def _image_hash_md5(frame):
+        return hashlib.md5(np.ascontiguousarray(frame).tobytes()).hexdigest()
+
+    @staticmethod
+    def _pose_changed(previous, current, atol=1e-6):
+        previous_pos, previous_rpy = previous
+        current_pos, current_rpy = current
+        return (
+            not np.allclose(previous_pos, current_pos, atol=atol, rtol=0.0)
+            or not np.allclose(previous_rpy, current_rpy, atol=atol, rtol=0.0)
+        )
+
+    def maybe_save_from_callback(self, frame, camera_matrix, dist_coeffs, telemetry_obj, image_stamp):
+        if (
+            not self.enabled
+            or not self.telemetry_ready
+            or frame is None
+            or camera_matrix is None
+            or dist_coeffs is None
+        ):
+            return None
+
+        stamp = (int(image_stamp.sec), int(image_stamp.nanosec))
+        if stamp == self.last_saved_image_stamp:
+            return None
+
+        now = time.time()
+        if now < self.next_capture_time:
+            return None
+
+        if self.capture_period_s > 0.0:
+            self.next_capture_time = now + self.capture_period_s
+
+        self.frame_idx += 1
+        image_filename = f"frame_{self.frame_idx:06d}.jpg"
+        metadata_filename = f"frame_{self.frame_idx:06d}.json"
+        image_path = os.path.join(self.images_dir, image_filename)
+        metadata_path = os.path.join(self.metadata_dir, metadata_filename)
+
+        image_height, image_width = frame.shape[:2]
+        drone_pos = [
+            self._telemetry_float(telemetry_obj.pos, "x"),
+            self._telemetry_float(telemetry_obj.pos, "y"),
+            self._telemetry_float(telemetry_obj.pos, "z"),
+        ]
+        drone_rpy_rad = [
+            self._telemetry_float(telemetry_obj.rpy, "roll"),
+            self._telemetry_float(telemetry_obj.rpy, "pitch"),
+            self._telemetry_float(telemetry_obj.rpy, "yaw"),
+        ]
+        image_hash_md5 = self._image_hash_md5(frame)
+        metadata = {
+            "image_filename": image_filename,
+            "timestamp": float(now),
+            "metadata_write_time": float(now),
+            "ros_image_stamp_sec": stamp[0],
+            "ros_image_stamp_nanosec": stamp[1],
+            "drone_pos": drone_pos,
+            "drone_rpy_rad": drone_rpy_rad,
+            "camera_matrix": self._json_list(camera_matrix),
+            "dist_coeffs": self._json_list(dist_coeffs),
+            "image_width": int(image_width),
+            "image_height": int(image_height),
+            "image_hash_md5": image_hash_md5,
+        }
+
+        if not cv2.imwrite(image_path, frame):
+            print(f"[RAW DATASET] failed to write image: {image_path}")
+            self.frame_idx -= 1
+            return None
+
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
+
+        current_pose = (np.asarray(drone_pos, dtype=float), np.asarray(drone_rpy_rad, dtype=float))
+        previous_pose = self.saved_image_hash_poses.get(image_hash_md5)
+        if previous_pose is not None and self._pose_changed(previous_pose, current_pose):
+            print(
+                "[RAW DATASET WARN] duplicate image hash saved with different telemetry "
+                f"hash={image_hash_md5} image={image_filename}"
+            )
+        self.saved_image_hash_poses.setdefault(image_hash_md5, current_pose)
+        self.last_saved_image_stamp = stamp
+
+        if self.frame_idx % 50 == 0:
+            print(f"[RAW DATASET] saved {self.frame_idx} frames")
+
+        return image_path, metadata_path
 
 
 # -------------------------------------------------
@@ -126,9 +261,19 @@ async def track_orientation(drone):
 # Main
 # -------------------------------------------------
 async def main():
+    save_raw_dataset_frames = True
+    raw_dataset_capture_hz = 5.0
+    raw_dataset_saver = RawDatasetFrameSaver(
+        enabled=save_raw_dataset_frames,
+        capture_hz=raw_dataset_capture_hz,
+    )
+
     # ---------------- ROS2 startup ----------------
     rclpy.init()
-    perception_node = PerceptionNode()
+    perception_node = PerceptionNode(
+        raw_dataset_saver=raw_dataset_saver,
+        telemetry_obj=telemetry,
+    )
     ros_thread = threading.Thread(target=ros_spin_thread, args=(perception_node,), daemon=True)
     ros_thread.start()
 
@@ -171,14 +316,17 @@ async def main():
         math.radians(att0.yaw_deg),
     )
     telemetry.telemetry_rpy(start_orientation, start_orientation=start_orientation)
+    raw_dataset_saver.telemetry_ready = True
 
     # Start live telemetry tasks
     asyncio.create_task(track_position(drone))
     asyncio.create_task(track_velocity(drone))
     asyncio.create_task(track_orientation(drone))
 
-    if use_perception:
-        # Wait for ROS2 camera + camera_info only when perception is active.
+    use_camera = use_perception or save_raw_dataset_frames
+
+    if use_camera:
+        # Wait for ROS2 camera + camera_info when either perception or raw capture is active.
         print("Waiting for camera frame and intrinsics...")
         while (
             perception_node.frame is None
@@ -299,7 +447,7 @@ async def main():
                 print(f"[WARN] control loop gap {loop_dt:.3f}s; suppressing aggressive command.")
                 stale_command_suppressed = True
 
-            if use_perception:
+            if use_camera:
                 frame = perception_node.frame
                 camera_matrix = perception_node.camera_matrix
                 dist_coeffs = perception_node.dist_coeffs
@@ -309,6 +457,7 @@ async def main():
                     await asyncio.sleep(0.05)
                     continue
 
+            if use_perception:
                 # -------------------------------------------------
                 # 1) Update gate memory from current frame
                 # -------------------------------------------------
