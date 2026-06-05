@@ -230,6 +230,14 @@ class GateMemory:
         self.last_track_stable_now = False
         self.last_track_state_change = ""
         self.last_outlier_rejected = False
+        self.nearest_track_id = None
+        self.nearest_track_distance = float("nan")
+        self.nearest_track_hits = 0
+        self.nearest_track_committed = False
+        self.nearest_track_stable = False
+        self.association_attempted = False
+        self.association_success = False
+        self.duplicate_rejection_reason = ""
 
         self._next_id = 0
         self.tracks: List[GateTrack] = []
@@ -253,6 +261,35 @@ class GateMemory:
                 best_dist = d
 
         return best
+
+    def _find_nearest_track(self, center: np.ndarray, radius: Optional[float] = None) -> Optional[GateTrack]:
+        best = None
+        best_dist = float("inf")
+        max_radius = float("inf") if radius is None else float(radius)
+        for tr in self.tracks:
+            d = self._distance(center, tr.center)
+            if d < max_radius and d < best_dist:
+                best = tr
+                best_dist = d
+        return best
+
+    def _record_nearest_track_debug(self, center: np.ndarray):
+        nearest = self._find_nearest_track(
+            center,
+            radius=max(self.association_radius, self.new_track_block_radius),
+        )
+        self.nearest_track_id = None
+        self.nearest_track_distance = float("nan")
+        self.nearest_track_hits = 0
+        self.nearest_track_committed = False
+        self.nearest_track_stable = False
+        if nearest is not None:
+            self.nearest_track_id = nearest.id
+            self.nearest_track_distance = self._distance(center, nearest.center)
+            self.nearest_track_hits = int(nearest.hits)
+            self.nearest_track_committed = bool(nearest.committed)
+            self.nearest_track_stable = bool(nearest.is_stable)
+        return nearest
 
     def _near_any_committed(self, center: np.ndarray, radius: Optional[float] = None) -> bool:
         r = self.new_track_block_radius if radius is None else float(radius)
@@ -574,6 +611,14 @@ class GateMemory:
         self.last_track_stable_now = False
         self.last_track_state_change = ""
         self.last_outlier_rejected = False
+        self.nearest_track_id = None
+        self.nearest_track_distance = float("nan")
+        self.nearest_track_hits = 0
+        self.nearest_track_committed = False
+        self.nearest_track_stable = False
+        self.association_attempted = False
+        self.association_success = False
+        self.duplicate_rejection_reason = ""
 
         if confidence < self.min_confidence_per_hit:
             return {
@@ -585,15 +630,27 @@ class GateMemory:
                 "center": center,
             }
 
+        nearest = self._record_nearest_track_debug(center)
+
         # 1) Prefer matching an existing committed landmark
         tr = self._find_best_track(center, committed_only=True)
+        if tr is None and nearest is not None and nearest.committed:
+            # A committed-but-not-stable landmark must continue receiving hits.
+            # The wider duplicate radius should block only new-track creation,
+            # not observations that belong to the nearest existing track.
+            tr = nearest
         if tr is not None:
             dist = self._distance(center, tr.center)
             self.last_update_innovation = dist
             self.last_track_center_before = tr.center.copy()
+            self.association_attempted = True
             print(f"[ASSOC] trying match: dist={dist:.2f}, track_id={tr.id}")
             outlier_threshold = self.max_outlier_distance if tr.is_stable else self.max_committed_match_distance
-            if dist < self.max_committed_match_distance or (tr.is_stable and dist <= outlier_threshold):
+            if (
+                dist < self.max_committed_match_distance
+                or (tr.is_stable and dist <= outlier_threshold)
+                or (not tr.is_stable and dist <= self.new_track_block_radius)
+            ):
                 tr.observe_without_moving(
                     center,
                     confidence,
@@ -606,6 +663,7 @@ class GateMemory:
                 )
                 self._update_track_filter(tr)
                 self.last_update_accepted = True
+                self.association_success = True
                 self.last_track_center_after = tr.center.copy()
 
                 if dist > 2.0:
@@ -659,8 +717,10 @@ class GateMemory:
             innovation = self._distance(center, tr.center)
             self.last_update_innovation = innovation
             self.last_track_center_before = tr.center.copy()
+            self.association_attempted = True
             if innovation > self.max_candidate_update_innovation:
                 self.last_track_center_after = tr.center.copy()
+                self.duplicate_rejection_reason = f"candidate_update_innovation_too_large:{innovation:.2f}"
                 return {
                     "accepted": False,
                     "reason": f"candidate_update_innovation_too_large:{innovation:.2f}",
@@ -684,6 +744,7 @@ class GateMemory:
             self._maybe_commit(tr)
             self._update_track_filter(tr)
             self.last_update_accepted = True
+            self.association_success = True
             self.last_track_center_after = tr.center.copy()
 
             return {
@@ -699,6 +760,17 @@ class GateMemory:
 
         # 3) Block spawning a new track too close to a committed landmark
         if self._near_any_committed(center, radius=self.new_track_block_radius):
+            self.duplicate_rejection_reason = "near_existing_committed_landmark"
+            print(
+                "[ASSOC REJECT] near_existing_committed_landmark "
+                f"nearest_track_id={self.nearest_track_id} "
+                f"nearest_dist={self.nearest_track_distance:.2f} "
+                f"nearest_hits={self.nearest_track_hits} "
+                f"nearest_committed={self.nearest_track_committed} "
+                f"nearest_stable={self.nearest_track_stable} "
+                f"association_attempted={self.association_attempted} "
+                f"association_success={self.association_success}"
+            )
             return {
                 "accepted": False,
                 "reason": "near_existing_committed_landmark",

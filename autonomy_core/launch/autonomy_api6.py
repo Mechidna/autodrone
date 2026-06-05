@@ -211,6 +211,19 @@ class AutonomyAPI:
         self.use_planning_lookahead_tracks = True
         self.use_raw_rejected_planning_lookahead = False
         self.planning_lookahead_min_hits = 6
+        self.perception_transform_mode = "physical_direct_rad_x_mirror"
+        self.perception_transform_modes = (
+            "legacy_scaled_yaw",
+            "direct_rad",
+            "physical_direct_rad",
+            "physical_direct_rad_x_mirror",
+            "yaw_minus_pi_over_2",
+            "pi_over_2_minus_yaw",
+            "neg_yaw",
+            "neg_yaw_plus_pi_over_2",
+            "physical_mavsdk_yaw_aligned",
+        )
+        self.print_perception_transform_startup()
         self.use_tentative_lookahead_spline = True
         self.lookahead_min_hits = 3
         self.lookahead_min_confidence_sum = 0.8
@@ -302,6 +315,7 @@ class AutonomyAPI:
         self.selected_target_source = ""
         self.last_raw_image_corners = None
         self.last_ordered_image_corners = None
+        self.last_pnp_debug_best_ordered_corners = None
         self.last_reprojected_image_corners = None
         self.last_pnp_rvec = None
         self.last_pnp_tvec = None
@@ -327,15 +341,47 @@ class AutonomyAPI:
         self.last_quad_aspect_ratio = float("nan")
         self.last_quad_area_px = float("nan")
         self.last_detection_drone_pose = None
+        self.last_telemetry_rpy_raw_rad = None
+        self.perception_rpy_debug_frames_remaining = 5
+        self.transform_sweep_error_stats = {}
         self.last_transform_source = ""
         self.last_camera_to_body_matrix_used = None
         self.last_body_to_world_method_used = ""
+        self.live_vs_physical_direct_delta_m = float("nan")
+        self.live_camera_axis_mode = ""
+        self.live_camera_axis_det = float("nan")
+        self.live_uses_x_mirror = False
+        self.live_vs_camera_axis_x_flipped_delta_m = float("nan")
         self.last_pnp_size_sweep = {}
         self.last_pnp_formulation_debug = []
         self.last_camera_matrix = None
         self.last_dist_coeffs = None
         self.last_live_solver_name = ""
         self.last_pnp_fallback_reason = ""
+        self.pnp_selected_order = ""
+        self.pnp_selected_solver = ""
+        self.pnp_selected_score = float("nan")
+        self.pnp_selected_reprojection_error = float("nan")
+        self.pnp_selected_gate_center_camera = None
+        self.pnp_selected_reason = ""
+        self.pnp_candidate_summary = ""
+        self.allow_pnp_corner_reordering = False
+        self.pnp_live_candidate_orders_allowed = ""
+        self.pnp_debug_best_order = ""
+        self.pnp_live_vs_debug_best_order_mismatch = False
+        self.pnp_lateral_angle = float("nan")
+        self.image_center_offset_normalized = float("nan")
+        self.keypoint_polygon_signed_area = float("nan")
+        self.keypoint_polygon_winding = ""
+        self.keypoint_edge_top = float("nan")
+        self.keypoint_edge_right = float("nan")
+        self.keypoint_edge_bottom = float("nan")
+        self.keypoint_edge_left = float("nan")
+        self.keypoint_bbox_center = np.full(2, np.nan, dtype=float)
+        self.keypoint_polygon_center = np.full(2, np.nan, dtype=float)
+        self.keypoint_bbox_polygon_delta = np.full(2, np.nan, dtype=float)
+        self.raw_keypoint_polygon_signed_area = float("nan")
+        self.raw_keypoint_polygon_winding = ""
         self.reset_transform_validation_debug()
         self.image_width = 0
         self.image_height = 0
@@ -351,6 +397,14 @@ class AutonomyAPI:
         self.track_update_accepted = False
         self.track_center_before_update = None
         self.track_center_after_update = None
+        self.nearest_track_id = None
+        self.nearest_track_distance = float("nan")
+        self.nearest_track_hits = 0
+        self.nearest_track_committed = False
+        self.nearest_track_stable = False
+        self.association_attempted = False
+        self.association_success = False
+        self.duplicate_rejection_reason = ""
         self.candidate_track_id = None
         self.candidate_center = None
         self.candidate_order_score = float("nan")
@@ -722,9 +776,114 @@ class AutonomyAPI:
         self.current_gate_pos = np.asarray(result["center"], dtype=float)
         return self.current_gate_pos.copy()
 
+    def perception_rpy_for_mode(self, telemetry_rpy_raw_rad, mode):
+        """
+        Temporary transform-convention switch.
+
+        telemetry_rpy_raw_rad is stored in radians by px4_runner.py. The
+        legacy mode intentionally preserves the previous working behavior that
+        scaled those radians by pi/180 before the camera-to-world transform.
+        """
+        roll, pitch, yaw = np.asarray(telemetry_rpy_raw_rad, dtype=float).reshape(3)
+        mode = str(mode or "legacy_scaled_yaw")
+
+        if mode == "legacy_scaled_yaw":
+            return np.array([roll, pitch, yaw], dtype=float) * np.pi / 180.0
+        if mode in ("direct_rad", "physical_direct_rad", "physical_direct_rad_x_mirror"):
+            return np.array([roll, pitch, yaw], dtype=float)
+        if mode == "yaw_minus_pi_over_2":
+            return np.array([roll, pitch, yaw - (np.pi / 2.0)], dtype=float)
+        if mode == "pi_over_2_minus_yaw":
+            return np.array([roll, pitch, (np.pi / 2.0) - yaw], dtype=float)
+        if mode == "neg_yaw":
+            return np.array([roll, pitch, -yaw], dtype=float)
+        if mode == "neg_yaw_plus_pi_over_2":
+            return np.array([roll, pitch, -yaw + (np.pi / 2.0)], dtype=float)
+        if mode == "physical_mavsdk_yaw_aligned":
+            return np.array([roll, pitch, yaw - (np.pi / 2.0)], dtype=float)
+
+        print(f"[PERCEPTION TRANSFORM WARN] unknown mode={mode}; using legacy_scaled_yaw")
+        return np.array([roll, pitch, yaw], dtype=float) * np.pi / 180.0
+
+    def body_camera_matrix_for_mode(self, mode, default_matrix=None):
+        if mode == "legacy_scaled_yaw":
+            return self.legacy_body_camera_matrix()
+        if mode in ("physical_direct_rad", "physical_mavsdk_yaw_aligned"):
+            return self.physical_body_camera_matrix()
+        if mode == "physical_direct_rad_x_mirror":
+            return self.physical_x_mirror_body_camera_matrix()
+        if default_matrix is not None:
+            return np.asarray(default_matrix, dtype=float).reshape(3, 3)
+        return np.asarray(self.perception_node.R_body_camera, dtype=float).reshape(3, 3)
+
+    @staticmethod
+    def legacy_body_camera_matrix():
+        return np.array([
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, -1.0, 0.0],
+        ], dtype=float)
+
+    @staticmethod
+    def physical_x_mirror_body_camera_matrix():
+        return np.array([
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ], dtype=float)
+
+    def print_perception_transform_startup(self):
+        if self.perception_node is None:
+            return
+        R = self.body_camera_matrix_for_mode(self.perception_transform_mode)
+        ex = R @ np.array([1.0, 0.0, 0.0], dtype=float)
+        ey = R @ np.array([0.0, 1.0, 0.0], dtype=float)
+        ez = R @ np.array([0.0, 0.0, 1.0], dtype=float)
+        print("[PERCEPTION TRANSFORM STARTUP] "
+              f"perception_transform_mode={self.perception_transform_mode}")
+        print("[PERCEPTION TRANSFORM STARTUP] R_body_camera="
+              f"{np.array2string(R, precision=3, suppress_small=True)}")
+        print("[PERCEPTION TRANSFORM STARTUP] "
+              f"det(R_body_camera)={np.linalg.det(R):.3f}")
+        print("[PERCEPTION TRANSFORM STARTUP] "
+              f"camera +x -> body {ex.tolist()}")
+        print("[PERCEPTION TRANSFORM STARTUP] "
+              f"camera +y -> body {ey.tolist()}")
+        print("[PERCEPTION TRANSFORM STARTUP] "
+              f"camera +z -> body {ez.tolist()}")
+        if self.perception_transform_mode == "physical_direct_rad_x_mirror":
+            print(
+                "[PERCEPTION TRANSFORM WARNING] "
+                "physical_direct_rad_x_mirror uses a horizontal mirror convention; "
+                "this indicates the live camera image or optical x-axis is mirrored "
+                "relative to OpenCV assumptions."
+            )
+
+    def transform_gate_camera_to_world(self, gate_camera, drone_pos, telemetry_rpy_raw_rad, mode, r_body_camera):
+        gate_camera = np.asarray(gate_camera, dtype=float).reshape(3)
+        drone_pos = np.asarray(drone_pos, dtype=float).reshape(3)
+        r_body_camera = np.asarray(r_body_camera, dtype=float).reshape(3, 3)
+        rpy = self.perception_rpy_for_mode(telemetry_rpy_raw_rad, mode)
+        roll, pitch, yaw = rpy
+        r_wb = self.perception_node._rpy_to_rotmat(float(roll), float(pitch), float(yaw))
+        gate_body = r_body_camera @ gate_camera
+        world = drone_pos + r_wb @ (self.camera_offset_body + gate_body)
+        return world, gate_body, rpy
+
+    @staticmethod
+    def physical_body_camera_matrix():
+        return np.array([
+            [0.0, 0.0, 1.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+        ], dtype=float)
+
     def update_gate_memory_from_frame(self, frame, camera_matrix, dist_coeffs):
         if not self.use_perception or self.perception_node is None:
             return None
+
+        self.reset_pnp_selection_debug()
+        self.reset_association_debug_log_fields()
 
         drone_pos = np.array([
             self.telemetry.pos["x"],
@@ -732,18 +891,34 @@ class AutonomyAPI:
             self.telemetry.pos["z"],
         ], dtype=float)
 
-        drone_rpy_rad = (np.array([
+        telemetry_rpy_raw_rad = np.array([
             float(self.telemetry.rpy["roll"]),
             float(self.telemetry.rpy["pitch"]),
             float(self.telemetry.rpy["yaw"]),
-        ], dtype=float)* np.pi / 180.0)
+        ], dtype=float)
+        self.last_telemetry_rpy_raw_rad = telemetry_rpy_raw_rad.copy()
+        drone_rpy_for_perception = self.perception_rpy_for_mode(
+            telemetry_rpy_raw_rad,
+            self.perception_transform_mode,
+        )
+
+        if self.perception_rpy_debug_frames_remaining > 0:
+            print(
+                "[PERCEPTION RPY DEBUG] "
+                f"mode={self.perception_transform_mode} "
+                f"telemetry_rpy_raw_rad={telemetry_rpy_raw_rad.tolist()} "
+                f"telemetry_yaw_deg={math.degrees(float(self.telemetry.rpy['yaw'])):.2f} "
+                f"drone_rpy_for_perception={drone_rpy_for_perception.tolist()} "
+                f"drone_rpy_for_perception_yaw_deg={math.degrees(float(drone_rpy_for_perception[2])):.2f}"
+            )
+            self.perception_rpy_debug_frames_remaining -= 1
 
         detections = self.perception_node.detect_gates(
             frame=frame,
             camera_matrix=camera_matrix,
             dist_coeffs=dist_coeffs,
             drone_pos=drone_pos,
-            drone_rpy_rad=drone_rpy_rad,
+            drone_rpy_rad=drone_rpy_for_perception,
         )
 
         now = time.time()
@@ -758,6 +933,38 @@ class AutonomyAPI:
             return None
 
         det = detections[0]
+
+        if self.perception_transform_mode in (
+            "physical_direct_rad",
+            "physical_direct_rad_x_mirror",
+            "physical_mavsdk_yaw_aligned",
+            "legacy_scaled_yaw",
+        ):
+            gate_camera = np.asarray(det.get("gate_center_camera", np.full(3, np.nan)), dtype=float).reshape(3)
+            if np.all(np.isfinite(gate_camera)):
+                r_body_camera = self.body_camera_matrix_for_mode(self.perception_transform_mode)
+                gate_world, gate_body, _ = self.transform_gate_camera_to_world(
+                    gate_camera=gate_camera,
+                    drone_pos=drone_pos,
+                    telemetry_rpy_raw_rad=telemetry_rpy_raw_rad,
+                    mode=self.perception_transform_mode,
+                    r_body_camera=r_body_camera,
+                )
+                gate_normal_camera = np.asarray(
+                    det.get("gate_normal_camera", np.full(3, np.nan)),
+                    dtype=float,
+                ).reshape(3)
+                det["gate_center_body"] = gate_body.copy()
+                det["gate_center_cam"] = gate_body.copy()
+                det["gate_center_world"] = gate_world.copy()
+                det["camera_to_body_matrix_used"] = r_body_camera.copy()
+                det["body_to_world_method_used"] = self.perception_transform_mode
+                if np.all(np.isfinite(gate_normal_camera)):
+                    gate_normal_body = r_body_camera @ gate_normal_camera
+                    rpy = self.perception_rpy_for_mode(telemetry_rpy_raw_rad, self.perception_transform_mode)
+                    r_wb = self.perception_node._rpy_to_rotmat(float(rpy[0]), float(rpy[1]), float(rpy[2]))
+                    det["gate_normal_body"] = gate_normal_body.copy()
+                    det["gate_normal_world"] = r_wb @ gate_normal_body
 
         self.gate_confidence = float(det["confidence"])
         raw_center = np.asarray(det["gate_center_world"], dtype=float).reshape(3)
@@ -777,6 +984,7 @@ class AutonomyAPI:
         self.last_raw_gate_center = raw_center.copy()
         self.last_raw_image_corners = det.get("raw_corners", None)
         self.last_ordered_image_corners = det.get("ordered_corners", None)
+        self.last_pnp_debug_best_ordered_corners = det.get("pnp_debug_best_ordered_corners", None)
         self.last_reprojected_image_corners = det.get("reprojected_corners", None)
         self.last_pnp_rvec = det.get("rvec", None)
         self.last_pnp_tvec = det.get("tvec", None)
@@ -801,13 +1009,41 @@ class AutonomyAPI:
         self.last_dist_coeffs = np.asarray(dist_coeffs, dtype=float).copy()
         self.last_live_solver_name = det.get("live_solver_name", "")
         self.last_pnp_fallback_reason = det.get("pnp_fallback_reason", "")
+        self.pnp_selected_order = det.get("pnp_selected_order", "")
+        self.pnp_selected_solver = det.get("pnp_selected_solver", "")
+        self.pnp_selected_score = float(det.get("pnp_selected_score", np.nan))
+        self.pnp_selected_reprojection_error = float(det.get("pnp_selected_reprojection_error", np.nan))
+        self.pnp_selected_gate_center_camera = det.get("pnp_selected_gate_center_camera", None)
+        self.pnp_selected_reason = det.get("pnp_selected_reason", "")
+        self.pnp_candidate_summary = det.get("pnp_candidate_summary", "")
+        self.allow_pnp_corner_reordering = bool(det.get("allow_pnp_corner_reordering", False))
+        self.pnp_live_candidate_orders_allowed = det.get("pnp_live_candidate_orders_allowed", "")
+        self.pnp_debug_best_order = det.get("pnp_debug_best_order", "")
+        self.pnp_live_vs_debug_best_order_mismatch = bool(
+            det.get("pnp_live_vs_debug_best_order_mismatch", False)
+        )
+        self.pnp_lateral_angle = float(det.get("pnp_lateral_angle", np.nan))
+        self.image_center_offset_normalized = float(det.get("image_center_offset_normalized", np.nan))
+        self.keypoint_polygon_signed_area = float(det.get("keypoint_polygon_signed_area", np.nan))
+        self.keypoint_polygon_winding = det.get("keypoint_polygon_winding", "")
+        self.keypoint_edge_top = float(det.get("keypoint_edge_top", np.nan))
+        self.keypoint_edge_right = float(det.get("keypoint_edge_right", np.nan))
+        self.keypoint_edge_bottom = float(det.get("keypoint_edge_bottom", np.nan))
+        self.keypoint_edge_left = float(det.get("keypoint_edge_left", np.nan))
+        self.keypoint_bbox_center = det.get("keypoint_bbox_center", np.full(2, np.nan))
+        self.keypoint_polygon_center = det.get("keypoint_polygon_center", np.full(2, np.nan))
+        self.keypoint_bbox_polygon_delta = det.get("keypoint_bbox_polygon_delta", np.full(2, np.nan))
+        self.raw_keypoint_polygon_signed_area = float(
+            det.get("raw_keypoint_polygon_signed_area", np.nan)
+        )
+        self.raw_keypoint_polygon_winding = det.get("raw_keypoint_polygon_winding", "")
         self.last_detection_drone_pose = np.array([
             drone_pos[0],
             drone_pos[1],
             drone_pos[2],
-            drone_rpy_rad[0],
-            drone_rpy_rad[1],
-            drone_rpy_rad[2],
+            drone_rpy_for_perception[0],
+            drone_rpy_for_perception[1],
+            drone_rpy_for_perception[2],
         ], dtype=float)
         self.update_quad_debug(self.last_ordered_image_corners, frame.shape)
 
@@ -901,6 +1137,7 @@ class AutonomyAPI:
         self.track_update_accepted = self.gate_memory.last_update_accepted
         self.track_center_before_update = self.gate_memory.last_track_center_before
         self.track_center_after_update = self.gate_memory.last_track_center_after
+        self.update_association_debug_log_fields()
 
         self.gate_memory.prune(now)
         merge_event = self.refresh_landmark_merges()
@@ -927,7 +1164,7 @@ class AutonomyAPI:
             self.last_perception_accepted = bool(result.get("accepted", False))
             self.last_perception_rejection_reason = "" if self.last_perception_accepted else result.get("reason", "")
             if self.last_perception_accepted:
-                self.compute_transform_validation_debug(drone_pos, drone_rpy_rad)
+                self.compute_transform_validation_debug(drone_pos, drone_rpy_for_perception)
             else:
                 self.reset_transform_validation_debug()
             self.save_perception_debug_frame(
@@ -1002,6 +1239,7 @@ class AutonomyAPI:
                 solver_name=det.get("live_solver_name", ""),
                 active_gate_idx=self.current_gate_idx,
             )
+            self.update_association_debug_log_fields()
             tr = self.gate_memory.get_track_by_id(result.get("track_id")) if result is not None else None
             if tr is not None:
                 self.track_id = tr.id
@@ -1060,6 +1298,26 @@ class AutonomyAPI:
         self.track_stability_score = float(getattr(tr, "stability_score", np.nan))
         self.promotion_blocked_reason = getattr(tr, "promotion_blocked_reason", "")
         self.promotion_reason = "stable" if self.track_is_stable else ""
+
+    def update_association_debug_log_fields(self):
+        self.nearest_track_id = self.gate_memory.nearest_track_id
+        self.nearest_track_distance = float(self.gate_memory.nearest_track_distance)
+        self.nearest_track_hits = int(self.gate_memory.nearest_track_hits)
+        self.nearest_track_committed = bool(self.gate_memory.nearest_track_committed)
+        self.nearest_track_stable = bool(self.gate_memory.nearest_track_stable)
+        self.association_attempted = bool(self.gate_memory.association_attempted)
+        self.association_success = bool(self.gate_memory.association_success)
+        self.duplicate_rejection_reason = str(self.gate_memory.duplicate_rejection_reason or "")
+
+    def reset_association_debug_log_fields(self):
+        self.nearest_track_id = None
+        self.nearest_track_distance = float("nan")
+        self.nearest_track_hits = 0
+        self.nearest_track_committed = False
+        self.nearest_track_stable = False
+        self.association_attempted = False
+        self.association_success = False
+        self.duplicate_rejection_reason = ""
 
     def update_gate_filter_summary_logs(self):
         self.tentative_track_ids = self.gate_memory.tentative_track_ids()
@@ -1217,6 +1475,315 @@ class AutonomyAPI:
         self.pnp_candidate1_projected_corners = None
         self.pnp_gt_projected_center = np.full(2, np.nan, dtype=float)
         self.pnp_gt_projected_quad_center_error_px = float("nan")
+        self.transform_sweep_best_mode = ""
+        self.transform_sweep_best_error = float("nan")
+        self.transform_sweep_legacy_error = float("nan")
+        self.transform_sweep_direct_rad_error = float("nan")
+        self.transform_sweep_pi_over_2_minus_yaw_error = float("nan")
+        self.transform_sweep_yaw_minus_pi_over_2_error = float("nan")
+        self.transform_sweep_neg_yaw_error = float("nan")
+        self.transform_sweep_neg_yaw_plus_pi_over_2_error = float("nan")
+        self.transform_sweep_legacy_world = nan3.copy()
+        self.transform_sweep_direct_rad_world = nan3.copy()
+        self.transform_sweep_yaw_minus_pi_over_2_world = nan3.copy()
+        self.transform_sweep_pi_over_2_minus_yaw_world = nan3.copy()
+        self.transform_sweep_physical_direct_rad_world = nan3.copy()
+        self.transform_sweep_best_world = nan3.copy()
+        self.live_vs_physical_direct_delta_m = float("nan")
+        self.camera_axis_sweep_flu_x_flipped_world = nan3.copy()
+        self.live_camera_axis_mode = ""
+        self.live_camera_axis_det = float("nan")
+        self.live_uses_x_mirror = False
+        self.live_vs_camera_axis_x_flipped_delta_m = float("nan")
+        self.camera_axis_sweep_best_mode = ""
+        self.camera_axis_sweep_best_error = float("nan")
+        self.camera_axis_sweep_best_world = nan3.copy()
+        self.camera_axis_sweep_flu_error = float("nan")
+        self.camera_axis_sweep_flu_x_flipped_error = float("nan")
+        self.camera_axis_sweep_frd_error = float("nan")
+        self.camera_axis_sweep_old_default_error = float("nan")
+        self.sign_match_pnp_vs_image = False
+        self.sign_match_expected_vs_image = False
+
+    def reset_pnp_selection_debug(self):
+        self.pnp_selected_order = ""
+        self.pnp_selected_solver = ""
+        self.pnp_selected_score = float("nan")
+        self.pnp_selected_reprojection_error = float("nan")
+        self.pnp_selected_gate_center_camera = np.full(3, np.nan, dtype=float)
+        self.pnp_selected_reason = ""
+        self.pnp_candidate_summary = ""
+        self.allow_pnp_corner_reordering = False
+        self.pnp_live_candidate_orders_allowed = ""
+        self.pnp_debug_best_order = ""
+        self.pnp_live_vs_debug_best_order_mismatch = False
+        self.pnp_lateral_angle = float("nan")
+        self.image_center_offset_normalized = float("nan")
+        self.keypoint_polygon_signed_area = float("nan")
+        self.keypoint_polygon_winding = ""
+        self.keypoint_edge_top = float("nan")
+        self.keypoint_edge_right = float("nan")
+        self.keypoint_edge_bottom = float("nan")
+        self.keypoint_edge_left = float("nan")
+        self.keypoint_bbox_center = np.full(2, np.nan, dtype=float)
+        self.keypoint_polygon_center = np.full(2, np.nan, dtype=float)
+        self.keypoint_bbox_polygon_delta = np.full(2, np.nan, dtype=float)
+        self.raw_keypoint_polygon_signed_area = float("nan")
+        self.raw_keypoint_polygon_winding = ""
+
+    def compute_transform_sweep_debug(self, drone_pos, expected_gate_world, gate_idx=None):
+        if self.last_telemetry_rpy_raw_rad is None:
+            return
+        if self.last_gate_center_camera is None:
+            return
+
+        gate_camera = self._vec3_for_debug(self.last_gate_center_camera)
+        if not np.all(np.isfinite(gate_camera)):
+            return
+
+        drone_pos = np.asarray(drone_pos, dtype=float).reshape(3)
+        expected_gate_world = np.asarray(expected_gate_world, dtype=float).reshape(3)
+        telemetry_rpy_raw_rad = np.asarray(self.last_telemetry_rpy_raw_rad, dtype=float).reshape(3)
+
+        matrices = (
+            ("current", np.asarray(self.perception_node.R_body_camera, dtype=float).reshape(3, 3)),
+            ("physical", self.physical_body_camera_matrix()),
+        )
+
+        best_error = float("inf")
+        best_mode = ""
+        best_world = np.full(3, np.nan, dtype=float)
+        current_matrix_errors = {}
+        current_matrix_worlds = {}
+        physical_matrix_worlds = {}
+        print("[TRANSFORM SWEEP] comparing camera-to-world conventions")
+        for matrix_name, r_body_camera in matrices:
+            for mode in self.perception_transform_modes:
+                world, _, rpy = self.transform_gate_camera_to_world(
+                    gate_camera=gate_camera,
+                    drone_pos=drone_pos,
+                    telemetry_rpy_raw_rad=telemetry_rpy_raw_rad,
+                    mode=mode,
+                    r_body_camera=r_body_camera,
+                )
+                yaw = rpy[2]
+                error = float(np.linalg.norm(world - expected_gate_world))
+                yaw_deg = math.degrees(float(yaw))
+                print(
+                    "[TRANSFORM SWEEP] "
+                    f"matrix={matrix_name} mode={mode} "
+                    f"world={world.tolist()} error={error:.3f} yaw_used_deg={yaw_deg:.2f}"
+                )
+                if matrix_name == "current":
+                    current_matrix_errors[mode] = error
+                    current_matrix_worlds[mode] = world.copy()
+                if matrix_name == "physical":
+                    physical_matrix_worlds[mode] = world.copy()
+                if error < best_error:
+                    best_error = error
+                    best_mode = f"{matrix_name}:{mode}"
+                    best_world = world.copy()
+
+        self.transform_sweep_best_mode = best_mode
+        self.transform_sweep_best_error = best_error if np.isfinite(best_error) else float("nan")
+        self.transform_sweep_best_world = best_world.copy()
+        self.transform_sweep_legacy_error = current_matrix_errors.get("legacy_scaled_yaw", float("nan"))
+        self.transform_sweep_direct_rad_error = current_matrix_errors.get("direct_rad", float("nan"))
+        self.transform_sweep_pi_over_2_minus_yaw_error = current_matrix_errors.get("pi_over_2_minus_yaw", float("nan"))
+        self.transform_sweep_yaw_minus_pi_over_2_error = current_matrix_errors.get("yaw_minus_pi_over_2", float("nan"))
+        self.transform_sweep_neg_yaw_error = current_matrix_errors.get("neg_yaw", float("nan"))
+        self.transform_sweep_neg_yaw_plus_pi_over_2_error = current_matrix_errors.get("neg_yaw_plus_pi_over_2", float("nan"))
+        self.transform_sweep_legacy_world = current_matrix_worlds.get("legacy_scaled_yaw", np.full(3, np.nan)).copy()
+        self.transform_sweep_direct_rad_world = current_matrix_worlds.get("direct_rad", np.full(3, np.nan)).copy()
+        self.transform_sweep_yaw_minus_pi_over_2_world = current_matrix_worlds.get("yaw_minus_pi_over_2", np.full(3, np.nan)).copy()
+        self.transform_sweep_pi_over_2_minus_yaw_world = current_matrix_worlds.get("pi_over_2_minus_yaw", np.full(3, np.nan)).copy()
+        self.transform_sweep_physical_direct_rad_world = physical_matrix_worlds.get("direct_rad", np.full(3, np.nan)).copy()
+        if np.all(np.isfinite(self.pnp_gate_world)) and np.all(np.isfinite(self.transform_sweep_physical_direct_rad_world)):
+            self.live_vs_physical_direct_delta_m = float(
+                np.linalg.norm(self.pnp_gate_world - self.transform_sweep_physical_direct_rad_world)
+            )
+            if self.perception_transform_mode == "physical_direct_rad":
+                print(
+                    "[PERCEPTION TRANSFORM CHECK] "
+                    f"live_vs_physical_direct_delta_m={self.live_vs_physical_direct_delta_m:.9f}"
+                )
+        else:
+            self.live_vs_physical_direct_delta_m = float("nan")
+
+        if gate_idx is not None:
+            gate_stats = self.transform_sweep_error_stats.setdefault(int(gate_idx), {})
+            for mode, error in current_matrix_errors.items():
+                stats = gate_stats.setdefault(f"current:{mode}", [0.0, 0])
+                stats[0] += float(error)
+                stats[1] += 1
+            for mode, world in physical_matrix_worlds.items():
+                error = float(np.linalg.norm(world - expected_gate_world))
+                stats = gate_stats.setdefault(f"physical:{mode}", [0.0, 0])
+                stats[0] += error
+                stats[1] += 1
+            avg_best_mode = ""
+            avg_best_error = float("inf")
+            for mode, (error_sum, count) in gate_stats.items():
+                if count <= 0:
+                    continue
+                avg_error = error_sum / count
+                if avg_error < avg_best_error:
+                    avg_best_error = avg_error
+                    avg_best_mode = mode
+            if avg_best_mode:
+                print(
+                    "[TRANSFORM SWEEP SUMMARY] "
+                    f"gate_idx={gate_idx} avg_best={avg_best_mode} "
+                    f"avg_error={avg_best_error:.3f} samples={gate_stats[avg_best_mode][1]}"
+                )
+
+        print(
+            "[TRANSFORM SUMMARY] "
+            f"selected_live_mode={self.perception_transform_mode} "
+            f"legacy_world={self.transform_sweep_legacy_world.tolist()} "
+            f"yaw_minus_pi_over_2_world={self.transform_sweep_yaw_minus_pi_over_2_world.tolist()} "
+            f"physical_direct_rad_world={self.transform_sweep_physical_direct_rad_world.tolist()} "
+            f"selected_world={self.pnp_gate_world.tolist()} "
+            f"gt_error={self.world_error_norm:.3f} "
+            f"best={self.transform_sweep_best_mode}:{self.transform_sweep_best_error:.3f}"
+        )
+
+    def camera_axis_sweep_matrices(self):
+        return (
+            (
+                "opencv_to_body_flu_current",
+                np.array([
+                    [0.0, 0.0, 1.0],
+                    [-1.0, 0.0, 0.0],
+                    [0.0, -1.0, 0.0],
+                ], dtype=float),
+            ),
+            (
+                "opencv_to_body_flu_x_flipped",
+                np.array([
+                    [0.0, 0.0, 1.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, -1.0, 0.0],
+                ], dtype=float),
+            ),
+            (
+                "opencv_to_body_frd",
+                np.array([
+                    [0.0, 0.0, 1.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ], dtype=float),
+            ),
+            (
+                "old_live_default",
+                np.array([
+                    [-1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                    [0.0, -1.0, 0.0],
+                ], dtype=float),
+            ),
+        )
+
+    @staticmethod
+    def sign_matches(a, b):
+        if not np.isfinite(a) or not np.isfinite(b):
+            return False
+        if abs(a) < 1e-9 or abs(b) < 1e-9:
+            return False
+        return bool(np.sign(a) == np.sign(b))
+
+    def compute_camera_axis_sweep_debug(self, drone_pos, expected_gate_world):
+        gate_camera = self._vec3_for_debug(self.last_gate_center_camera)
+        if not np.all(np.isfinite(gate_camera)):
+            return
+        if self.last_telemetry_rpy_raw_rad is None:
+            return
+
+        drone_pos = np.asarray(drone_pos, dtype=float).reshape(3)
+        expected_gate_world = np.asarray(expected_gate_world, dtype=float).reshape(3)
+        telemetry_rpy_raw_rad = np.asarray(self.last_telemetry_rpy_raw_rad, dtype=float).reshape(3)
+
+        errors = {}
+        worlds = {}
+        best_mode = ""
+        best_error = float("inf")
+        best_world = np.full(3, np.nan, dtype=float)
+        print("[CAMERA AXIS SWEEP] direct telemetry RPY camera matrix comparison")
+        for mode_name, r_body_camera in self.camera_axis_sweep_matrices():
+            world, _, _ = self.transform_gate_camera_to_world(
+                gate_camera=gate_camera,
+                drone_pos=drone_pos,
+                telemetry_rpy_raw_rad=telemetry_rpy_raw_rad,
+                mode="direct_rad",
+                r_body_camera=r_body_camera,
+            )
+            error = float(np.linalg.norm(world - expected_gate_world))
+            det = float(np.linalg.det(r_body_camera))
+            errors[mode_name] = error
+            worlds[mode_name] = world.copy()
+            print(
+                "[CAMERA AXIS SWEEP] "
+                f"mode={mode_name} det={det:.3f} "
+                f"world={world.tolist()} gt_error={error:.3f}"
+            )
+            if error < best_error:
+                best_error = error
+                best_mode = mode_name
+                best_world = world.copy()
+
+        self.camera_axis_sweep_best_mode = best_mode
+        self.camera_axis_sweep_best_error = best_error if np.isfinite(best_error) else float("nan")
+        self.camera_axis_sweep_best_world = best_world.copy()
+        self.camera_axis_sweep_flu_x_flipped_world = worlds.get(
+            "opencv_to_body_flu_x_flipped",
+            np.full(3, np.nan, dtype=float),
+        ).copy()
+        self.camera_axis_sweep_flu_error = errors.get("opencv_to_body_flu_current", float("nan"))
+        self.camera_axis_sweep_flu_x_flipped_error = errors.get("opencv_to_body_flu_x_flipped", float("nan"))
+        self.camera_axis_sweep_frd_error = errors.get("opencv_to_body_frd", float("nan"))
+        self.camera_axis_sweep_old_default_error = errors.get("old_live_default", float("nan"))
+
+        live_matrix = self.body_camera_matrix_for_mode(self.perception_transform_mode)
+        self.live_camera_axis_mode = self.perception_transform_mode
+        self.live_camera_axis_det = float(np.linalg.det(live_matrix))
+        self.live_uses_x_mirror = self.perception_transform_mode == "physical_direct_rad_x_mirror"
+        if self.live_uses_x_mirror and np.all(np.isfinite(self.pnp_gate_world)) and np.all(
+            np.isfinite(self.camera_axis_sweep_flu_x_flipped_world)
+        ):
+            self.live_vs_camera_axis_x_flipped_delta_m = float(
+                np.linalg.norm(self.pnp_gate_world - self.camera_axis_sweep_flu_x_flipped_world)
+            )
+            print(
+                "[CAMERA AXIS CHECK] "
+                f"live_vs_camera_axis_x_flipped_delta_m="
+                f"{self.live_vs_camera_axis_x_flipped_delta_m:.9f}"
+            )
+            if self.live_vs_camera_axis_x_flipped_delta_m > 1e-6:
+                print(
+                    "[CAMERA AXIS WARN] "
+                    "physical_direct_rad_x_mirror live world does not exactly match "
+                    "opencv_to_body_flu_x_flipped sweep"
+                )
+        else:
+            self.live_vs_camera_axis_x_flipped_delta_m = float("nan")
+
+        pnp_camera_x = float(self.pnp_gate_cam[0]) if np.all(np.isfinite(self.pnp_gate_cam)) else float("nan")
+        expected_camera_x = (
+            float(self.expected_gate_cam[0])
+            if np.all(np.isfinite(self.expected_gate_cam))
+            else float("nan")
+        )
+        image_offset_x = float(self.last_quad_center_offset_x)
+        self.sign_match_pnp_vs_image = self.sign_matches(pnp_camera_x, image_offset_x)
+        self.sign_match_expected_vs_image = self.sign_matches(expected_camera_x, image_offset_x)
+        print(
+            "[CAMERA AXIS SIGN] "
+            f"quad_center_offset_x={image_offset_x:.2f} "
+            f"pnp_camera_x={pnp_camera_x:.3f} "
+            f"expected_gate_cam_x={expected_camera_x:.3f} "
+            f"pnp_vs_image={self.sign_match_pnp_vs_image} "
+            f"expected_vs_image={self.sign_match_expected_vs_image}"
+        )
 
     def compute_transform_validation_debug(self, drone_pos, drone_rpy_rad):
         """
@@ -1259,6 +1826,8 @@ class AutonomyAPI:
         self.update_gate_size_sweep_debug(self.expected_gate_world)
         self.update_pnp_formulation_debug(self.expected_gate_world, self.expected_gate_cam)
         self.update_gt_projected_center_debug(self.expected_gate_cam)
+        self.compute_transform_sweep_debug(drone_pos, self.expected_gate_world, gate_idx=gate_idx)
+        self.compute_camera_axis_sweep_debug(drone_pos, self.expected_gate_world)
 
         print(
             "[TRANSFORM VALIDATION] "
@@ -1398,12 +1967,14 @@ class AutonomyAPI:
 
         raw = self._corners_for_debug(self.last_raw_image_corners)
         ordered = self._corners_for_debug(self.last_ordered_image_corners)
+        debug_best = self._corners_for_debug(self.last_pnp_debug_best_ordered_corners)
         reprojected = self._corners_for_debug(self.last_reprojected_image_corners)
         candidate0_projected = self._corners_for_debug(self.pnp_candidate0_projected_corners)
         candidate1_projected = self._corners_for_debug(self.pnp_candidate1_projected_corners)
 
-        self._draw_debug_corners(canvas, raw, color=(0, 0, 255), prefix="raw", connect=False)
-        self._draw_debug_corners(canvas, ordered, color=(0, 255, 0), prefix="ord", connect=True)
+        self._draw_debug_corners(canvas, raw, color=(0, 0, 255), prefix="yolo", connect=False)
+        self._draw_debug_corners(canvas, ordered, color=(0, 255, 0), prefix="sel", connect=True)
+        self._draw_debug_corners(canvas, debug_best, color=(255, 128, 0), prefix="best", connect=True)
         self._draw_debug_corners(canvas, reprojected, color=(255, 0, 0), prefix="rep", connect=True, cross=True)
         self._draw_debug_corners(canvas, candidate0_projected, color=(255, 255, 0), prefix="c0", connect=True, cross=True)
         self._draw_debug_corners(canvas, candidate1_projected, color=(255, 0, 255), prefix="c1", connect=True, cross=True)
@@ -1447,6 +2018,9 @@ class AutonomyAPI:
             f"filter hits={self.track_observations} hist={self.track_history_len} stable={self.track_is_stable} score={self.track_stability_score:.2f} block={self.promotion_blocked_reason or 'none'}",
             f"filtered=({filtered[0]:.2f},{filtered[1]:.2f},{filtered[2]:.2f}) std={self.track_center_std_norm:.2f}",
             f"live={self.live_solver_name} fallback={self.pnp_fallback_reason or 'none'}",
+            f"pnp_order sel={self.pnp_selected_order} best={self.pnp_debug_best_order} reorder={self.allow_pnp_corner_reordering}",
+            f"poly area={self.keypoint_polygon_signed_area:.1f} {self.keypoint_polygon_winding} edges=({self.keypoint_edge_top:.1f},{self.keypoint_edge_right:.1f},{self.keypoint_edge_bottom:.1f},{self.keypoint_edge_left:.1f})",
+            f"bbox-poly=({self.keypoint_bbox_polygon_delta[0]:.1f},{self.keypoint_bbox_polygon_delta[1]:.1f}) lat={self.pnp_lateral_angle:.3f} img={self.image_center_offset_normalized:.3f}",
             f"world=({gate_world[0]:.2f},{gate_world[1]:.2f},{gate_world[2]:.2f})",
             f"curr_gt_err={self.pnp_current_world_error_gt:.2f} best={self.pnp_best_debug_solver}/{self.pnp_best_debug_order}:{self.pnp_best_world_error_gt:.2f}",
             f"best_world=({self.pnp_best_world[0]:.2f},{self.pnp_best_world[1]:.2f},{self.pnp_best_world[2]:.2f}) reproj={self.pnp_best_reproj_error:.2f}",

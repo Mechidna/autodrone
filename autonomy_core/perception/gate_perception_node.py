@@ -13,8 +13,8 @@ class GatePerceptionNode:
             # OpenCV optical frame: x right, y down, z forward.
             # Body/world convention used here: x forward, y left, z up.
             camera_to_body_rotmat = np.array([
-                [-1.0,  0.0, 0.0],
                 [0.0, 0.0, 1.0],
+                [-1.0, 0.0, 0.0],
                 [0.0, -1.0, 0.0],
             ], dtype=float)
 
@@ -223,6 +223,8 @@ class GatePerceptionNode:
             "gate_center_body": gate_body,
             "gate_center_cam": gate_body,
             "gate_center_world": gate_world,
+            "camera_to_body_matrix_used": self.R_body_camera.copy(),
+            "body_to_world_method_used": "gate_perception_node_default",
             "drone_pos": np.asarray(drone_pos, dtype=float).reshape(3),
             "drone_yaw_rad": float(drone_yaw_rad) if drone_yaw_rad is not None else float(yaw),
             "gate_normal_camera": gate_normal_camera,
@@ -232,6 +234,7 @@ class GatePerceptionNode:
             "corner_reprojection_error_px": float(debug.get("corner_reprojection_error_px", np.nan)),
             "raw_corners": debug.get("raw_corners", None),
             "ordered_corners": debug.get("ordered_corners", None),
+            "pnp_debug_best_ordered_corners": debug.get("pnp_debug_best_ordered_corners", None),
             "reprojected_corners": debug.get("reprojected_corners", None),
             "rvec": debug.get("rvec", None),
             "tvec": debug.get("tvec", gate_camera),
@@ -239,6 +242,48 @@ class GatePerceptionNode:
             "chosen_candidate": debug.get("chosen_candidate", None),
             "live_solver_name": debug.get("live_solver_name", ""),
             "pnp_fallback_reason": debug.get("pnp_fallback_reason", ""),
+            "pnp_selected_order": debug.get("pnp_selected_order", ""),
+            "pnp_selected_solver": debug.get("pnp_selected_solver", ""),
+            "pnp_selected_score": float(debug.get("pnp_selected_score", np.nan)),
+            "pnp_selected_reprojection_error": float(debug.get("pnp_selected_reprojection_error", np.nan)),
+            "pnp_selected_gate_center_camera": np.asarray(
+                debug.get("pnp_selected_gate_center_camera", gate_camera),
+                dtype=float,
+            ).reshape(3),
+            "pnp_selected_reason": debug.get("pnp_selected_reason", ""),
+            "pnp_candidate_summary": debug.get("pnp_candidate_summary", ""),
+            "allow_pnp_corner_reordering": bool(debug.get("allow_pnp_corner_reordering", False)),
+            "pnp_live_candidate_orders_allowed": debug.get("pnp_live_candidate_orders_allowed", ""),
+            "pnp_debug_best_order": debug.get("pnp_debug_best_order", ""),
+            "pnp_live_vs_debug_best_order_mismatch": bool(
+                debug.get("pnp_live_vs_debug_best_order_mismatch", False)
+            ),
+            "pnp_lateral_angle": float(debug.get("pnp_lateral_angle", np.nan)),
+            "image_center_offset_normalized": float(
+                debug.get("image_center_offset_normalized", np.nan)
+            ),
+            "keypoint_polygon_signed_area": float(debug.get("keypoint_polygon_signed_area", np.nan)),
+            "keypoint_polygon_winding": debug.get("keypoint_polygon_winding", ""),
+            "keypoint_edge_top": float(debug.get("keypoint_edge_top", np.nan)),
+            "keypoint_edge_right": float(debug.get("keypoint_edge_right", np.nan)),
+            "keypoint_edge_bottom": float(debug.get("keypoint_edge_bottom", np.nan)),
+            "keypoint_edge_left": float(debug.get("keypoint_edge_left", np.nan)),
+            "keypoint_bbox_center": np.asarray(
+                debug.get("keypoint_bbox_center", np.full(2, np.nan)),
+                dtype=float,
+            ).reshape(2),
+            "keypoint_polygon_center": np.asarray(
+                debug.get("keypoint_polygon_center", np.full(2, np.nan)),
+                dtype=float,
+            ).reshape(2),
+            "keypoint_bbox_polygon_delta": np.asarray(
+                debug.get("keypoint_bbox_polygon_delta", np.full(2, np.nan)),
+                dtype=float,
+            ).reshape(2),
+            "raw_keypoint_polygon_signed_area": float(
+                debug.get("raw_keypoint_polygon_signed_area", np.nan)
+            ),
+            "raw_keypoint_polygon_winding": debug.get("raw_keypoint_polygon_winding", ""),
             "gate_size_sweep": gate_size_sweep,
             "pnp_formulation_debug": pnp_formulation_debug,
             "raw": perception,

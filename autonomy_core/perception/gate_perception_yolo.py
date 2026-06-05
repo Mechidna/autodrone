@@ -22,7 +22,7 @@ class GatePerception:
         self.max_failures = max_failures
         self.failure_counter = 0
         self.last_debug = {}
-        self.live_solver_name = "SOLVEPNP_ITERATIVE"
+        self.live_solver_name = "IPPE_SQUARE_CANDIDATE_SWEEP"
 
         # YOLO pose settings
         if yolo_model_path is None:
@@ -36,10 +36,12 @@ class GatePerception:
         self.yolo_device = yolo_device
         self.preprocess_mode = preprocess_mode
         self.corners_are_semantic = True  # YOLO pose outputs TL, TR, BR, BL directly.
+        self.allow_pnp_corner_reordering = True
 
         print(f"[YOLO PERCEPTION] model={self.yolo_model_path}")
         print(f"[YOLO PERCEPTION] preprocess_mode={self.preprocess_mode}, conf={self.yolo_conf}, imgsz={self.yolo_imgsz}")
-        print("[LIVE PNP] using SOLVEPNP_ITERATIVE")
+        print("[LIVE PNP] using IPPE_SQUARE candidate sweep")
+        print(f"[LIVE PNP] allow_pnp_corner_reordering={self.allow_pnp_corner_reordering}")
 
         # TII keypoint labels are inner opening corners, so use the inner opening size.
         # Competition/spec gate: inner opening = 1.5 m x 1.5 m.
@@ -153,6 +155,10 @@ class GatePerception:
             return None
 
         R_mat, tvec, pnp_debug = pose
+        selected_ordered = np.asarray(
+            pnp_debug.get("ordered_points", ordered),
+            dtype=np.float32,
+        ).reshape(4, 2)
         confidence = self.compute_confidence(ordered)
 
         # Do not smooth camera-frame pose while the camera is moving. Averaging
@@ -164,7 +170,7 @@ class GatePerception:
             t_out,
             camera_matrix,
             dist_coeffs,
-            ordered,
+            selected_ordered,
         )
         reprojected_corners = self.project_model_points(
             R_out,
@@ -176,7 +182,11 @@ class GatePerception:
         gate_normal_camera /= np.linalg.norm(gate_normal_camera) + 1e-12
         debug = {
             "raw_corners": np.asarray(corners, dtype=float).reshape(-1, 2).copy(),
-            "ordered_corners": ordered.copy(),
+            "ordered_corners": selected_ordered.copy(),
+            "pnp_debug_best_ordered_corners": np.asarray(
+                pnp_debug.get("debug_best_ordered_points", selected_ordered),
+                dtype=float,
+            ).reshape(4, 2).copy(),
             "reprojected_corners": reprojected_corners.copy(),
             "rvec": pnp_debug["rvec"].copy(),
             "tvec": np.asarray(t_out, dtype=float).reshape(3).copy(),
@@ -185,16 +195,57 @@ class GatePerception:
             "gate_normal_camera": gate_normal_camera.copy(),
             "pnp_candidates": pnp_debug["candidates"],
             "chosen_candidate": int(pnp_debug["chosen_candidate"]),
-            "live_solver_name": pnp_debug.get("live_solver_name", "SOLVEPNP_ITERATIVE"),
+            "live_solver_name": pnp_debug.get("live_solver_name", ""),
             "pnp_fallback_reason": pnp_debug.get("fallback_reason", ""),
+            "pnp_selected_order": pnp_debug.get("selected_order", ""),
+            "pnp_selected_solver": pnp_debug.get("selected_solver", ""),
+            "pnp_selected_score": float(pnp_debug.get("selected_score", np.nan)),
+            "pnp_selected_reprojection_error": float(pnp_debug.get("selected_reprojection_error", np.nan)),
+            "pnp_selected_gate_center_camera": np.asarray(t_out, dtype=float).reshape(3).copy(),
+            "pnp_selected_reason": pnp_debug.get("selected_reason", ""),
+            "pnp_candidate_summary": pnp_debug.get("candidate_summary", ""),
+            "allow_pnp_corner_reordering": bool(pnp_debug.get("allow_pnp_corner_reordering", False)),
+            "pnp_live_candidate_orders_allowed": pnp_debug.get("live_candidate_orders_allowed", ""),
+            "pnp_debug_best_order": pnp_debug.get("debug_best_order", ""),
+            "pnp_live_vs_debug_best_order_mismatch": bool(
+                pnp_debug.get("live_vs_debug_best_order_mismatch", False)
+            ),
+            "pnp_lateral_angle": float(pnp_debug.get("pnp_lateral_angle", np.nan)),
+            "image_center_offset_normalized": float(
+                pnp_debug.get("image_center_offset_normalized", np.nan)
+            ),
+            "keypoint_polygon_signed_area": float(
+                pnp_debug.get("keypoint_polygon_signed_area", np.nan)
+            ),
+            "keypoint_polygon_winding": pnp_debug.get("keypoint_polygon_winding", ""),
+            "keypoint_edge_top": float(pnp_debug.get("keypoint_edge_top", np.nan)),
+            "keypoint_edge_right": float(pnp_debug.get("keypoint_edge_right", np.nan)),
+            "keypoint_edge_bottom": float(pnp_debug.get("keypoint_edge_bottom", np.nan)),
+            "keypoint_edge_left": float(pnp_debug.get("keypoint_edge_left", np.nan)),
+            "keypoint_bbox_center": np.asarray(
+                pnp_debug.get("keypoint_bbox_center", np.full(2, np.nan)),
+                dtype=float,
+            ).reshape(2).copy(),
+            "keypoint_polygon_center": np.asarray(
+                pnp_debug.get("keypoint_polygon_center", np.full(2, np.nan)),
+                dtype=float,
+            ).reshape(2).copy(),
+            "keypoint_bbox_polygon_delta": np.asarray(
+                pnp_debug.get("keypoint_bbox_polygon_delta", np.full(2, np.nan)),
+                dtype=float,
+            ).reshape(2).copy(),
+            "raw_keypoint_polygon_signed_area": float(
+                pnp_debug.get("raw_keypoint_polygon_signed_area", np.nan)
+            ),
+            "raw_keypoint_polygon_winding": pnp_debug.get("raw_keypoint_polygon_winding", ""),
             "gate_size_sweep": self.solve_pnp_gate_size_sweep(
-                ordered,
+                selected_ordered,
                 camera_matrix,
                 dist_coeffs,
                 sizes=(1.40, 1.50, 1.60),
             ),
             "pnp_formulation_debug": self.solve_pnp_formulation_debug(
-                ordered,
+                selected_ordered,
                 camera_matrix,
                 dist_coeffs,
             ),
@@ -420,121 +471,353 @@ class GatePerception:
     # -------------------------------------------------
     # Pose Estimation
     # -------------------------------------------------
+    @staticmethod
+    def pnp_order_permutations():
+        return [
+            ("tl_tr_br_bl", [0, 1, 2, 3]),
+            ("tr_br_bl_tl", [1, 2, 3, 0]),
+            ("br_bl_tl_tr", [2, 3, 0, 1]),
+            ("bl_tl_tr_br", [3, 0, 1, 2]),
+            ("tl_bl_br_tr", [0, 3, 2, 1]),
+            ("tr_tl_bl_br", [1, 0, 3, 2]),
+        ]
+
+    @staticmethod
+    def _pnp_err_scalar(err):
+        if err is None:
+            return float("nan")
+        return float(np.asarray(err).reshape(-1)[0])
+
+    def estimate_size_depth(self, image_points, camera_matrix):
+        pts = np.asarray(image_points, dtype=float).reshape(4, 2)
+        k = np.asarray(camera_matrix, dtype=float).reshape(3, 3)
+        fx = float(k[0, 0])
+        fy = float(k[1, 1])
+        width_px = 0.5 * (
+            np.linalg.norm(pts[1] - pts[0]) +
+            np.linalg.norm(pts[2] - pts[3])
+        )
+        height_px = 0.5 * (
+            np.linalg.norm(pts[3] - pts[0]) +
+            np.linalg.norm(pts[2] - pts[1])
+        )
+        depths = []
+        if width_px > 1.0 and np.isfinite(fx):
+            depths.append(fx * float(self.gate_size) / width_px)
+        if height_px > 1.0 and np.isfinite(fy):
+            depths.append(fy * float(self.gate_size) / height_px)
+        if not depths:
+            return float("nan")
+        return float(np.mean(depths))
+
+    def image_center_offset_normalized(self, image_points, camera_matrix):
+        pts = np.asarray(image_points, dtype=float).reshape(4, 2)
+        k = np.asarray(camera_matrix, dtype=float).reshape(3, 3)
+        fx = float(k[0, 0])
+        cx = float(k[0, 2])
+        if not np.isfinite(fx) or abs(fx) < 1e-9:
+            return float("nan")
+        return float((np.mean(pts[:, 0]) - cx) / fx)
+
+    @staticmethod
+    def keypoint_geometry(image_points):
+        pts = np.asarray(image_points, dtype=float).reshape(4, 2)
+        signed_area = 0.5 * float(
+            np.dot(pts[:, 0], np.roll(pts[:, 1], -1)) -
+            np.dot(pts[:, 1], np.roll(pts[:, 0], -1))
+        )
+        edge_lengths = [
+            float(np.linalg.norm(pts[1] - pts[0])),
+            float(np.linalg.norm(pts[2] - pts[1])),
+            float(np.linalg.norm(pts[3] - pts[2])),
+            float(np.linalg.norm(pts[0] - pts[3])),
+        ]
+        bbox_center = 0.5 * (np.min(pts, axis=0) + np.max(pts, axis=0))
+        polygon_center = np.mean(pts, axis=0)
+        return {
+            "signed_area": signed_area,
+            "winding": "ccw" if signed_area > 0.0 else "cw" if signed_area < 0.0 else "degenerate",
+            "edge_top": edge_lengths[0],
+            "edge_right": edge_lengths[1],
+            "edge_bottom": edge_lengths[2],
+            "edge_left": edge_lengths[3],
+            "bbox_center": bbox_center,
+            "polygon_center": polygon_center,
+            "bbox_polygon_delta": bbox_center - polygon_center,
+        }
+
+    def score_pnp_candidate(self, error, tvec, normal, size_depth, image_center_offset):
+        tvec = np.asarray(tvec, dtype=float).reshape(3)
+        normal = np.asarray(normal, dtype=float).reshape(3)
+        depth = float(tvec[2])
+        lateral_angle = float(tvec[0] / depth) if abs(depth) > 1e-9 else float("nan")
+        normal_score = abs(float(normal[2]))
+        depth_disagreement = (
+            abs(depth - float(size_depth))
+            if np.isfinite(depth) and np.isfinite(size_depth)
+            else float("nan")
+        )
+        lateral_offset_disagreement = (
+            abs(lateral_angle - float(image_center_offset))
+            if np.isfinite(lateral_angle) and np.isfinite(image_center_offset)
+            else float("nan")
+        )
+        error_value = float(error) if np.isfinite(error) else 1e6
+        score = -error_value
+        reason = "lowest_reprojection_geometry_pass"
+
+        if not np.isfinite(error):
+            score -= 1e6
+            reason = "non_finite_reprojection"
+        if depth <= 0.0:
+            score -= 1e6
+            reason = "non_positive_depth"
+        elif depth < 0.5 or depth > 30.0:
+            score -= 50.0
+            reason = "depth_outside_soft_range"
+        if normal_score < 0.15:
+            score -= 25.0
+            reason = "normal_grazing_camera"
+        if np.isfinite(depth_disagreement) and depth_disagreement > 1.0:
+            score -= 10.0 * depth_disagreement
+            reason = "size_depth_disagreement"
+        if np.isfinite(lateral_offset_disagreement) and lateral_offset_disagreement > 0.25:
+            score -= 25.0 * lateral_offset_disagreement
+            reason = "lateral_angle_inconsistent_with_image_center"
+
+        # Mild preference for less grazing planar solutions after reprojection.
+        score += 0.25 * normal_score
+        return (
+            float(score),
+            reason,
+            float(depth),
+            float(normal_score),
+            float(size_depth) if np.isfinite(size_depth) else float("nan"),
+            float(depth_disagreement) if np.isfinite(depth_disagreement) else float("nan"),
+            float(lateral_angle) if np.isfinite(lateral_angle) else float("nan"),
+            float(image_center_offset) if np.isfinite(image_center_offset) else float("nan"),
+            float(lateral_offset_disagreement) if np.isfinite(lateral_offset_disagreement) else float("nan"),
+        )
+
     def estimate_pose(self, image_points, camera_matrix, dist_coeffs):
-        image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 1, 2)
+        ordered_points = np.asarray(image_points, dtype=np.float32).reshape(4, 2)
 
         print("\n------ Perception ------")
-        fallback_reason = ""
+        candidates = []
+
+        for order_name, idx in self.pnp_order_permutations():
+            pts = ordered_points[idx].astype(np.float32)
+            image_points_ordered = pts.reshape(-1, 1, 2)
+            size_depth = self.estimate_size_depth(pts, camera_matrix)
+            image_center_offset = self.image_center_offset_normalized(pts, camera_matrix)
+            try:
+                ok, rvecs, tvecs, reprojErrs = cv2.solvePnPGeneric(
+                    self.model_points,
+                    image_points_ordered,
+                    camera_matrix,
+                    dist_coeffs,
+                    flags=cv2.SOLVEPNP_IPPE_SQUARE,
+                )
+            except Exception:
+                continue
+
+            if not ok or rvecs is None or len(rvecs) == 0:
+                continue
+
+            for candidate_index, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
+                R_mat, _ = cv2.Rodrigues(rvec)
+                normal = R_mat[:, 2].astype(float)
+                normal /= np.linalg.norm(normal) + 1e-12
+                err = (
+                    self._pnp_err_scalar(reprojErrs[candidate_index])
+                    if reprojErrs is not None and len(reprojErrs) > candidate_index
+                    else self.compute_reprojection_error(
+                        R_mat,
+                        tvec,
+                        camera_matrix,
+                        dist_coeffs,
+                        image_points_ordered,
+                    )
+                )
+                (
+                    score,
+                    reason,
+                    depth,
+                    normal_score,
+                    size_depth,
+                    depth_disagreement,
+                    lateral_angle,
+                    image_center_offset,
+                    lateral_offset_disagreement,
+                ) = self.score_pnp_candidate(err, tvec, normal, size_depth, image_center_offset)
+                candidates.append({
+                    "index": len(candidates),
+                    "solver": "IPPE_SQUARE",
+                    "order": order_name,
+                    "order_indices": list(idx),
+                    "solver_candidate_index": int(candidate_index),
+                    "rvec": np.asarray(rvec, dtype=float).reshape(3),
+                    "tvec": np.asarray(tvec, dtype=float).reshape(3),
+                    "normal": normal.copy(),
+                    "error": float(err),
+                    "score": float(score),
+                    "selected_reason": reason,
+                    "depth": float(depth),
+                    "normal_score": float(normal_score),
+                    "size_depth": float(size_depth),
+                    "depth_disagreement": float(depth_disagreement),
+                    "lateral_angle": float(lateral_angle),
+                    "image_center_offset_normalized": float(image_center_offset),
+                    "lateral_offset_disagreement": float(lateral_offset_disagreement),
+                    "ordered_points": pts.copy(),
+                    "projected_corners": self.project_model_points(
+                        R_mat,
+                        tvec,
+                        camera_matrix,
+                        dist_coeffs,
+                    ),
+                })
+
+        image_points_default = ordered_points.reshape(-1, 1, 2)
+        size_depth_default = self.estimate_size_depth(ordered_points, camera_matrix)
+        image_center_offset_default = self.image_center_offset_normalized(ordered_points, camera_matrix)
         try:
             ok, rvec, tvec = cv2.solvePnP(
                 self.model_points,
-                image_points,
+                image_points_default,
                 camera_matrix,
                 dist_coeffs,
                 flags=cv2.SOLVEPNP_ITERATIVE,
             )
-        except Exception as exc:
+        except Exception:
             ok = False
-            fallback_reason = f"iterative_exception:{exc}"
-
         if ok:
             R_mat, _ = cv2.Rodrigues(rvec)
-            reprojection_error = self.compute_reprojection_error(
+            normal = R_mat[:, 2].astype(float)
+            normal /= np.linalg.norm(normal) + 1e-12
+            err = self.compute_reprojection_error(
                 R_mat,
                 tvec,
                 camera_matrix,
                 dist_coeffs,
-                image_points,
+                image_points_default,
             )
-            normal = R_mat[:, 2].astype(float)
-            normal /= np.linalg.norm(normal) + 1e-12
-            print("[LIVE PNP] solver=SOLVEPNP_ITERATIVE")
-            print("  iterative t:", np.asarray(tvec, dtype=float).reshape(3))
-            print("  iterative reprojection_error:", reprojection_error)
-            candidate = {
-                "index": 0,
+            (
+                score,
+                reason,
+                depth,
+                normal_score,
+                size_depth,
+                depth_disagreement,
+                lateral_angle,
+                image_center_offset,
+                lateral_offset_disagreement,
+            ) = self.score_pnp_candidate(err, tvec, normal, size_depth_default, image_center_offset_default)
+            candidates.append({
+                "index": len(candidates),
+                "solver": "ITERATIVE",
+                "order": "tl_tr_br_bl",
+                "order_indices": [0, 1, 2, 3],
+                "solver_candidate_index": 0,
                 "rvec": np.asarray(rvec, dtype=float).reshape(3),
                 "tvec": np.asarray(tvec, dtype=float).reshape(3),
-                "normal": normal,
-                "error": float(reprojection_error),
-            }
-            return R_mat, tvec, {
-                "rvec": np.asarray(rvec, dtype=float).reshape(3),
-                "tvec": np.asarray(tvec, dtype=float).reshape(3),
-                "chosen_candidate": 0,
-                "candidates": [candidate],
-                "live_solver_name": "SOLVEPNP_ITERATIVE",
-                "fallback_reason": "",
-            }
+                "normal": normal.copy(),
+                "error": float(err),
+                "score": float(score),
+                "selected_reason": reason,
+                "depth": float(depth),
+                "normal_score": float(normal_score),
+                "size_depth": float(size_depth),
+                "depth_disagreement": float(depth_disagreement),
+                "lateral_angle": float(lateral_angle),
+                "image_center_offset_normalized": float(image_center_offset),
+                "lateral_offset_disagreement": float(lateral_offset_disagreement),
+                "ordered_points": ordered_points.copy(),
+                "projected_corners": self.project_model_points(
+                    R_mat,
+                    tvec,
+                    camera_matrix,
+                    dist_coeffs,
+                ),
+            })
 
-        if not fallback_reason:
-            fallback_reason = "iterative_failed"
-        print(f"[LIVE PNP] ITERATIVE failed; falling back to SOLVEPNP_IPPE_SQUARE reason={fallback_reason}")
-
-        ok, rvecs, tvecs, reprojErrs = cv2.solvePnPGeneric(
-            self.model_points,
-            image_points,
-            camera_matrix,
-            dist_coeffs,
-            flags=cv2.SOLVEPNP_IPPE_SQUARE,
-        )
-        if not ok or rvecs is None or len(rvecs) == 0:
-            print("fallback solvePnPGeneric returned no solutions")
+        if len(candidates) == 0:
+            print("[LIVE PNP] candidate sweep returned no solutions")
             return None
 
-        print(f"fallback solvePnPGeneric returned {len(rvecs)} solutions")
+        live_allowed_orders = (
+            {order for order, _ in self.pnp_order_permutations()}
+            if self.allow_pnp_corner_reordering
+            else {"tl_tr_br_bl"}
+        )
+        live_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.get("order", "") in live_allowed_orders
+        ]
+        if len(live_candidates) == 0:
+            print("[LIVE PNP] semantic-order candidate set returned no solutions")
+            return None
 
-        def err_scalar(e):
-            if e is None:
-                return 0.0
-            return float(np.asarray(e).reshape(-1)[0])
-
-        best_i = 0
-        best_score = -1e18
-
-        for i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
-            R_mat, _ = cv2.Rodrigues(rvec)
-            n = R_mat[:, 2].astype(float)
-            n /= (np.linalg.norm(n) + 1e-12)
-
-            z = n[2]
-            e = err_scalar(reprojErrs[i]) if reprojErrs is not None and len(reprojErrs) > i else 0.0
-            tz = float(np.asarray(tvec).reshape(-1)[2])
-
-            score = (10.0 * z) - e
-            if tz <= 0:
-                score -= 1e6
-
-            print(f"  cand {i}: n={n}, n.z={z:.3f}, t.z={tz:.3f}, err={e:.6f}, score={score:.6f}")
-
-            if score > best_score:
-                best_score = score
-                best_i = i
-
-        print("Chosen candidate:", best_i)
-
-        rvec = rvecs[best_i]
-        tvec = tvecs[best_i]
-        R_mat, _ = cv2.Rodrigues(rvec)
-        candidates = []
-        for i, (cand_rvec, cand_tvec) in enumerate(zip(rvecs, tvecs)):
-            cand_R, _ = cv2.Rodrigues(cand_rvec)
-            cand_normal = cand_R[:, 2].astype(float)
-            cand_normal /= np.linalg.norm(cand_normal) + 1e-12
-            candidates.append({
-                "index": int(i),
-                "rvec": np.asarray(cand_rvec, dtype=float).reshape(3),
-                "tvec": np.asarray(cand_tvec, dtype=float).reshape(3),
-                "normal": cand_normal,
-                "error": err_scalar(reprojErrs[i]) if reprojErrs is not None and len(reprojErrs) > i else float("nan"),
-            })
+        debug_best = max(candidates, key=lambda item: item["score"])
+        best = max(live_candidates, key=lambda item: item["score"])
+        live_vs_debug_best_order_mismatch = best["order"] != debug_best["order"]
+        selected_geometry = self.keypoint_geometry(best["ordered_points"])
+        raw_geometry = self.keypoint_geometry(ordered_points)
+        R_mat, _ = cv2.Rodrigues(best["rvec"])
+        tvec = best["tvec"].reshape(3, 1)
+        candidate_summary = ";".join(
+            f"{c['solver']}/{c['order']}/{c['solver_candidate_index']}:"
+            f"err={c['error']:.2f},z={c['depth']:.2f},size_z={c['size_depth']:.2f},"
+            f"dz={c['depth_disagreement']:.2f},lat={c['lateral_angle']:.2f},"
+            f"img={c['image_center_offset_normalized']:.2f},"
+            f"lat_d={c['lateral_offset_disagreement']:.2f},"
+            f"n={c['normal_score']:.2f},score={c['score']:.2f}"
+            for c in candidates[:16]
+        )
+        print(
+            "[LIVE PNP] selected "
+            f"solver={best['solver']} order={best['order']} "
+            f"candidate={best['solver_candidate_index']} error={best['error']:.3f} "
+            f"depth={best['depth']:.3f} score={best['score']:.3f}"
+        )
+        if live_vs_debug_best_order_mismatch:
+            print(
+                "[LIVE PNP] debug best order differs from live semantic order: "
+                f"debug={debug_best['order']} live={best['order']}"
+            )
         return R_mat, tvec, {
-            "rvec": np.asarray(rvec, dtype=float).reshape(3),
-            "tvec": np.asarray(tvec, dtype=float).reshape(3),
-            "chosen_candidate": best_i,
+            "rvec": best["rvec"].copy(),
+            "tvec": best["tvec"].copy(),
+            "chosen_candidate": int(best["index"]),
             "candidates": candidates,
-            "live_solver_name": "SOLVEPNP_IPPE_SQUARE_FALLBACK",
-            "fallback_reason": fallback_reason,
+            "live_solver_name": f"{best['solver']}_{best['order']}",
+            "fallback_reason": "",
+            "selected_order": best["order"],
+            "selected_solver": best["solver"],
+            "selected_score": float(best["score"]),
+            "selected_reprojection_error": float(best["error"]),
+            "selected_reason": best["selected_reason"],
+            "ordered_points": best["ordered_points"].copy(),
+            "debug_best_ordered_points": debug_best["ordered_points"].copy(),
+            "candidate_summary": candidate_summary,
+            "allow_pnp_corner_reordering": bool(self.allow_pnp_corner_reordering),
+            "live_candidate_orders_allowed": ",".join(sorted(live_allowed_orders)),
+            "debug_best_order": debug_best["order"],
+            "live_vs_debug_best_order_mismatch": bool(live_vs_debug_best_order_mismatch),
+            "pnp_lateral_angle": float(best["lateral_angle"]),
+            "image_center_offset_normalized": float(best["image_center_offset_normalized"]),
+            "keypoint_polygon_signed_area": float(selected_geometry["signed_area"]),
+            "keypoint_polygon_winding": selected_geometry["winding"],
+            "keypoint_edge_top": float(selected_geometry["edge_top"]),
+            "keypoint_edge_right": float(selected_geometry["edge_right"]),
+            "keypoint_edge_bottom": float(selected_geometry["edge_bottom"]),
+            "keypoint_edge_left": float(selected_geometry["edge_left"]),
+            "keypoint_bbox_center": selected_geometry["bbox_center"].copy(),
+            "keypoint_polygon_center": selected_geometry["polygon_center"].copy(),
+            "keypoint_bbox_polygon_delta": selected_geometry["bbox_polygon_delta"].copy(),
+            "raw_keypoint_polygon_signed_area": float(raw_geometry["signed_area"]),
+            "raw_keypoint_polygon_winding": raw_geometry["winding"],
         }
 
     @staticmethod
