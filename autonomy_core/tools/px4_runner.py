@@ -664,6 +664,15 @@ async def main():
                 should_replan = True
                 autonomy.last_perception_replan_trigger = True
 
+            if (
+                use_perception
+                and not gate_changed
+                and autonomy.check_tentative_lookahead_shift_replan()
+            ):
+                print("Tentative lookahead shifted persistently -> replanning future horizon.")
+                should_replan = True
+                autonomy.last_perception_replan_trigger = True
+
             # Current trajectory finished
             if autonomy.planner.total_time > 0.0 and autonomy.time_elapsed >= autonomy.planner.total_time:
                 print("Trajectory horizon exhausted -> replanning.")
@@ -833,6 +842,14 @@ async def main():
                 planning_lookahead_track_ids=getattr(autonomy, "planning_lookahead_track_ids", []),
                 planning_lookahead_source=getattr(autonomy, "planning_lookahead_source", ""),
                 planning_lookahead_used=getattr(autonomy, "planning_lookahead_used", False),
+                tentative_lookahead_used=getattr(autonomy, "tentative_lookahead_used", False),
+                tentative_lookahead_track_ids=getattr(autonomy, "tentative_lookahead_track_ids", []),
+                tentative_lookahead_centers=getattr(autonomy, "tentative_lookahead_centers", ""),
+                tentative_lookahead_rejection_reason=getattr(autonomy, "tentative_lookahead_rejection_reason", ""),
+                planning_horizon_waypoint_types=getattr(autonomy, "planning_horizon_waypoint_types", ""),
+                tentative_lookahead_shift_m=getattr(autonomy, "tentative_lookahead_shift_m", float("nan")),
+                tentative_lookahead_shift_track_id=getattr(autonomy, "tentative_lookahead_shift_track_id", None),
+                tentative_lookahead_shift_replan_triggered=getattr(autonomy, "tentative_lookahead_shift_replan_triggered", False),
                 passthrough_velocity_enabled=getattr(autonomy, "passthrough_velocity_enabled", False),
                 passthrough_speed_used=getattr(autonomy, "passthrough_speed_used", float("nan")),
                 waypoint_velocity_log=getattr(autonomy, "waypoint_velocity_log", None),
