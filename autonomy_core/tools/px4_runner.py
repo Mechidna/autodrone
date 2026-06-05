@@ -397,8 +397,9 @@ async def track_orientation(drone):
 # Main
 # -------------------------------------------------
 async def main():
-    save_raw_dataset_frames = True
+    save_raw_dataset_frames = False
     raw_dataset_capture_hz = 5.0
+    startup_hover_s = 10.0
     raw_dataset_saver = RawDatasetFrameSaver(
         enabled=save_raw_dataset_frames,
         capture_hz=raw_dataset_capture_hz,
@@ -557,6 +558,23 @@ async def main():
         await drone.offboard.start()
         print("Offboard started.")
         flight_logger = FlightLogger("flight_log.csv")
+
+        if startup_hover_s > 0.0:
+            hover_started = time.time()
+            print(f"[STARTUP HOVER] holding neutral hover for {startup_hover_s:.1f}s")
+            while time.time() - hover_started < startup_hover_s:
+                roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = hover_command(autonomy)
+                await drone.offboard.set_attitude(
+                    Attitude(
+                        roll_deg=rad2deg(roll_cmd),
+                        pitch_deg=rad2deg(pitch_cmd),
+                        yaw_deg=rad2deg(yaw_cmd),
+                        thrust_value=thrust_cmd,
+                    )
+                )
+                await asyncio.sleep(0.02)
+
+        autonomy.seed_yaw_hold(float(telemetry.rpy["yaw"]), reason="after_startup_hover")
     except OffboardError as e:
         print(f"Offboard start failed: {e._result.result}")
         await drone.action.disarm()
@@ -772,10 +790,14 @@ async def main():
                 completed_gate_reference_blocked=getattr(autonomy, "completed_gate_reference_blocked", False),
                 p_ref_source=getattr(autonomy, "p_ref_source", ""),
                 yaw_hold_value=math.degrees(getattr(autonomy, "yaw_hold_value", float("nan"))),
-                telemetry_yaw_deg=float(getattr(autonomy.telemetry, "rpy", {}).get("yaw", float("nan"))),
+                yaw_hold_value_deg=math.degrees(getattr(autonomy, "yaw_hold_value", float("nan"))),
+                current_yaw_rad_deg=math.degrees(float(getattr(autonomy.telemetry, "rpy", {}).get("yaw", float("nan")))),
+                perception_hold_yaw_deg=math.degrees(getattr(autonomy, "perception_hold_yaw", float("nan"))),
+                telemetry_yaw_deg=math.degrees(float(getattr(autonomy.telemetry, "rpy", {}).get("yaw", float("nan")))),
                 previous_yaw_cmd_deg=math.degrees(getattr(autonomy, "previous_yaw_cmd_log", float("nan"))),
                 raw_yaw_cmd_deg=math.degrees(getattr(autonomy, "raw_yaw_cmd", float("nan"))),
                 yaw_cmd_after_unwrap_deg=math.degrees(getattr(autonomy, "yaw_cmd_after_unwrap", float("nan"))),
+                has_commanded_yaw_reference=getattr(autonomy, "has_commanded_yaw_reference", False),
                 yaw_rate_limited=getattr(autonomy, "yaw_rate_limited", False),
                 post_completion_grace_active=getattr(autonomy, "post_completion_grace_active", False),
                 next_track_available_after_completion=getattr(autonomy, "next_track_available_after_completion", False),

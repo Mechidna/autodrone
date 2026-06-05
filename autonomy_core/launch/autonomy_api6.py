@@ -65,9 +65,9 @@ class AutonomyAPI:
         self.camera_offset_body = np.array([0.12, 0.03, 0.242], dtype=float)
 
         self.gate_perception = GatePerception(
-            gate_size=1.75,
-            yolo_model_path="/home/paolo/datasets/drone-racing-dataset/runs/pose/tii_gate_pose_distinctive_10e/weights/best.pt",
-            preprocess_mode="distinctive",
+            gate_size=1.5,
+            yolo_model_path="/home/paolo/datasets/gazebo_gate_yolo_pose/runs/gazebo_gate_pose_50e/weights/best.pt",
+            preprocess_mode="raw",
             yolo_conf=0.1,
             yolo_imgsz=640,
             yolo_device=0,
@@ -1837,7 +1837,7 @@ class AutonomyAPI:
             self.telemetry.pos["z"],
         ], dtype=float)
         self.perception_hold_position = pos.copy()
-        telemetry_yaw = float(self.telemetry.rpy["yaw"]) * math.pi / 180.0
+        telemetry_yaw = float(self.telemetry.rpy["yaw"])
         self.perception_hold_yaw = self.get_perception_yaw_hold_reference(telemetry_yaw)
         if reason in ("gate_completed", "completed_target_in_control"):
             self.post_completion_grace_until = time.time() + self.no_target_grace_s
@@ -2533,6 +2533,23 @@ class AutonomyAPI:
 
         return fallback_yaw
 
+    def seed_yaw_hold(self, current_yaw_rad, reason=""):
+        current_yaw_rad = float(current_yaw_rad)
+        if not np.isfinite(current_yaw_rad):
+            return
+
+        self.perception_hold_yaw = current_yaw_rad
+        self.ref_yaw = current_yaw_rad
+        self.last_desired_yaw = current_yaw_rad
+        self.previous_yaw_cmd = current_yaw_rad
+        self.previous_yaw_cmd_log = current_yaw_rad
+        self.raw_yaw_cmd = current_yaw_rad
+        self.yaw_cmd_after_unwrap = current_yaw_rad
+        self.yaw_hold_value = current_yaw_rad
+        self.has_commanded_yaw_reference = True
+        self.yaw_target_source = f"seed_yaw_hold:{reason}"
+        print(f"[YAW HOLD SEED] reason={reason} yaw_deg={math.degrees(current_yaw_rad):.2f}")
+
     def continuous_yaw_command(self, raw_yaw, fallback_yaw):
         now = time.time()
         raw_yaw = float(raw_yaw)
@@ -2579,6 +2596,7 @@ class AutonomyAPI:
         """
         if self.perception_hold_position is None:
             self.perception_hold_position = state.pos.copy()
+            self.seed_yaw_hold(current_yaw_rad, reason="first_no_target_hold")
         self.perception_hold_yaw = self.get_perception_yaw_hold_reference(current_yaw_rad)
 
         now = time.time()
@@ -2635,13 +2653,17 @@ class AutonomyAPI:
         print("No active perception target; damping velocity and holding altitude/yaw.")
         print("state pos:", state.pos)
         print("hold ref pos:", ref.pos)
+        print("current yaw_deg:", math.degrees(current_yaw_rad))
         print("hold yaw_des:", self.perception_hold_yaw)
+        print("hold yaw_des_deg:", math.degrees(self.perception_hold_yaw))
+        print("previous yaw_cmd_deg:", math.degrees(self.previous_yaw_cmd) if self.previous_yaw_cmd is not None else float("nan"))
+        print("has_commanded_yaw_reference:", self.has_commanded_yaw_reference)
         print("cmd roll pitch yaw thrust:", roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd)
 
         return roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd
 
     def attitude_control(self):
-        current_yaw_rad = float(self.telemetry.rpy["yaw"]) * math.pi / 180.0
+        current_yaw_rad = float(self.telemetry.rpy["yaw"])
 
         pos = np.array([
             self.telemetry.pos["x"],
@@ -2692,12 +2714,9 @@ class AutonomyAPI:
             self.current_target_gate = self.current_gate_pos.copy()
 
         if self.use_perception and not self.last_perception_accepted:
-            # desired_yaw = self.get_perception_yaw_hold_reference(current_yaw_rad)
-            # self.perception_hold_yaw = desired_yaw
-            # self.yaw_target_source = "perception_lost_hold_yaw"
-            desired_yaw = np.pi / 2.0
+            desired_yaw = current_yaw_rad
             self.perception_hold_yaw = desired_yaw
-            self.yaw_target_source = "perception_lost_hold_yaw_plus_y"
+            self.yaw_target_source = "perception_lost_hold_current_yaw"
         elif self.use_perception and self.current_target_gate is not None:
             if self.is_near_completed_gate(self.current_target_gate):
                 self.target_retained_after_completion = True
@@ -2767,8 +2786,8 @@ if __name__ == "__main__":
             api.telemetry.vel["vy"] = float(v[1])
             api.telemetry.vel["vz"] = float(v[2])
 
-        # tracker yaw_cmd is in radians, but telemetry stores degrees
-        api.telemetry.rpy["yaw"] = float(np.degrees(yaw))
+        # tracker yaw_cmd is in radians; telemetry RPY is stored in radians.
+        api.telemetry.rpy["yaw"] = float(yaw)
 
         print(f"roll={roll:.2f}, pitch={pitch:.2f}, yaw={yaw:.2f}, thrust={thrust:.2f}")
 

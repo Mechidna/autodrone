@@ -29,6 +29,7 @@ GATE_YAWS_RAD_GAZEBO = (
     np.pi / 2.0,
 )
 INNER_OPENING_M = 1.5
+OUTER_GATE_M = 2.7
 CAMERA_OFFSET_BODY = np.array([0.12, 0.03, 0.242], dtype=float)
 ROLL_SIGN = -1.0
 PITCH_SIGN = -1.0
@@ -87,6 +88,21 @@ def gate_inner_corners_world(center_world: np.ndarray, gate_yaw_rad: float) -> n
     half = INNER_OPENING_M / 2.0
 
     # yaw=0 means the gate plane is vertical with normal along +world Y.
+    right = np.array([np.cos(gate_yaw_rad), np.sin(gate_yaw_rad), 0.0], dtype=float)
+    up = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    return np.array([
+        center_world - half * right + half * up,  # TL
+        center_world + half * right + half * up,  # TR
+        center_world + half * right - half * up,  # BR
+        center_world - half * right - half * up,  # BL
+    ], dtype=float)
+
+
+def gate_outer_corners_world(center_world: np.ndarray, gate_yaw_rad: float) -> np.ndarray:
+    center_world = np.asarray(center_world, dtype=float).reshape(3)
+    half = OUTER_GATE_M / 2.0
+
     right = np.array([np.cos(gate_yaw_rad), np.sin(gate_yaw_rad), 0.0], dtype=float)
     up = np.array([0.0, 0.0, 1.0], dtype=float)
 
@@ -264,10 +280,11 @@ def inside_image(points_image, width, height):
     return bool(np.all((x >= 0.0) & (x < float(width)) & (y >= 0.0) & (y < float(height))))
 
 
-def yolo_pose_line(points_image, width, height, class_id=0):
-    points_image = np.asarray(points_image, dtype=float).reshape(4, 2)
-    xs = points_image[:, 0]
-    ys = points_image[:, 1]
+def yolo_pose_line(bbox_points_image, keypoints_image, width, height, class_id=0):
+    bbox_points_image = np.asarray(bbox_points_image, dtype=float).reshape(4, 2)
+    keypoints_image = np.asarray(keypoints_image, dtype=float).reshape(4, 2)
+    xs = bbox_points_image[:, 0]
+    ys = bbox_points_image[:, 1]
 
     x_min = float(np.min(xs))
     x_max = float(np.max(xs))
@@ -280,7 +297,7 @@ def yolo_pose_line(points_image, width, height, class_id=0):
     h = (y_max - y_min) / float(height)
 
     values = [class_id, cx, cy, w, h]
-    for x, y in points_image:
+    for x, y in keypoints_image:
         values.extend([float(x) / float(width), float(y) / float(height), 2])
 
     return " ".join(
@@ -317,22 +334,27 @@ def load_metadata(path):
 
 def draw_preview(image, labels):
     preview = image.copy()
-    colors = ((0, 255, 0), (255, 0, 0), (0, 128, 255))
+    outer_colors = ((0, 180, 255), (255, 128, 0), (0, 128, 255))
+    inner_colors = ((0, 255, 0), (255, 0, 0), (0, 255, 255))
     names = ("TL", "TR", "BR", "BL")
 
-    for gate_idx, points in labels:
-        color = colors[gate_idx % len(colors)]
-        pts = np.round(points).astype(int).reshape(-1, 2)
-        cv2.polylines(preview, [pts], isClosed=True, color=color, thickness=2)
-        for point_idx, (x, y) in enumerate(pts):
-            cv2.circle(preview, (int(x), int(y)), 4, color, -1)
+    for gate_idx, bbox_points, keypoints in labels:
+        outer_color = outer_colors[gate_idx % len(outer_colors)]
+        inner_color = inner_colors[gate_idx % len(inner_colors)]
+        bbox_pts = np.round(bbox_points).astype(int).reshape(-1, 2)
+        keypoint_pts = np.round(keypoints).astype(int).reshape(-1, 2)
+
+        cv2.polylines(preview, [bbox_pts], isClosed=True, color=outer_color, thickness=2)
+        cv2.polylines(preview, [keypoint_pts], isClosed=True, color=inner_color, thickness=2)
+        for point_idx, (x, y) in enumerate(keypoint_pts):
+            cv2.circle(preview, (int(x), int(y)), 4, inner_color, -1)
             cv2.putText(
                 preview,
                 f"g{gate_idx}:{names[point_idx]}",
                 (int(x) + 4, int(y) - 4),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.4,
-                color,
+                inner_color,
                 1,
                 cv2.LINE_AA,
             )
@@ -437,12 +459,12 @@ def print_frame_summary_debug(frame_name, metadata, labels, gazebo_rotation_mode
     corrected_yaw = YAW_SIGN * float(raw_yaw) + YAW_OFFSET_RAD
 
     if labels:
-        selected_gate_idx, points_image = labels[0]
-        points_image = np.asarray(points_image, dtype=float).reshape(4, 2)
-        x_min = float(np.min(points_image[:, 0]))
-        x_max = float(np.max(points_image[:, 0]))
-        y_min = float(np.min(points_image[:, 1]))
-        y_max = float(np.max(points_image[:, 1]))
+        selected_gate_idx, bbox_points, _ = labels[0]
+        bbox_points = np.asarray(bbox_points, dtype=float).reshape(4, 2)
+        x_min = float(np.min(bbox_points[:, 0]))
+        x_max = float(np.max(bbox_points[:, 0]))
+        y_min = float(np.min(bbox_points[:, 1]))
+        y_max = float(np.max(bbox_points[:, 1]))
         bbox_center = ((x_min + x_max) * 0.5, (y_min + y_max) * 0.5)
         bbox_size = (x_max - x_min, y_max - y_min)
     else:
@@ -483,46 +505,73 @@ def build_labels(
     gate_yaws = metadata_gate_yaws(metadata)
 
     for gate_idx, (center, yaw) in enumerate(zip(gate_centers, gate_yaws)):
-        corners_world = gate_inner_corners_world(center, yaw)
+        inner_corners_world = gate_inner_corners_world(center, yaw)
+        outer_corners_world = gate_outer_corners_world(center, yaw)
         points_body = None
         if metadata_has_gazebo_pose(metadata):
             points_body = gazebo_world_to_camera_body(
-                corners_world,
+                inner_corners_world,
                 metadata["gazebo_camera_pos_world"],
                 metadata["gazebo_camera_quat_world"],
                 gazebo_rotation_mode=gazebo_rotation_mode,
             )
-            corners_camera = gazebo_body_to_camera_optical(
+            inner_corners_camera = gazebo_body_to_camera_optical(
                 points_body,
                 gazebo_optical_mode=gazebo_optical_mode,
             )
+            outer_points_body = gazebo_world_to_camera_body(
+                outer_corners_world,
+                metadata["gazebo_camera_pos_world"],
+                metadata["gazebo_camera_quat_world"],
+                gazebo_rotation_mode=gazebo_rotation_mode,
+            )
+            outer_corners_camera = gazebo_body_to_camera_optical(
+                outer_points_body,
+                gazebo_optical_mode=gazebo_optical_mode,
+            )
         else:
-            corners_camera = metadata_world_to_camera(
-                corners_world,
+            inner_corners_camera = metadata_world_to_camera(
+                inner_corners_world,
                 metadata,
                 gazebo_rotation_mode=gazebo_rotation_mode,
                 gazebo_optical_mode=gazebo_optical_mode,
             )
-        mean_depth = float(np.mean(corners_camera[:, 2]))
+            outer_corners_camera = metadata_world_to_camera(
+                outer_corners_world,
+                metadata,
+                gazebo_rotation_mode=gazebo_rotation_mode,
+                gazebo_optical_mode=gazebo_optical_mode,
+            )
+        mean_depth = float(np.mean(inner_corners_camera[:, 2]))
         accepted = True
         reason = ""
-        corners_image = np.full((4, 2), np.nan, dtype=float)
+        keypoints_image = np.full((4, 2), np.nan, dtype=float)
+        bbox_points_image = np.full((4, 2), np.nan, dtype=float)
 
-        if not np.all(corners_camera[:, 2] > 0.0):
+        if not np.all(inner_corners_camera[:, 2] > 0.0):
             accepted = False
-            reason = "corner_behind_camera"
+            reason = "inner_corner_behind_camera"
+        elif not np.all(outer_corners_camera[:, 2] > 0.0):
+            accepted = False
+            reason = "outer_corner_behind_camera"
         else:
-            corners_image = project_camera_points(
-                corners_camera,
+            keypoints_image = project_camera_points(
+                inner_corners_camera,
+                metadata["camera_matrix"],
+                metadata["dist_coeffs"],
+            )
+            bbox_points_image = project_camera_points(
+                outer_corners_camera,
                 metadata["camera_matrix"],
                 metadata["dist_coeffs"],
             )
             if order_image_corners:
-                corners_image = order_points_tl_tr_br_bl(corners_image)
+                keypoints_image = order_points_tl_tr_br_bl(keypoints_image)
+                bbox_points_image = order_points_tl_tr_br_bl(bbox_points_image)
 
-            if not inside_image(corners_image, width, height):
+            if not inside_image(bbox_points_image, width, height):
                 accepted = False
-                reason = "corner_outside_image"
+                reason = "outer_corner_outside_image"
 
         candidate = {
             "gate_idx": gate_idx,
@@ -530,8 +579,9 @@ def build_labels(
             "gate_yaw_rad": float(yaw),
             "gate_right_axis_world": gate_right_axis(float(yaw)),
             "points_body": points_body,
-            "points_camera": corners_camera.copy(),
-            "corners_image": corners_image,
+            "points_camera": inner_corners_camera.copy(),
+            "bbox_points_image": bbox_points_image,
+            "corners_image": keypoints_image,
             "mean_depth": mean_depth,
             "accepted": accepted,
             "reason": reason,
@@ -539,7 +589,7 @@ def build_labels(
         candidates.append(candidate)
 
         if accepted:
-            labels.append((gate_idx, corners_image))
+            labels.append((gate_idx, bbox_points_image, keypoints_image))
 
     selected_gate_idx = None
     if labels and not label_all_visible_gates:
@@ -548,7 +598,11 @@ def build_labels(
             key=lambda candidate: candidate["mean_depth"],
         )
         selected_gate_idx = selected["gate_idx"]
-        labels = [(selected["gate_idx"], selected["corners_image"])]
+        labels = [(
+            selected["gate_idx"],
+            selected["bbox_points_image"],
+            selected["corners_image"],
+        )]
     elif labels:
         selected_gate_idx = "all_visible"
 
@@ -637,8 +691,15 @@ def process_dataset(args):
 
         shutil.copy2(image_path, output_image_path)
         with open(output_label_path, "w", encoding="utf-8") as f:
-            for _, points_image in labels:
-                f.write(yolo_pose_line(points_image, metadata["image_width"], metadata["image_height"]))
+            for _, bbox_points_image, keypoints_image in labels:
+                f.write(
+                    yolo_pose_line(
+                        bbox_points_image,
+                        keypoints_image,
+                        metadata["image_width"],
+                        metadata["image_height"],
+                    )
+                )
                 f.write("\n")
         copied += 1
 
