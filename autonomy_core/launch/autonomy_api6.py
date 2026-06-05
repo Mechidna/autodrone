@@ -352,6 +352,15 @@ class AutonomyAPI:
         self.next_valid_target_found = False
         self.valid_candidate_count = 0
         self.active_target_center = None
+        self.active_target_center_at_plan = None
+        self.active_target_latest_filtered_center = None
+        self.active_target_shift_m = float("nan")
+        self.active_target_shift_frames = 0
+        self.active_target_shift_replan_triggered = False
+        self.active_target_shift_threshold_m = 0.45
+        self.active_target_shift_required_frames = 3
+        self.active_target_shift_replan_min_interval_s = 0.5
+        self.pending_active_target_correction = None
         self.approach_start_position = None
         self.approach_vector = None
         self.previous_gate_progress_along_approach = None
@@ -1830,6 +1839,12 @@ class AutonomyAPI:
         self.v_ref = None
         self.a_ref = None
         self.active_target_center = None
+        self.active_target_center_at_plan = None
+        self.active_target_latest_filtered_center = None
+        self.active_target_shift_m = float("nan")
+        self.active_target_shift_frames = 0
+        self.active_target_shift_replan_triggered = False
+        self.pending_active_target_correction = None
         self.approach_start_position = None
         pos = np.array([
             self.telemetry.pos["x"],
@@ -2350,6 +2365,23 @@ class AutonomyAPI:
         if self.use_perception:
             target_track_ids = [self.canonical_track_id(tid) for tid in target_track_ids]
 
+        correction = self.pending_active_target_correction if self.use_perception else None
+        if (
+            correction is not None
+            and len(target_gates) > 0
+            and len(target_track_ids) > 0
+            and self.canonical_track_id(target_track_ids[0]) == correction.get("track_id")
+        ):
+            corrected_target = np.asarray(correction["center"], dtype=float).reshape(3)
+            print(
+                "[ACTIVE TARGET SHIFT] applying smoothed correction "
+                f"track_id={correction.get('track_id')} "
+                f"old={target_gates[0]} corrected={corrected_target}"
+            )
+            target_gates[0] = corrected_target.copy()
+            waypoints = np.vstack([pos] + target_gates)
+        self.pending_active_target_correction = None
+
         print("=== REPLAN DEBUG ===")
         for tr in self.gate_memory.get_committed_tracks():
             print(f"track_id={tr.id}, center={tr.center}")
@@ -2416,6 +2448,7 @@ class AutonomyAPI:
             self.next_valid_target_found = True
             self.active_target_cleared = False
             self.set_active_perception_target_geometry(target_gates[0], pos)
+            self.active_target_center_at_plan = target_gates[0].copy()
 
         times_init = self.allocate_segment_times(
             waypoints,
@@ -2504,6 +2537,80 @@ class AutonomyAPI:
         self.last_plan_finished_at = time.time()
         self.last_plan_duration = self.last_plan_finished_at - plan_start
         print("planner duration:", self.last_plan_duration)
+        return True
+
+    def check_active_target_shift_correction(self):
+        self.active_target_shift_replan_triggered = False
+
+        if not self.use_perception:
+            return False
+        if len(self.active_target_gates) == 0 or len(self.active_target_track_ids) == 0:
+            self.active_target_shift_m = float("nan")
+            self.active_target_shift_frames = 0
+            self.active_target_latest_filtered_center = None
+            return False
+        if not (0 <= self.current_target_idx < len(self.active_target_track_ids)):
+            return False
+        if self.gate_completion_triggered or self.gate_plane_crossed:
+            return False
+
+        track_id = self.canonical_track_id(self.active_target_track_ids[self.current_target_idx])
+        if track_id is None or track_id < 0:
+            return False
+
+        track = self.gate_memory.get_track_by_id(track_id)
+        if track is None:
+            return False
+
+        latest = getattr(track, "filtered_center_world", None)
+        if latest is None:
+            latest = getattr(track, "center", None)
+        if latest is None:
+            return False
+
+        latest = np.asarray(latest, dtype=float).reshape(3)
+        if not np.all(np.isfinite(latest)):
+            return False
+
+        if self.active_target_center_at_plan is None:
+            if 0 <= self.current_target_idx < len(self.active_target_gates):
+                self.active_target_center_at_plan = np.asarray(
+                    self.active_target_gates[self.current_target_idx],
+                    dtype=float,
+                ).reshape(3).copy()
+            else:
+                return False
+
+        planned = np.asarray(self.active_target_center_at_plan, dtype=float).reshape(3)
+        self.active_target_latest_filtered_center = latest.copy()
+        self.active_target_shift_m = float(np.linalg.norm(latest - planned))
+
+        if self.active_target_shift_m <= self.active_target_shift_threshold_m:
+            self.active_target_shift_frames = 0
+            return False
+
+        self.active_target_shift_frames += 1
+        if self.active_target_shift_frames < self.active_target_shift_required_frames:
+            return False
+
+        if time.time() - self.replan_time <= self.active_target_shift_replan_min_interval_s:
+            return False
+
+        if self.is_near_completed_gate(planned):
+            return False
+
+        corrected_target = 0.7 * planned + 0.3 * latest
+        self.pending_active_target_correction = {
+            "track_id": track_id,
+            "center": corrected_target.copy(),
+        }
+        self.active_target_shift_replan_triggered = True
+        print(
+            "[ACTIVE TARGET SHIFT] replan requested "
+            f"track_id={track_id} shift={self.active_target_shift_m:.3f}m "
+            f"frames={self.active_target_shift_frames} "
+            f"planned={planned} latest={latest} corrected={corrected_target}"
+        )
         return True
 
     # -------------------------------------------------------------------------

@@ -82,6 +82,15 @@ class FlightLogger:
             "lap_reset_triggered",
             "active_target_cleared",
             "active_target_track_id",
+            "active_target_shift_m",
+            "active_target_shift_frames",
+            "active_target_shift_replan_triggered",
+            "active_target_center_at_plan_x",
+            "active_target_center_at_plan_y",
+            "active_target_center_at_plan_z",
+            "active_target_latest_filtered_x",
+            "active_target_latest_filtered_y",
+            "active_target_latest_filtered_z",
             "completed_gate_track_id",
             "yaw_target_source",
             "target_retained_after_completion",
@@ -492,6 +501,11 @@ class FlightLogger:
         lap_reset_triggered=False,
         active_target_cleared=False,
         active_target_track_id=None,
+        active_target_shift_m=np.nan,
+        active_target_shift_frames=0,
+        active_target_shift_replan_triggered=False,
+        active_target_center_at_plan=None,
+        active_target_latest_filtered_center=None,
         completed_gate_track_id=None,
         yaw_target_source="",
         target_retained_after_completion=False,
@@ -700,6 +714,8 @@ class FlightLogger:
         last_valid_target = self._vec3(last_valid_target)
         completed_gate_position = self._vec3(completed_gate_position)
         candidate_center = self._vec3(candidate_center)
+        active_target_center_at_plan = self._vec3(active_target_center_at_plan)
+        active_target_latest_filtered_center = self._vec3(active_target_latest_filtered_center)
         approach_vector = self._vec3(approach_vector)
         hold_anchor = self._vec3(hold_anchor)
         pnp_rvec = self._vec3(pnp_rvec)
@@ -826,6 +842,15 @@ class FlightLogger:
             bool(lap_reset_triggered),
             bool(active_target_cleared),
             active_target_track_id,
+            active_target_shift_m,
+            active_target_shift_frames,
+            bool(active_target_shift_replan_triggered),
+            active_target_center_at_plan[0],
+            active_target_center_at_plan[1],
+            active_target_center_at_plan[2],
+            active_target_latest_filtered_center[0],
+            active_target_latest_filtered_center[1],
+            active_target_latest_filtered_center[2],
             completed_gate_track_id,
             yaw_target_source,
             bool(target_retained_after_completion),

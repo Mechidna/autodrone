@@ -655,6 +655,15 @@ async def main():
                 if use_perception:
                     autonomy.last_perception_replan_trigger = True
 
+            if (
+                use_perception
+                and not gate_changed
+                and autonomy.check_active_target_shift_correction()
+            ):
+                print("Active target shifted persistently -> replanning.")
+                should_replan = True
+                autonomy.last_perception_replan_trigger = True
+
             # Current trajectory finished
             if autonomy.planner.total_time > 0.0 and autonomy.time_elapsed >= autonomy.planner.total_time:
                 print("Trajectory horizon exhausted -> replanning.")
@@ -771,6 +780,11 @@ async def main():
                 lap_reset_triggered=getattr(autonomy, "lap_reset_triggered", False),
                 active_target_cleared=getattr(autonomy, "active_target_cleared", False),
                 active_target_track_id=getattr(autonomy, "active_target_track_id", None),
+                active_target_shift_m=getattr(autonomy, "active_target_shift_m", float("nan")),
+                active_target_shift_frames=getattr(autonomy, "active_target_shift_frames", 0),
+                active_target_shift_replan_triggered=getattr(autonomy, "active_target_shift_replan_triggered", False),
+                active_target_center_at_plan=getattr(autonomy, "active_target_center_at_plan", None),
+                active_target_latest_filtered_center=getattr(autonomy, "active_target_latest_filtered_center", None),
                 completed_gate_track_id=getattr(autonomy, "completed_gate_track_id", None),
                 yaw_target_source=getattr(autonomy, "yaw_target_source", ""),
                 target_retained_after_completion=getattr(autonomy, "target_retained_after_completion", False),
