@@ -386,6 +386,15 @@ class FlightLogger:
             "world_error_y",
             "world_error_z",
             "world_error_norm",
+            "debug_expected_gate_idx",
+            "live_minus_expected_x",
+            "live_minus_expected_y",
+            "live_minus_expected_z",
+            "live_lateral_error_m",
+            "filtered_minus_expected_x",
+            "filtered_minus_expected_y",
+            "filtered_minus_expected_z",
+            "selected_order_vs_axis_mode",
             "live_vs_physical_direct_delta_m",
             "transform_sweep_best_mode",
             "transform_sweep_best_error",
@@ -769,6 +778,11 @@ class FlightLogger:
         pnp_gate_world=None,
         world_error=None,
         world_error_norm=np.nan,
+        debug_expected_gate_idx=-1,
+        live_minus_expected=None,
+        live_lateral_error_m=np.nan,
+        filtered_minus_expected=None,
+        selected_order_vs_axis_mode="",
         live_vs_physical_direct_delta_m=np.nan,
         transform_sweep_best_mode="",
         transform_sweep_best_error=np.nan,
@@ -900,6 +914,8 @@ class FlightLogger:
         expected_gate_world = self._vec3(expected_gate_world)
         pnp_gate_world = self._vec3(pnp_gate_world)
         world_error = self._vec3(world_error)
+        live_minus_expected = self._vec3(live_minus_expected)
+        filtered_minus_expected = self._vec3(filtered_minus_expected)
         transform_sweep_legacy_world = self._vec3(transform_sweep_legacy_world)
         transform_sweep_direct_rad_world = self._vec3(transform_sweep_direct_rad_world)
         transform_sweep_yaw_minus_pi_over_2_world = self._vec3(transform_sweep_yaw_minus_pi_over_2_world)
@@ -1325,6 +1341,15 @@ class FlightLogger:
             world_error[1],
             world_error[2],
             world_error_norm,
+            debug_expected_gate_idx,
+            live_minus_expected[0],
+            live_minus_expected[1],
+            live_minus_expected[2],
+            live_lateral_error_m,
+            filtered_minus_expected[0],
+            filtered_minus_expected[1],
+            filtered_minus_expected[2],
+            selected_order_vs_axis_mode,
             live_vs_physical_direct_delta_m,
             transform_sweep_best_mode,
             transform_sweep_best_error,

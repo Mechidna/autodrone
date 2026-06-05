@@ -352,6 +352,12 @@ class AutonomyAPI:
         self.live_camera_axis_det = float("nan")
         self.live_uses_x_mirror = False
         self.live_vs_camera_axis_x_flipped_delta_m = float("nan")
+        self.per_gate_debug_summary = {}
+        self.debug_expected_gate_idx = -1
+        self.live_minus_expected = np.full(3, np.nan, dtype=float)
+        self.live_lateral_error_m = float("nan")
+        self.filtered_minus_expected = np.full(3, np.nan, dtype=float)
+        self.selected_order_vs_axis_mode = ""
         self.last_pnp_size_sweep = {}
         self.last_pnp_formulation_debug = []
         self.last_camera_matrix = None
@@ -1504,6 +1510,11 @@ class AutonomyAPI:
         self.camera_axis_sweep_old_default_error = float("nan")
         self.sign_match_pnp_vs_image = False
         self.sign_match_expected_vs_image = False
+        self.debug_expected_gate_idx = -1
+        self.live_minus_expected = nan3.copy()
+        self.live_lateral_error_m = float("nan")
+        self.filtered_minus_expected = nan3.copy()
+        self.selected_order_vs_axis_mode = ""
 
     def reset_pnp_selection_debug(self):
         self.pnp_selected_order = ""
@@ -1785,6 +1796,99 @@ class AutonomyAPI:
             f"expected_vs_image={self.sign_match_expected_vs_image}"
         )
 
+    def update_per_gate_debug_summary(self, gate_idx):
+        if gate_idx is None or int(gate_idx) < 0:
+            return
+
+        gate_idx = int(gate_idx)
+        raw_world = self._vec3_for_debug(self.last_gate_center_world_debug)
+        filtered = self._vec3_for_debug(self.track_filtered_center)
+        expected = self._vec3_for_debug(self.expected_gate_world)
+        live_error = raw_world - expected
+        filtered_error = filtered - expected
+
+        self.debug_expected_gate_idx = gate_idx
+        self.live_minus_expected = live_error.copy()
+        self.live_lateral_error_m = (
+            float(np.linalg.norm(live_error[:2]))
+            if np.all(np.isfinite(live_error[:2]))
+            else float("nan")
+        )
+        self.filtered_minus_expected = filtered_error.copy()
+        self.selected_order_vs_axis_mode = (
+            f"{self.pnp_selected_order or 'none'}|{self.camera_axis_sweep_best_mode or 'none'}"
+        )
+
+        stats = self.per_gate_debug_summary.setdefault(
+            gate_idx,
+            {
+                "count": 0,
+                "raw_sum": np.zeros(3, dtype=float),
+                "raw_count": 0,
+                "filtered_sum": np.zeros(3, dtype=float),
+                "filtered_count": 0,
+                "error_sum": 0.0,
+                "error_count": 0,
+                "xyz_error_sum": np.zeros(3, dtype=float),
+                "xyz_error_count": 0,
+                "axis_mode_counts": {},
+                "pnp_order_counts": {},
+                "solver_counts": {},
+            },
+        )
+        stats["count"] += 1
+
+        if np.all(np.isfinite(raw_world)):
+            stats["raw_sum"] += raw_world
+            stats["raw_count"] += 1
+        if np.all(np.isfinite(filtered)):
+            stats["filtered_sum"] += filtered
+            stats["filtered_count"] += 1
+        if np.all(np.isfinite(live_error)):
+            stats["error_sum"] += float(np.linalg.norm(live_error))
+            stats["error_count"] += 1
+            stats["xyz_error_sum"] += live_error
+            stats["xyz_error_count"] += 1
+
+        axis_mode = self.camera_axis_sweep_best_mode or "none"
+        order = self.pnp_selected_order or "none"
+        solver = self.pnp_selected_solver or self.live_solver_name or "none"
+        stats["axis_mode_counts"][axis_mode] = stats["axis_mode_counts"].get(axis_mode, 0) + 1
+        stats["pnp_order_counts"][order] = stats["pnp_order_counts"].get(order, 0) + 1
+        stats["solver_counts"][solver] = stats["solver_counts"].get(solver, 0) + 1
+
+        raw_mean = (
+            stats["raw_sum"] / stats["raw_count"]
+            if stats["raw_count"] > 0
+            else np.full(3, np.nan, dtype=float)
+        )
+        filtered_mean = (
+            stats["filtered_sum"] / stats["filtered_count"]
+            if stats["filtered_count"] > 0
+            else np.full(3, np.nan, dtype=float)
+        )
+        mean_error = (
+            stats["error_sum"] / stats["error_count"]
+            if stats["error_count"] > 0
+            else float("nan")
+        )
+        mean_xyz_error = (
+            stats["xyz_error_sum"] / stats["xyz_error_count"]
+            if stats["xyz_error_count"] > 0
+            else np.full(3, np.nan, dtype=float)
+        )
+        print(
+            "[PER-GATE DEBUG SUMMARY] "
+            f"gate_idx={gate_idx} count={stats['count']} "
+            f"mean_raw=({raw_mean[0]:.2f},{raw_mean[1]:.2f},{raw_mean[2]:.2f}) "
+            f"mean_filtered=({filtered_mean[0]:.2f},{filtered_mean[1]:.2f},{filtered_mean[2]:.2f}) "
+            f"mean_world_error={mean_error:.2f} "
+            f"mean_xyz_error=({mean_xyz_error[0]:.2f},{mean_xyz_error[1]:.2f},{mean_xyz_error[2]:.2f}) "
+            f"axis_counts={stats['axis_mode_counts']} "
+            f"order_counts={stats['pnp_order_counts']} "
+            f"solver_counts={stats['solver_counts']}"
+        )
+
     def compute_transform_validation_debug(self, drone_pos, drone_rpy_rad):
         """
         Debug-only comparison against the known simulator GT gate. This does
@@ -1828,6 +1932,7 @@ class AutonomyAPI:
         self.update_gt_projected_center_debug(self.expected_gate_cam)
         self.compute_transform_sweep_debug(drone_pos, self.expected_gate_world, gate_idx=gate_idx)
         self.compute_camera_axis_sweep_debug(drone_pos, self.expected_gate_world)
+        self.update_per_gate_debug_summary(gate_idx)
 
         print(
             "[TRANSFORM VALIDATION] "
@@ -2004,6 +2109,9 @@ class AutonomyAPI:
         gate_camera = self._vec3_for_debug(self.last_gate_center_camera)
         pnp_tvec = self._vec3_for_debug(self.last_pnp_tvec)
         filtered = self._vec3_for_debug(self.track_filtered_center)
+        expected_world = self._vec3_for_debug(self.expected_gate_world)
+        axis_best_world = self._vec3_for_debug(self.camera_axis_sweep_best_world)
+        live_error = self._vec3_for_debug(self.live_minus_expected)
         track_label = "none" if track_id is None else str(track_id)
         active_status = (
             f"active_track={self.active_target_track_id}"
@@ -2022,6 +2130,9 @@ class AutonomyAPI:
             f"poly area={self.keypoint_polygon_signed_area:.1f} {self.keypoint_polygon_winding} edges=({self.keypoint_edge_top:.1f},{self.keypoint_edge_right:.1f},{self.keypoint_edge_bottom:.1f},{self.keypoint_edge_left:.1f})",
             f"bbox-poly=({self.keypoint_bbox_polygon_delta[0]:.1f},{self.keypoint_bbox_polygon_delta[1]:.1f}) lat={self.pnp_lateral_angle:.3f} img={self.image_center_offset_normalized:.3f}",
             f"world=({gate_world[0]:.2f},{gate_world[1]:.2f},{gate_world[2]:.2f})",
+            f"axis_best={self.camera_axis_sweep_best_mode or 'none'} ({axis_best_world[0]:.2f},{axis_best_world[1]:.2f},{axis_best_world[2]:.2f})",
+            f"expected_gate[{self.debug_expected_gate_idx}]=({expected_world[0]:.2f},{expected_world[1]:.2f},{expected_world[2]:.2f})",
+            f"live-expected=({live_error[0]:.2f},{live_error[1]:.2f},{live_error[2]:.2f}) lat={self.live_lateral_error_m:.2f}",
             f"curr_gt_err={self.pnp_current_world_error_gt:.2f} best={self.pnp_best_debug_solver}/{self.pnp_best_debug_order}:{self.pnp_best_world_error_gt:.2f}",
             f"best_world=({self.pnp_best_world[0]:.2f},{self.pnp_best_world[1]:.2f},{self.pnp_best_world[2]:.2f}) reproj={self.pnp_best_reproj_error:.2f}",
             f"camera=({gate_camera[0]:.2f},{gate_camera[1]:.2f},{gate_camera[2]:.2f})",

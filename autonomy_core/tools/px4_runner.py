@@ -1022,6 +1022,23 @@ async def main():
                 pnp_gate_world=getattr(autonomy, "pnp_gate_world", None),
                 world_error=getattr(autonomy, "world_error", None),
                 world_error_norm=getattr(autonomy, "world_error_norm", float("nan")),
+                debug_expected_gate_idx=getattr(autonomy, "debug_expected_gate_idx", -1),
+                live_minus_expected=getattr(autonomy, "live_minus_expected", None),
+                live_lateral_error_m=getattr(
+                    autonomy,
+                    "live_lateral_error_m",
+                    float("nan"),
+                ),
+                filtered_minus_expected=getattr(
+                    autonomy,
+                    "filtered_minus_expected",
+                    None,
+                ),
+                selected_order_vs_axis_mode=getattr(
+                    autonomy,
+                    "selected_order_vs_axis_mode",
+                    "",
+                ),
                 live_vs_physical_direct_delta_m=getattr(
                     autonomy,
                     "live_vs_physical_direct_delta_m",
