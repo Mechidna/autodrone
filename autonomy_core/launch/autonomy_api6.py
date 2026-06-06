@@ -214,11 +214,14 @@ class AutonomyAPI:
         self.target_clear_reason = ""
         self.post_completion_grace_suppressed = False
         self.use_passthrough_gate_velocities = True
-        self.pass_through_speed = 1.5
+        self.pass_through_speed = 3
         self.use_planning_lookahead_tracks = True
         self.use_raw_rejected_planning_lookahead = False
         self.planning_lookahead_min_hits = 6
         self.perception_transform_mode = "physical_direct_rad_x_mirror"
+        # Diagnostic experiment only: compensate the measured far-range PnP
+        # depth bias for detections classified as future/lookahead gates.
+        self.use_diagnostic_far_depth_correction = True
         self.perception_transform_modes = (
             "legacy_scaled_yaw",
             "direct_rad",
@@ -295,6 +298,11 @@ class AutonomyAPI:
         self.memory_confidence_used = ""
         self.memory_admission_threshold = ""
         self.memory_admission_passed = ""
+        self.pnp_camera_original = ""
+        self.pnp_camera_depth_corrected = ""
+        self.depth_correction_factor = ""
+        self.world_original = ""
+        self.world_depth_corrected = ""
         self.planning_track_horizon_debug = ""
         self.planning_cycle_debug = ""
         self.horizon_track_decisions = {}
@@ -396,6 +404,17 @@ class AutonomyAPI:
         self.last_telemetry_rpy_raw_rad = None
         self.image_stamp_sec = 0
         self.image_stamp_nanosec = 0
+        self.last_processed_image_stamp = None
+        self.skipped_stale_image = False
+        self.skipped_image_stamp = ""
+        self.duplicate_image_skipped = False
+        self.detection_world_computed_once = False
+        self.pose_stamp_used_for_detection = float("nan")
+        self.telemetry_stamp_current = float("nan")
+        self.image_pose_age_s = float("nan")
+        self.image_pose_snapshot_position = np.full(3, np.nan, dtype=float)
+        self.image_pose_snapshot_rpy_raw = np.full(3, np.nan, dtype=float)
+        self.image_pose_snapshot_rpy_perception = np.full(3, np.nan, dtype=float)
         self.image_received_wall_time = float("nan")
         self.image_processed_wall_time = float("nan")
         self.telemetry_position_sample_time = float("nan")
@@ -541,6 +560,16 @@ class AutonomyAPI:
         self.active_target_shift_threshold_m = 0.45
         self.active_target_shift_required_frames = 3
         self.active_target_shift_replan_min_interval_s = 0.5
+        self.freeze_current_gate_target_near_gate = True
+        self.current_gate_freeze_distance = 2.0
+        self.current_gate_freeze_progress_margin = 1.5
+        self.max_current_gate_target_shift_near_gate = 0.35
+        self.active_target_shift_suppressed = False
+        self.distance_to_active_target_at_shift = float("nan")
+        self.target_shift_xy = float("nan")
+        self.target_shift_z = float("nan")
+        self.shift_replan_allowed = False
+        self.shift_replan_suppressed_reason = ""
         self.pending_active_target_correction = None
         self.approach_start_position = None
         self.approach_vector = None
@@ -1179,6 +1208,149 @@ class AutonomyAPI:
         world = drone_pos + r_wb @ (self.camera_offset_body + gate_body)
         return world, gate_body, rpy
 
+    def apply_diagnostic_far_depth_correction(
+        self,
+        detections,
+        drone_pos,
+        telemetry_rpy_raw_rad,
+    ):
+        """Apply the opt-in simulation diagnostic only to future detections."""
+        if not detections:
+            return detections
+
+        drone_pos = np.asarray(drone_pos, dtype=float).reshape(3)
+        r_body_camera = self.body_camera_matrix_for_mode(self.perception_transform_mode)
+        race_order = list(self.race_progression.order())
+        active_track_id = self.canonical_track_id(self.active_target_track_id)
+        classified = []
+
+        for det in detections:
+            camera = np.asarray(
+                det.get("gate_center_camera", np.full(3, np.nan)),
+                dtype=float,
+            ).reshape(3)
+            world = np.asarray(
+                det.get("gate_center_world", np.full(3, np.nan)),
+                dtype=float,
+            ).reshape(3)
+            det["pnp_camera_original"] = camera.copy()
+            det["pnp_camera_depth_corrected"] = camera.copy()
+            det["depth_correction_factor"] = 1.0
+            det["world_original"] = world.copy()
+            det["world_depth_corrected"] = world.copy()
+            det["diagnostic_far_depth_is_future"] = False
+            det["diagnostic_far_depth_classification"] = "unclassified"
+
+            matched_track = None
+            matched_distance = float("inf")
+            if np.all(np.isfinite(world)):
+                for tr in self.gate_memory.tracks:
+                    center = getattr(tr, "filtered_center_world", None)
+                    if center is None:
+                        center = getattr(tr, "center", None)
+                    if center is None:
+                        continue
+                    distance = float(
+                        np.linalg.norm(world - np.asarray(center, dtype=float).reshape(3))
+                    )
+                    if distance < matched_distance:
+                        matched_track = tr
+                        matched_distance = distance
+
+            matched_id = (
+                self.canonical_track_id(matched_track.id)
+                if matched_track is not None
+                and matched_distance <= self.gate_memory.association_radius
+                else None
+            )
+            race_idx = race_order.index(matched_id) if matched_id in race_order else None
+            is_future = race_idx is not None and race_idx > self.current_gate_idx
+            if is_future:
+                det["diagnostic_far_depth_classification"] = (
+                    f"future_race_track:{matched_id}:race_idx={race_idx}"
+                )
+            elif matched_id is not None and matched_id == active_track_id:
+                det["diagnostic_far_depth_classification"] = f"active_track:{matched_id}"
+            classified.append({
+                "det": det,
+                "world": world,
+                "distance": (
+                    float(np.linalg.norm(world - drone_pos))
+                    if np.all(np.isfinite(world))
+                    else float("inf")
+                ),
+                "is_future": is_future,
+                "matched_id": matched_id,
+                "race_idx": race_idx,
+            })
+
+        # Before tracks have race indices, multiple simultaneous detections are
+        # classified conservatively: the nearest valid gate remains current,
+        # and only farther detections are eligible for this diagnostic.
+        valid = [item for item in classified if np.all(np.isfinite(item["world"]))]
+        if len(valid) >= 2:
+            nearest = min(valid, key=lambda item: item["distance"])
+            for item in valid:
+                explicitly_current = bool(
+                    item["matched_id"] == active_track_id
+                    or item["race_idx"] == self.current_gate_idx
+                )
+                if item is not nearest and not explicitly_current and item["race_idx"] is None:
+                    item["is_future"] = True
+                    item["det"]["diagnostic_far_depth_classification"] = (
+                        "future_by_multi_detection_distance"
+                    )
+                elif item is nearest and item["race_idx"] is None:
+                    item["det"]["diagnostic_far_depth_classification"] = (
+                        "current_by_multi_detection_distance"
+                    )
+
+        for item in classified:
+            det = item["det"]
+            det["diagnostic_far_depth_is_future"] = bool(item["is_future"])
+            camera = det["pnp_camera_original"]
+            depth = float(camera[2]) if np.all(np.isfinite(camera)) else float("nan")
+            factor = 1.0
+            if item["is_future"] and np.isfinite(depth) and depth > 0.0:
+                if depth > 14.0:
+                    factor = 1.0 / 0.915
+                elif depth >= 8.0:
+                    factor = 1.0 / 0.95
+
+            corrected_camera = camera * factor
+            corrected_world = det["world_original"].copy()
+            if np.all(np.isfinite(corrected_camera)):
+                corrected_world, corrected_body, _ = self.transform_gate_camera_to_world(
+                    gate_camera=corrected_camera,
+                    drone_pos=drone_pos,
+                    telemetry_rpy_raw_rad=telemetry_rpy_raw_rad,
+                    mode=self.perception_transform_mode,
+                    r_body_camera=r_body_camera,
+                )
+                det["pnp_camera_depth_corrected"] = corrected_camera.copy()
+                det["world_depth_corrected"] = corrected_world.copy()
+                det["depth_correction_factor"] = float(factor)
+                if self.use_diagnostic_far_depth_correction and factor != 1.0:
+                    det["gate_center_camera"] = corrected_camera.copy()
+                    det["tvec"] = corrected_camera.copy()
+                    det["gate_center_body"] = corrected_body.copy()
+                    det["gate_center_cam"] = corrected_body.copy()
+                    det["gate_center_world"] = corrected_world.copy()
+
+            print(
+                "[DIAGNOSTIC FAR DEPTH] "
+                f"enabled={self.use_diagnostic_far_depth_correction} "
+                f"det={det.get('detection_index', -1)} "
+                f"future={item['is_future']} "
+                f"class={det['diagnostic_far_depth_classification']} "
+                f"factor={factor:.6f} "
+                f"camera_original={camera.tolist()} "
+                f"camera_corrected={det['pnp_camera_depth_corrected'].tolist()} "
+                f"world_original={det['world_original'].tolist()} "
+                f"world_corrected={det['world_depth_corrected'].tolist()}"
+            )
+        return detections
+
     @staticmethod
     def _safe_norm(vec):
         vec = np.asarray(vec, dtype=float).reshape(-1)
@@ -1483,6 +1655,11 @@ class AutonomyAPI:
         self.memory_confidence_used = ""
         self.memory_admission_threshold = ""
         self.memory_admission_passed = ""
+        self.pnp_camera_original = ""
+        self.pnp_camera_depth_corrected = ""
+        self.depth_correction_factor = ""
+        self.world_original = ""
+        self.world_depth_corrected = ""
 
     def initialize_detection_flow_debug(self, yolo):
         for meta in getattr(yolo, "last_yolo_candidate_debug", []) or []:
@@ -1499,6 +1676,13 @@ class AutonomyAPI:
                 "cam": np.full(3, np.nan),
                 "raw": np.full(3, np.nan),
                 "corrected": np.full(3, np.nan),
+                "pnp_camera_original": np.full(3, np.nan),
+                "pnp_camera_depth_corrected": np.full(3, np.nan),
+                "depth_correction_factor": 1.0,
+                "world_original": np.full(3, np.nan),
+                "world_depth_corrected": np.full(3, np.nan),
+                "diagnostic_far_depth_is_future": False,
+                "diagnostic_far_depth_classification": "",
                 "track": None,
                 "memory": False,
                 "state": "",
@@ -1559,6 +1743,25 @@ class AutonomyAPI:
             "cam": cam,
             "raw": raw_world,
             "corrected": corrected,
+            "pnp_camera_original": np.asarray(
+                det.get("pnp_camera_original", cam), dtype=float
+            ).reshape(3),
+            "pnp_camera_depth_corrected": np.asarray(
+                det.get("pnp_camera_depth_corrected", cam), dtype=float
+            ).reshape(3),
+            "depth_correction_factor": float(det.get("depth_correction_factor", 1.0)),
+            "world_original": np.asarray(
+                det.get("world_original", corrected), dtype=float
+            ).reshape(3),
+            "world_depth_corrected": np.asarray(
+                det.get("world_depth_corrected", corrected), dtype=float
+            ).reshape(3),
+            "diagnostic_far_depth_is_future": bool(
+                det.get("diagnostic_far_depth_is_future", False)
+            ),
+            "diagnostic_far_depth_classification": det.get(
+                "diagnostic_far_depth_classification", ""
+            ),
             "track": track_id,
             "memory": bool(result is not None and result.get("accepted", False)),
             "state": (
@@ -1578,6 +1781,11 @@ class AutonomyAPI:
         memory_confidence_used = []
         memory_admission_threshold = []
         memory_admission_passed = []
+        pnp_camera_original = []
+        pnp_camera_depth_corrected = []
+        depth_correction_factor = []
+        world_original = []
+        world_depth_corrected = []
         for idx in sorted(self.perception_detection_flow_entries):
             e = self.perception_detection_flow_entries[idx]
             vec = lambda v: "/".join(f"{x:.2f}" for x in np.asarray(v, dtype=float).reshape(3))
@@ -1591,6 +1799,21 @@ class AutonomyAPI:
             memory_admission_passed.append(
                 f"det{idx}:{int(bool(e.get('memory_admission_passed', False)))}"
             )
+            pnp_camera_original.append(
+                f"det{idx}:{vec(e.get('pnp_camera_original', np.full(3,np.nan)))}"
+            )
+            pnp_camera_depth_corrected.append(
+                f"det{idx}:{vec(e.get('pnp_camera_depth_corrected', np.full(3,np.nan)))}"
+            )
+            depth_correction_factor.append(
+                f"det{idx}:{e.get('depth_correction_factor', 1.0):.6f}"
+            )
+            world_original.append(
+                f"det{idx}:{vec(e.get('world_original', np.full(3,np.nan)))}"
+            )
+            world_depth_corrected.append(
+                f"det{idx}:{vec(e.get('world_depth_corrected', np.full(3,np.nan)))}"
+            )
             parts.append(
                 f"det{idx}:yolo={e.get('yolo_confidence', np.nan):.3f},"
                 f"area_px2={e.get('quad_area_px2', np.nan):.1f},"
@@ -1601,6 +1824,9 @@ class AutonomyAPI:
                 f"cam={vec(e.get('cam', np.full(3,np.nan)))},"
                 f"raw={vec(e.get('raw', np.full(3,np.nan)))},"
                 f"corrected={vec(e.get('corrected', np.full(3,np.nan)))},"
+                f"depth_diag_future={int(bool(e.get('diagnostic_far_depth_is_future', False)))},"
+                f"depth_diag_class={e.get('diagnostic_far_depth_classification','')},"
+                f"depth_factor={e.get('depth_correction_factor', 1.0):.6f},"
                 f"track={e.get('track')},mem={int(bool(e.get('memory')))},"
                 f"state={e.get('state','')},race={e.get('race_idx')},"
                 f"role={e.get('role','')},reason={e.get('reason','')}"
@@ -1612,6 +1838,11 @@ class AutonomyAPI:
         self.memory_confidence_used = ";".join(memory_confidence_used)
         self.memory_admission_threshold = ";".join(memory_admission_threshold)
         self.memory_admission_passed = ";".join(memory_admission_passed)
+        self.pnp_camera_original = ";".join(pnp_camera_original)
+        self.pnp_camera_depth_corrected = ";".join(pnp_camera_depth_corrected)
+        self.depth_correction_factor = ";".join(depth_correction_factor)
+        self.world_original = ";".join(world_original)
+        self.world_depth_corrected = ";".join(world_depth_corrected)
         if parts:
             print("[DETECTION FLOW] " + self.perception_detection_flow)
 
@@ -1729,6 +1960,7 @@ class AutonomyAPI:
         image_stamp_sec=0,
         image_stamp_nanosec=0,
         image_received_wall_time=np.nan,
+        image_pose_snapshot=None,
         gazebo_pose=None,
     ):
         if not self.use_perception or self.perception_node is None:
@@ -1746,12 +1978,93 @@ class AutonomyAPI:
         self.image_stamp_nanosec = int(image_stamp_nanosec)
         self.image_received_wall_time = float(image_received_wall_time)
         self.image_processed_wall_time = process_wall_time
-        self.telemetry_position_sample_time = float(
+        current_position_sample_time = float(
             getattr(self.telemetry, "position_sample_time", np.nan)
         )
-        self.telemetry_attitude_sample_time = float(
+        current_attitude_sample_time = float(
             getattr(self.telemetry, "attitude_sample_time", np.nan)
         )
+        current_stamps = [
+            stamp
+            for stamp in (current_position_sample_time, current_attitude_sample_time)
+            if np.isfinite(stamp)
+        ]
+        self.telemetry_stamp_current = (
+            max(current_stamps) if current_stamps else float("nan")
+        )
+        if self.image_stamp_sec != 0 or self.image_stamp_nanosec != 0:
+            image_key = ("ros", self.image_stamp_sec, self.image_stamp_nanosec)
+        elif np.isfinite(self.image_received_wall_time):
+            image_key = ("wall", self.image_received_wall_time)
+        else:
+            image_key = None
+        self.skipped_stale_image = (
+            image_key is not None and image_key == self.last_processed_image_stamp
+        )
+        self.duplicate_image_skipped = self.skipped_stale_image
+        self.skipped_image_stamp = (
+            f"{self.image_stamp_sec}.{self.image_stamp_nanosec:09d}"
+            if self.skipped_stale_image
+            else ""
+        )
+        self.detection_world_computed_once = False
+        if self.skipped_stale_image:
+            print(
+                "[PERCEPTION FRAME] duplicate image skipped "
+                f"stamp={self.skipped_image_stamp}"
+            )
+            return None
+        if image_key is not None:
+            self.last_processed_image_stamp = image_key
+
+        snapshot = image_pose_snapshot if isinstance(image_pose_snapshot, dict) else {}
+        snapshot_position = np.asarray(
+            snapshot.get(
+                "position",
+                [
+                    self.telemetry.pos["x"],
+                    self.telemetry.pos["y"],
+                    self.telemetry.pos["z"],
+                ],
+            ),
+            dtype=float,
+        ).reshape(3)
+        snapshot_rpy_raw = np.asarray(
+            snapshot.get(
+                "rpy_raw_rad",
+                [
+                    self.telemetry.rpy["roll"],
+                    self.telemetry.rpy["pitch"],
+                    self.telemetry.rpy["yaw"],
+                ],
+            ),
+            dtype=float,
+        ).reshape(3)
+        self.telemetry_position_sample_time = float(
+            snapshot.get("position_sample_time", current_position_sample_time)
+        )
+        self.telemetry_attitude_sample_time = float(
+            snapshot.get("attitude_sample_time", current_attitude_sample_time)
+        )
+        pose_stamps = [
+            stamp
+            for stamp in (
+                self.telemetry_position_sample_time,
+                self.telemetry_attitude_sample_time,
+            )
+            if np.isfinite(stamp)
+        ]
+        self.pose_stamp_used_for_detection = (
+            min(pose_stamps) if pose_stamps else float("nan")
+        )
+        self.image_pose_age_s = (
+            self.image_received_wall_time - self.pose_stamp_used_for_detection
+            if np.isfinite(self.image_received_wall_time)
+            and np.isfinite(self.pose_stamp_used_for_detection)
+            else float("nan")
+        )
+        self.image_pose_snapshot_position = snapshot_position.copy()
+        self.image_pose_snapshot_rpy_raw = snapshot_rpy_raw.copy()
         if np.isfinite(self.image_received_wall_time):
             self.image_age_s = process_wall_time - self.image_received_wall_time
         if np.isfinite(self.telemetry_attitude_sample_time):
@@ -1771,17 +2084,8 @@ class AutonomyAPI:
                 self.image_received_wall_time - pose_sample_time
             )
 
-        drone_pos = np.array([
-            self.telemetry.pos["x"],
-            self.telemetry.pos["y"],
-            self.telemetry.pos["z"],
-        ], dtype=float)
-
-        telemetry_rpy_raw_rad = np.array([
-            float(self.telemetry.rpy["roll"]),
-            float(self.telemetry.rpy["pitch"]),
-            float(self.telemetry.rpy["yaw"]),
-        ], dtype=float)
+        drone_pos = snapshot_position
+        telemetry_rpy_raw_rad = snapshot_rpy_raw
         self.last_telemetry_rpy_raw_rad = telemetry_rpy_raw_rad.copy()
         self.telemetry_yaw_raw_deg = math.degrees(float(telemetry_rpy_raw_rad[2]))
         self.update_dynamic_gazebo_perception_yaw_correction(
@@ -1792,6 +2096,9 @@ class AutonomyAPI:
             telemetry_rpy_raw_rad,
             self.perception_transform_mode,
         )
+        self.image_pose_snapshot_rpy_perception = np.asarray(
+            drone_rpy_for_perception, dtype=float
+        ).reshape(3).copy()
         self.telemetry_yaw_perception_deg = math.degrees(
             float(drone_rpy_for_perception[2])
         )
@@ -1835,6 +2142,7 @@ class AutonomyAPI:
             drone_pos=drone_pos,
             drone_rpy_rad=drone_rpy_for_perception,
         )
+        self.detection_world_computed_once = True
         node_debug = getattr(self.perception_node, "last_pipeline_debug", {})
         yolo = getattr(self.perception_node, "gate_perception", None)
         self.initialize_detection_flow_debug(yolo)
@@ -1930,6 +2238,11 @@ class AutonomyAPI:
                     live_det["gate_normal_body"] = gate_normal_body.copy()
                     live_det["gate_normal_world"] = r_wb @ gate_normal_body
 
+        detections = self.apply_diagnostic_far_depth_correction(
+            detections=detections,
+            drone_pos=drone_pos,
+            telemetry_rpy_raw_rad=telemetry_rpy_raw_rad,
+        )
         det = detections[0]
 
         if self.perception_transform_mode in (
@@ -4121,6 +4434,12 @@ class AutonomyAPI:
         self.target_update_raw_detection_center = np.full(3, np.nan, dtype=float)
         self.target_update_filtered_track_center = np.full(3, np.nan, dtype=float)
         self.target_update_reason = ""
+        self.active_target_shift_suppressed = False
+        self.distance_to_active_target_at_shift = float("nan")
+        self.target_shift_xy = float("nan")
+        self.target_shift_z = float("nan")
+        self.shift_replan_allowed = False
+        self.shift_replan_suppressed_reason = ""
 
     def record_target_update_debug(self, previous, new, track_id, reason):
         new = np.asarray(new, dtype=float).reshape(3)
@@ -5146,6 +5465,12 @@ class AutonomyAPI:
 
     def check_active_target_shift_correction(self):
         self.active_target_shift_replan_triggered = False
+        self.active_target_shift_suppressed = False
+        self.distance_to_active_target_at_shift = float("nan")
+        self.target_shift_xy = float("nan")
+        self.target_shift_z = float("nan")
+        self.shift_replan_allowed = False
+        self.shift_replan_suppressed_reason = ""
 
         if not self.use_perception:
             return False
@@ -5205,6 +5530,76 @@ class AutonomyAPI:
             return False
 
         corrected_target = 0.7 * planned + 0.3 * latest
+        proposed_shift = corrected_target - planned
+        self.target_shift_xy = float(np.linalg.norm(proposed_shift[:2]))
+        self.target_shift_z = float(abs(proposed_shift[2]))
+        current_pos = np.array([
+            self.telemetry.pos["x"],
+            self.telemetry.pos["y"],
+            self.telemetry.pos["z"],
+        ], dtype=float)
+        self.distance_to_active_target_at_shift = float(
+            np.linalg.norm(planned - current_pos)
+        )
+
+        has_future_horizon_gate = self.current_target_idx + 1 < len(self.active_target_gates)
+        has_future_race_gate = (
+            self.race_gate_count is not None
+            and self.current_gate_idx < self.race_gate_count - 1
+        )
+        active_is_internal_passthrough = bool(
+            has_future_horizon_gate or has_future_race_gate
+        )
+        planned_valid, _ = self.validate_planning_target(planned)
+        planned_target_stale = bool(
+            time.time() - self.replan_time > self.gate_memory.stale_time
+        )
+
+        raw_shift = latest - planned
+        if self.approach_vector is not None and np.all(np.isfinite(self.approach_vector)):
+            approach = np.asarray(self.approach_vector, dtype=float).reshape(3)
+            progress_shift = abs(float(np.dot(raw_shift, approach)))
+            lateral_shift = float(
+                np.linalg.norm(raw_shift - np.dot(raw_shift, approach) * approach)
+            )
+        else:
+            progress_shift = float(np.linalg.norm(raw_shift[:2]))
+            lateral_shift = float(abs(raw_shift[2]))
+        crossing_change_large = bool(
+            progress_shift > self.current_gate_freeze_progress_margin
+            or lateral_shift > self.current_gate_freeze_progress_margin
+        )
+        proposed_horizontal_shift_large = bool(
+            self.target_shift_xy > self.max_current_gate_target_shift_near_gate
+        )
+
+        suppress_near_gate_shift = bool(
+            self.freeze_current_gate_target_near_gate
+            and active_is_internal_passthrough
+            and self.distance_to_active_target_at_shift <= self.current_gate_freeze_distance
+            and not proposed_horizontal_shift_large
+            and not crossing_change_large
+            and planned_valid
+            and not planned_target_stale
+        )
+        if suppress_near_gate_shift:
+            self.pending_active_target_correction = None
+            self.active_target_shift_suppressed = True
+            self.shift_replan_allowed = False
+            self.shift_replan_suppressed_reason = (
+                "internal_passthrough_near_gate_small_target_correction"
+            )
+            self.active_target_shift_frames = 0
+            print(
+                "[ACTIVE TARGET SHIFT] suppressed "
+                f"track_id={track_id} distance={self.distance_to_active_target_at_shift:.3f}m "
+                f"shift_xy={self.target_shift_xy:.3f}m shift_z={self.target_shift_z:.3f}m "
+                f"progress_shift={progress_shift:.3f}m lateral_shift={lateral_shift:.3f}m "
+                f"reason={self.shift_replan_suppressed_reason}"
+            )
+            return False
+
+        self.shift_replan_allowed = True
         self.pending_active_target_correction = {
             "track_id": track_id,
             "center": corrected_target.copy(),

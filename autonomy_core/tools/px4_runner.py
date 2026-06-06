@@ -75,6 +75,7 @@ class PerceptionNode(Node):
         self.last_image_stamp_sec = 0
         self.last_image_stamp_nanosec = 0
         self.last_image_received_wall_time = float("nan")
+        self.last_image_pose_snapshot = None
         self.latest_gazebo_pose = None
 
         camera_info_qos = QoSProfile(
@@ -115,12 +116,41 @@ class PerceptionNode(Node):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             received_wall_time = time.time()
+            pose_snapshot = None
+            if self.telemetry is not None:
+                pose_snapshot = {
+                    "position": np.array([
+                        self.telemetry.pos["x"],
+                        self.telemetry.pos["y"],
+                        self.telemetry.pos["z"],
+                    ], dtype=float),
+                    "rpy_raw_rad": np.array([
+                        self.telemetry.rpy["roll"],
+                        self.telemetry.rpy["pitch"],
+                        self.telemetry.rpy["yaw"],
+                    ], dtype=float),
+                    "yaw_perception_rad": float(
+                        getattr(
+                            self.telemetry,
+                            "yaw_rad_perception",
+                            self.telemetry.rpy["yaw"],
+                        )
+                    ),
+                    "position_sample_time": float(
+                        getattr(self.telemetry, "position_sample_time", np.nan)
+                    ),
+                    "attitude_sample_time": float(
+                        getattr(self.telemetry, "attitude_sample_time", np.nan)
+                    ),
+                    "snapshot_wall_time": received_wall_time,
+                }
             with self.frame_lock:
                 self.frame = frame
                 self.last_frame_time = received_wall_time
                 self.last_image_stamp_sec = int(msg.header.stamp.sec)
                 self.last_image_stamp_nanosec = int(msg.header.stamp.nanosec)
                 self.last_image_received_wall_time = received_wall_time
+                self.last_image_pose_snapshot = pose_snapshot
             if self.raw_dataset_saver is not None and self.telemetry is not None:
                 self.raw_dataset_saver.maybe_save_from_callback(
                     frame,
@@ -139,6 +169,7 @@ class PerceptionNode(Node):
                 self.last_image_stamp_sec,
                 self.last_image_stamp_nanosec,
                 self.last_image_received_wall_time,
+                self.last_image_pose_snapshot,
             )
 
     def gazebo_pose_callback(self, msg: TFMessage):
@@ -536,6 +567,7 @@ async def main():
                 image_stamp_sec,
                 image_stamp_nanosec,
                 image_received_wall_time,
+                image_pose_snapshot,
             ) = perception_node.latest_frame_snapshot()
             camera_matrix = perception_node.camera_matrix
             dist_coeffs = perception_node.dist_coeffs
@@ -548,6 +580,7 @@ async def main():
                     image_stamp_sec=image_stamp_sec,
                     image_stamp_nanosec=image_stamp_nanosec,
                     image_received_wall_time=image_received_wall_time,
+                    image_pose_snapshot=image_pose_snapshot,
                     gazebo_pose=perception_node.latest_gazebo_pose_snapshot(),
                 )
 
@@ -667,6 +700,7 @@ async def main():
                     image_stamp_sec,
                     image_stamp_nanosec,
                     image_received_wall_time,
+                    image_pose_snapshot,
                 ) = perception_node.latest_frame_snapshot()
                 camera_matrix = perception_node.camera_matrix
                 dist_coeffs = perception_node.dist_coeffs
@@ -687,6 +721,7 @@ async def main():
                     image_stamp_sec=image_stamp_sec,
                     image_stamp_nanosec=image_stamp_nanosec,
                     image_received_wall_time=image_received_wall_time,
+                    image_pose_snapshot=image_pose_snapshot,
                     gazebo_pose=perception_node.latest_gazebo_pose_snapshot(),
                 )
 
@@ -878,6 +913,24 @@ async def main():
                 active_target_shift_m=getattr(autonomy, "active_target_shift_m", float("nan")),
                 active_target_shift_frames=getattr(autonomy, "active_target_shift_frames", 0),
                 active_target_shift_replan_triggered=getattr(autonomy, "active_target_shift_replan_triggered", False),
+                active_target_shift_suppressed=getattr(
+                    autonomy, "active_target_shift_suppressed", False
+                ),
+                distance_to_active_target_at_shift=getattr(
+                    autonomy, "distance_to_active_target_at_shift", float("nan")
+                ),
+                target_shift_xy=getattr(
+                    autonomy, "target_shift_xy", float("nan")
+                ),
+                target_shift_z=getattr(
+                    autonomy, "target_shift_z", float("nan")
+                ),
+                shift_replan_allowed=getattr(
+                    autonomy, "shift_replan_allowed", False
+                ),
+                shift_replan_suppressed_reason=getattr(
+                    autonomy, "shift_replan_suppressed_reason", ""
+                ),
                 active_target_center_at_plan=getattr(autonomy, "active_target_center_at_plan", None),
                 active_target_latest_filtered_center=getattr(autonomy, "active_target_latest_filtered_center", None),
                 target_update_event=getattr(autonomy, "target_update_event", False),
@@ -977,6 +1030,20 @@ async def main():
                 memory_confidence_used=getattr(autonomy, "memory_confidence_used", ""),
                 memory_admission_threshold=getattr(autonomy, "memory_admission_threshold", ""),
                 memory_admission_passed=getattr(autonomy, "memory_admission_passed", ""),
+                use_diagnostic_far_depth_correction=getattr(
+                    autonomy, "use_diagnostic_far_depth_correction", False
+                ),
+                pnp_camera_original=getattr(autonomy, "pnp_camera_original", ""),
+                pnp_camera_depth_corrected=getattr(
+                    autonomy, "pnp_camera_depth_corrected", ""
+                ),
+                depth_correction_factor=getattr(
+                    autonomy, "depth_correction_factor", ""
+                ),
+                world_original=getattr(autonomy, "world_original", ""),
+                world_depth_corrected=getattr(
+                    autonomy, "world_depth_corrected", ""
+                ),
                 planning_cycle_debug=getattr(autonomy, "planning_cycle_debug", ""),
                 planning_track_horizon_debug=getattr(
                     autonomy, "planning_track_horizon_debug", ""
@@ -1091,6 +1158,31 @@ async def main():
                 detection_drone_yaw_deg=getattr(autonomy, "detection_drone_yaw_deg", float("nan")),
                 ros_image_stamp_sec=getattr(autonomy, "image_stamp_sec", 0),
                 ros_image_stamp_nanosec=getattr(autonomy, "image_stamp_nanosec", 0),
+                image_stamp=(
+                    f"{getattr(autonomy, 'image_stamp_sec', 0)}."
+                    f"{getattr(autonomy, 'image_stamp_nanosec', 0):09d}"
+                ),
+                pose_stamp_used_for_detection=getattr(
+                    autonomy, "pose_stamp_used_for_detection", float("nan")
+                ),
+                telemetry_stamp_current=getattr(
+                    autonomy, "telemetry_stamp_current", float("nan")
+                ),
+                image_pose_age_s=getattr(
+                    autonomy, "image_pose_age_s", float("nan")
+                ),
+                skipped_stale_image=getattr(
+                    autonomy, "skipped_stale_image", False
+                ),
+                skipped_image_stamp=getattr(
+                    autonomy, "skipped_image_stamp", ""
+                ),
+                duplicate_image_skipped=getattr(
+                    autonomy, "duplicate_image_skipped", False
+                ),
+                detection_world_computed_once=getattr(
+                    autonomy, "detection_world_computed_once", False
+                ),
                 image_received_wall_time=getattr(autonomy, "image_received_wall_time", float("nan")),
                 image_processed_wall_time=getattr(autonomy, "image_processed_wall_time", float("nan")),
                 telemetry_position_sample_time=getattr(
