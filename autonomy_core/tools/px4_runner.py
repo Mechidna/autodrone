@@ -1059,6 +1059,33 @@ async def main():
                 tentative_lookahead_shift_m=getattr(autonomy, "tentative_lookahead_shift_m", float("nan")),
                 tentative_lookahead_shift_track_id=getattr(autonomy, "tentative_lookahead_shift_track_id", None),
                 tentative_lookahead_shift_replan_triggered=getattr(autonomy, "tentative_lookahead_shift_replan_triggered", False),
+                post_completion_horizon_has_future=getattr(
+                    autonomy, "post_completion_horizon_has_future", False
+                ),
+                terminal_passthrough_extension_used=getattr(
+                    autonomy, "terminal_passthrough_extension_used", False
+                ),
+                terminal_passthrough_extension_point=getattr(
+                    autonomy, "terminal_passthrough_extension_point", None
+                ),
+                current_gate_treated_as_terminal=getattr(
+                    autonomy, "current_gate_treated_as_terminal", False
+                ),
+                first_segment_terminal_velocity_zero=getattr(
+                    autonomy, "first_segment_terminal_velocity_zero", False
+                ),
+                tentative_lookahead_replan_suppressed=getattr(
+                    autonomy, "tentative_lookahead_replan_suppressed", False
+                ),
+                tentative_lookahead_replan_suppression_reason=getattr(
+                    autonomy, "tentative_lookahead_replan_suppression_reason", ""
+                ),
+                horizon_material_change_m=getattr(
+                    autonomy, "horizon_material_change_m", float("nan")
+                ),
+                first_segment_min_v_ref_predicted=getattr(
+                    autonomy, "first_segment_min_v_ref_predicted", float("nan")
+                ),
                 passthrough_velocity_enabled=getattr(autonomy, "passthrough_velocity_enabled", False),
                 passthrough_speed_used=getattr(autonomy, "passthrough_speed_used", float("nan")),
                 waypoint_velocity_log=getattr(autonomy, "waypoint_velocity_log", None),

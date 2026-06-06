@@ -217,6 +217,17 @@ class FlightLogger:
             "tentative_lookahead_shift_m",
             "tentative_lookahead_shift_track_id",
             "tentative_lookahead_shift_replan_triggered",
+            "post_completion_horizon_has_future",
+            "terminal_passthrough_extension_used",
+            "terminal_passthrough_extension_point_x",
+            "terminal_passthrough_extension_point_y",
+            "terminal_passthrough_extension_point_z",
+            "current_gate_treated_as_terminal",
+            "first_segment_terminal_velocity_zero",
+            "tentative_lookahead_replan_suppressed",
+            "tentative_lookahead_replan_suppression_reason",
+            "horizon_material_change_m",
+            "first_segment_min_v_ref_predicted",
             "passthrough_velocity_enabled",
             "passthrough_speed_used",
             "waypoint_velocity_0_x",
@@ -887,6 +898,15 @@ class FlightLogger:
         tentative_lookahead_shift_m=np.nan,
         tentative_lookahead_shift_track_id=None,
         tentative_lookahead_shift_replan_triggered=False,
+        post_completion_horizon_has_future=False,
+        terminal_passthrough_extension_used=False,
+        terminal_passthrough_extension_point=None,
+        current_gate_treated_as_terminal=False,
+        first_segment_terminal_velocity_zero=False,
+        tentative_lookahead_replan_suppressed=False,
+        tentative_lookahead_replan_suppression_reason="",
+        horizon_material_change_m=np.nan,
+        first_segment_min_v_ref_predicted=np.nan,
         passthrough_velocity_enabled=False,
         passthrough_speed_used=np.nan,
         waypoint_velocity_log=None,
@@ -1284,6 +1304,9 @@ class FlightLogger:
         gate_world_gazebo = self._vec3(gate_world_gazebo)
         gate_world_uncorrected = self._vec3(gate_world_uncorrected)
         gate_world_corrected = self._vec3(gate_world_corrected)
+        terminal_passthrough_extension_point = self._vec3(
+            terminal_passthrough_extension_point
+        )
         if detection_pose.size < 6:
             detection_pose = np.full(6, np.nan)
         chosen_pnp_candidate = -1 if chosen_pnp_candidate is None else chosen_pnp_candidate
@@ -1503,6 +1526,17 @@ class FlightLogger:
             tentative_lookahead_shift_m,
             tentative_lookahead_shift_track_id,
             bool(tentative_lookahead_shift_replan_triggered),
+            bool(post_completion_horizon_has_future),
+            bool(terminal_passthrough_extension_used),
+            terminal_passthrough_extension_point[0],
+            terminal_passthrough_extension_point[1],
+            terminal_passthrough_extension_point[2],
+            bool(current_gate_treated_as_terminal),
+            bool(first_segment_terminal_velocity_zero),
+            bool(tentative_lookahead_replan_suppressed),
+            tentative_lookahead_replan_suppression_reason,
+            horizon_material_change_m,
+            first_segment_min_v_ref_predicted,
             bool(passthrough_velocity_enabled),
             passthrough_speed_used,
             waypoint_velocity_log[0, 0],

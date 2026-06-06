@@ -246,6 +246,10 @@ class AutonomyAPI:
         self.lookahead_min_confidence_sum = 0.8
         self.lookahead_max_reprojection_error = 8.0
         self.lookahead_max_distance = 25.0
+        self.use_terminal_passthrough_extension = True
+        self.terminal_passthrough_extension_distance = 4.0
+        self.suppress_minor_tentative_lookahead_replans = True
+        self.tentative_lookahead_replan_min_shift = 0.75
         self.tentative_lookahead_shift_replan_threshold = 0.5
         self.tentative_lookahead_replan_min_interval_s = 0.5
         self.raw_planning_lookahead_ttl_s = 1.25
@@ -310,6 +314,15 @@ class AutonomyAPI:
         self.tentative_lookahead_shift_m = float("nan")
         self.tentative_lookahead_shift_track_id = None
         self.tentative_lookahead_shift_replan_triggered = False
+        self.post_completion_horizon_has_future = False
+        self.terminal_passthrough_extension_used = False
+        self.terminal_passthrough_extension_point = np.full(3, np.nan, dtype=float)
+        self.current_gate_treated_as_terminal = False
+        self.first_segment_terminal_velocity_zero = False
+        self.tentative_lookahead_replan_suppressed = False
+        self.tentative_lookahead_replan_suppression_reason = ""
+        self.horizon_material_change_m = float("nan")
+        self.first_segment_min_v_ref_predicted = float("nan")
         self.passthrough_velocity_enabled = False
         self.passthrough_speed_used = float("nan")
         self.waypoint_velocity_log = np.full((3, 3), np.nan, dtype=float)
@@ -677,6 +690,34 @@ class AutonomyAPI:
             self.internal_gate_velocity_nonzero = True
 
         return velocities
+
+    def is_final_race_gate(self):
+        if self.race_gate_count is not None:
+            return self.current_gate_idx >= int(self.race_gate_count) - 1
+        return self.current_gate_idx >= len(self.gt_gates) - 1
+
+    def compute_terminal_passthrough_extension(self, current_pos, current_gate):
+        current_pos = np.asarray(current_pos, dtype=float).reshape(3)
+        current_gate = np.asarray(current_gate, dtype=float).reshape(3)
+
+        direction = None
+        next_gate_idx = self.current_gate_idx + 1
+        next_gate_exists = next_gate_idx < len(self.gt_gates)
+        if self.race_gate_count is not None:
+            next_gate_exists = next_gate_exists and next_gate_idx < int(self.race_gate_count)
+        if next_gate_exists:
+            direction = np.asarray(self.gt_gates[next_gate_idx], dtype=float).reshape(3) - current_gate
+        elif self.approach_vector is not None:
+            approach = np.asarray(self.approach_vector, dtype=float).reshape(3)
+            if np.all(np.isfinite(approach)):
+                direction = approach
+        if direction is None or not np.all(np.isfinite(direction)):
+            direction = current_gate - current_pos
+
+        norm = float(np.linalg.norm(direction))
+        if norm < 1e-6:
+            return None
+        return current_gate + float(self.terminal_passthrough_extension_distance) * direction / norm
 
     def remember_raw_planning_lookahead_candidate(self, center, reason, now=None):
         if not self.use_raw_rejected_planning_lookahead:
@@ -1920,6 +1961,9 @@ class AutonomyAPI:
         now = time.time() if now is None else float(now)
         self.tentative_lookahead_replan_requested = False
         self.tentative_lookahead_replan_blocked_reason = ""
+        self.tentative_lookahead_replan_suppressed = False
+        self.tentative_lookahead_replan_suppression_reason = ""
+        self.horizon_material_change_m = float("nan")
 
         if not self.use_perception:
             self.tentative_lookahead_replan_blocked_reason = "perception_disabled"
@@ -1942,6 +1986,99 @@ class AutonomyAPI:
         future_ids = [tid for tid in eligible_ids if tid != active_id]
         if len(future_ids) == 0:
             self.tentative_lookahead_replan_blocked_reason = "eligible_is_active_target"
+            return False
+
+        horizon_ids = {
+            self.canonical_track_id(tid)
+            for tid in self.active_target_track_ids[1:]
+            if tid is not None and int(tid) >= 0
+        }
+        horizon_future_centers = [
+            np.asarray(center, dtype=float).reshape(3)
+            for center in self.active_target_gates[1:]
+            if np.all(np.isfinite(np.asarray(center, dtype=float).reshape(3)))
+        ]
+        horizon_has_future = len(self.active_target_gates) >= 2
+        horizon_stale = bool(
+            self.active_waypoints is None
+            or self.active_times is None
+            or (
+                self.planner.total_time > 0.0
+                and self.time_elapsed >= self.planner.total_time
+            )
+        )
+        current_target_valid = False
+        if len(self.active_target_gates) > 0:
+            current_target_valid, _ = self.validate_planning_target(
+                self.active_target_gates[0]
+            )
+        horizon_invalid = not current_target_valid
+        race_order = {
+            self.canonical_track_id(tid)
+            for tid in self.race_progression.order()
+        }
+        new_race_order_ids = [
+            tid for tid in future_ids
+            if tid in race_order and tid not in horizon_ids
+        ]
+
+        material_changes = []
+        for track_id in future_ids:
+            tr = self.gate_memory.get_track_by_id(track_id)
+            if tr is None:
+                continue
+            center = getattr(tr, "filtered_center_world", None)
+            if center is None:
+                center = getattr(tr, "center", None)
+            if center is None:
+                continue
+            center = np.asarray(center, dtype=float).reshape(3)
+            if not np.all(np.isfinite(center)):
+                continue
+            if track_id in horizon_ids:
+                idx = next(
+                    (
+                        i for i, tid in enumerate(self.active_target_track_ids[1:], start=1)
+                        if self.canonical_track_id(tid) == track_id
+                    ),
+                    None,
+                )
+                if idx is not None:
+                    material_changes.append(
+                        float(np.linalg.norm(center - self.active_target_gates[idx]))
+                    )
+            elif horizon_future_centers:
+                material_changes.append(
+                    min(float(np.linalg.norm(center - point)) for point in horizon_future_centers)
+                )
+            else:
+                material_changes.append(float("inf"))
+        if material_changes:
+            self.horizon_material_change_m = max(material_changes)
+
+        if (
+            self.suppress_minor_tentative_lookahead_replans
+            and horizon_has_future
+            and not horizon_stale
+            and not horizon_invalid
+            and not new_race_order_ids
+            and np.isfinite(self.horizon_material_change_m)
+            and self.horizon_material_change_m <= self.tentative_lookahead_replan_min_shift
+        ):
+            self.tentative_lookahead_replan_suppressed = True
+            self.tentative_lookahead_replan_suppression_reason = (
+                "internal_passthrough_horizon_minor_lookahead_change"
+            )
+            self.tentative_lookahead_replan_blocked_reason = (
+                self.tentative_lookahead_replan_suppression_reason
+            )
+            self.tentative_lookahead_shift_m = self.horizon_material_change_m
+            print(
+                "[TENTATIVE LOOKAHEAD] replan suppressed "
+                f"change={self.horizon_material_change_m:.3f}m "
+                f"threshold={self.tentative_lookahead_replan_min_shift:.3f}m "
+                f"reason={self.tentative_lookahead_replan_suppression_reason}"
+            )
             return False
         dt = now - float(getattr(self, "replan_time", 0.0))
         if dt <= 0.5:
@@ -5242,6 +5379,12 @@ class AutonomyAPI:
         self.waypoint_velocity_log = np.full((3, 3), np.nan, dtype=float)
         self.internal_gate_velocity_nonzero = False
         self.terminal_velocity_mode = ""
+        self.post_completion_horizon_has_future = False
+        self.terminal_passthrough_extension_used = False
+        self.terminal_passthrough_extension_point = np.full(3, np.nan, dtype=float)
+        self.current_gate_treated_as_terminal = False
+        self.first_segment_terminal_velocity_zero = False
+        self.first_segment_min_v_ref_predicted = float("nan")
 
         pos = np.array([
             self.telemetry.pos["x"],
@@ -5330,8 +5473,31 @@ class AutonomyAPI:
             target_waypoint_types = list(self._planning_target_waypoint_types[:len(validated_target_gates)])
             target_gates = validated_target_gates
             target_track_ids = validated_target_track_ids
+
+            if (
+                self.use_perception
+                and self.use_terminal_passthrough_extension
+                and len(target_gates) == 1
+                and not self.is_final_race_gate()
+            ):
+                extension = self.compute_terminal_passthrough_extension(pos, target_gates[0])
+                if extension is not None and np.all(np.isfinite(extension)):
+                    target_gates.append(np.asarray(extension, dtype=float).reshape(3))
+                    target_track_ids.append(-2)
+                    target_waypoint_types.append("terminal_extension")
+                    self.terminal_passthrough_extension_used = True
+                    self.terminal_passthrough_extension_point = np.asarray(
+                        extension, dtype=float
+                    ).reshape(3).copy()
+
             waypoints = np.vstack([pos] + target_gates)
             self.planning_horizon_waypoint_types = " ".join(["start"] + target_waypoint_types)
+            self._planning_target_waypoint_types = list(target_waypoint_types)
+
+        self.current_gate_treated_as_terminal = len(target_gates) == 1
+        self.first_segment_terminal_velocity_zero = self.current_gate_treated_as_terminal
+        if str(replan_reason).startswith("gate_completed") or replan_reason == "active_target_advanced":
+            self.post_completion_horizon_has_future = len(target_gates) >= 2
 
         self.planning_horizon_track_ids = list(target_track_ids)
         self.planning_horizon_waypoint_count = int(len(waypoints))
@@ -5438,8 +5604,21 @@ class AutonomyAPI:
             waypoint_velocities=waypoint_velocities,
         )
 
+        if len(times_opt) > 0 and float(times_opt[0]) > 0.0:
+            first_segment_speeds = []
+            for tau in np.linspace(0.0, float(times_opt[0]), 101):
+                _, velocity_ref, _ = self.planner.sample(float(tau))
+                first_segment_speeds.append(float(np.linalg.norm(velocity_ref[:2])))
+            self.first_segment_min_v_ref_predicted = min(first_segment_speeds)
+
         print("fixed segment times:", times_opt)
         print("fixed total horizon:", float(np.sum(times_opt)))
+        print("post_completion_horizon_has_future:", self.post_completion_horizon_has_future)
+        print("terminal_passthrough_extension_used:", self.terminal_passthrough_extension_used)
+        print("terminal_passthrough_extension_point:", self.terminal_passthrough_extension_point)
+        print("current_gate_treated_as_terminal:", self.current_gate_treated_as_terminal)
+        print("first_segment_terminal_velocity_zero:", self.first_segment_terminal_velocity_zero)
+        print("first_segment_min_v_ref_predicted:", self.first_segment_min_v_ref_predicted)
 
         self.current_gate_pos = waypoints[1].copy()
         self.active_waypoints = waypoints.copy()
@@ -5658,7 +5837,25 @@ class AutonomyAPI:
         self.tentative_lookahead_shift_track_id = best_track_id
         if best_track_id is None:
             return False
-        if best_shift <= self.tentative_lookahead_shift_replan_threshold:
+        threshold = float(self.tentative_lookahead_shift_replan_threshold)
+        if (
+            self.suppress_minor_tentative_lookahead_replans
+            and len(self.active_target_gates) >= 2
+        ):
+            threshold = max(threshold, float(self.tentative_lookahead_replan_min_shift))
+        if best_shift <= threshold:
+            if self.suppress_minor_tentative_lookahead_replans:
+                self.tentative_lookahead_replan_suppressed = True
+                self.tentative_lookahead_replan_suppression_reason = (
+                    "internal_passthrough_horizon_minor_lookahead_shift"
+                )
+                self.horizon_material_change_m = best_shift
+                print(
+                    "[TENTATIVE LOOKAHEAD SHIFT] replan suppressed "
+                    f"track_id={best_track_id} shift={best_shift:.3f}m "
+                    f"threshold={threshold:.3f}m "
+                    f"reason={self.tentative_lookahead_replan_suppression_reason}"
+                )
             return False
 
         self.tentative_lookahead_shift_replan_triggered = True
