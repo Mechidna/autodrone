@@ -65,11 +65,17 @@ class PerceptionNode(Node):
         self.bridge = CvBridge()
         self.raw_dataset_saver = raw_dataset_saver
         self.telemetry = telemetry_obj
+        self.frame_lock = threading.Lock()
+        self.gazebo_pose_lock = threading.Lock()
 
         self.frame = None
         self.camera_matrix = None
         self.dist_coeffs = None
         self.last_frame_time = None
+        self.last_image_stamp_sec = 0
+        self.last_image_stamp_nanosec = 0
+        self.last_image_received_wall_time = float("nan")
+        self.latest_gazebo_pose = None
 
         camera_info_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -108,8 +114,13 @@ class PerceptionNode(Node):
     def image_callback(self, msg: Image):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-            self.frame = frame
-            self.last_frame_time = time.time()
+            received_wall_time = time.time()
+            with self.frame_lock:
+                self.frame = frame
+                self.last_frame_time = received_wall_time
+                self.last_image_stamp_sec = int(msg.header.stamp.sec)
+                self.last_image_stamp_nanosec = int(msg.header.stamp.nanosec)
+                self.last_image_received_wall_time = received_wall_time
             if self.raw_dataset_saver is not None and self.telemetry is not None:
                 self.raw_dataset_saver.maybe_save_from_callback(
                     frame,
@@ -121,13 +132,22 @@ class PerceptionNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to convert image: {e}")
 
-    def gazebo_pose_callback(self, msg: TFMessage):
-        if self.raw_dataset_saver is None:
-            return
+    def latest_frame_snapshot(self):
+        with self.frame_lock:
+            return (
+                self.frame,
+                self.last_image_stamp_sec,
+                self.last_image_stamp_nanosec,
+                self.last_image_received_wall_time,
+            )
 
+    def gazebo_pose_callback(self, msg: TFMessage):
         if len(msg.transforms) == 0:
-            print("[RAW DATASET WARN] Gazebo dynamic pose TFMessage has no transforms; falling back to MAVSDK metadata.")
-            self.raw_dataset_saver.latest_gazebo_pose = None
+            print("[GAZEBO POSE WARN] dynamic pose TFMessage has no transforms.")
+            with self.gazebo_pose_lock:
+                self.latest_gazebo_pose = None
+            if self.raw_dataset_saver is not None:
+                self.raw_dataset_saver.latest_gazebo_pose = None
             return
 
         selected_transform = None
@@ -160,17 +180,40 @@ class PerceptionNode(Node):
             model_pos_world
             + rotate_vector_by_quaternion(model_quat_world, CAMERA_OFFSET_BODY)
         )
+        wall_time = time.time()
+        gazebo_pose = {
+            "gazebo_model_pos_world": model_pos_world.copy(),
+            "gazebo_model_quat_world": model_quat_world.copy(),
+            "gazebo_camera_pos_world": camera_pos_world.copy(),
+            "gazebo_camera_quat_world": model_quat_world.copy(),
+            "gazebo_pose_ros_stamp_sec": int(stamp.sec),
+            "gazebo_pose_ros_stamp_nanosec": int(stamp.nanosec),
+            "gazebo_pose_wall_time": wall_time,
+            "gazebo_pose_selection_method": selection_method,
+        }
+        with self.gazebo_pose_lock:
+            self.latest_gazebo_pose = gazebo_pose
 
-        self.raw_dataset_saver.update_gazebo_pose(
-            model_pos_world=model_pos_world,
-            model_quat_world=model_quat_world,
-            camera_pos_world=camera_pos_world,
-            camera_quat_world=model_quat_world.copy(),
-            ros_stamp_sec=int(stamp.sec),
-            ros_stamp_nanosec=int(stamp.nanosec),
-            wall_time=time.time(),
-            selection_method=selection_method,
-        )
+        if self.raw_dataset_saver is not None:
+            self.raw_dataset_saver.update_gazebo_pose(
+                model_pos_world=model_pos_world,
+                model_quat_world=model_quat_world,
+                camera_pos_world=camera_pos_world,
+                camera_quat_world=model_quat_world.copy(),
+                ros_stamp_sec=int(stamp.sec),
+                ros_stamp_nanosec=int(stamp.nanosec),
+                wall_time=wall_time,
+                selection_method=selection_method,
+            )
+
+    def latest_gazebo_pose_snapshot(self):
+        with self.gazebo_pose_lock:
+            if self.latest_gazebo_pose is None:
+                return None
+            return {
+                key: value.copy() if isinstance(value, np.ndarray) else value
+                for key, value in self.latest_gazebo_pose.items()
+            }
 
 
 def ros_spin_thread(node):
@@ -453,6 +496,9 @@ async def main():
         math.radians(att0.yaw_deg),
     )
     telemetry.telemetry_rpy(start_orientation, start_orientation=start_orientation)
+    autonomy.initialize_perception_yaw_correction(
+        perception_node.latest_gazebo_pose_snapshot()
+    )
     raw_dataset_saver.telemetry_ready = True
 
     # Start live telemetry tasks
@@ -485,12 +531,25 @@ async def main():
         warmup_deadline = time.time() + 1.0
 
         while time.time() < warmup_deadline:
-            frame = perception_node.frame
+            (
+                frame,
+                image_stamp_sec,
+                image_stamp_nanosec,
+                image_received_wall_time,
+            ) = perception_node.latest_frame_snapshot()
             camera_matrix = perception_node.camera_matrix
             dist_coeffs = perception_node.dist_coeffs
 
             if frame is not None and camera_matrix is not None and dist_coeffs is not None:
-                result = autonomy.update_gate_memory_from_frame(frame, camera_matrix, dist_coeffs)
+                result = autonomy.update_gate_memory_from_frame(
+                    frame,
+                    camera_matrix,
+                    dist_coeffs,
+                    image_stamp_sec=image_stamp_sec,
+                    image_stamp_nanosec=image_stamp_nanosec,
+                    image_received_wall_time=image_received_wall_time,
+                    gazebo_pose=perception_node.latest_gazebo_pose_snapshot(),
+                )
 
                 gate_ready = (
                     result is not None
@@ -589,6 +648,7 @@ async def main():
             loop_start = time.time()
             loop_dt = loop_start - last_loop_time
             last_loop_time = loop_start
+            autonomy.reset_target_update_event_debug()
 
             mem_result = None
             replan_requested = False
@@ -602,7 +662,12 @@ async def main():
                 stale_command_suppressed = True
 
             if use_camera:
-                frame = perception_node.frame
+                (
+                    frame,
+                    image_stamp_sec,
+                    image_stamp_nanosec,
+                    image_received_wall_time,
+                ) = perception_node.latest_frame_snapshot()
                 camera_matrix = perception_node.camera_matrix
                 dist_coeffs = perception_node.dist_coeffs
 
@@ -619,12 +684,17 @@ async def main():
                     frame,
                     camera_matrix,
                     dist_coeffs,
+                    image_stamp_sec=image_stamp_sec,
+                    image_stamp_nanosec=image_stamp_nanosec,
+                    image_received_wall_time=image_received_wall_time,
+                    gazebo_pose=perception_node.latest_gazebo_pose_snapshot(),
                 )
 
             # -------------------------------------------------
             # 2) Replan only when it makes sense
             # -------------------------------------------------
             should_replan = False
+            requested_replan_reason = "scheduled"
 
             # A new future gate became usable for perception planning.
             if mem_result is not None and (
@@ -636,6 +706,7 @@ async def main():
             ):
                 print("New committed/stable gate -> replanning.")
                 should_replan = True
+                requested_replan_reason = "new_committed_or_stable_gate"
                 if use_perception:
                     autonomy.last_perception_replan_trigger = True
 
@@ -645,6 +716,7 @@ async def main():
                 and len(getattr(autonomy, "race_accepted_track_ids", [])) > 0
             ):
                 should_replan = True
+                requested_replan_reason = "no_active_target_with_race_order"
                 autonomy.last_perception_replan_trigger = True
 
             # Current active target passed
@@ -652,8 +724,19 @@ async def main():
             if gate_changed:
                 print("Active target advanced -> replanning.")
                 should_replan = True
+                requested_replan_reason = "active_target_advanced"
                 if use_perception:
                     autonomy.last_perception_replan_trigger = True
+
+            if (
+                use_perception
+                and not gate_changed
+                and autonomy.check_tentative_lookahead_new_candidate_replan()
+            ):
+                print("Eligible tentative lookahead appeared -> replanning future horizon.")
+                should_replan = True
+                requested_replan_reason = "tentative_lookahead_new_candidate"
+                autonomy.last_perception_replan_trigger = True
 
             if (
                 use_perception
@@ -662,6 +745,7 @@ async def main():
             ):
                 print("Active target shifted persistently -> replanning.")
                 should_replan = True
+                requested_replan_reason = "active_target_shift"
                 autonomy.last_perception_replan_trigger = True
 
             if (
@@ -671,12 +755,14 @@ async def main():
             ):
                 print("Tentative lookahead shifted persistently -> replanning future horizon.")
                 should_replan = True
+                requested_replan_reason = "tentative_lookahead_shift"
                 autonomy.last_perception_replan_trigger = True
 
             # Current trajectory finished
             if autonomy.planner.total_time > 0.0 and autonomy.time_elapsed >= autonomy.planner.total_time:
                 print("Trajectory horizon exhausted -> replanning.")
                 should_replan = True
+                requested_replan_reason = "trajectory_horizon_exhausted"
                 if use_perception:
                     autonomy.last_perception_replan_trigger = True
 
@@ -692,7 +778,7 @@ async def main():
                 hold_command = True
                 replan_started = time.time()
                 print(f"[REPLAN] start t={replan_started:.3f}")
-                ok = autonomy.path_plan()
+                ok = autonomy.path_plan(replan_reason=requested_replan_reason)
                 replan_duration = time.time() - replan_started
                 print(
                     f"[REPLAN] end duration={replan_duration:.3f}s "
@@ -794,6 +880,20 @@ async def main():
                 active_target_shift_replan_triggered=getattr(autonomy, "active_target_shift_replan_triggered", False),
                 active_target_center_at_plan=getattr(autonomy, "active_target_center_at_plan", None),
                 active_target_latest_filtered_center=getattr(autonomy, "active_target_latest_filtered_center", None),
+                target_update_event=getattr(autonomy, "target_update_event", False),
+                target_update_previous=getattr(autonomy, "target_update_previous", None),
+                target_update_new=getattr(autonomy, "target_update_new", None),
+                target_update_delta_m=getattr(autonomy, "target_update_delta_m", float("nan")),
+                target_update_source_track_id=getattr(
+                    autonomy, "target_update_source_track_id", None
+                ),
+                target_update_raw_detection_center=getattr(
+                    autonomy, "target_update_raw_detection_center", None
+                ),
+                target_update_filtered_track_center=getattr(
+                    autonomy, "target_update_filtered_track_center", None
+                ),
+                target_update_reason=getattr(autonomy, "target_update_reason", ""),
                 completed_gate_track_id=getattr(autonomy, "completed_gate_track_id", None),
                 yaw_target_source=getattr(autonomy, "yaw_target_source", ""),
                 target_retained_after_completion=getattr(autonomy, "target_retained_after_completion", False),
@@ -805,6 +905,16 @@ async def main():
                 gate_plane_crossed=getattr(autonomy, "gate_plane_crossed", False),
                 near_gate_but_not_crossed=getattr(autonomy, "near_gate_but_not_crossed", False),
                 completion_blocked_reason=getattr(autonomy, "completion_blocked_reason", ""),
+                crossing_true_gate_center=getattr(
+                    autonomy, "crossing_true_gate_center", None
+                ),
+                crossing_vehicle_position=getattr(
+                    autonomy, "crossing_vehicle_position", None
+                ),
+                crossing_error=getattr(autonomy, "crossing_error", None),
+                crossing_lateral_error_xz=getattr(
+                    autonomy, "crossing_lateral_error_xz", float("nan")
+                ),
                 no_active_target=getattr(autonomy, "no_active_target", False),
                 no_target_control_mode=getattr(autonomy, "no_target_control_mode", ""),
                 hold_anchor_source=getattr(autonomy, "hold_anchor_source", ""),
@@ -846,6 +956,38 @@ async def main():
                 tentative_lookahead_track_ids=getattr(autonomy, "tentative_lookahead_track_ids", []),
                 tentative_lookahead_centers=getattr(autonomy, "tentative_lookahead_centers", ""),
                 tentative_lookahead_rejection_reason=getattr(autonomy, "tentative_lookahead_rejection_reason", ""),
+                yolo_detection_count=getattr(autonomy, "yolo_detection_count", 0),
+                yolo_detection_confidences=getattr(autonomy, "yolo_detection_confidences", ""),
+                yolo_detection_bboxes=getattr(autonomy, "yolo_detection_bboxes", ""),
+                yolo_detection_keypoints=getattr(autonomy, "yolo_detection_keypoints", ""),
+                processed_detection_indices=getattr(autonomy, "processed_detection_indices", []),
+                yolo_raw_count=getattr(autonomy, "yolo_raw_count", 0),
+                pnp_success_count=getattr(autonomy, "pnp_success_count", 0),
+                world_valid_count=getattr(autonomy, "world_valid_count", 0),
+                memory_update_count=getattr(autonomy, "memory_update_count", 0),
+                tentative_track_count=getattr(autonomy, "tentative_track_count", 0),
+                tentative_lookahead_eligible_count=getattr(autonomy, "tentative_lookahead_eligible_count", 0),
+                lookahead_pipeline_debug=getattr(autonomy, "lookahead_pipeline_debug", ""),
+                perception_detection_flow=getattr(
+                    autonomy, "perception_detection_flow", ""
+                ),
+                yolo_confidence=getattr(autonomy, "yolo_confidence", ""),
+                quad_area_px2=getattr(autonomy, "quad_area_px2", ""),
+                old_area_confidence=getattr(autonomy, "old_area_confidence", ""),
+                memory_confidence_used=getattr(autonomy, "memory_confidence_used", ""),
+                memory_admission_threshold=getattr(autonomy, "memory_admission_threshold", ""),
+                memory_admission_passed=getattr(autonomy, "memory_admission_passed", ""),
+                planning_cycle_debug=getattr(autonomy, "planning_cycle_debug", ""),
+                planning_track_horizon_debug=getattr(
+                    autonomy, "planning_track_horizon_debug", ""
+                ),
+                tentative_lookahead_replan_requested=getattr(autonomy, "tentative_lookahead_replan_requested", False),
+                tentative_lookahead_replan_blocked_reason=getattr(autonomy, "tentative_lookahead_replan_blocked_reason", ""),
+                append_lookahead_called=getattr(autonomy, "append_lookahead_called", False),
+                append_lookahead_input_track_ids=getattr(autonomy, "append_lookahead_input_track_ids", []),
+                append_lookahead_selected_track_ids=getattr(autonomy, "append_lookahead_selected_track_ids", []),
+                append_lookahead_selected_centers=getattr(autonomy, "append_lookahead_selected_centers", ""),
+                append_lookahead_selected_types=getattr(autonomy, "append_lookahead_selected_types", ""),
                 planning_horizon_waypoint_types=getattr(autonomy, "planning_horizon_waypoint_types", ""),
                 tentative_lookahead_shift_m=getattr(autonomy, "tentative_lookahead_shift_m", float("nan")),
                 tentative_lookahead_shift_track_id=getattr(autonomy, "tentative_lookahead_shift_track_id", None),
@@ -877,10 +1019,42 @@ async def main():
                 merge_blocked_reason=getattr(autonomy, "merge_blocked_reason", ""),
                 rejected_track_temporary_vs_permanent=getattr(autonomy, "rejected_track_temporary_vs_permanent", ""),
                 active_target_admission_status=getattr(autonomy, "active_target_admission_status", ""),
+                promoted_lookahead_to_active=getattr(
+                    autonomy, "promoted_lookahead_to_active", False
+                ),
+                promoted_track_id=getattr(autonomy, "promoted_track_id", None),
+                promoted_track_center=getattr(autonomy, "promoted_track_center", None),
+                previous_horizon_track_ids=getattr(
+                    autonomy, "previous_horizon_track_ids", []
+                ),
+                previous_horizon_waypoint_types=getattr(
+                    autonomy, "previous_horizon_waypoint_types", ""
+                ),
+                lookahead_promotion_blocked_reason=getattr(
+                    autonomy, "promotion_blocked_reason", ""
+                ),
                 race_order_after_merge=getattr(autonomy, "race_order_after_merge", []),
                 tentative_track_ids=getattr(autonomy, "tentative_track_ids", []),
                 stable_track_ids=getattr(autonomy, "stable_track_ids", []),
                 race_admitted_track_ids=getattr(autonomy, "race_admitted_track_ids", []),
+                current_gate_candidate_track_ids=getattr(
+                    autonomy, "current_gate_candidate_track_ids", []
+                ),
+                selected_current_track_id=getattr(
+                    autonomy, "selected_current_track_id", None
+                ),
+                rejected_current_track_ids=getattr(
+                    autonomy, "rejected_current_track_ids", []
+                ),
+                current_selection_rejection_reason=getattr(
+                    autonomy, "current_selection_rejection_reason", ""
+                ),
+                future_lookahead_track_ids=getattr(
+                    autonomy, "future_lookahead_track_ids", []
+                ),
+                race_order_assignment_debug=getattr(
+                    autonomy, "race_order_assignment_debug", ""
+                ),
                 selected_next_gate_track_id=getattr(autonomy, "selected_next_gate_track_id", None),
                 selected_next_gate_stability_score=getattr(autonomy, "selected_next_gate_stability_score", float("nan")),
                 track_hits=getattr(autonomy, "track_observations", 0),
@@ -914,6 +1088,117 @@ async def main():
                 gate_normal_world=getattr(autonomy, "last_gate_normal_world", None),
                 gate_normal_camera=getattr(autonomy, "last_gate_normal_camera", None),
                 detection_drone_pose=getattr(autonomy, "last_detection_drone_pose", None),
+                detection_drone_yaw_deg=getattr(autonomy, "detection_drone_yaw_deg", float("nan")),
+                ros_image_stamp_sec=getattr(autonomy, "image_stamp_sec", 0),
+                ros_image_stamp_nanosec=getattr(autonomy, "image_stamp_nanosec", 0),
+                image_received_wall_time=getattr(autonomy, "image_received_wall_time", float("nan")),
+                image_processed_wall_time=getattr(autonomy, "image_processed_wall_time", float("nan")),
+                telemetry_position_sample_time=getattr(
+                    autonomy, "telemetry_position_sample_time", float("nan")
+                ),
+                telemetry_attitude_sample_time=getattr(
+                    autonomy, "telemetry_attitude_sample_time", float("nan")
+                ),
+                image_age_s=getattr(autonomy, "image_age_s", float("nan")),
+                attitude_age_s=getattr(autonomy, "attitude_age_s", float("nan")),
+                position_age_s=getattr(autonomy, "position_age_s", float("nan")),
+                pose_age_relative_to_image_s=getattr(
+                    autonomy, "pose_age_relative_to_image_s", float("nan")
+                ),
+                bearing_to_gate_deg=getattr(autonomy, "bearing_to_gate_deg", float("nan")),
+                telemetry_yaw_deg_for_image=getattr(
+                    autonomy, "telemetry_yaw_deg_for_image", float("nan")
+                ),
+                yaw_error_deg=getattr(autonomy, "yaw_error_deg", float("nan")),
+                predicted_quad_offset_from_yaw_px=getattr(
+                    autonomy, "predicted_quad_offset_from_yaw_px", float("nan")
+                ),
+                yaw_pixel_error_px=getattr(autonomy, "yaw_pixel_error_px", float("nan")),
+                yaw_image_consistency_status=getattr(
+                    autonomy, "yaw_image_consistency_status", ""
+                ),
+                gazebo_model_pos=getattr(autonomy, "gazebo_model_pos_world", None),
+                gazebo_model_yaw_deg=getattr(autonomy, "gazebo_model_yaw_deg", float("nan")),
+                gazebo_camera_pos=getattr(autonomy, "gazebo_camera_pos_world", None),
+                gazebo_camera_yaw_deg=getattr(autonomy, "gazebo_camera_yaw_deg", float("nan")),
+                mavsdk_pos=(
+                    getattr(autonomy, "last_detection_drone_pose", None)[:3]
+                    if getattr(autonomy, "last_detection_drone_pose", None) is not None
+                    else None
+                ),
+                mavsdk_yaw_deg=getattr(autonomy, "detection_drone_yaw_deg", float("nan")),
+                mavsdk_minus_gazebo_pos=getattr(
+                    autonomy, "mavsdk_minus_gazebo_pos", None
+                ),
+                mavsdk_minus_gazebo_yaw_deg=getattr(
+                    autonomy, "mavsdk_minus_gazebo_yaw_deg", float("nan")
+                ),
+                gazebo_pose_age_s=getattr(autonomy, "gazebo_pose_age_s", float("nan")),
+                gate_world_mavsdk=getattr(autonomy, "gate_world_mavsdk", None),
+                gate_world_gazebo=getattr(autonomy, "gate_world_gazebo", None),
+                gate_world_mavsdk_error_to_gt=getattr(
+                    autonomy, "gate_world_mavsdk_error_to_gt", float("nan")
+                ),
+                gate_world_gazebo_error_to_gt=getattr(
+                    autonomy, "gate_world_gazebo_error_to_gt", float("nan")
+                ),
+                required_yaw_deg_from_pnp_to_gt=getattr(
+                    autonomy, "required_yaw_deg_from_pnp_to_gt", float("nan")
+                ),
+                mavsdk_yaw_minus_required_deg=getattr(
+                    autonomy, "mavsdk_yaw_minus_required_deg", float("nan")
+                ),
+                gazebo_yaw_minus_required_deg=getattr(
+                    autonomy, "gazebo_yaw_minus_required_deg", float("nan")
+                ),
+                telemetry_yaw_raw_deg=getattr(
+                    autonomy, "telemetry_yaw_raw_deg", float("nan")
+                ),
+                telemetry_yaw_perception_deg=getattr(
+                    autonomy, "telemetry_yaw_perception_deg", float("nan")
+                ),
+                perception_yaw_correction_deg=math.degrees(
+                    float(getattr(autonomy, "active_perception_yaw_correction_rad", float("nan")))
+                ),
+                gazebo_yaw_deg=getattr(autonomy, "gazebo_model_yaw_deg", float("nan")),
+                expected_planner_yaw_from_gazebo_deg=getattr(
+                    autonomy, "expected_planner_yaw_from_gazebo_deg", float("nan")
+                ),
+                dynamic_expected_planner_yaw_from_gazebo_deg=getattr(
+                    autonomy,
+                    "dynamic_expected_planner_yaw_from_gazebo_deg",
+                    float("nan"),
+                ),
+                raw_yaw_minus_dynamic_gazebo_expected_deg=getattr(
+                    autonomy,
+                    "raw_yaw_minus_dynamic_gazebo_expected_deg",
+                    float("nan"),
+                ),
+                perception_yaw_minus_dynamic_gazebo_expected_deg=getattr(
+                    autonomy,
+                    "perception_yaw_minus_dynamic_gazebo_expected_deg",
+                    float("nan"),
+                ),
+                dynamic_correction_deg=math.degrees(
+                    float(
+                        getattr(
+                            autonomy,
+                            "dynamic_gazebo_perception_yaw_correction_rad",
+                            float("nan"),
+                        )
+                    )
+                ),
+                use_dynamic_gazebo_perception_yaw_correction=getattr(
+                    autonomy,
+                    "use_dynamic_gazebo_perception_yaw_correction",
+                    False,
+                ),
+                gate_world_uncorrected=getattr(
+                    autonomy, "gate_world_uncorrected", None
+                ),
+                gate_world_corrected=getattr(
+                    autonomy, "gate_world_corrected", None
+                ),
                 reprojection_error=getattr(autonomy, "last_reprojection_error", float("nan")),
                 reprojected_corners=getattr(autonomy, "last_reprojected_image_corners", None),
                 corner_reprojection_error_px=getattr(
@@ -950,6 +1235,9 @@ async def main():
                 ),
                 pnp_selected_reason=getattr(autonomy, "pnp_selected_reason", ""),
                 pnp_candidate_summary=getattr(autonomy, "pnp_candidate_summary", ""),
+                pnp_candidate_world_summary=getattr(autonomy, "pnp_candidate_world_summary", ""),
+                pnp_selected_world_score=getattr(autonomy, "pnp_selected_world_score", float("nan")),
+                pnp_selected_world_reason=getattr(autonomy, "pnp_selected_world_reason", ""),
                 allow_pnp_corner_reordering=getattr(
                     autonomy,
                     "allow_pnp_corner_reordering",
@@ -1011,10 +1299,34 @@ async def main():
                     "last_body_to_world_method_used",
                     "",
                 ),
+                expected_camera_axis_mode=getattr(autonomy, "expected_camera_axis_mode", ""),
+                live_camera_axis_mode_for_expected=getattr(autonomy, "live_camera_axis_mode", ""),
+                expected_uses_live_axis_convention=getattr(
+                    autonomy,
+                    "expected_uses_live_axis_convention",
+                    False,
+                ),
+                expected_gate_cam_live_axis=getattr(autonomy, "expected_gate_cam_live_axis", None),
+                expected_gate_cam_old_axis=getattr(autonomy, "expected_gate_cam_old_axis", None),
                 expected_gate_cam=getattr(autonomy, "expected_gate_cam", None),
+                pnp_camera=getattr(autonomy, "pnp_camera", None),
                 pnp_gate_cam=getattr(autonomy, "pnp_gate_cam", None),
                 camera_error=getattr(autonomy, "camera_error", None),
                 camera_error_norm=getattr(autonomy, "camera_error_norm", float("nan")),
+                size_depth=getattr(autonomy, "size_depth", float("nan")),
+                size_depth_from_width=getattr(autonomy, "size_depth_from_width", float("nan")),
+                size_depth_from_height=getattr(autonomy, "size_depth_from_height", float("nan")),
+                pnp_depth_minus_size_depth=getattr(autonomy, "pnp_depth_minus_size_depth", float("nan")),
+                expected_gate_projected_center=getattr(
+                    autonomy,
+                    "expected_gate_projected_center",
+                    None,
+                ),
+                expected_vs_quad_center_error_px=getattr(
+                    autonomy,
+                    "expected_vs_quad_center_error_px",
+                    float("nan"),
+                ),
                 expected_gate_body=getattr(autonomy, "expected_gate_body", None),
                 pnp_gate_body=getattr(autonomy, "pnp_gate_body", None),
                 body_error=getattr(autonomy, "body_error", None),

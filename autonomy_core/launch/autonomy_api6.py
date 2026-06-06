@@ -204,6 +204,13 @@ class AutonomyAPI:
         self.skipped_target_clear_after_completion = False
         self.next_track_after_completion_id = None
         self.next_target_installed_same_cycle = False
+        self.promoted_lookahead_to_active = False
+        self.promoted_track_id = None
+        self.promoted_track_center = np.full(3, np.nan, dtype=float)
+        self.previous_horizon_track_ids = []
+        self.previous_horizon_waypoint_types = ""
+        self.promotion_blocked_reason = ""
+        self.pending_lookahead_handoff = None
         self.target_clear_reason = ""
         self.post_completion_grace_suppressed = False
         self.use_passthrough_gate_velocities = True
@@ -224,6 +231,13 @@ class AutonomyAPI:
             "physical_mavsdk_yaw_aligned",
         )
         self.print_perception_transform_startup()
+        print(
+            "[LOOKAHEAD POLICY] active_target_shift applies only to the current "
+            "active target; non-active detections update GateMemory before activation; "
+            "an early lookahead center can later seed the active target; soft_tentative "
+            "controls admission/type only and is passed to the same minimum-snap waypoint "
+            "solver once included."
+        )
         self.use_tentative_lookahead_spline = True
         self.lookahead_min_hits = 3
         self.lookahead_min_confidence_sum = 0.8
@@ -252,6 +266,38 @@ class AutonomyAPI:
         self.tentative_lookahead_track_ids = []
         self.tentative_lookahead_centers = ""
         self.tentative_lookahead_rejection_reason = ""
+        self.yolo_detection_count = 0
+        self.yolo_detection_confidences = ""
+        self.yolo_detection_bboxes = ""
+        self.yolo_detection_keypoints = ""
+        self.processed_detection_indices = []
+        self.yolo_raw_count = 0
+        self.pnp_success_count = 0
+        self.world_valid_count = 0
+        self.memory_update_count = 0
+        self.tentative_track_count = 0
+        self.tentative_lookahead_eligible_count = 0
+        self.tentative_lookahead_eligible_track_ids = []
+        self.tentative_lookahead_replan_requested = False
+        self.tentative_lookahead_replan_blocked_reason = ""
+        self.append_lookahead_called = False
+        self.append_lookahead_input_track_ids = []
+        self.append_lookahead_selected_track_ids = []
+        self.append_lookahead_selected_centers = ""
+        self.append_lookahead_selected_types = ""
+        self.lookahead_pipeline_reasons = ""
+        self.lookahead_pipeline_debug = "raw=0,pnp=0,valid=0,mem=0,tentative=0,eligible=0,used=0,reasons="
+        self.perception_detection_flow = ""
+        self.perception_detection_flow_entries = {}
+        self.yolo_confidence = ""
+        self.quad_area_px2 = ""
+        self.old_area_confidence = ""
+        self.memory_confidence_used = ""
+        self.memory_admission_threshold = ""
+        self.memory_admission_passed = ""
+        self.planning_track_horizon_debug = ""
+        self.planning_cycle_debug = ""
+        self.horizon_track_decisions = {}
         self.tentative_lookahead_centers_at_plan = {}
         self.tentative_lookahead_shift_m = float("nan")
         self.tentative_lookahead_shift_track_id = None
@@ -296,6 +342,12 @@ class AutonomyAPI:
         self.tentative_track_ids = []
         self.stable_track_ids = []
         self.race_admitted_track_ids = []
+        self.current_gate_candidate_track_ids = []
+        self.selected_current_track_id = None
+        self.rejected_current_track_ids = []
+        self.current_selection_rejection_reason = ""
+        self.future_lookahead_track_ids = []
+        self.race_order_assignment_debug = ""
         self.selected_next_gate_track_id = None
         self.selected_next_gate_stability_score = float("nan")
         self.track_history_len = 0
@@ -342,6 +394,55 @@ class AutonomyAPI:
         self.last_quad_area_px = float("nan")
         self.last_detection_drone_pose = None
         self.last_telemetry_rpy_raw_rad = None
+        self.image_stamp_sec = 0
+        self.image_stamp_nanosec = 0
+        self.image_received_wall_time = float("nan")
+        self.image_processed_wall_time = float("nan")
+        self.telemetry_position_sample_time = float("nan")
+        self.telemetry_attitude_sample_time = float("nan")
+        self.image_age_s = float("nan")
+        self.attitude_age_s = float("nan")
+        self.position_age_s = float("nan")
+        self.pose_age_relative_to_image_s = float("nan")
+        self.detection_drone_yaw_deg = float("nan")
+        self.bearing_to_gate_deg = float("nan")
+        self.telemetry_yaw_deg_for_image = float("nan")
+        self.yaw_error_deg = float("nan")
+        self.predicted_quad_offset_from_yaw_px = float("nan")
+        self.yaw_pixel_error_px = float("nan")
+        self.yaw_image_consistency_status = ""
+        self.gazebo_model_pos_world = np.full(3, np.nan, dtype=float)
+        self.gazebo_model_quat_world = np.full(4, np.nan, dtype=float)
+        self.gazebo_camera_pos_world = np.full(3, np.nan, dtype=float)
+        self.gazebo_camera_quat_world = np.full(4, np.nan, dtype=float)
+        self.gazebo_pose_wall_time = float("nan")
+        self.gazebo_pose_age_s = float("nan")
+        self.gazebo_model_yaw_deg = float("nan")
+        self.gazebo_camera_yaw_deg = float("nan")
+        self.mavsdk_minus_gazebo_pos = np.full(3, np.nan, dtype=float)
+        self.mavsdk_minus_gazebo_yaw_deg = float("nan")
+        self.gate_world_mavsdk = np.full(3, np.nan, dtype=float)
+        self.gate_world_gazebo = np.full(3, np.nan, dtype=float)
+        self.gate_world_mavsdk_error_to_gt = float("nan")
+        self.gate_world_gazebo_error_to_gt = float("nan")
+        self.required_yaw_deg_from_pnp_to_gt = float("nan")
+        self.mavsdk_yaw_minus_required_deg = float("nan")
+        self.gazebo_yaw_minus_required_deg = float("nan")
+        self.gate_world_uncorrected = np.full(3, np.nan, dtype=float)
+        self.gate_world_corrected = np.full(3, np.nan, dtype=float)
+        self.perception_yaw_correction_rad = 0.0
+        self.perception_yaw_correction_initialized = False
+        self.use_dynamic_gazebo_perception_yaw_correction = True
+        self.dynamic_gazebo_perception_yaw_correction_rad = float("nan")
+        self.active_perception_yaw_correction_rad = 0.0
+        self.telemetry_yaw_raw_deg = float("nan")
+        self.telemetry_yaw_perception_deg = float("nan")
+        self.expected_planner_yaw_from_gazebo_deg = float("nan")
+        self.dynamic_expected_planner_yaw_from_gazebo_deg = float("nan")
+        self.raw_yaw_minus_dynamic_gazebo_expected_deg = float("nan")
+        self.perception_yaw_minus_dynamic_gazebo_expected_deg = float("nan")
+        self.gate_world_uncorrected = np.full(3, np.nan, dtype=float)
+        self.gate_world_corrected = np.full(3, np.nan, dtype=float)
         self.perception_rpy_debug_frames_remaining = 5
         self.transform_sweep_error_stats = {}
         self.last_transform_source = ""
@@ -371,6 +472,9 @@ class AutonomyAPI:
         self.pnp_selected_gate_center_camera = None
         self.pnp_selected_reason = ""
         self.pnp_candidate_summary = ""
+        self.pnp_candidate_world_summary = ""
+        self.pnp_selected_world_score = float("nan")
+        self.pnp_selected_world_reason = ""
         self.allow_pnp_corner_reordering = False
         self.pnp_live_candidate_orders_allowed = ""
         self.pnp_debug_best_order = ""
@@ -448,6 +552,18 @@ class AutonomyAPI:
         self.completion_blocked_reason = ""
         self.gate_pass_radius = 0.75
         self.gate_progress_threshold = 0.2
+        self.target_update_event = False
+        self.target_update_previous = np.full(3, np.nan, dtype=float)
+        self.target_update_new = np.full(3, np.nan, dtype=float)
+        self.target_update_delta_m = float("nan")
+        self.target_update_source_track_id = None
+        self.target_update_raw_detection_center = np.full(3, np.nan, dtype=float)
+        self.target_update_filtered_track_center = np.full(3, np.nan, dtype=float)
+        self.target_update_reason = ""
+        self.crossing_true_gate_center = np.full(3, np.nan, dtype=float)
+        self.crossing_vehicle_position = np.full(3, np.nan, dtype=float)
+        self.crossing_error = np.full(3, np.nan, dtype=float)
+        self.crossing_lateral_error_xz = float("nan")
 
     # -------------------------------------------------------------------------
     # Time allocation helpers
@@ -587,6 +703,16 @@ class AutonomyAPI:
             return False
         return any(err <= self.lookahead_max_reprojection_error for err in finite_errors)
 
+    def _track_reprojection_rejection_for_tentative_lookahead(self, tr):
+        mean = float(getattr(tr, "reprojection_error_mean", np.nan))
+        median = float(getattr(tr, "reprojection_error_median", np.nan))
+        threshold = float(self.lookahead_max_reprojection_error)
+        if np.isfinite(mean) and mean > threshold:
+            return "reprojection_error_mean_high"
+        if np.isfinite(median) and median > threshold:
+            return "reprojection_error_median_high"
+        return "tentative_reprojection_error_high"
+
     def _is_duplicate_of_committed_or_stable_track(self, track_id, center):
         center = np.asarray(center, dtype=float).reshape(3)
         for other in self.gate_memory.tracks:
@@ -628,7 +754,7 @@ class AutonomyAPI:
         if float(getattr(tr, "confidence_sum", 0.0)) < self.lookahead_min_confidence_sum:
             return "tentative_insufficient_confidence"
         if not self._track_reprojection_ok_for_tentative_lookahead(tr):
-            return "tentative_reprojection_error_high"
+            return self._track_reprojection_rejection_for_tentative_lookahead(tr)
         if float(np.linalg.norm(center - current_pos)) > self.lookahead_max_distance:
             return "tentative_too_far"
         return ""
@@ -642,11 +768,22 @@ class AutonomyAPI:
         max_gates_ahead,
         allow_raw_candidates,
     ):
+        self.append_lookahead_called = True
+        self.append_lookahead_input_track_ids = [
+            int(getattr(tr, "id", -1))
+            for tr in sorted(self.gate_memory.tracks, key=lambda tr: tr.id)
+        ]
+        self.append_lookahead_selected_track_ids = []
+        self.append_lookahead_selected_centers = ""
+        self.append_lookahead_selected_types = ""
+        initial_selected_count = len(target_track_ids)
         if not self.use_planning_lookahead_tracks:
+            self.tentative_lookahead_rejection_reason = "append_disabled"
             return target_gates, target_track_ids, target_waypoint_types
 
         remaining = int(max_gates_ahead) - len(target_gates)
         if remaining <= 0:
+            self.tentative_lookahead_rejection_reason = "append_no_remaining_slots"
             return target_gates, target_track_ids, target_waypoint_types
 
         now = time.time()
@@ -662,10 +799,15 @@ class AutonomyAPI:
                 break
             track_id = self.canonical_track_id(tr.id)
             if track_id is None or track_id in selected_ids:
+                if track_id is not None and track_id in selected_ids:
+                    self.horizon_track_decisions.setdefault(
+                        track_id, "included:hard_current_or_stable"
+                    )
                 continue
             if track_id in self.completed_track_ids_this_cycle:
                 self.horizon_rejected_track_ids.append(track_id)
                 self.horizon_rejection_reason = "completed_this_lap"
+                self.horizon_track_decisions[track_id] = "excluded:completed_this_lap"
                 continue
 
             is_hard_lookahead = bool(getattr(tr, "committed", False) or getattr(tr, "is_stable", False))
@@ -678,29 +820,35 @@ class AutonomyAPI:
             if center_source is None:
                 self.horizon_rejected_track_ids.append(track_id)
                 self.horizon_rejection_reason = "lookahead_missing_center"
+                self.horizon_track_decisions[track_id] = "excluded:lookahead_missing_center"
                 continue
             center, reason = self._planning_target_safe_center(center_source)
             if center is None:
                 self.horizon_rejected_track_ids.append(track_id)
                 self.horizon_rejection_reason = reason
+                self.horizon_track_decisions[track_id] = f"excluded:{reason}"
                 continue
             waypoint_type = "hard_stable"
             if is_hard_lookahead:
                 if tr.hits < self.planning_lookahead_min_hits:
                     self.horizon_rejected_track_ids.append(track_id)
                     self.horizon_rejection_reason = "lookahead_insufficient_hits"
+                    self.horizon_track_decisions[track_id] = "excluded:lookahead_insufficient_hits"
                     continue
                 if self.is_near_completed_gate(center):
                     self.horizon_rejected_track_ids.append(track_id)
                     self.horizon_rejection_reason = "lookahead_completed_this_lap"
+                    self.horizon_track_decisions[track_id] = "excluded:lookahead_completed_this_lap"
                     continue
                 if any(float(np.linalg.norm(center - p)) < self.gate_memory.commit_radius for p in existing_points):
                     self.horizon_rejected_track_ids.append(track_id)
                     self.horizon_rejection_reason = "lookahead_duplicate_selected"
+                    self.horizon_track_decisions[track_id] = "excluded:lookahead_duplicate_selected"
                     continue
                 if float(np.linalg.norm(center - current_pos)) > self.max_detection_range:
                     self.horizon_rejected_track_ids.append(track_id)
                     self.horizon_rejection_reason = "lookahead_too_far"
+                    self.horizon_track_decisions[track_id] = "excluded:lookahead_too_far"
                     continue
             else:
                 reason = self._tentative_lookahead_rejection(
@@ -715,6 +863,7 @@ class AutonomyAPI:
                     self.horizon_rejected_track_ids.append(track_id)
                     self.horizon_rejection_reason = reason
                     self.tentative_lookahead_rejection_reason = reason
+                    self.horizon_track_decisions[track_id] = f"excluded:{reason}"
                     continue
                 waypoint_type = "soft_tentative"
 
@@ -724,6 +873,7 @@ class AutonomyAPI:
             selected_ids.add(track_id)
             existing_points.append(center.copy())
             self.planning_lookahead_track_ids.append(track_id)
+            self.horizon_track_decisions[track_id] = f"included:{waypoint_type}"
             if waypoint_type == "soft_tentative":
                 self.tentative_lookahead_used = True
                 self.tentative_lookahead_track_ids.append(track_id)
@@ -757,9 +907,68 @@ class AutonomyAPI:
                 lookahead_sources.append("raw_rejected_clamped")
                 remaining -= 1
 
+        appended_ids = target_track_ids[initial_selected_count:]
+        appended_gates = target_gates[initial_selected_count:]
+        appended_types = target_waypoint_types[initial_selected_count:]
+        self.append_lookahead_selected_track_ids = list(appended_ids)
+        self.append_lookahead_selected_centers = ";".join(
+            f"{track_id}:{gate[0]:.2f},{gate[1]:.2f},{gate[2]:.2f}"
+            for gate, track_id in zip(appended_gates, appended_ids)
+        )
+        self.append_lookahead_selected_types = " ".join(str(t) for t in appended_types)
+        if (
+            int(getattr(self, "tentative_lookahead_eligible_count", 0)) > 0
+            and not self.tentative_lookahead_used
+            and not self.tentative_lookahead_rejection_reason
+        ):
+            self.tentative_lookahead_rejection_reason = (
+                self.horizon_rejection_reason
+                or "eligible_tentative_not_selected"
+            )
         self.planning_lookahead_used = len(lookahead_sources) > 0
         self.planning_lookahead_source = " ".join(lookahead_sources)
         return target_gates, target_track_ids, target_waypoint_types
+
+    def finalize_planning_horizon_debug(self):
+        selected = {
+            self.canonical_track_id(tid)
+            for tid in self.active_target_track_ids + self.planning_lookahead_track_ids
+            if tid is not None
+        }
+        parts = []
+        for tr in sorted(self.gate_memory.tracks, key=lambda item: item.id):
+            tid = self.canonical_track_id(tr.id)
+            center = getattr(tr, "filtered_center_world", None)
+            if center is None:
+                center = getattr(tr, "center", np.full(3, np.nan))
+            center = np.asarray(center, dtype=float).reshape(3)
+            state = "stable" if getattr(tr, "is_stable", False) else "tentative"
+            decision = self.horizon_track_decisions.get(tid)
+            if decision is None:
+                decision = (
+                    "included:selected_horizon"
+                    if tid in selected
+                    else "excluded:not_selected_by_race_or_lookahead_policy"
+                )
+            parts.append(
+                f"track{tid}:state={state},center={center[0]:.2f}/{center[1]:.2f}/{center[2]:.2f},"
+                f"decision={decision}"
+            )
+        self.planning_track_horizon_debug = ";".join(parts)
+        active_center = (
+            np.asarray(self.active_target_center, dtype=float).reshape(3)
+            if self.active_target_center is not None
+            else np.full(3, np.nan)
+        )
+        self.planning_cycle_debug = (
+            f"gate_idx={self.current_gate_idx},active_track={self.active_target_track_id},"
+            f"active={active_center[0]:.2f}/{active_center[1]:.2f}/{active_center[2]:.2f},"
+            f"lookahead_ids={'/'.join(map(str,self.planning_lookahead_track_ids))},"
+            f"lookahead_centers={self.append_lookahead_selected_centers},"
+            f"types={self.planning_horizon_waypoint_types},"
+            f"tracks={self.planning_track_horizon_debug}"
+        )
+        print("[PLANNING FLOW] " + self.planning_cycle_debug)
 
     # -------------------------------------------------------------------------
     # Perception / memory
@@ -782,7 +991,12 @@ class AutonomyAPI:
         self.current_gate_pos = np.asarray(result["center"], dtype=float)
         return self.current_gate_pos.copy()
 
-    def perception_rpy_for_mode(self, telemetry_rpy_raw_rad, mode):
+    def perception_rpy_for_mode(
+        self,
+        telemetry_rpy_raw_rad,
+        mode,
+        apply_yaw_correction=True,
+    ):
         """
         Temporary transform-convention switch.
 
@@ -791,6 +1005,8 @@ class AutonomyAPI:
         scaled those radians by pi/180 before the camera-to-world transform.
         """
         roll, pitch, yaw = np.asarray(telemetry_rpy_raw_rad, dtype=float).reshape(3)
+        if apply_yaw_correction:
+            yaw = self.wrap_pi(yaw + self.active_perception_yaw_correction_rad)
         mode = str(mode or "legacy_scaled_yaw")
 
         if mode == "legacy_scaled_yaw":
@@ -810,6 +1026,93 @@ class AutonomyAPI:
 
         print(f"[PERCEPTION TRANSFORM WARN] unknown mode={mode}; using legacy_scaled_yaw")
         return np.array([roll, pitch, yaw], dtype=float) * np.pi / 180.0
+
+    @staticmethod
+    def wrap_pi(angle):
+        return (float(angle) + np.pi) % (2.0 * np.pi) - np.pi
+
+    def initialize_perception_yaw_correction(self, gazebo_pose=None):
+        if self.perception_yaw_correction_initialized or not isinstance(gazebo_pose, dict):
+            return False
+        try:
+            gazebo_quat = np.asarray(
+                gazebo_pose["gazebo_model_quat_world"], dtype=float
+            ).reshape(4)
+            gazebo_yaw_rad = math.radians(
+                self._quaternion_xyzw_yaw_deg(gazebo_quat)
+            )
+            telemetry_yaw_raw = float(self.telemetry.rpy["yaw"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not np.isfinite(gazebo_yaw_rad) or not np.isfinite(telemetry_yaw_raw):
+            return False
+
+        expected_planner_yaw = self.wrap_pi((np.pi / 2.0) - gazebo_yaw_rad)
+        self.perception_yaw_correction_rad = self.wrap_pi(
+            expected_planner_yaw - telemetry_yaw_raw
+        )
+        self.active_perception_yaw_correction_rad = self.perception_yaw_correction_rad
+        self.expected_planner_yaw_from_gazebo_deg = math.degrees(
+            expected_planner_yaw
+        )
+        self.perception_yaw_correction_initialized = True
+        if hasattr(self.telemetry, "set_perception_yaw_correction"):
+            self.telemetry.set_perception_yaw_correction(
+                self.perception_yaw_correction_rad
+            )
+        print(
+            "[PERCEPTION YAW CORRECTION] "
+            f"raw_deg={math.degrees(telemetry_yaw_raw):.3f} "
+            f"gazebo_deg={math.degrees(gazebo_yaw_rad):.3f} "
+            f"expected_planner_deg={self.expected_planner_yaw_from_gazebo_deg:.3f} "
+            f"correction_deg={math.degrees(self.perception_yaw_correction_rad):.3f}"
+        )
+        return True
+
+    def update_dynamic_gazebo_perception_yaw_correction(
+        self,
+        gazebo_pose,
+        telemetry_yaw_raw_rad,
+    ):
+        self.dynamic_gazebo_perception_yaw_correction_rad = float("nan")
+        self.dynamic_expected_planner_yaw_from_gazebo_deg = float("nan")
+        self.raw_yaw_minus_dynamic_gazebo_expected_deg = float("nan")
+        self.perception_yaw_minus_dynamic_gazebo_expected_deg = float("nan")
+        self.active_perception_yaw_correction_rad = self.perception_yaw_correction_rad
+
+        if not isinstance(gazebo_pose, dict):
+            return
+        try:
+            gazebo_quat = np.asarray(
+                gazebo_pose["gazebo_model_quat_world"], dtype=float
+            ).reshape(4)
+            gazebo_yaw_deg = self._quaternion_xyzw_yaw_deg(gazebo_quat)
+        except (KeyError, TypeError, ValueError):
+            return
+        if not np.isfinite(gazebo_yaw_deg) or not np.isfinite(telemetry_yaw_raw_rad):
+            return
+
+        gazebo_yaw_rad = math.radians(gazebo_yaw_deg)
+        expected_yaw = self.wrap_pi((np.pi / 2.0) - gazebo_yaw_rad)
+        dynamic_correction = self.wrap_pi(
+            expected_yaw - float(telemetry_yaw_raw_rad)
+        )
+        self.dynamic_expected_planner_yaw_from_gazebo_deg = math.degrees(
+            expected_yaw
+        )
+        self.dynamic_gazebo_perception_yaw_correction_rad = dynamic_correction
+        self.raw_yaw_minus_dynamic_gazebo_expected_deg = self._wrap_degrees(
+            math.degrees(float(telemetry_yaw_raw_rad) - expected_yaw)
+        )
+        if self.use_dynamic_gazebo_perception_yaw_correction:
+            self.active_perception_yaw_correction_rad = dynamic_correction
+        perception_yaw = self.wrap_pi(
+            float(telemetry_yaw_raw_rad)
+            + self.active_perception_yaw_correction_rad
+        )
+        self.perception_yaw_minus_dynamic_gazebo_expected_deg = self._wrap_degrees(
+            math.degrees(perception_yaw - expected_yaw)
+        )
 
     def body_camera_matrix_for_mode(self, mode, default_matrix=None):
         if mode == "legacy_scaled_yaw":
@@ -877,6 +1180,230 @@ class AutonomyAPI:
         return world, gate_body, rpy
 
     @staticmethod
+    def _safe_norm(vec):
+        vec = np.asarray(vec, dtype=float).reshape(-1)
+        return float(np.linalg.norm(vec)) if np.all(np.isfinite(vec)) else float("nan")
+
+    def _track_reference_points_for_candidate_selection(self):
+        refs = []
+        for tr in getattr(self.gate_memory, "tracks", []):
+            points = []
+            center = getattr(tr, "filtered_center_world", None)
+            if center is None:
+                center = getattr(tr, "center", None)
+            if center is not None:
+                points.append(np.asarray(center, dtype=float).reshape(3))
+            for obs in list(getattr(tr, "obs_history", []))[-5:]:
+                points.append(np.asarray(obs.center_world, dtype=float).reshape(3))
+            finite_points = [p for p in points if np.all(np.isfinite(p))]
+            if finite_points:
+                refs.append((tr, finite_points))
+        return refs
+
+    def _temporal_candidate_distance(self, world, track_refs):
+        best_dist = float("nan")
+        best_track_id = None
+        world = np.asarray(world, dtype=float).reshape(3)
+        for tr, points in track_refs:
+            for point in points:
+                dist = float(np.linalg.norm(world - point))
+                if not np.isfinite(best_dist) or dist < best_dist:
+                    best_dist = dist
+                    best_track_id = getattr(tr, "id", None)
+        return best_dist, best_track_id
+
+    def _route_direction_for_candidate_selection(self, current_pos):
+        if self.active_target_center is not None:
+            target = np.asarray(self.active_target_center, dtype=float).reshape(3)
+        elif self.last_valid_target is not None:
+            target = np.asarray(self.last_valid_target, dtype=float).reshape(3)
+        else:
+            target = None
+        if target is None:
+            return None
+        vec = target - np.asarray(current_pos, dtype=float).reshape(3)
+        norm = float(np.linalg.norm(vec))
+        if norm < 1e-6:
+            return None
+        return vec / norm
+
+    def select_pnp_candidate_for_live_geometry(
+        self,
+        det,
+        drone_pos,
+        telemetry_rpy_raw_rad,
+        expected_gate_world=None,
+    ):
+        candidates = det.get("pnp_candidates", [])
+        if not isinstance(candidates, list) or len(candidates) == 0:
+            self.pnp_candidate_world_summary = ""
+            return det
+
+        r_body_camera = self.body_camera_matrix_for_mode(self.perception_transform_mode)
+        rpy = self.perception_rpy_for_mode(telemetry_rpy_raw_rad, self.perception_transform_mode)
+        r_wb = self.perception_node._rpy_to_rotmat(float(rpy[0]), float(rpy[1]), float(rpy[2]))
+        current_pos = np.asarray(drone_pos, dtype=float).reshape(3)
+        route_dir = self._route_direction_for_candidate_selection(current_pos)
+        track_refs = self._track_reference_points_for_candidate_selection()
+        expected_gate_world = (
+            np.asarray(expected_gate_world, dtype=float).reshape(3)
+            if expected_gate_world is not None
+            else None
+        )
+
+        evaluated = []
+        for cand in candidates:
+            cam = np.asarray(cand.get("tvec", np.full(3, np.nan)), dtype=float).reshape(3)
+            normal_camera = np.asarray(cand.get("normal", np.full(3, np.nan)), dtype=float).reshape(3)
+            if not np.all(np.isfinite(cam)):
+                continue
+            gate_body = r_body_camera @ cam
+            world = current_pos + r_wb @ (self.camera_offset_body + gate_body)
+            normal_body = r_body_camera @ normal_camera if np.all(np.isfinite(normal_camera)) else np.full(3, np.nan)
+            normal_world = r_wb @ normal_body if np.all(np.isfinite(normal_body)) else np.full(3, np.nan)
+            if np.all(np.isfinite(normal_world)):
+                normal_world = normal_world / (np.linalg.norm(normal_world) + 1e-12)
+
+            reproj = float(cand.get("error", np.nan))
+            size_depth_error = abs(float(cand.get("depth_disagreement", np.nan)))
+            if not np.isfinite(size_depth_error):
+                size_depth_error = abs(float(cand.get("depth", np.nan)) - float(cand.get("size_depth", np.nan)))
+            if not np.isfinite(size_depth_error):
+                size_depth_error = 0.0
+
+            z_error = abs(float(world[2]) - 1.45) if np.isfinite(world[2]) else 10.0
+            dist_vehicle = float(np.linalg.norm(world - current_pos)) if np.all(np.isfinite(world)) else 1e3
+            range_penalty = 0.0
+            if dist_vehicle < 1.0:
+                range_penalty = 1.0 - dist_vehicle
+            elif dist_vehicle > self.max_detection_range:
+                range_penalty = dist_vehicle - self.max_detection_range
+
+            route_penalty = 0.0
+            if route_dir is not None and np.all(np.isfinite(normal_world)):
+                # Gate plane normal should usually align with course direction;
+                # use abs() because the normal sign is ambiguous for a planar target.
+                route_penalty = 1.0 - abs(float(np.dot(normal_world, route_dir)))
+
+            temporal_dist, temporal_track_id = self._temporal_candidate_distance(world, track_refs)
+            temporal_penalty = 0.0
+            temporal_bonus = 0.0
+            if np.isfinite(temporal_dist):
+                temporal_penalty = min(temporal_dist, 5.0)
+                if temporal_dist <= self.gate_memory.association_radius:
+                    temporal_bonus = 2.0
+
+            lateral_penalty = 0.0
+            if self.active_target_center is not None:
+                active = np.asarray(self.active_target_center, dtype=float).reshape(3)
+                if np.all(np.isfinite(active)) and float(np.linalg.norm(world[:2] - active[:2])) > self.max_gate_jump:
+                    lateral_penalty = 2.0
+
+            score = (
+                -1.20 * z_error
+                -0.20 * (reproj if np.isfinite(reproj) else 10.0)
+                -0.35 * size_depth_error
+                -0.15 * range_penalty
+                -0.50 * route_penalty
+                -0.80 * temporal_penalty
+                -1.00 * lateral_penalty
+                + temporal_bonus
+            )
+            reason = "geometry_score"
+            if np.isfinite(temporal_dist) and temporal_dist <= self.gate_memory.association_radius:
+                reason = "temporal_consistency"
+
+            gt_error = (
+                float(np.linalg.norm(world - expected_gate_world))
+                if expected_gate_world is not None and np.all(np.isfinite(expected_gate_world))
+                else float("nan")
+            )
+            evaluated.append({
+                "candidate": cand,
+                "cam": cam,
+                "gate_body": gate_body,
+                "world": world,
+                "normal_camera": normal_camera,
+                "normal_world": normal_world,
+                "reproj": reproj,
+                "size_depth_error": size_depth_error,
+                "z_error": z_error,
+                "dist_vehicle": dist_vehicle,
+                "temporal_dist": temporal_dist,
+                "temporal_track_id": temporal_track_id,
+                "score": float(score),
+                "reason": reason,
+                "gt_error": gt_error,
+            })
+
+        if not evaluated:
+            self.pnp_candidate_world_summary = ""
+            return det
+
+        best = max(evaluated, key=lambda item: item["score"])
+        best_cand = best["candidate"]
+        current_cam = np.asarray(det.get("gate_center_camera", np.full(3, np.nan)), dtype=float).reshape(3)
+        if not np.all(np.isfinite(current_cam)):
+            current_cam = best["cam"].copy()
+        current_reproj = float(det.get("reprojection_error", np.nan))
+        fallback = min(evaluated, key=lambda item: item["reproj"] if np.isfinite(item["reproj"]) else 1e9)
+        if best["score"] < -50.0:
+            best = fallback
+            best_cand = best["candidate"]
+            best["reason"] = "lowest_reprojection_fallback"
+
+        det["gate_center_camera"] = best["cam"].copy()
+        det["gate_center_body"] = best["gate_body"].copy()
+        det["gate_center_cam"] = best["gate_body"].copy()
+        det["gate_center_world"] = best["world"].copy()
+        det["gate_normal_camera"] = best["normal_camera"].copy()
+        det["gate_normal_body"] = r_body_camera @ best["normal_camera"] if np.all(np.isfinite(best["normal_camera"])) else np.full(3, np.nan)
+        det["gate_normal_world"] = best["normal_world"].copy()
+        det["reprojection_error"] = float(best["reproj"])
+        det["corner_reprojection_error_px"] = float(best["reproj"])
+        det["tvec"] = best["cam"].copy()
+        det["rvec"] = np.asarray(best_cand.get("rvec", np.full(3, np.nan)), dtype=float).reshape(3).copy()
+        det["ordered_corners"] = np.asarray(best_cand.get("ordered_points", det.get("ordered_corners")), dtype=float).reshape(4, 2).copy()
+        det["reprojected_corners"] = best_cand.get("projected_corners", det.get("reprojected_corners", None))
+        det["chosen_candidate"] = int(best_cand.get("index", -1))
+        det["live_solver_name"] = f"{best_cand.get('solver', '')}_{best_cand.get('order', '')}"
+        det["pnp_selected_order"] = best_cand.get("order", "")
+        det["pnp_selected_solver"] = best_cand.get("solver", "")
+        det["pnp_selected_score"] = float(best["score"])
+        det["pnp_selected_reprojection_error"] = float(best["reproj"])
+        det["pnp_selected_gate_center_camera"] = best["cam"].copy()
+        det["pnp_selected_reason"] = best["reason"]
+        det["pnp_selected_world_score"] = float(best["score"])
+        det["pnp_selected_world_reason"] = best["reason"]
+
+        summary_parts = []
+        for item in sorted(evaluated, key=lambda x: x["score"], reverse=True)[:18]:
+            cand = item["candidate"]
+            nw = item["normal_world"]
+            summary_parts.append(
+                f"{cand.get('order','')}/{cand.get('solver','')}:"
+                f"reproj={item['reproj']:.2f},"
+                f"cam=({item['cam'][0]:.2f},{item['cam'][1]:.2f},{item['cam'][2]:.2f}),"
+                f"world=({item['world'][0]:.2f},{item['world'][1]:.2f},{item['world'][2]:.2f}),"
+                f"z={item['world'][2]:.2f},"
+                f"normal=({nw[0]:.2f},{nw[1]:.2f},{nw[2]:.2f}),"
+                f"score={item['score']:.2f},"
+                f"reason={item['reason']},"
+                f"gt={item['gt_error']:.2f},"
+                f"track={item['temporal_track_id']}:{item['temporal_dist']:.2f}"
+            )
+        self.pnp_candidate_world_summary = ";".join(summary_parts)
+        det["pnp_candidate_world_summary"] = self.pnp_candidate_world_summary
+        print(
+            "[PNP WORLD SELECT] "
+            f"reason={best['reason']} order={det['pnp_selected_order']} "
+            f"solver={det['pnp_selected_solver']} score={best['score']:.2f} "
+            f"world={best['world'].tolist()} cam={best['cam'].tolist()} "
+            f"prev_cam={current_cam.tolist()} prev_reproj={current_reproj:.2f}"
+        )
+        return det
+
+    @staticmethod
     def physical_body_camera_matrix():
         return np.array([
             [0.0, 0.0, 1.0],
@@ -884,12 +1411,365 @@ class AutonomyAPI:
             [0.0, -1.0, 0.0],
         ], dtype=float)
 
-    def update_gate_memory_from_frame(self, frame, camera_matrix, dist_coeffs):
+    @staticmethod
+    def _compact_float_list(values, precision=3):
+        out = []
+        for value in values or []:
+            try:
+                out.append(f"{float(value):.{precision}f}")
+            except Exception:
+                out.append("nan")
+        return " ".join(out)
+
+    @staticmethod
+    def _compact_nested_points(values, precision=1):
+        chunks = []
+        for item in values or []:
+            arr = np.asarray(item, dtype=float).reshape(-1)
+            chunks.append(" ".join(f"{x:.{precision}f}" for x in arr))
+        return ";".join(chunks)
+
+    @staticmethod
+    def _compact_reason(reason):
+        reason = str(reason or "")
+        if reason.startswith("reprojection_error_high"):
+            return "reprojection_error_high"
+        if reason.startswith("z_below_safe_min"):
+            return "z_below_safe_min"
+        if reason.startswith("z_above_safe_max"):
+            return "z_above_safe_max"
+        if reason.startswith("detection_too_far") or reason.endswith("too_far"):
+            return "too_far"
+        if "duplicate" in reason:
+            return "duplicate_existing_track"
+        if "completed" in reason or "near_completed" in reason:
+            return "near_completed_gate"
+        if "insufficient_hits" in reason:
+            return "insufficient_hits"
+        if "insufficient_confidence" in reason:
+            return "insufficient_confidence_sum"
+        if "reprojection_error_mean" in reason:
+            return "reprojection_mean_high"
+        if "reprojection_error_median" in reason:
+            return "reprojection_median_high"
+        if "reprojection" in reason:
+            return "reprojection_error_high"
+        if reason in ("invalid_gate_center", "non_finite_target", "non_finite_center"):
+            return "invalid_world_center"
+        return reason
+
+    def reset_lookahead_pipeline_debug(self):
+        self.yolo_detection_count = 0
+        self.yolo_detection_confidences = ""
+        self.yolo_detection_bboxes = ""
+        self.yolo_detection_keypoints = ""
+        self.processed_detection_indices = []
+        self.yolo_raw_count = 0
+        self.pnp_success_count = 0
+        self.world_valid_count = 0
+        self.memory_update_count = 0
+        self.tentative_track_count = 0
+        self.tentative_lookahead_eligible_count = 0
+        self.tentative_lookahead_eligible_track_ids = []
+        self.tentative_lookahead_replan_requested = False
+        self.tentative_lookahead_replan_blocked_reason = ""
+        self.lookahead_pipeline_reasons = ""
+        self.lookahead_pipeline_debug = "raw=0,pnp=0,valid=0,mem=0,tentative=0,eligible=0,used=0,reasons="
+        self.perception_detection_flow = ""
+        self.perception_detection_flow_entries = {}
+        self.yolo_confidence = ""
+        self.quad_area_px2 = ""
+        self.old_area_confidence = ""
+        self.memory_confidence_used = ""
+        self.memory_admission_threshold = ""
+        self.memory_admission_passed = ""
+
+    def initialize_detection_flow_debug(self, yolo):
+        for meta in getattr(yolo, "last_yolo_candidate_debug", []) or []:
+            idx = int(meta.get("detection_index", len(self.perception_detection_flow_entries)))
+            self.perception_detection_flow_entries[idx] = {
+                "idx": idx,
+                "yolo_confidence": float(meta.get("box_confidence", np.nan)),
+                "quad_area_px2": float("nan"),
+                "old_area_confidence": float("nan"),
+                "memory_confidence": float("nan"),
+                "memory_admission_threshold": float(self.gate_memory.min_confidence_per_hit),
+                "memory_admission_passed": False,
+                "pnp": not bool(meta.get("rejection_reason", "")),
+                "cam": np.full(3, np.nan),
+                "raw": np.full(3, np.nan),
+                "corrected": np.full(3, np.nan),
+                "track": None,
+                "memory": False,
+                "state": "",
+                "race_idx": None,
+                "role": "rejected" if meta.get("rejection_reason") else "visible_but_unused",
+                "reason": meta.get("rejection_reason", ""),
+            }
+
+    def update_detection_flow_debug(self, det, result=None, rejection_reason=""):
+        idx = int(det.get("detection_index", det.get("processed_detection_index", -1)))
+        entry = self.perception_detection_flow_entries.setdefault(idx, {"idx": idx})
+        cam = np.asarray(det.get("gate_center_camera", np.full(3, np.nan)), dtype=float).reshape(3)
+        corrected = np.asarray(det.get("gate_center_world", np.full(3, np.nan)), dtype=float).reshape(3)
+        raw_world = np.full(3, np.nan)
+        drone_pos = np.asarray(det.get("drone_pos", np.full(3, np.nan)), dtype=float).reshape(3)
+        if np.all(np.isfinite(cam)) and np.all(np.isfinite(drone_pos)) and self.last_telemetry_rpy_raw_rad is not None:
+            raw_rpy = self.perception_rpy_for_mode(
+                self.last_telemetry_rpy_raw_rad,
+                self.perception_transform_mode,
+                apply_yaw_correction=False,
+            )
+            r_wb = self.perception_node._rpy_to_rotmat(*map(float, raw_rpy))
+            raw_world = drone_pos + r_wb @ (
+                self.camera_offset_body
+                + self.body_camera_matrix_for_mode(self.perception_transform_mode) @ cam
+            )
+        track_id = result.get("track_id") if result is not None else None
+        tr = self.gate_memory.get_track_by_id(track_id) if track_id is not None else None
+        race_order = self.race_progression.order()
+        race_idx = race_order.index(track_id) if track_id in race_order else None
+        active_id = self.canonical_track_id(self.active_target_track_id)
+        lookahead_ids = {
+            self.canonical_track_id(tid)
+            for tid in self.planning_lookahead_track_ids + self.tentative_lookahead_track_ids
+        }
+        role = "rejected" if rejection_reason else "visible_but_unused"
+        if track_id is not None and self.canonical_track_id(track_id) == active_id:
+            role = "active_current_target"
+        elif track_id is not None and self.canonical_track_id(track_id) in lookahead_ids:
+            role = "tentative_lookahead_target"
+        entry.update({
+            "yolo_confidence": float(
+                det.get("yolo_confidence", entry.get("yolo_confidence", np.nan))
+            ),
+            "quad_area_px2": float(det.get("quad_area_px2", np.nan)),
+            "old_area_confidence": float(
+                det.get("old_area_confidence", det.get("quad_area_confidence", np.nan))
+            ),
+            "memory_confidence": float(
+                det.get("memory_confidence", det.get("yolo_confidence", np.nan))
+            ),
+            "memory_admission_threshold": float(self.gate_memory.min_confidence_per_hit),
+            "memory_admission_passed": bool(
+                float(det.get("memory_confidence", det.get("yolo_confidence", np.nan)))
+                >= self.gate_memory.min_confidence_per_hit
+            ),
+            "pnp": np.all(np.isfinite(cam)),
+            "cam": cam,
+            "raw": raw_world,
+            "corrected": corrected,
+            "track": track_id,
+            "memory": bool(result is not None and result.get("accepted", False)),
+            "state": (
+                "stable" if tr is not None and getattr(tr, "is_stable", False)
+                else "tentative" if tr is not None else ""
+            ),
+            "race_idx": race_idx,
+            "role": role,
+            "reason": rejection_reason or (result.get("reason", "") if result else ""),
+        })
+
+    def finalize_detection_flow_debug(self):
+        parts = []
+        yolo_confidence = []
+        quad_area_px2 = []
+        old_area_confidence = []
+        memory_confidence_used = []
+        memory_admission_threshold = []
+        memory_admission_passed = []
+        for idx in sorted(self.perception_detection_flow_entries):
+            e = self.perception_detection_flow_entries[idx]
+            vec = lambda v: "/".join(f"{x:.2f}" for x in np.asarray(v, dtype=float).reshape(3))
+            yolo_confidence.append(f"det{idx}:{e.get('yolo_confidence', np.nan):.3f}")
+            quad_area_px2.append(f"det{idx}:{e.get('quad_area_px2', np.nan):.1f}")
+            old_area_confidence.append(f"det{idx}:{e.get('old_area_confidence', np.nan):.3f}")
+            memory_confidence_used.append(f"det{idx}:{e.get('memory_confidence', np.nan):.3f}")
+            memory_admission_threshold.append(
+                f"det{idx}:{e.get('memory_admission_threshold', np.nan):.3f}"
+            )
+            memory_admission_passed.append(
+                f"det{idx}:{int(bool(e.get('memory_admission_passed', False)))}"
+            )
+            parts.append(
+                f"det{idx}:yolo={e.get('yolo_confidence', np.nan):.3f},"
+                f"area_px2={e.get('quad_area_px2', np.nan):.1f},"
+                f"old_area_conf={e.get('old_area_confidence', np.nan):.3f},"
+                f"mem_conf={e.get('memory_confidence', np.nan):.3f},"
+                f"mem_pass={int(bool(e.get('memory_admission_passed', False)))},"
+                f"pnp={int(bool(e.get('pnp')))},"
+                f"cam={vec(e.get('cam', np.full(3,np.nan)))},"
+                f"raw={vec(e.get('raw', np.full(3,np.nan)))},"
+                f"corrected={vec(e.get('corrected', np.full(3,np.nan)))},"
+                f"track={e.get('track')},mem={int(bool(e.get('memory')))},"
+                f"state={e.get('state','')},race={e.get('race_idx')},"
+                f"role={e.get('role','')},reason={e.get('reason','')}"
+            )
+        self.perception_detection_flow = ";".join(parts)
+        self.yolo_confidence = ";".join(yolo_confidence)
+        self.quad_area_px2 = ";".join(quad_area_px2)
+        self.old_area_confidence = ";".join(old_area_confidence)
+        self.memory_confidence_used = ";".join(memory_confidence_used)
+        self.memory_admission_threshold = ";".join(memory_admission_threshold)
+        self.memory_admission_passed = ";".join(memory_admission_passed)
+        if parts:
+            print("[DETECTION FLOW] " + self.perception_detection_flow)
+
+    def add_lookahead_pipeline_reason(self, label, reason):
+        compact = self._compact_reason(reason)
+        if not compact:
+            return
+        entry = f"{label}:{compact}"
+        parts = [p for p in str(self.lookahead_pipeline_reasons or "").split(";") if p]
+        parts.append(entry)
+        self.lookahead_pipeline_reasons = ";".join(parts[-12:])
+        self.update_lookahead_pipeline_debug()
+
+    def update_lookahead_pipeline_debug(self):
+        self.tentative_track_count = len(getattr(self, "tentative_track_ids", []) or [])
+        eligible = 0
+        eligible_track_ids = []
+        current_pos = np.array([
+            self.telemetry.pos["x"],
+            self.telemetry.pos["y"],
+            self.telemetry.pos["z"],
+        ], dtype=float)
+        selected_ids = set()
+        existing_points = []
+        for tr in getattr(self.gate_memory, "tracks", []):
+            track_id = self.canonical_track_id(getattr(tr, "id", None))
+            if track_id is None:
+                continue
+            if bool(getattr(tr, "committed", False) or getattr(tr, "is_stable", False)):
+                continue
+            center = getattr(tr, "filtered_center_world", None)
+            if center is None:
+                center = getattr(tr, "center", None)
+            if center is None:
+                continue
+            center, safe_reason = self._planning_target_safe_center(center)
+            if center is None:
+                compact = self._compact_reason(safe_reason)
+                if compact:
+                    parts = [p for p in str(self.lookahead_pipeline_reasons or "").split(";") if p]
+                    parts.append(f"track{track_id}:{compact}")
+                    self.lookahead_pipeline_reasons = ";".join(parts[-12:])
+                continue
+            reason = self._tentative_lookahead_rejection(
+                tr=tr,
+                track_id=track_id,
+                center=center,
+                current_pos=current_pos,
+                selected_ids=selected_ids,
+                existing_points=existing_points,
+            )
+            if reason:
+                compact = self._compact_reason(reason)
+                if compact:
+                    parts = [p for p in str(self.lookahead_pipeline_reasons or "").split(";") if p]
+                    parts.append(f"track{track_id}:{compact}")
+                    self.lookahead_pipeline_reasons = ";".join(parts[-12:])
+            else:
+                eligible += 1
+                eligible_track_ids.append(track_id)
+        self.tentative_lookahead_eligible_count = eligible
+        self.tentative_lookahead_eligible_track_ids = eligible_track_ids
+        self.lookahead_pipeline_debug = (
+            f"raw={int(self.yolo_raw_count)},"
+            f"pnp={int(self.pnp_success_count)},"
+            f"valid={int(self.world_valid_count)},"
+            f"mem={int(self.memory_update_count)},"
+            f"tentative={int(self.tentative_track_count)},"
+            f"eligible={int(self.tentative_lookahead_eligible_count)},"
+            f"used={int(bool(self.tentative_lookahead_used))},"
+            f"reasons={self.lookahead_pipeline_reasons}"
+        )
+
+    def check_tentative_lookahead_new_candidate_replan(self, now=None):
+        now = time.time() if now is None else float(now)
+        self.tentative_lookahead_replan_requested = False
+        self.tentative_lookahead_replan_blocked_reason = ""
+
+        if not self.use_perception:
+            self.tentative_lookahead_replan_blocked_reason = "perception_disabled"
+            return False
+        if self.gate_completion_triggered:
+            self.tentative_lookahead_replan_blocked_reason = "gate_completed_same_cycle"
+            return False
+        active_id = self.canonical_track_id(getattr(self, "active_target_track_id", None))
+        if active_id is None:
+            self.tentative_lookahead_replan_blocked_reason = "no_active_target"
+            return False
+        eligible_ids = [
+            self.canonical_track_id(tid)
+            for tid in getattr(self, "tentative_lookahead_eligible_track_ids", [])
+        ]
+        eligible_ids = [tid for tid in eligible_ids if tid is not None]
+        if len(eligible_ids) == 0:
+            self.tentative_lookahead_replan_blocked_reason = "no_eligible_tentative_track"
+            return False
+        future_ids = [tid for tid in eligible_ids if tid != active_id]
+        if len(future_ids) == 0:
+            self.tentative_lookahead_replan_blocked_reason = "eligible_is_active_target"
+            return False
+        dt = now - float(getattr(self, "replan_time", 0.0))
+        if dt <= 0.5:
+            self.tentative_lookahead_replan_blocked_reason = f"replan_throttled:{dt:.2f}"
+            return False
+
+        self.tentative_lookahead_replan_requested = True
+        self.tentative_lookahead_replan_blocked_reason = ""
+        return True
+
+    def update_gate_memory_from_frame(
+        self,
+        frame,
+        camera_matrix,
+        dist_coeffs,
+        image_stamp_sec=0,
+        image_stamp_nanosec=0,
+        image_received_wall_time=np.nan,
+        gazebo_pose=None,
+    ):
         if not self.use_perception or self.perception_node is None:
             return None
 
+        self.reset_yaw_image_consistency_debug()
+        self.reset_gazebo_pose_comparison_debug()
+        self.initialize_perception_yaw_correction(gazebo_pose)
         self.reset_pnp_selection_debug()
         self.reset_association_debug_log_fields()
+        self.reset_lookahead_pipeline_debug()
+
+        process_wall_time = time.time()
+        self.image_stamp_sec = int(image_stamp_sec)
+        self.image_stamp_nanosec = int(image_stamp_nanosec)
+        self.image_received_wall_time = float(image_received_wall_time)
+        self.image_processed_wall_time = process_wall_time
+        self.telemetry_position_sample_time = float(
+            getattr(self.telemetry, "position_sample_time", np.nan)
+        )
+        self.telemetry_attitude_sample_time = float(
+            getattr(self.telemetry, "attitude_sample_time", np.nan)
+        )
+        if np.isfinite(self.image_received_wall_time):
+            self.image_age_s = process_wall_time - self.image_received_wall_time
+        if np.isfinite(self.telemetry_attitude_sample_time):
+            self.attitude_age_s = process_wall_time - self.telemetry_attitude_sample_time
+        if np.isfinite(self.telemetry_position_sample_time):
+            self.position_age_s = process_wall_time - self.telemetry_position_sample_time
+        if (
+            np.isfinite(self.image_received_wall_time)
+            and np.isfinite(self.telemetry_attitude_sample_time)
+            and np.isfinite(self.telemetry_position_sample_time)
+        ):
+            pose_sample_time = min(
+                self.telemetry_attitude_sample_time,
+                self.telemetry_position_sample_time,
+            )
+            self.pose_age_relative_to_image_s = (
+                self.image_received_wall_time - pose_sample_time
+            )
 
         drone_pos = np.array([
             self.telemetry.pos["x"],
@@ -903,9 +1783,38 @@ class AutonomyAPI:
             float(self.telemetry.rpy["yaw"]),
         ], dtype=float)
         self.last_telemetry_rpy_raw_rad = telemetry_rpy_raw_rad.copy()
+        self.telemetry_yaw_raw_deg = math.degrees(float(telemetry_rpy_raw_rad[2]))
+        self.update_dynamic_gazebo_perception_yaw_correction(
+            gazebo_pose=gazebo_pose,
+            telemetry_yaw_raw_rad=float(telemetry_rpy_raw_rad[2]),
+        )
         drone_rpy_for_perception = self.perception_rpy_for_mode(
             telemetry_rpy_raw_rad,
             self.perception_transform_mode,
+        )
+        self.telemetry_yaw_perception_deg = math.degrees(
+            float(drone_rpy_for_perception[2])
+        )
+        if hasattr(self.telemetry, "yaw_rad_raw"):
+            self.telemetry.yaw_rad_raw = float(telemetry_rpy_raw_rad[2])
+            self.telemetry.yaw_rad_perception = float(drone_rpy_for_perception[2])
+            self.telemetry.perception_yaw_correction_rad = (
+                self.active_perception_yaw_correction_rad
+            )
+        self.last_detection_drone_pose = np.array([
+            drone_pos[0],
+            drone_pos[1],
+            drone_pos[2],
+            drone_rpy_for_perception[0],
+            drone_rpy_for_perception[1],
+            drone_rpy_for_perception[2],
+        ], dtype=float)
+        self.detection_drone_yaw_deg = math.degrees(float(drone_rpy_for_perception[2]))
+        self.capture_gazebo_pose_debug(
+            gazebo_pose=gazebo_pose,
+            mavsdk_pos=drone_pos,
+            mavsdk_yaw_rad=float(telemetry_rpy_raw_rad[2]),
+            process_wall_time=process_wall_time,
         )
 
         if self.perception_rpy_debug_frames_remaining > 0:
@@ -926,17 +1835,100 @@ class AutonomyAPI:
             drone_pos=drone_pos,
             drone_rpy_rad=drone_rpy_for_perception,
         )
+        node_debug = getattr(self.perception_node, "last_pipeline_debug", {})
+        yolo = getattr(self.perception_node, "gate_perception", None)
+        self.initialize_detection_flow_debug(yolo)
+        self.yolo_raw_count = int(node_debug.get("yolo_raw_count", 0))
+        self.yolo_detection_count = int(getattr(yolo, "last_yolo_detection_count", self.yolo_raw_count))
+        self.pnp_success_count = int(node_debug.get("pnp_success_count", 0))
+        self.world_valid_count = int(node_debug.get("world_valid_count", len(detections)))
+        self.processed_detection_indices = list(node_debug.get("processed_detection_indices", []))
+        self.yolo_detection_confidences = self._compact_float_list(
+            getattr(yolo, "last_yolo_detection_confidences", []),
+            precision=3,
+        )
+        self.yolo_detection_bboxes = self._compact_nested_points(
+            getattr(yolo, "last_yolo_detection_bboxes", []),
+            precision=1,
+        )
+        self.yolo_detection_keypoints = self._compact_nested_points(
+            getattr(yolo, "last_yolo_detection_keypoints", []),
+            precision=1,
+        )
+        for meta in getattr(yolo, "last_yolo_candidate_debug", []):
+            reason = meta.get("rejection_reason", "")
+            if reason:
+                self.add_lookahead_pipeline_reason(
+                    f"det{int(meta.get('detection_index', -1))}",
+                    reason,
+                )
 
         now = time.time()
 
         if len(detections) == 0:
+            if self.yolo_raw_count > 0 and self.pnp_success_count == 0:
+                self.add_lookahead_pipeline_reason("det*", "no_pnp_solution")
             self.gate_memory.prune(now)
             self.last_raw_gate_center = None
             self.last_perception_accepted = False
             self.last_perception_rejection_reason = "no_detection"
             self.reset_transform_validation_debug()
             self.update_quad_debug(None, frame.shape)
+            self.update_gate_filter_summary_logs()
+            self.update_lookahead_pipeline_debug()
+            self.finalize_detection_flow_debug()
             return None
+
+        expected_gate_world_for_debug = None
+        if len(self.gt_gates) > 0:
+            gate_idx = int(np.clip(self.current_gate_idx, 0, len(self.gt_gates) - 1))
+            expected_gate_world_for_debug = np.asarray(self.gt_gates[gate_idx], dtype=float).reshape(3)
+        detections = [
+            self.select_pnp_candidate_for_live_geometry(
+                det=live_det,
+                drone_pos=drone_pos,
+                telemetry_rpy_raw_rad=telemetry_rpy_raw_rad,
+                expected_gate_world=expected_gate_world_for_debug,
+            )
+            for live_det in detections
+        ]
+
+        if self.perception_transform_mode in (
+            "physical_direct_rad",
+            "physical_direct_rad_x_mirror",
+            "physical_mavsdk_yaw_aligned",
+            "legacy_scaled_yaw",
+        ):
+            r_body_camera = self.body_camera_matrix_for_mode(self.perception_transform_mode)
+            rpy = self.perception_rpy_for_mode(telemetry_rpy_raw_rad, self.perception_transform_mode)
+            r_wb = self.perception_node._rpy_to_rotmat(float(rpy[0]), float(rpy[1]), float(rpy[2]))
+            for live_det in detections:
+                gate_camera = np.asarray(
+                    live_det.get("gate_center_camera", np.full(3, np.nan)),
+                    dtype=float,
+                ).reshape(3)
+                if not np.all(np.isfinite(gate_camera)):
+                    continue
+                gate_world, gate_body, _ = self.transform_gate_camera_to_world(
+                    gate_camera=gate_camera,
+                    drone_pos=drone_pos,
+                    telemetry_rpy_raw_rad=telemetry_rpy_raw_rad,
+                    mode=self.perception_transform_mode,
+                    r_body_camera=r_body_camera,
+                )
+                live_det["gate_center_body"] = gate_body.copy()
+                live_det["gate_center_cam"] = gate_body.copy()
+                live_det["gate_center_world"] = gate_world.copy()
+                live_det["camera_to_body_matrix_used"] = r_body_camera.copy()
+                live_det["body_to_world_method_used"] = self.perception_transform_mode
+                gate_normal_camera = np.asarray(
+                    live_det.get("gate_normal_camera", np.full(3, np.nan)),
+                    dtype=float,
+                ).reshape(3)
+                if np.all(np.isfinite(gate_normal_camera)):
+                    gate_normal_body = r_body_camera @ gate_normal_camera
+                    live_det["gate_normal_body"] = gate_normal_body.copy()
+                    live_det["gate_normal_world"] = r_wb @ gate_normal_body
 
         det = detections[0]
 
@@ -979,6 +1971,22 @@ class AutonomyAPI:
             self.gate_memory.prune(now)
             self.last_perception_accepted = False
             self.last_perception_rejection_reason = f"reprojection_error_high:{reproj:.2f}"
+            self.add_lookahead_pipeline_reason(
+                f"det{int(det.get('detection_index', 0))}",
+                self.last_perception_rejection_reason,
+            )
+            if len(detections) > 1:
+                self.add_supplemental_gate_detections(
+                    detections[1:],
+                    frame_shape=frame.shape,
+                    timestamp=now,
+                )
+            self.update_gate_filter_summary_logs()
+            self.update_lookahead_pipeline_debug()
+            self.update_detection_flow_debug(
+                det, rejection_reason=self.last_perception_rejection_reason
+            )
+            self.finalize_detection_flow_debug()
             return {
                 "accepted": False,
                 "reason": self.last_perception_rejection_reason,
@@ -1022,6 +2030,9 @@ class AutonomyAPI:
         self.pnp_selected_gate_center_camera = det.get("pnp_selected_gate_center_camera", None)
         self.pnp_selected_reason = det.get("pnp_selected_reason", "")
         self.pnp_candidate_summary = det.get("pnp_candidate_summary", "")
+        self.pnp_candidate_world_summary = det.get("pnp_candidate_world_summary", "")
+        self.pnp_selected_world_score = float(det.get("pnp_selected_world_score", np.nan))
+        self.pnp_selected_world_reason = det.get("pnp_selected_world_reason", "")
         self.allow_pnp_corner_reordering = bool(det.get("allow_pnp_corner_reordering", False))
         self.pnp_live_candidate_orders_allowed = det.get("pnp_live_candidate_orders_allowed", "")
         self.pnp_debug_best_order = det.get("pnp_debug_best_order", "")
@@ -1043,15 +2054,18 @@ class AutonomyAPI:
             det.get("raw_keypoint_polygon_signed_area", np.nan)
         )
         self.raw_keypoint_polygon_winding = det.get("raw_keypoint_polygon_winding", "")
-        self.last_detection_drone_pose = np.array([
-            drone_pos[0],
-            drone_pos[1],
-            drone_pos[2],
-            drone_rpy_for_perception[0],
-            drone_rpy_for_perception[1],
-            drone_rpy_for_perception[2],
-        ], dtype=float)
         self.update_quad_debug(self.last_ordered_image_corners, frame.shape)
+        self.compute_yaw_image_consistency_debug(
+            drone_pos=drone_pos,
+            telemetry_yaw_rad=float(drone_rpy_for_perception[2]),
+            camera_matrix=camera_matrix,
+        )
+        self.compute_gazebo_pose_gate_comparison_debug(
+            pnp_camera=self.last_gate_center_camera,
+            mavsdk_pos=drone_pos,
+            mavsdk_rpy_raw=telemetry_rpy_raw_rad,
+            perception_rpy=drone_rpy_for_perception,
+        )
 
         image_valid, image_reason = self.validate_detection_image_bounds(
             det.get("ordered_corners", None),
@@ -1061,6 +2075,10 @@ class AutonomyAPI:
             self.gate_memory.prune(now)
             self.last_perception_accepted = False
             self.last_perception_rejection_reason = image_reason
+            self.add_lookahead_pipeline_reason(
+                f"det{int(det.get('detection_index', 0))}",
+                image_reason,
+            )
             self.reset_transform_validation_debug()
             self.save_perception_debug_frame(
                 frame=frame,
@@ -1070,6 +2088,16 @@ class AutonomyAPI:
                 rejection_reason=image_reason,
             )
             print(f"[PERCEPTION REJECT] reason={image_reason} corners={self.last_ordered_image_corners}")
+            if len(detections) > 1:
+                self.add_supplemental_gate_detections(
+                    detections[1:],
+                    frame_shape=frame.shape,
+                    timestamp=now,
+                )
+            self.update_gate_filter_summary_logs()
+            self.update_lookahead_pipeline_debug()
+            self.update_detection_flow_debug(det, rejection_reason=image_reason)
+            self.finalize_detection_flow_debug()
             return {
                 "accepted": False,
                 "reason": image_reason,
@@ -1081,6 +2109,10 @@ class AutonomyAPI:
 
         valid, reason = self.validate_perception_gate_center(raw_center, drone_pos)
         if not valid:
+            self.add_lookahead_pipeline_reason(
+                f"det{int(det.get('detection_index', 0))}",
+                reason,
+            )
             if reason.startswith("z_below_safe_min"):
                 self.future_track_visible_before_completion = True
                 self.future_track_blocked_reason = reason
@@ -1097,6 +2129,16 @@ class AutonomyAPI:
                 rejection_reason=reason,
             )
             print(f"[PERCEPTION REJECT] reason={reason} raw_center={raw_center}")
+            if len(detections) > 1:
+                self.add_supplemental_gate_detections(
+                    detections[1:],
+                    frame_shape=frame.shape,
+                    timestamp=now,
+                )
+            self.update_gate_filter_summary_logs()
+            self.update_lookahead_pipeline_debug()
+            self.update_detection_flow_debug(det, rejection_reason=reason)
+            self.finalize_detection_flow_debug()
             return {
                 "accepted": False,
                 "reason": reason,
@@ -1110,6 +2152,10 @@ class AutonomyAPI:
             self.gate_memory.prune(now)
             self.last_perception_accepted = False
             self.last_perception_rejection_reason = "near_completed_landmark_this_lap"
+            self.add_lookahead_pipeline_reason(
+                f"det{int(det.get('detection_index', 0))}",
+                self.last_perception_rejection_reason,
+            )
             self.rejected_completed_this_lap = True
             self.target_rejected_completed = True
             self.reset_transform_validation_debug()
@@ -1121,6 +2167,18 @@ class AutonomyAPI:
                 rejection_reason="near_completed_landmark_this_lap",
             )
             print(f"[PERCEPTION REJECT] reason=near_completed_landmark_this_lap raw_center={raw_center}")
+            if len(detections) > 1:
+                self.add_supplemental_gate_detections(
+                    detections[1:],
+                    frame_shape=frame.shape,
+                    timestamp=now,
+                )
+            self.update_gate_filter_summary_logs()
+            self.update_lookahead_pipeline_debug()
+            self.update_detection_flow_debug(
+                det, rejection_reason="near_completed_landmark_this_lap"
+            )
+            self.finalize_detection_flow_debug()
             return {
                 "accepted": False,
                 "reason": "near_completed_landmark_this_lap",
@@ -1132,13 +2190,15 @@ class AutonomyAPI:
 
         result = self.gate_memory.add_detection(
             center=raw_center,
-            confidence=det["confidence"],
+            confidence=det["memory_confidence"],
             timestamp=now,
             center_camera=det.get("gate_center_camera", None),
             reprojection_error=det.get("reprojection_error", np.nan),
             solver_name=det.get("live_solver_name", ""),
             active_gate_idx=self.current_gate_idx,
         )
+        if result is not None:
+            self.memory_update_count += 1
         self.track_update_innovation = self.gate_memory.last_update_innovation
         self.track_update_accepted = self.gate_memory.last_update_accepted
         self.track_center_before_update = self.gate_memory.last_track_center_before
@@ -1169,6 +2229,11 @@ class AutonomyAPI:
             self.update_gate_filter_summary_logs()
             self.last_perception_accepted = bool(result.get("accepted", False))
             self.last_perception_rejection_reason = "" if self.last_perception_accepted else result.get("reason", "")
+            if not self.last_perception_accepted:
+                self.add_lookahead_pipeline_reason(
+                    f"track{result.get('track_id')}",
+                    self.last_perception_rejection_reason,
+                )
             if self.last_perception_accepted:
                 self.compute_transform_validation_debug(drone_pos, drone_rpy_for_perception)
             else:
@@ -1196,7 +2261,12 @@ class AutonomyAPI:
                 print(
                     f"    id={tr.id}, center={tr.center}, hits={tr.hits}, "
                     f"stable={tr.is_stable}, score={tr.stability_score:.2f}"
-                )
+            )
+        self.update_detection_flow_debug(
+            det,
+            result=result,
+            rejection_reason="" if result is not None else "memory_update_failed",
+        )
 
         supplemental_result = self.add_supplemental_gate_detections(
             detections[1:],
@@ -1212,39 +2282,51 @@ class AutonomyAPI:
         ):
             result = supplemental_result
 
+        self.update_gate_filter_summary_logs()
+        self.update_lookahead_pipeline_debug()
+        self.finalize_detection_flow_debug()
         return result
 
     def add_supplemental_gate_detections(self, detections, frame_shape, timestamp):
         selected_result = None
         for det in detections:
+            det_label = f"det{int(det.get('detection_index', det.get('processed_detection_index', -1)))}"
             raw_center = np.asarray(det["gate_center_world"], dtype=float).reshape(3)
 
-            image_valid, _ = self.validate_detection_image_bounds(
+            image_valid, image_reason = self.validate_detection_image_bounds(
                 det.get("ordered_corners", None),
                 frame_shape,
             )
             if not image_valid:
+                self.add_lookahead_pipeline_reason(det_label, image_reason)
+                self.update_detection_flow_debug(det, rejection_reason=image_reason)
                 continue
 
-            valid, _ = self.validate_perception_gate_center(
+            valid, valid_reason = self.validate_perception_gate_center(
                 raw_center,
                 np.asarray(det.get("drone_pos", np.zeros(3)), dtype=float).reshape(3),
             )
             if not valid:
+                self.add_lookahead_pipeline_reason(det_label, valid_reason)
+                self.update_detection_flow_debug(det, rejection_reason=valid_reason)
                 continue
 
             if self.is_near_completed_gate(raw_center, radius=self.gate_memory.new_track_block_radius):
+                self.add_lookahead_pipeline_reason(det_label, "near_completed_gate")
+                self.update_detection_flow_debug(det, rejection_reason="near_completed_gate")
                 continue
 
             result = self.gate_memory.add_detection(
                 center=raw_center,
-                confidence=det["confidence"],
+                confidence=det["memory_confidence"],
                 timestamp=timestamp,
                 center_camera=det.get("gate_center_camera", None),
                 reprojection_error=det.get("reprojection_error", np.nan),
                 solver_name=det.get("live_solver_name", ""),
                 active_gate_idx=self.current_gate_idx,
             )
+            if result is not None:
+                self.memory_update_count += 1
             self.update_association_debug_log_fields()
             tr = self.gate_memory.get_track_by_id(result.get("track_id")) if result is not None else None
             if tr is not None:
@@ -1268,7 +2350,13 @@ class AutonomyAPI:
                     f"stable={result.get('stable', False)}"
                 )
                 if result.get("stable_now", False):
+                    self.update_detection_flow_debug(det, result=result)
                     break
+            self.update_detection_flow_debug(
+                det,
+                result=result,
+                rejection_reason="" if result is not None else "memory_update_failed",
+            )
 
         self.update_gate_filter_summary_logs()
         return selected_result
@@ -1422,6 +2510,238 @@ class AutonomyAPI:
             )
         ))
 
+    def reset_yaw_image_consistency_debug(self):
+        self.bearing_to_gate_deg = float("nan")
+        self.telemetry_yaw_deg_for_image = float("nan")
+        self.yaw_error_deg = float("nan")
+        self.predicted_quad_offset_from_yaw_px = float("nan")
+        self.yaw_pixel_error_px = float("nan")
+        self.yaw_image_consistency_status = ""
+
+    def compute_yaw_image_consistency_debug(
+        self,
+        drone_pos,
+        telemetry_yaw_rad,
+        camera_matrix,
+    ):
+        if len(self.gt_gates) == 0:
+            return
+        try:
+            gate_idx = int(np.clip(self.current_gate_idx, 0, len(self.gt_gates) - 1))
+            gate = np.asarray(self.gt_gates[gate_idx], dtype=float).reshape(3)
+            pos = np.asarray(drone_pos, dtype=float).reshape(3)
+            fx = float(np.asarray(camera_matrix, dtype=float).reshape(3, 3)[0, 0])
+            actual_offset = float(self.last_quad_center_offset_x)
+        except Exception:
+            return
+        if not (
+            np.all(np.isfinite(gate[:2]))
+            and np.all(np.isfinite(pos[:2]))
+            and np.isfinite(telemetry_yaw_rad)
+            and np.isfinite(fx)
+            and np.isfinite(actual_offset)
+        ):
+            return
+
+        bearing_rad = math.atan2(float(gate[1] - pos[1]), float(gate[0] - pos[0]))
+        yaw_error_rad = math.atan2(
+            math.sin(float(telemetry_yaw_rad) - bearing_rad),
+            math.cos(float(telemetry_yaw_rad) - bearing_rad),
+        )
+        predicted_offset = fx * math.tan(-yaw_error_rad)
+
+        self.bearing_to_gate_deg = math.degrees(bearing_rad)
+        self.telemetry_yaw_deg_for_image = math.degrees(float(telemetry_yaw_rad))
+        self.yaw_error_deg = math.degrees(yaw_error_rad)
+        self.predicted_quad_offset_from_yaw_px = predicted_offset
+        self.yaw_pixel_error_px = predicted_offset - actual_offset
+        self.yaw_image_consistency_status = (
+            "YAW_IMAGE_INCONSISTENT"
+            if abs(self.yaw_pixel_error_px) > 30.0
+            else "consistent"
+        )
+        if self.yaw_image_consistency_status == "YAW_IMAGE_INCONSISTENT":
+            print(
+                "[YAW_IMAGE_INCONSISTENT] "
+                f"gate_idx={gate_idx} "
+                f"image_stamp={self.image_stamp_sec}.{self.image_stamp_nanosec:09d} "
+                f"image_age_s={self.image_age_s:.3f} "
+                f"attitude_age_s={self.attitude_age_s:.3f} "
+                f"position_age_s={self.position_age_s:.3f} "
+                f"pose_vs_image_s={self.pose_age_relative_to_image_s:.3f} "
+                f"yaw_deg={self.telemetry_yaw_deg_for_image:.2f} "
+                f"bearing_deg={self.bearing_to_gate_deg:.2f} "
+                f"yaw_error_deg={self.yaw_error_deg:.2f} "
+                f"predicted_px={predicted_offset:.1f} "
+                f"actual_px={actual_offset:.1f} "
+                f"error_px={self.yaw_pixel_error_px:.1f}"
+            )
+
+    @staticmethod
+    def _wrap_degrees(angle_deg):
+        return (float(angle_deg) + 180.0) % 360.0 - 180.0
+
+    @staticmethod
+    def _quaternion_xyzw_to_rotmat(quat):
+        x, y, z, w = np.asarray(quat, dtype=float).reshape(4)
+        norm = math.sqrt(x * x + y * y + z * z + w * w)
+        if norm < 1e-12:
+            return np.full((3, 3), np.nan, dtype=float)
+        x, y, z, w = x / norm, y / norm, z / norm, w / norm
+        return np.array([
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ], dtype=float)
+
+    @classmethod
+    def _quaternion_xyzw_yaw_deg(cls, quat):
+        rot = cls._quaternion_xyzw_to_rotmat(quat)
+        if not np.all(np.isfinite(rot)):
+            return float("nan")
+        return math.degrees(math.atan2(float(rot[1, 0]), float(rot[0, 0])))
+
+    def reset_gazebo_pose_comparison_debug(self):
+        self.gazebo_model_pos_world = np.full(3, np.nan, dtype=float)
+        self.gazebo_model_quat_world = np.full(4, np.nan, dtype=float)
+        self.gazebo_camera_pos_world = np.full(3, np.nan, dtype=float)
+        self.gazebo_camera_quat_world = np.full(4, np.nan, dtype=float)
+        self.gazebo_pose_wall_time = float("nan")
+        self.gazebo_pose_age_s = float("nan")
+        self.gazebo_model_yaw_deg = float("nan")
+        self.gazebo_camera_yaw_deg = float("nan")
+        self.mavsdk_minus_gazebo_pos = np.full(3, np.nan, dtype=float)
+        self.mavsdk_minus_gazebo_yaw_deg = float("nan")
+        self.gate_world_mavsdk = np.full(3, np.nan, dtype=float)
+        self.gate_world_gazebo = np.full(3, np.nan, dtype=float)
+        self.gate_world_mavsdk_error_to_gt = float("nan")
+        self.gate_world_gazebo_error_to_gt = float("nan")
+        self.required_yaw_deg_from_pnp_to_gt = float("nan")
+        self.mavsdk_yaw_minus_required_deg = float("nan")
+        self.gazebo_yaw_minus_required_deg = float("nan")
+
+    def capture_gazebo_pose_debug(
+        self,
+        gazebo_pose,
+        mavsdk_pos,
+        mavsdk_yaw_rad,
+        process_wall_time,
+    ):
+        if not isinstance(gazebo_pose, dict):
+            return
+        try:
+            self.gazebo_model_pos_world = np.asarray(
+                gazebo_pose["gazebo_model_pos_world"], dtype=float
+            ).reshape(3)
+            self.gazebo_model_quat_world = np.asarray(
+                gazebo_pose["gazebo_model_quat_world"], dtype=float
+            ).reshape(4)
+            self.gazebo_camera_pos_world = np.asarray(
+                gazebo_pose["gazebo_camera_pos_world"], dtype=float
+            ).reshape(3)
+            self.gazebo_camera_quat_world = np.asarray(
+                gazebo_pose["gazebo_camera_quat_world"], dtype=float
+            ).reshape(4)
+            self.gazebo_pose_wall_time = float(gazebo_pose["gazebo_pose_wall_time"])
+        except (KeyError, TypeError, ValueError):
+            self.reset_gazebo_pose_comparison_debug()
+            return
+
+        self.gazebo_pose_age_s = float(process_wall_time) - self.gazebo_pose_wall_time
+        self.gazebo_model_yaw_deg = self._quaternion_xyzw_yaw_deg(
+            self.gazebo_model_quat_world
+        )
+        self.gazebo_camera_yaw_deg = self._quaternion_xyzw_yaw_deg(
+            self.gazebo_camera_quat_world
+        )
+        self.mavsdk_minus_gazebo_pos = (
+            np.asarray(mavsdk_pos, dtype=float).reshape(3)
+            - self.gazebo_model_pos_world
+        )
+        self.mavsdk_minus_gazebo_yaw_deg = self._wrap_degrees(
+            math.degrees(float(mavsdk_yaw_rad)) - self.gazebo_model_yaw_deg
+        )
+
+    def compute_gazebo_pose_gate_comparison_debug(
+        self,
+        pnp_camera,
+        mavsdk_pos,
+        mavsdk_rpy_raw,
+        perception_rpy,
+    ):
+        if pnp_camera is None or len(self.gt_gates) == 0:
+            return
+        pnp_camera = np.asarray(pnp_camera, dtype=float).reshape(3)
+        mavsdk_pos = np.asarray(mavsdk_pos, dtype=float).reshape(3)
+        mavsdk_rpy_raw = np.asarray(mavsdk_rpy_raw, dtype=float).reshape(3)
+        perception_rpy = np.asarray(perception_rpy, dtype=float).reshape(3)
+        if not np.all(np.isfinite(pnp_camera)):
+            return
+
+        gate_idx = int(np.clip(self.current_gate_idx, 0, len(self.gt_gates) - 1))
+        gt_gate = np.asarray(self.gt_gates[gate_idx], dtype=float).reshape(3)
+        r_body_camera = self.body_camera_matrix_for_mode(self.perception_transform_mode)
+        body_vec = self.camera_offset_body + r_body_camera @ pnp_camera
+        r_wb_uncorrected = self.perception_node._rpy_to_rotmat(
+            float(mavsdk_rpy_raw[0]),
+            float(mavsdk_rpy_raw[1]),
+            float(mavsdk_rpy_raw[2]),
+        )
+        r_wb_corrected = self.perception_node._rpy_to_rotmat(
+            float(perception_rpy[0]),
+            float(perception_rpy[1]),
+            float(perception_rpy[2]),
+        )
+        self.gate_world_uncorrected = mavsdk_pos + r_wb_uncorrected @ body_vec
+        self.gate_world_corrected = mavsdk_pos + r_wb_corrected @ body_vec
+        self.gate_world_mavsdk = self.gate_world_uncorrected.copy()
+        self.gate_world_mavsdk_error_to_gt = float(
+            np.linalg.norm(self.gate_world_mavsdk - gt_gate)
+        )
+
+        r_wb_gazebo = self._quaternion_xyzw_to_rotmat(self.gazebo_model_quat_world)
+        if (
+            np.all(np.isfinite(self.gazebo_model_pos_world))
+            and np.all(np.isfinite(r_wb_gazebo))
+        ):
+            self.gate_world_gazebo = (
+                self.gazebo_model_pos_world + r_wb_gazebo @ body_vec
+            )
+            self.gate_world_gazebo_error_to_gt = float(
+                np.linalg.norm(self.gate_world_gazebo - gt_gate)
+            )
+
+        # For Rz(yaw) @ Ry(pitch) @ Rx(roll), solve the yaw that aligns
+        # the pitch/roll-adjusted body vector with the GT horizontal bearing.
+        r_no_yaw = self.perception_node._rpy_to_rotmat(
+            float(mavsdk_rpy_raw[0]),
+            float(mavsdk_rpy_raw[1]),
+            0.0,
+        )
+        leveled_body_vec = r_no_yaw @ body_vec
+        desired_delta = gt_gate - mavsdk_pos
+        if (
+            np.linalg.norm(leveled_body_vec[:2]) > 1e-9
+            and np.linalg.norm(desired_delta[:2]) > 1e-9
+        ):
+            required_yaw = math.atan2(
+                float(desired_delta[1]), float(desired_delta[0])
+            ) - math.atan2(
+                float(leveled_body_vec[1]), float(leveled_body_vec[0])
+            )
+            self.required_yaw_deg_from_pnp_to_gt = self._wrap_degrees(
+                math.degrees(required_yaw)
+            )
+            self.mavsdk_yaw_minus_required_deg = self._wrap_degrees(
+                math.degrees(float(mavsdk_rpy_raw[2]))
+                - self.required_yaw_deg_from_pnp_to_gt
+            )
+            if np.isfinite(self.gazebo_model_yaw_deg):
+                self.gazebo_yaw_minus_required_deg = self._wrap_degrees(
+                    self.gazebo_model_yaw_deg
+                    - self.required_yaw_deg_from_pnp_to_gt
+                )
+
     @staticmethod
     def pnp_candidate_error(candidates, index):
         if candidates is None or len(candidates) <= index:
@@ -1434,9 +2754,20 @@ class AutonomyAPI:
     def reset_transform_validation_debug(self):
         nan3 = np.full(3, np.nan, dtype=float)
         self.expected_gate_cam = nan3.copy()
+        self.expected_gate_cam_live_axis = nan3.copy()
+        self.expected_gate_cam_old_axis = nan3.copy()
+        self.expected_camera_axis_mode = ""
+        self.expected_uses_live_axis_convention = False
+        self.expected_gate_projected_center = np.full(2, np.nan, dtype=float)
+        self.expected_vs_quad_center_error_px = float("nan")
+        self.pnp_camera = nan3.copy()
         self.pnp_gate_cam = nan3.copy()
         self.camera_error = nan3.copy()
         self.camera_error_norm = float("nan")
+        self.size_depth = float("nan")
+        self.size_depth_from_width = float("nan")
+        self.size_depth_from_height = float("nan")
+        self.pnp_depth_minus_size_depth = float("nan")
         self.expected_gate_body = nan3.copy()
         self.pnp_gate_body = nan3.copy()
         self.body_error = nan3.copy()
@@ -1516,6 +2847,49 @@ class AutonomyAPI:
         self.filtered_minus_expected = nan3.copy()
         self.selected_order_vs_axis_mode = ""
 
+    def compute_size_depth_debug(self):
+        self.size_depth = float("nan")
+        self.size_depth_from_width = float("nan")
+        self.size_depth_from_height = float("nan")
+        self.pnp_depth_minus_size_depth = float("nan")
+
+        corners = self.last_ordered_image_corners
+        if corners is None or self.last_camera_matrix is None:
+            return
+        try:
+            pts = np.asarray(corners, dtype=float).reshape(4, 2)
+            k = np.asarray(self.last_camera_matrix, dtype=float).reshape(3, 3)
+        except Exception:
+            return
+        if not np.all(np.isfinite(pts)) or not np.all(np.isfinite(k)):
+            return
+
+        fx = float(k[0, 0])
+        fy = float(k[1, 1])
+        width_px = 0.5 * (
+            float(np.linalg.norm(pts[1] - pts[0]))
+            + float(np.linalg.norm(pts[2] - pts[3]))
+        )
+        height_px = 0.5 * (
+            float(np.linalg.norm(pts[3] - pts[0]))
+            + float(np.linalg.norm(pts[2] - pts[1]))
+        )
+
+        gate_size = float(getattr(self.gate_perception, "gate_size", 1.5))
+        depths = []
+        if width_px > 1.0 and np.isfinite(fx):
+            self.size_depth_from_width = fx * gate_size / width_px
+            depths.append(self.size_depth_from_width)
+        if height_px > 1.0 and np.isfinite(fy):
+            self.size_depth_from_height = fy * gate_size / height_px
+            depths.append(self.size_depth_from_height)
+        if len(depths) > 0:
+            self.size_depth = float(np.mean(depths))
+
+        pnp_camera = self._vec3_for_debug(self.last_gate_center_camera)
+        if np.isfinite(self.size_depth) and np.all(np.isfinite(pnp_camera)):
+            self.pnp_depth_minus_size_depth = float(pnp_camera[2] - self.size_depth)
+
     def reset_pnp_selection_debug(self):
         self.pnp_selected_order = ""
         self.pnp_selected_solver = ""
@@ -1524,6 +2898,9 @@ class AutonomyAPI:
         self.pnp_selected_gate_center_camera = np.full(3, np.nan, dtype=float)
         self.pnp_selected_reason = ""
         self.pnp_candidate_summary = ""
+        self.pnp_candidate_world_summary = ""
+        self.pnp_selected_world_score = float("nan")
+        self.pnp_selected_world_reason = ""
         self.allow_pnp_corner_reordering = False
         self.pnp_live_candidate_orders_allowed = ""
         self.pnp_debug_best_order = ""
@@ -1906,19 +3283,30 @@ class AutonomyAPI:
 
         R_wb = self.perception_node._rpy_to_rotmat(float(roll), float(pitch), float(yaw))
         R_bw = R_wb.T
-        R_body_camera = np.asarray(self.perception_node.R_body_camera, dtype=float).reshape(3, 3)
-        R_camera_body = R_body_camera.T
+        R_body_camera_old = np.asarray(self.perception_node.R_body_camera, dtype=float).reshape(3, 3)
+        R_body_camera_live = self.body_camera_matrix_for_mode(
+            self.perception_transform_mode,
+            default_matrix=R_body_camera_old,
+        )
+        R_camera_body_old = R_body_camera_old.T
+        R_camera_body_live = R_body_camera_live.T
 
         expected_body_from_camera = (
             R_bw @ (gt_gate_world - drone_pos)
         ) - self.camera_offset_body
-        expected_camera = R_camera_body @ expected_body_from_camera
+        expected_camera_old = R_camera_body_old @ expected_body_from_camera
+        expected_camera_live = R_camera_body_live @ expected_body_from_camera
 
-        self.expected_gate_cam = expected_camera.copy()
+        self.expected_gate_cam_old_axis = expected_camera_old.copy()
+        self.expected_gate_cam_live_axis = expected_camera_live.copy()
+        self.expected_gate_cam = expected_camera_live.copy()
+        self.expected_camera_axis_mode = self.perception_transform_mode
+        self.expected_uses_live_axis_convention = True
         self.expected_gate_body = expected_body_from_camera.copy()
         self.expected_gate_world = gt_gate_world.copy()
 
         self.pnp_gate_cam = self._vec3_for_debug(self.last_gate_center_camera)
+        self.pnp_camera = self.pnp_gate_cam.copy()
         self.pnp_gate_body = self._vec3_for_debug(self.last_gate_center_body)
         self.pnp_gate_world = self._vec3_for_debug(self.last_gate_center_world_debug)
 
@@ -1927,6 +3315,7 @@ class AutonomyAPI:
         self.world_error = self.pnp_gate_world - self.expected_gate_world
         self.camera_error_norm = float(np.linalg.norm(self.camera_error))
         self.world_error_norm = float(np.linalg.norm(self.world_error))
+        self.compute_size_depth_debug()
         self.update_gate_size_sweep_debug(self.expected_gate_world)
         self.update_pnp_formulation_debug(self.expected_gate_world, self.expected_gate_cam)
         self.update_gt_projected_center_debug(self.expected_gate_cam)
@@ -1937,10 +3326,15 @@ class AutonomyAPI:
         print(
             "[TRANSFORM VALIDATION] "
             f"gt_gate_idx={gate_idx} "
+            f"expected_axis_mode={self.expected_camera_axis_mode} "
+            f"expected_uses_live_axis={self.expected_uses_live_axis_convention} "
+            f"expected_cam_old_axis={self.expected_gate_cam_old_axis} "
             f"expected_cam={self.expected_gate_cam} "
             f"pnp_cam={self.pnp_gate_cam} "
             f"camera_error={self.camera_error} "
             f"camera_error_norm={self.camera_error_norm:.3f} "
+            f"size_depth={self.size_depth:.3f} "
+            f"pnp_depth_minus_size_depth={self.pnp_depth_minus_size_depth:.3f} "
             f"world_error_norm={self.world_error_norm:.3f}"
         )
 
@@ -2008,6 +3402,8 @@ class AutonomyAPI:
     def update_gt_projected_center_debug(self, expected_gate_cam):
         self.pnp_gt_projected_center = np.full(2, np.nan, dtype=float)
         self.pnp_gt_projected_quad_center_error_px = float("nan")
+        self.expected_gate_projected_center = np.full(2, np.nan, dtype=float)
+        self.expected_vs_quad_center_error_px = float("nan")
         if self.last_camera_matrix is None:
             return
         expected_gate_cam = np.asarray(expected_gate_cam, dtype=float).reshape(3)
@@ -2024,10 +3420,12 @@ class AutonomyAPI:
             pixel = projected.reshape(2)
         except Exception:
             return
-        self.pnp_gt_projected_center = pixel.astype(float)
+        self.expected_gate_projected_center = pixel.astype(float)
+        self.pnp_gt_projected_center = self.expected_gate_projected_center.copy()
         if np.isfinite(self.last_quad_center_x) and np.isfinite(self.last_quad_center_y):
             quad = np.array([self.last_quad_center_x, self.last_quad_center_y], dtype=float)
-            self.pnp_gt_projected_quad_center_error_px = float(np.linalg.norm(pixel - quad))
+            self.expected_vs_quad_center_error_px = float(np.linalg.norm(pixel - quad))
+            self.pnp_gt_projected_quad_center_error_px = self.expected_vs_quad_center_error_px
 
     def update_gate_size_sweep_debug(self, expected_gate_world):
         expected_gate_world = np.asarray(expected_gate_world, dtype=float).reshape(3)
@@ -2107,6 +3505,7 @@ class AutonomyAPI:
 
         gate_world = self._vec3_for_debug(self.last_gate_center_world_debug)
         gate_camera = self._vec3_for_debug(self.last_gate_center_camera)
+        expected_camera = self._vec3_for_debug(self.expected_gate_cam)
         pnp_tvec = self._vec3_for_debug(self.last_pnp_tvec)
         filtered = self._vec3_for_debug(self.track_filtered_center)
         expected_world = self._vec3_for_debug(self.expected_gate_world)
@@ -2135,7 +3534,13 @@ class AutonomyAPI:
             f"live-expected=({live_error[0]:.2f},{live_error[1]:.2f},{live_error[2]:.2f}) lat={self.live_lateral_error_m:.2f}",
             f"curr_gt_err={self.pnp_current_world_error_gt:.2f} best={self.pnp_best_debug_solver}/{self.pnp_best_debug_order}:{self.pnp_best_world_error_gt:.2f}",
             f"best_world=({self.pnp_best_world[0]:.2f},{self.pnp_best_world[1]:.2f},{self.pnp_best_world[2]:.2f}) reproj={self.pnp_best_reproj_error:.2f}",
-            f"camera=({gate_camera[0]:.2f},{gate_camera[1]:.2f},{gate_camera[2]:.2f})",
+            f"pnp_camera=({gate_camera[0]:.2f},{gate_camera[1]:.2f},{gate_camera[2]:.2f})",
+            f"expected_camera=({expected_camera[0]:.2f},{expected_camera[1]:.2f},{expected_camera[2]:.2f})",
+            f"expected_axis={self.expected_camera_axis_mode or 'none'} live_axis={self.live_camera_axis_mode or 'none'} uses_live={self.expected_uses_live_axis_convention}",
+            f"expected_old_axis=({self.expected_gate_cam_old_axis[0]:.2f},{self.expected_gate_cam_old_axis[1]:.2f},{self.expected_gate_cam_old_axis[2]:.2f})",
+            f"expected_proj=({self.expected_gate_projected_center[0]:.1f},{self.expected_gate_projected_center[1]:.1f}) quad=({self.last_quad_center_x:.1f},{self.last_quad_center_y:.1f}) err={self.expected_vs_quad_center_error_px:.1f}px",
+            f"size_depth={self.size_depth:.2f} width={self.size_depth_from_width:.2f} height={self.size_depth_from_height:.2f} dz={self.pnp_depth_minus_size_depth:.2f}",
+            f"camera_error=({self.camera_error[0]:.2f},{self.camera_error[1]:.2f},{self.camera_error[2]:.2f}) norm={self.camera_error_norm:.2f}",
             f"tvec=({pnp_tvec[0]:.2f},{pnp_tvec[1]:.2f},{pnp_tvec[2]:.2f})",
             f"{active_status} t={timestamp:.3f}",
         ]
@@ -2481,15 +3886,154 @@ class AutonomyAPI:
             return False
 
         self.race_accepted_track_ids.append(track_id)
-        self.race_progression.sync_committed_tracks([tr])
         self.race_order_inserted = True
         self.active_target_admission_status = "accepted"
         self.race_admitted_track_ids = list(self.race_accepted_track_ids)
         print(
-            f"TRACK {track_id} admitted as future gate "
-            f"idx={len(self.race_accepted_track_ids) - 1}"
+            f"TRACK {track_id} admitted to race candidate pool; "
+            "sequence index assigned by geometric progress"
         )
         return True
+
+    def assign_race_order_from_progress(self, committed_tracks):
+        """Assign uncompleted tracks without letting a farther gate take the current slot."""
+        current_pos = np.array([
+            self.telemetry.pos["x"],
+            self.telemetry.pos["y"],
+            self.telemetry.pos["z"],
+        ], dtype=float)
+        previous_idx = int(self.current_gate_idx)
+        candidates = []
+        rejected = []
+
+        for tr in committed_tracks:
+            track_id = self.canonical_track_id(tr.id)
+            center_source = getattr(tr, "filtered_center_world", None)
+            if center_source is None:
+                center_source = getattr(tr, "center", None)
+            if track_id is None or center_source is None:
+                continue
+            center = np.asarray(center_source, dtype=float).reshape(3)
+            valid, reason = self.validate_planning_target(center)
+            if not valid:
+                rejected.append((track_id, reason))
+                continue
+            if track_id in self.completed_track_ids_this_cycle or self.is_near_completed_gate(center):
+                rejected.append((track_id, "completed_gate"))
+                continue
+            candidates.append({
+                "track": tr,
+                "track_id": track_id,
+                "center": center,
+                "distance": float(np.linalg.norm(center - current_pos)),
+                "progress": float("nan"),
+            })
+
+        candidates.sort(key=lambda item: (item["distance"], item["track_id"]))
+        self.current_gate_candidate_track_ids = [item["track_id"] for item in candidates]
+        self.selected_current_track_id = candidates[0]["track_id"] if candidates else None
+        self.rejected_current_track_ids = [
+            item["track_id"] for item in candidates[1:]
+        ] + [track_id for track_id, _ in rejected]
+
+        if len(candidates) >= 2:
+            nearest = candidates[0]["center"]
+            farthest = max(candidates[1:], key=lambda item: item["distance"])["center"]
+            course_direction = farthest - nearest
+            norm = float(np.linalg.norm(course_direction))
+            if norm > 1e-6:
+                course_direction /= norm
+                if float(np.dot(nearest - current_pos, course_direction)) < 0.0:
+                    course_direction *= -1.0
+            else:
+                course_direction = (nearest - current_pos) / max(
+                    float(np.linalg.norm(nearest - current_pos)), 1e-6
+                )
+        elif len(candidates) == 1:
+            course_direction = candidates[0]["center"] - current_pos
+            course_direction /= max(float(np.linalg.norm(course_direction)), 1e-6)
+        else:
+            course_direction = np.array([0.0, 1.0, 0.0], dtype=float)
+
+        for item in candidates:
+            item["progress"] = float(np.dot(item["center"] - current_pos, course_direction))
+
+        if candidates:
+            current = candidates[0]
+            future = sorted(
+                candidates[1:],
+                key=lambda item: (item["progress"], item["distance"], item["track_id"]),
+            )
+            assigned = [current] + future
+        else:
+            assigned = []
+
+        assigned_index = {
+            item["track_id"]: previous_idx + rank
+            for rank, item in enumerate(assigned)
+        }
+        self.future_lookahead_track_ids = [
+            item["track_id"] for item in assigned[1:]
+        ]
+
+        existing_order = [
+            self.canonical_track_id(track_id)
+            for track_id in self.race_progression.inferred_order
+        ]
+        completed_prefix = []
+        for track_id in existing_order[:previous_idx]:
+            if track_id is not None and track_id not in completed_prefix:
+                completed_prefix.append(track_id)
+
+        contiguous_order = list(completed_prefix)
+        missing_preceding = False
+        for item in assigned:
+            track_id = item["track_id"]
+            if missing_preceding or track_id not in self.race_accepted_track_ids:
+                missing_preceding = True
+                continue
+            contiguous_order.append(track_id)
+
+        self.race_progression.inferred_order = contiguous_order
+        self.race_progression.cursor = min(
+            max(int(self.race_progression.cursor), previous_idx),
+            len(contiguous_order),
+        )
+
+        rejection_parts = []
+        for item in assigned[1:]:
+            rejection_parts.append(
+                f"track{item['track_id']}:farther_than_current_track{self.selected_current_track_id}"
+            )
+        rejection_parts.extend(f"track{track_id}:{reason}" for track_id, reason in rejected)
+        self.current_selection_rejection_reason = ";".join(rejection_parts)
+
+        debug_parts = []
+        for rank, item in enumerate(assigned):
+            track_id = item["track_id"]
+            race_idx = assigned_index[track_id]
+            if rank == 0:
+                reason = "selected_nearest_valid_current_candidate"
+            elif track_id in self.race_accepted_track_ids:
+                reason = "future_gate_progress_order"
+            else:
+                reason = "future_gate_pending_race_admission"
+            if track_id in self.race_accepted_track_ids and track_id not in contiguous_order:
+                reason += "|withheld_until_preceding_gate_admitted"
+            center = item["center"]
+            debug_parts.append(
+                f"track{track_id}:center={center[0]:.2f}/{center[1]:.2f}/{center[2]:.2f},"
+                f"dist={item['distance']:.2f},progress={item['progress']:.2f},"
+                f"score={-item['progress']:.2f},prev_active={previous_idx},"
+                f"assigned={race_idx},reason={reason}"
+            )
+        for track_id, reason in rejected:
+            debug_parts.append(
+                f"track{track_id}:prev_active={previous_idx},assigned=None,reason=rejected:{reason}"
+            )
+        self.race_order_assignment_debug = ";".join(debug_parts)
+        if debug_parts:
+            print("[RACE ORDER ASSIGNMENT] " + self.race_order_assignment_debug)
 
     def refresh_race_order_from_memory(self):
         self.refresh_landmark_merges()
@@ -2504,6 +4048,7 @@ class AutonomyAPI:
         for tr in tracks_for_admission:
             self.accept_track_into_race_order(tr)
 
+        self.assign_race_order_from_progress(committed_tracks)
         valid_ids = {tr.id for tr in committed_tracks}
         order = []
         for tid in self.race_progression.inferred_order:
@@ -2566,6 +4111,66 @@ class AutonomyAPI:
             return
 
         self.approach_vector = approach / norm
+
+    def reset_target_update_event_debug(self):
+        self.target_update_event = False
+        self.target_update_previous = np.full(3, np.nan, dtype=float)
+        self.target_update_new = np.full(3, np.nan, dtype=float)
+        self.target_update_delta_m = float("nan")
+        self.target_update_source_track_id = None
+        self.target_update_raw_detection_center = np.full(3, np.nan, dtype=float)
+        self.target_update_filtered_track_center = np.full(3, np.nan, dtype=float)
+        self.target_update_reason = ""
+
+    def record_target_update_debug(self, previous, new, track_id, reason):
+        new = np.asarray(new, dtype=float).reshape(3)
+        previous = (
+            np.asarray(previous, dtype=float).reshape(3)
+            if previous is not None
+            else np.full(3, np.nan, dtype=float)
+        )
+        delta = (
+            float(np.linalg.norm(new - previous))
+            if np.all(np.isfinite(previous))
+            else float("inf")
+        )
+        if np.isfinite(delta) and delta <= 0.10:
+            return
+
+        canonical_id = self.canonical_track_id(track_id)
+        raw = np.full(3, np.nan, dtype=float)
+        filtered = np.full(3, np.nan, dtype=float)
+        tr = self.gate_memory.get_track_by_id(canonical_id) if canonical_id is not None else None
+        if tr is not None:
+            filtered_source = getattr(tr, "filtered_center_world", None)
+            if filtered_source is None:
+                filtered_source = getattr(tr, "center", None)
+            if filtered_source is not None:
+                filtered = np.asarray(filtered_source, dtype=float).reshape(3)
+            history = list(getattr(tr, "obs_history", []))
+            if history:
+                raw = np.asarray(history[-1].center_world, dtype=float).reshape(3)
+
+        self.target_update_event = True
+        self.target_update_previous = previous.copy()
+        self.target_update_new = new.copy()
+        self.target_update_delta_m = delta
+        self.target_update_source_track_id = canonical_id
+        self.target_update_raw_detection_center = raw.copy()
+        self.target_update_filtered_track_center = filtered.copy()
+        self.target_update_reason = str(reason or "")
+        print(
+            "[TARGET UPDATE] "
+            f"reason={self.target_update_reason} track_id={canonical_id} "
+            f"delta={delta:.3f} previous={previous.tolist()} new={new.tolist()} "
+            f"raw={raw.tolist()} filtered={filtered.tolist()}"
+        )
+
+    def reset_crossing_debug(self):
+        self.crossing_true_gate_center = np.full(3, np.nan, dtype=float)
+        self.crossing_vehicle_position = np.full(3, np.nan, dtype=float)
+        self.crossing_error = np.full(3, np.nan, dtype=float)
+        self.crossing_lateral_error_xz = float("nan")
 
     def compute_gate_pass_geometry(self, position, target):
         position = np.asarray(position, dtype=float).reshape(3)
@@ -2731,6 +4336,14 @@ class AutonomyAPI:
         self.tentative_lookahead_track_ids = []
         self.tentative_lookahead_centers = ""
         self.tentative_lookahead_rejection_reason = ""
+        self.append_lookahead_called = False
+        self.append_lookahead_input_track_ids = []
+        self.append_lookahead_selected_track_ids = []
+        self.append_lookahead_selected_centers = ""
+        self.append_lookahead_selected_types = ""
+        self.horizon_track_decisions = {}
+        self.planning_track_horizon_debug = ""
+        self.planning_cycle_debug = ""
 
         if len(committed_tracks) == 0:
             self.planning_horizon_waypoint_types = "start"
@@ -2740,8 +4353,29 @@ class AutonomyAPI:
         order = self.race_progression.order()
         self.horizon_available_order = list(order)
         target_tracks = []
+        target_center_overrides = {}
         selected_track_ids = set()
         first_selected_order_idx = None
+
+        if (
+            self.race_progression.cursor < len(order)
+            and self.selected_current_track_id is not None
+            and self.canonical_track_id(order[self.race_progression.cursor])
+            != self.canonical_track_id(self.selected_current_track_id)
+        ):
+            blocked_id = self.canonical_track_id(order[self.race_progression.cursor])
+            self.horizon_rejected_track_ids.append(blocked_id)
+            self.horizon_rejection_reason = "farther_future_track_cannot_be_hard_current"
+            self.current_selection_rejection_reason = (
+                f"track{blocked_id}:farther_future_track_cannot_be_hard_current;"
+                f"selected_current_track={self.selected_current_track_id}"
+            )
+            self.horizon_track_decisions[blocked_id] = (
+                "excluded:farther_future_track_cannot_be_hard_current"
+            )
+            self.planning_horizon_waypoint_types = "start"
+            self._planning_target_waypoint_types = []
+            return np.array([current_pos], dtype=float), [], []
 
         for order_idx in range(self.race_progression.cursor, len(order)):
             if len(target_tracks) >= max_gates_ahead:
@@ -2752,9 +4386,17 @@ class AutonomyAPI:
                 continue
 
             tr = self.gate_memory.get_track_by_id(track_id)
-            if tr is None or not tr.committed:
+            handoff = self.pending_lookahead_handoff
+            is_handoff = bool(
+                handoff is not None
+                and self.canonical_track_id(handoff.get("track_id")) == self.canonical_track_id(track_id)
+            )
+            if tr is None or (not tr.committed and not is_handoff):
                 self.horizon_rejected_track_ids.append(track_id)
                 self.horizon_rejection_reason = "order_track_not_committed"
+                self.horizon_track_decisions[track_id] = "excluded:order_track_not_committed"
+                if is_handoff:
+                    self.promotion_blocked_reason = "handoff_track_missing_or_not_committed"
                 # Sequence integrity matters more than horizon length. With a
                 # predefined race order, do not skip an unavailable next gate
                 # and accidentally plan to a later gate.
@@ -2763,51 +4405,88 @@ class AutonomyAPI:
                 self.use_lookahead_gate_filter
                 and not getattr(tr, "is_stable", False)
                 and track_id not in self.race_accepted_track_ids
+                and not is_handoff
             ):
                 self.last_perception_accepted = False
                 self.last_perception_rejection_reason = "track_not_stable"
                 self.active_target_admission_status = "pending_stability"
                 self.horizon_rejected_track_ids.append(track_id)
                 self.horizon_rejection_reason = "track_not_stable"
+                self.horizon_track_decisions[track_id] = "excluded:track_not_stable"
                 print(
                     f"[TARGET REJECT] reason=track_not_stable "
                     f"track_id={tr.id} blocked={getattr(tr, 'promotion_blocked_reason', '')}"
                 )
+                self.promotion_blocked_reason = (
+                    getattr(tr, "promotion_blocked_reason", "")
+                    or "track_not_stable"
+                )
                 break
-            valid, reason = self.validate_planning_target(tr.center)
+            candidate_center = (
+                np.asarray(handoff["center"], dtype=float).reshape(3)
+                if is_handoff
+                else np.asarray(tr.center, dtype=float).reshape(3)
+            )
+            valid, reason = self.validate_planning_target(candidate_center)
             if not valid:
                 self.last_perception_accepted = False
                 self.last_perception_rejection_reason = reason
                 self.horizon_rejected_track_ids.append(track_id)
                 self.horizon_rejection_reason = reason
+                self.horizon_track_decisions[track_id] = f"excluded:{reason}"
+                if is_handoff:
+                    self.promotion_blocked_reason = f"planning_target_invalid:{reason}"
                 print(f"[TARGET REJECT] reason={reason} track_id={tr.id} center={tr.center}")
                 break
-            if self.is_near_completed_gate(tr.center):
+            if self.is_near_completed_gate(candidate_center):
                 self.last_perception_accepted = False
                 self.last_perception_rejection_reason = "already_completed_landmark"
                 self.target_rejected_completed = True
                 self.rejected_completed_this_lap = True
                 self.horizon_rejected_track_ids.append(track_id)
                 self.horizon_rejection_reason = "already_completed_landmark"
+                self.horizon_track_decisions[track_id] = "excluded:already_completed_landmark"
+                if is_handoff:
+                    self.promotion_blocked_reason = "already_completed_landmark"
                 print(f"[TARGET REJECT] reason=already_completed_landmark track_id={tr.id} center={tr.center}")
                 continue
-            if track_id not in self.race_accepted_track_ids:
+            if track_id not in self.race_accepted_track_ids and not is_handoff:
                 self.last_perception_accepted = False
                 self.last_perception_rejection_reason = "track_not_admitted_to_race"
                 self.active_target_admission_status = "rejected"
                 self.horizon_rejected_track_ids.append(track_id)
                 self.horizon_rejection_reason = "track_not_admitted_to_race"
+                self.horizon_track_decisions[track_id] = "excluded:track_not_admitted_to_race"
                 print(f"[TARGET REJECT] reason=track_not_admitted_to_race track_id={tr.id} center={tr.center}")
                 continue
-            valid, reason = self.validate_candidate_target(tr.center, current_pos, track_id=tr.id)
+            valid, reason = self.validate_candidate_target(candidate_center, current_pos, track_id=tr.id)
             if not valid:
                 self.last_perception_accepted = False
                 self.last_perception_rejection_reason = reason
                 self.horizon_rejected_track_ids.append(track_id)
                 self.horizon_rejection_reason = reason
+                self.horizon_track_decisions[track_id] = f"excluded:{reason}"
+                if is_handoff:
+                    self.promotion_blocked_reason = f"candidate_target_invalid:{reason}"
                 print(f"[TARGET REJECT] reason={reason} track_id={tr.id} center={tr.center}")
                 continue
             target_tracks.append(tr)
+            if is_handoff:
+                target_center_overrides[track_id] = candidate_center.copy()
+                self.promoted_lookahead_to_active = True
+                self.promoted_track_id = track_id
+                self.promoted_track_center = candidate_center.copy()
+                self.promotion_blocked_reason = ""
+                self.active_target_admission_status = "promoted_lookahead"
+                print(
+                    "[LOOKAHEAD HANDOFF] promoted "
+                    f"track_id={track_id} center={candidate_center.tolist()} "
+                    f"previous_ids={self.previous_horizon_track_ids} "
+                    f"previous_types={self.previous_horizon_waypoint_types}"
+                )
+            self.horizon_track_decisions[track_id] = (
+                "included:hard_current" if len(target_tracks) == 1 else "included:hard_stable"
+            )
             selected_track_ids.add(track_id)
             self.valid_candidate_count += 1
             if len(target_tracks) == 1:
@@ -2822,7 +4501,10 @@ class AutonomyAPI:
             if first_selected_order_idx is None:
                 first_selected_order_idx = order_idx
 
-        target_gates = [tr.center.copy() for tr in target_tracks]
+        target_gates = [
+            target_center_overrides.get(tr.id, tr.center).copy()
+            for tr in target_tracks
+        ]
         target_track_ids = [tr.id for tr in target_tracks]
         target_waypoint_types = [
             "hard_current" if i == 0 else "hard_stable"
@@ -2842,6 +4524,7 @@ class AutonomyAPI:
             max_gates_ahead=max_gates_ahead,
             allow_raw_candidates=True,
         )
+        self.update_lookahead_pipeline_debug()
         self.horizon_selected_track_ids = list(target_track_ids)
         self.planning_horizon_waypoint_types = " ".join(["start"] + target_waypoint_types)
         self._planning_target_waypoint_types = list(target_waypoint_types)
@@ -2915,7 +4598,12 @@ class AutonomyAPI:
         ], dtype=float)
 
         if self.use_perception:
+            self.promoted_lookahead_to_active = False
+            self.promoted_track_id = None
+            self.promoted_track_center = np.full(3, np.nan, dtype=float)
+            self.promotion_blocked_reason = ""
             self.gate_completion_triggered = False
+            self.reset_crossing_debug()
             self.completion_reason = ""
             self.completed_gate_position = None
             self.no_active_target = len(self.active_target_gates) == 0
@@ -3020,6 +4708,50 @@ class AutonomyAPI:
             self.completion_blocked_reason = ""
             self.completed_gate_position = target.copy()
             self.completed_gate_track_id = track_id
+            self.previous_horizon_track_ids = list(self.planning_horizon_track_ids)
+            self.previous_horizon_waypoint_types = self.planning_horizon_waypoint_types
+            self.pending_lookahead_handoff = None
+            if track_id in self.previous_horizon_track_ids:
+                completed_horizon_idx = self.previous_horizon_track_ids.index(track_id)
+                next_horizon_idx = completed_horizon_idx + 1
+                if (
+                    next_horizon_idx < len(self.previous_horizon_track_ids)
+                    and next_horizon_idx < len(self.active_target_gates)
+                ):
+                    next_id = self.canonical_track_id(
+                        self.previous_horizon_track_ids[next_horizon_idx]
+                    )
+                    waypoint_types = self.previous_horizon_waypoint_types.split()
+                    next_type = (
+                        waypoint_types[next_horizon_idx + 1]
+                        if next_horizon_idx + 1 < len(waypoint_types)
+                        else ""
+                    )
+                    if next_type in ("soft_tentative", "hard_stable"):
+                        self.pending_lookahead_handoff = {
+                            "track_id": next_id,
+                            "center": np.asarray(
+                                self.active_target_gates[next_horizon_idx], dtype=float
+                            ).reshape(3).copy(),
+                            "waypoint_type": next_type,
+                        }
+            if 0 <= self.current_gate_idx < len(self.gt_gates):
+                true_center = np.asarray(
+                    self.gt_gates[self.current_gate_idx], dtype=float
+                ).reshape(3)
+                self.crossing_true_gate_center = true_center.copy()
+                self.crossing_vehicle_position = pos.copy()
+                self.crossing_error = pos - true_center
+                self.crossing_lateral_error_xz = float(
+                    np.linalg.norm(self.crossing_error[[0, 2]])
+                )
+                print(
+                    "[GATE CROSSING DEBUG] "
+                    f"gate_idx={self.current_gate_idx} track_id={track_id} "
+                    f"vehicle={pos.tolist()} true={true_center.tolist()} "
+                    f"error={self.crossing_error.tolist()} "
+                    f"lateral_xz={self.crossing_lateral_error_xz:.3f}"
+                )
 
             self.completed_track_ids_this_cycle.add(track_id)
             self.completed_gate_positions_this_cycle.append(target.copy())
@@ -3069,6 +4801,20 @@ class AutonomyAPI:
                 self.next_track_after_completion_id = None
                 self.next_track_available_after_completion = False
 
+            if self.pending_lookahead_handoff is not None:
+                handoff_id = self.canonical_track_id(
+                    self.pending_lookahead_handoff.get("track_id")
+                )
+                if self.next_track_after_completion_id is None:
+                    self.promotion_blocked_reason = "next_race_order_track_missing"
+                    self.pending_lookahead_handoff = None
+                elif handoff_id != self.canonical_track_id(self.next_track_after_completion_id):
+                    self.promotion_blocked_reason = (
+                        f"handoff_not_next_race_track:{handoff_id}!="
+                        f"{self.next_track_after_completion_id}"
+                    )
+                    self.pending_lookahead_handoff = None
+
             installed_next_target = False
             if self.next_track_available_after_completion:
                 installed_next_target = self.path_plan(
@@ -3105,6 +4851,8 @@ class AutonomyAPI:
                 # stack waits for a valid next gate. Replanning will install the
                 # next target if one passes validation.
                 self.clear_active_perception_target(reason="gate_completed")
+            else:
+                self.pending_lookahead_handoff = None
             self.active_gate_idx_after = self.current_gate_idx
             self.race_cursor_after = self.race_progression.cursor
             return True
@@ -3165,6 +4913,11 @@ class AutonomyAPI:
         self.tentative_lookahead_track_ids = []
         self.tentative_lookahead_centers = ""
         self.tentative_lookahead_rejection_reason = ""
+        self.append_lookahead_called = False
+        self.append_lookahead_input_track_ids = []
+        self.append_lookahead_selected_track_ids = []
+        self.append_lookahead_selected_centers = ""
+        self.append_lookahead_selected_types = ""
         self.passthrough_velocity_enabled = False
         self.passthrough_speed_used = float("nan")
         self.waypoint_velocity_log = np.full((3, 3), np.nan, dtype=float)
@@ -3223,6 +4976,7 @@ class AutonomyAPI:
             print("No valid gates available to plan to.")
             if self.use_perception:
                 self.clear_active_perception_target(reason="no_valid_next_gate")
+                self.finalize_planning_horizon_debug()
             self.last_plan_finished_at = time.time()
             self.last_plan_duration = self.last_plan_finished_at - plan_start
             return False
@@ -3248,6 +5002,7 @@ class AutonomyAPI:
         if self.use_perception and len(validated_target_gates) == 0:
             print("No valid perception target available; clearing existing trajectory.")
             self.clear_active_perception_target(reason="validated_target_empty")
+            self.finalize_planning_horizon_debug()
             self.last_plan_finished_at = time.time()
             self.last_plan_duration = self.last_plan_finished_at - plan_start
             return False
@@ -3276,6 +5031,12 @@ class AutonomyAPI:
             if track_id in self.tentative_lookahead_track_ids
         }
 
+        previous_active_target = None
+        if 0 <= self.current_target_idx < len(self.active_target_gates):
+            previous_active_target = np.asarray(
+                self.active_target_gates[self.current_target_idx], dtype=float
+            ).reshape(3).copy()
+
         self.active_target_gates = [g.copy() for g in target_gates]
         self.active_target_track_ids = list(target_track_ids)
         self.current_target_idx = 0
@@ -3286,6 +5047,13 @@ class AutonomyAPI:
             self.active_target_cleared = False
             self.set_active_perception_target_geometry(target_gates[0], pos)
             self.active_target_center_at_plan = target_gates[0].copy()
+            self.record_target_update_debug(
+                previous=previous_active_target,
+                new=target_gates[0],
+                track_id=self.active_target_track_id,
+                reason=replan_reason,
+            )
+            self.finalize_planning_horizon_debug()
 
         times_init = self.allocate_segment_times(
             waypoints,

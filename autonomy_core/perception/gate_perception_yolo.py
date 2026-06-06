@@ -22,6 +22,11 @@ class GatePerception:
         self.max_failures = max_failures
         self.failure_counter = 0
         self.last_debug = {}
+        self.last_yolo_detection_count = 0
+        self.last_yolo_detection_confidences = []
+        self.last_yolo_detection_bboxes = []
+        self.last_yolo_detection_keypoints = []
+        self.last_yolo_candidate_debug = []
         self.live_solver_name = "IPPE_SQUARE_CANDIDATE_SWEEP"
 
         # YOLO pose settings
@@ -128,11 +133,44 @@ class GatePerception:
 
         self.failure_counter = 0
         detections = []
-        for corners in corners_list:
+        candidate_debug = getattr(self, "last_yolo_candidate_debug", [])
+        for processed_index, corners in enumerate(corners_list):
             ordered = self.order_corners(corners)
             result = self._estimate_detection_result(corners, ordered, camera_matrix, dist_coeffs)
             if result is not None:
+                meta = candidate_debug[processed_index] if processed_index < len(candidate_debug) else {}
+                yolo_confidence = float(
+                    meta.get("box_confidence", result.get("confidence", np.nan))
+                )
+                old_area_confidence = float(result.get("confidence", np.nan))
+                quad_area_px2 = float(abs(cv2.contourArea(np.asarray(ordered, dtype=np.float32))))
+                result["yolo_confidence"] = yolo_confidence
+                result["quad_area_px2"] = quad_area_px2
+                result["quad_area_confidence"] = old_area_confidence
+                result["old_area_confidence"] = old_area_confidence
+                # Gate existence comes from YOLO; apparent image size is diagnostic only.
+                result["memory_confidence"] = yolo_confidence
+                result["debug"]["detection_index"] = int(meta.get("detection_index", processed_index))
+                result["debug"]["processed_detection_index"] = int(processed_index)
+                result["debug"]["yolo_bbox"] = np.asarray(
+                    meta.get("bbox", np.full(4, np.nan)),
+                    dtype=float,
+                ).reshape(4).copy()
+                result["debug"]["yolo_box_confidence"] = float(
+                    meta.get("box_confidence", result.get("confidence", np.nan))
+                )
+                result["debug"]["yolo_keypoints"] = np.asarray(
+                    meta.get("keypoints", np.full((4, 3), np.nan)),
+                    dtype=float,
+                ).reshape(-1, 3).copy()
+                result["debug"]["quad_area_px2"] = quad_area_px2
+                result["debug"]["quad_area_confidence"] = old_area_confidence
+                result["debug"]["old_area_confidence"] = old_area_confidence
+                result["debug"]["memory_confidence"] = yolo_confidence
                 detections.append(result)
+            else:
+                if processed_index < len(candidate_debug):
+                    candidate_debug[processed_index]["rejection_reason"] = "no_pnp_solution"
 
         detections.sort(
             key=lambda det: (
@@ -368,22 +406,61 @@ class GatePerception:
             result = self.yolo_model.predict(**kwargs)[0]
         except Exception as exc:
             print(f"[YOLO PERCEPTION] prediction failed: {exc}")
+            self.last_yolo_detection_count = 0
+            self.last_yolo_detection_confidences = []
+            self.last_yolo_detection_bboxes = []
+            self.last_yolo_detection_keypoints = []
+            self.last_yolo_candidate_debug = []
             return []
 
         if result.boxes is None or len(result.boxes) == 0:
+            self.last_yolo_detection_count = 0
+            self.last_yolo_detection_confidences = []
+            self.last_yolo_detection_bboxes = []
+            self.last_yolo_detection_keypoints = []
+            self.last_yolo_candidate_debug = []
             return []
         if result.keypoints is None or result.keypoints.data is None:
+            self.last_yolo_detection_count = 0
+            self.last_yolo_detection_confidences = []
+            self.last_yolo_detection_bboxes = []
+            self.last_yolo_detection_keypoints = []
+            self.last_yolo_candidate_debug = []
             return []
 
         boxes_xyxy = result.boxes.xyxy.detach().cpu().numpy()
         boxes_conf = result.boxes.conf.detach().cpu().numpy()
         keypoints = result.keypoints.data.detach().cpu().numpy()  # shape: N x K x 3
+        keep_mask = boxes_conf >= self.yolo_conf
+        self.last_yolo_detection_count = int(np.sum(keep_mask))
+        self.last_yolo_detection_confidences = [
+            float(c) for c in boxes_conf[keep_mask]
+        ]
+        self.last_yolo_detection_bboxes = [
+            np.asarray(b, dtype=float).reshape(4).tolist()
+            for b in boxes_xyxy[keep_mask]
+        ]
+        self.last_yolo_detection_keypoints = [
+            np.asarray(k, dtype=float).tolist()
+            for k in keypoints[keep_mask]
+        ]
 
         candidates = []
         h, w = frame_bgr.shape[:2]
 
         for i in range(len(boxes_conf)):
+            if float(boxes_conf[i]) < self.yolo_conf:
+                continue
+            meta = {
+                "detection_index": int(i),
+                "box_confidence": float(boxes_conf[i]),
+                "bbox": np.asarray(boxes_xyxy[i], dtype=float).reshape(4).copy(),
+                "keypoints": np.asarray(keypoints[i], dtype=float).copy(),
+                "rejection_reason": "",
+            }
             if keypoints.shape[1] < 4:
+                meta["rejection_reason"] = "fewer_than_4_keypoints"
+                candidates.append((-np.inf, float(boxes_conf[i]), 0.0, None, meta))
                 continue
 
             pts = keypoints[i, :4, :2].astype(np.float32)
@@ -391,35 +468,49 @@ class GatePerception:
 
             # Reject broken keypoint sets.
             if not np.isfinite(pts).all():
+                meta["rejection_reason"] = "non_finite_keypoints"
+                candidates.append((-np.inf, float(boxes_conf[i]), 0.0, None, meta))
                 continue
             if np.any(pts[:, 0] < -5) or np.any(pts[:, 0] > w + 5):
+                meta["rejection_reason"] = "keypoints_outside_image_x"
+                candidates.append((-np.inf, float(boxes_conf[i]), 0.0, None, meta))
                 continue
             if np.any(pts[:, 1] < -5) or np.any(pts[:, 1] > h + 5):
+                meta["rejection_reason"] = "keypoints_outside_image_y"
+                candidates.append((-np.inf, float(boxes_conf[i]), 0.0, None, meta))
                 continue
 
             # Very low keypoint confidence means the box may be okay but corners are not.
             mean_kconf = float(np.mean(kconf))
             if mean_kconf < 0.10:
+                meta["rejection_reason"] = "keypoint_confidence_low"
+                candidates.append((-np.inf, float(boxes_conf[i]), mean_kconf, None, meta))
                 continue
 
             area = abs(cv2.contourArea(pts))
             if area < 50:
+                meta["rejection_reason"] = "keypoint_area_low"
+                candidates.append((-np.inf, float(boxes_conf[i]), mean_kconf, None, meta))
                 continue
 
             # Score by bbox confidence, keypoint confidence, and keypoint quad area.
             score = float(boxes_conf[i]) + 0.25 * mean_kconf + min(area / 40000.0, 1.0) * 0.10
 
-            candidates.append((score, float(boxes_conf[i]), mean_kconf, pts))
+            candidates.append((score, float(boxes_conf[i]), mean_kconf, pts, meta))
 
         candidates.sort(key=lambda item: item[0], reverse=True)
 
         # De-duplicate similar detections.
         deduped = []
-        for score, box_conf, mean_kconf, pts in candidates:
+        rejected_meta = []
+        for score, box_conf, mean_kconf, pts, meta in candidates:
+            if pts is None:
+                rejected_meta.append(meta)
+                continue
             center = np.mean(pts, axis=0)
             size = np.ptp(pts, axis=0)
             duplicate = False
-            for kept_score, kept_box_conf, kept_mean_kconf, kept_pts in deduped:
+            for kept_score, kept_box_conf, kept_mean_kconf, kept_pts, kept_meta in deduped:
                 kept_center = np.mean(kept_pts, axis=0)
                 kept_size = np.ptp(kept_pts, axis=0)
                 center_close = np.linalg.norm(center - kept_center) < 12.0
@@ -428,9 +519,15 @@ class GatePerception:
                     duplicate = True
                     break
             if not duplicate:
-                deduped.append((score, box_conf, mean_kconf, pts))
+                deduped.append((score, box_conf, mean_kconf, pts, meta))
+            else:
+                meta["rejection_reason"] = "duplicate_yolo_detection"
+                rejected_meta.append(meta)
 
-        return [pts for _, _, _, pts in deduped]
+        self.last_yolo_candidate_debug = [
+            meta for _, _, _, _, meta in deduped
+        ] + rejected_meta
+        return [pts for _, _, _, pts, _ in deduped]
 
     # -------------------------------------------------
     # Correct Corner Ordering

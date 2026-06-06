@@ -9,6 +9,12 @@ class GatePerceptionNode:
 
     def __init__(self, gate_perception, camera_to_body_rotmat=None):
         self.gate_perception = gate_perception
+        self.last_pipeline_debug = {
+            "yolo_raw_count": 0,
+            "pnp_success_count": 0,
+            "world_valid_count": 0,
+            "processed_detection_indices": [],
+        }
         if camera_to_body_rotmat is None:
             # OpenCV optical frame: x right, y down, z forward.
             # Body/world convention used here: x forward, y left, z up.
@@ -107,10 +113,17 @@ class GatePerceptionNode:
                 drone_rpy_rad=drone_rpy_rad,
                 drone_yaw_rad=drone_yaw_rad,
             )
+            self.last_pipeline_debug = {
+                "yolo_raw_count": int(getattr(self.gate_perception, "last_yolo_detection_count", 0)),
+                "pnp_success_count": 0 if det is None else 1,
+                "world_valid_count": 0 if det is None else 1,
+                "processed_detection_indices": [],
+            }
             return [] if det is None else [det]
 
         perceptions = self.gate_perception.process_all(frame, camera_matrix, dist_coeffs)
         detections = []
+        processed_indices = []
         for perception in perceptions:
             det = self._perception_to_world_detection(
                 perception=perception,
@@ -122,6 +135,13 @@ class GatePerceptionNode:
             )
             if det is not None:
                 detections.append(det)
+                processed_indices.append(int(det.get("detection_index", len(processed_indices))))
+        self.last_pipeline_debug = {
+            "yolo_raw_count": int(getattr(self.gate_perception, "last_yolo_detection_count", 0)),
+            "pnp_success_count": int(len(perceptions)),
+            "world_valid_count": int(len(detections)),
+            "processed_detection_indices": processed_indices,
+        }
         return detections
 
     def _perception_to_world_detection(
@@ -219,6 +239,36 @@ class GatePerceptionNode:
 
         return {
             "confidence": float(conf),
+            "yolo_confidence": float(
+                perception.get(
+                    "yolo_confidence",
+                    debug.get("yolo_box_confidence", conf),
+                )
+            ),
+            "quad_area_px2": float(
+                perception.get("quad_area_px2", debug.get("quad_area_px2", np.nan))
+            ),
+            "quad_area_confidence": float(
+                perception.get(
+                    "quad_area_confidence",
+                    debug.get("quad_area_confidence", conf),
+                )
+            ),
+            "old_area_confidence": float(
+                perception.get(
+                    "old_area_confidence",
+                    debug.get("old_area_confidence", conf),
+                )
+            ),
+            "memory_confidence": float(
+                perception.get(
+                    "memory_confidence",
+                    perception.get(
+                        "yolo_confidence",
+                        debug.get("yolo_box_confidence", conf),
+                    ),
+                )
+            ),
             "gate_center_camera": gate_camera,
             "gate_center_body": gate_body,
             "gate_center_cam": gate_body,
@@ -286,5 +336,10 @@ class GatePerceptionNode:
             "raw_keypoint_polygon_winding": debug.get("raw_keypoint_polygon_winding", ""),
             "gate_size_sweep": gate_size_sweep,
             "pnp_formulation_debug": pnp_formulation_debug,
+            "detection_index": int(debug.get("detection_index", -1)),
+            "processed_detection_index": int(debug.get("processed_detection_index", -1)),
+            "yolo_bbox": debug.get("yolo_bbox", None),
+            "yolo_box_confidence": float(debug.get("yolo_box_confidence", np.nan)),
+            "yolo_keypoints": debug.get("yolo_keypoints", None),
             "raw": perception,
         }
