@@ -3,12 +3,15 @@ import time
 import math
 import os
 import cv2
+import json
+import itertools
 from autonomy_core.planning.minimum_snap_planner_multi_time_optimized import MultiSegmentMinimumSnapPlanner
 from autonomy_core.launch.get_telemetry import GetTelemetry
 from autonomy_core.controller.attitude_controller3 import RPGHighLevelTracker
 from autonomy_core.perception.gate_perception_yolo import GatePerception
 from autonomy_core.perception.gate_perception_node import GatePerceptionNode
 from autonomy_core.perception.gate_memory import GateMemory
+from autonomy_core.perception.corner_measurement import CornerMeasurement
 from autonomy_core.launch.race_progression import RaceProgression
 from dataclasses import dataclass
 
@@ -239,6 +242,28 @@ class AutonomyAPI:
         self.use_raw_rejected_planning_lookahead = False
         self.planning_lookahead_min_hits = 6
         self.perception_transform_mode = "physical_direct_rad_x_mirror"
+        # WARNING: gazebo_truth_sim_only is a simulation-only shortcut and
+        # must not be used for real flight.
+        self.perception_world_pose_source = "gazebo_truth_sim_only"
+        self.perception_world_pose_sources = (
+            "mavsdk",
+            "gazebo_truth_sim_only",
+        )
+        self.perception_world_pose_source_used = "mavsdk"
+        self.world_from_mavsdk = np.full(3, np.nan, dtype=float)
+        self.world_from_gazebo_truth = np.full(3, np.nan, dtype=float)
+        self.selected_world_estimate = np.full(3, np.nan, dtype=float)
+        self.selected_vs_mavsdk_world_delta = np.full(3, np.nan, dtype=float)
+        self.selected_vs_gazebo_world_delta = np.full(3, np.nan, dtype=float)
+        self.debug_verbose_overlay = False
+        self.image_gazebo_pose_snapshot = None
+        self.gt_rmse_px_raw_indexed = float("nan")
+        self.gt_rmse_px_ordered = float("nan")
+        self.gt_rmse_px_best_permutation = float("nan")
+        self.gt_center_err_px = float("nan")
+        self.gt_corner_order_warning = False
+        self.rmse_gate_idx = None
+        self.detection_race_idx_for_rmse = None
         # Diagnostic experiment only: compensate the measured far-range PnP
         # depth bias for detections classified as future/lookahead gates.
         self.use_diagnostic_far_depth_correction = False
@@ -462,6 +487,11 @@ class AutonomyAPI:
         self.image_pose_snapshot_position = np.full(3, np.nan, dtype=float)
         self.image_pose_snapshot_rpy_raw = np.full(3, np.nan, dtype=float)
         self.image_pose_snapshot_rpy_perception = np.full(3, np.nan, dtype=float)
+        self.corner_measurements = []
+        self.corner_measurements_frame = []
+        self.corner_measurement_records_frame = []
+        self.corner_measurement_count = 0
+        self.corner_measurements_log = ""
         self.image_received_wall_time = float("nan")
         self.image_processed_wall_time = float("nan")
         self.telemetry_position_sample_time = float("nan")
@@ -1293,11 +1323,124 @@ class AutonomyAPI:
         world = drone_pos + r_wb @ (self.camera_offset_body + gate_body)
         return world, gate_body, rpy
 
+    @staticmethod
+    def _gazebo_model_pose_to_planner(gazebo_pose):
+        """Convert Gazebo model truth into the established planner frame."""
+        if not isinstance(gazebo_pose, dict):
+            return None, None
+        try:
+            position_gazebo = np.asarray(
+                gazebo_pose["gazebo_model_pos_world"], dtype=float
+            ).reshape(3)
+            rotation_gazebo = AutonomyAPI._quaternion_xyzw_to_rotmat(
+                np.asarray(
+                    gazebo_pose["gazebo_model_quat_world"], dtype=float
+                ).reshape(4)
+            )
+        except (KeyError, TypeError, ValueError):
+            return None, None
+        if not (
+            np.all(np.isfinite(position_gazebo))
+            and np.all(np.isfinite(rotation_gazebo))
+        ):
+            return None, None
+
+        # Gazebo world x/y map to planner y/x. The body reflection is required
+        # to keep the result a proper rotation and yields yaw=90deg-gazebo_yaw.
+        world_gazebo_to_planner = np.array([
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ], dtype=float)
+        body_planner_to_gazebo = np.diag([1.0, -1.0, 1.0])
+        position_planner = world_gazebo_to_planner @ position_gazebo
+        rotation_planner_body = (
+            world_gazebo_to_planner
+            @ rotation_gazebo
+            @ body_planner_to_gazebo
+        )
+        return position_planner, rotation_planner_body
+
+    def transform_gate_camera_to_world_for_pose_source(
+        self,
+        gate_camera,
+        drone_pos,
+        telemetry_rpy_raw_rad,
+        mode,
+        r_body_camera,
+        gazebo_pose=None,
+    ):
+        source = str(self.perception_world_pose_source)
+        if source not in self.perception_world_pose_sources:
+            raise ValueError(
+                "perception_world_pose_source must be one of "
+                f"{self.perception_world_pose_sources}, got {source!r}"
+            )
+
+        world_mavsdk, gate_body, rpy = self.transform_gate_camera_to_world(
+            gate_camera=gate_camera,
+            drone_pos=drone_pos,
+            telemetry_rpy_raw_rad=telemetry_rpy_raw_rad,
+            mode=mode,
+            r_body_camera=r_body_camera,
+        )
+        gazebo_position, gazebo_rotation = self._gazebo_model_pose_to_planner(
+            gazebo_pose
+        )
+        world_gazebo = np.full(3, np.nan, dtype=float)
+        if gazebo_position is not None and gazebo_rotation is not None:
+            world_gazebo = (
+                gazebo_position
+                + gazebo_rotation @ (self.camera_offset_body + gate_body)
+            )
+
+        selected = world_mavsdk.copy()
+        source_used = "mavsdk"
+        selected_rotation = self.perception_node._rpy_to_rotmat(*map(float, rpy))
+        if source == "gazebo_truth_sim_only":
+            if np.all(np.isfinite(world_gazebo)):
+                selected = world_gazebo.copy()
+                source_used = "gazebo_truth_sim_only"
+                selected_rotation = gazebo_rotation
+            else:
+                source_used = "mavsdk_fallback_gazebo_truth_unavailable"
+
+        return {
+            "selected_world": selected,
+            "world_from_mavsdk": world_mavsdk,
+            "world_from_gazebo_truth": world_gazebo,
+            "gate_body": gate_body,
+            "rpy_mavsdk": rpy,
+            "selected_rotation_world_body": selected_rotation,
+            "source_used": source_used,
+        }
+
+    def update_perception_world_pose_source_debug(self, transform_result):
+        self.perception_world_pose_source_used = str(
+            transform_result["source_used"]
+        )
+        self.world_from_mavsdk = np.asarray(
+            transform_result["world_from_mavsdk"], dtype=float
+        ).reshape(3).copy()
+        self.world_from_gazebo_truth = np.asarray(
+            transform_result["world_from_gazebo_truth"], dtype=float
+        ).reshape(3).copy()
+        self.selected_world_estimate = np.asarray(
+            transform_result["selected_world"], dtype=float
+        ).reshape(3).copy()
+        self.selected_vs_mavsdk_world_delta = (
+            self.selected_world_estimate - self.world_from_mavsdk
+        )
+        self.selected_vs_gazebo_world_delta = (
+            self.selected_world_estimate - self.world_from_gazebo_truth
+        )
+
     def apply_diagnostic_far_depth_correction(
         self,
         detections,
         drone_pos,
         telemetry_rpy_raw_rad,
+        gazebo_pose=None,
     ):
         """Apply the opt-in simulation diagnostic only to future detections."""
         if not detections:
@@ -1405,13 +1548,16 @@ class AutonomyAPI:
             corrected_camera = camera * factor
             corrected_world = det["world_original"].copy()
             if np.all(np.isfinite(corrected_camera)):
-                corrected_world, corrected_body, _ = self.transform_gate_camera_to_world(
+                transform_result = self.transform_gate_camera_to_world_for_pose_source(
                     gate_camera=corrected_camera,
                     drone_pos=drone_pos,
                     telemetry_rpy_raw_rad=telemetry_rpy_raw_rad,
                     mode=self.perception_transform_mode,
                     r_body_camera=r_body_camera,
+                    gazebo_pose=gazebo_pose,
                 )
+                corrected_world = transform_result["selected_world"]
+                corrected_body = transform_result["gate_body"]
                 det["pnp_camera_depth_corrected"] = corrected_camera.copy()
                 det["world_depth_corrected"] = corrected_world.copy()
                 det["depth_correction_factor"] = float(factor)
@@ -1752,6 +1898,12 @@ class AutonomyAPI:
             self.perception_detection_flow_entries[idx] = {
                 "idx": idx,
                 "yolo_confidence": float(meta.get("box_confidence", np.nan)),
+                "bbox": np.asarray(
+                    meta.get("bbox", np.full(4, np.nan)), dtype=float
+                ).reshape(4),
+                "keypoints": np.asarray(
+                    meta.get("keypoints", np.full((4, 3), np.nan)), dtype=float
+                ).reshape(-1, 3),
                 "quad_area_px2": float("nan"),
                 "old_area_confidence": float("nan"),
                 "memory_confidence": float("nan"),
@@ -1812,6 +1964,17 @@ class AutonomyAPI:
             "yolo_confidence": float(
                 det.get("yolo_confidence", entry.get("yolo_confidence", np.nan))
             ),
+            "bbox": np.asarray(
+                det.get("yolo_bbox", entry.get("bbox", np.full(4, np.nan))),
+                dtype=float,
+            ).reshape(4),
+            "keypoints": np.asarray(
+                det.get(
+                    "yolo_keypoints",
+                    entry.get("keypoints", np.full((4, 3), np.nan)),
+                ),
+                dtype=float,
+            ).reshape(-1, 3),
             "quad_area_px2": float(det.get("quad_area_px2", np.nan)),
             "old_area_confidence": float(
                 det.get("old_area_confidence", det.get("quad_area_confidence", np.nan))
@@ -1857,6 +2020,232 @@ class AutonomyAPI:
             "role": role,
             "reason": rejection_reason or (result.get("reason", "") if result else ""),
         })
+
+    @staticmethod
+    def _ordered_image_quad(points):
+        points = np.asarray(points, dtype=float).reshape(4, 2)
+        by_y = points[np.argsort(points[:, 1])]
+        top = by_y[:2][np.argsort(by_y[:2, 0])]
+        bottom = by_y[2:][np.argsort(by_y[2:, 0])]
+        return np.array([top[0], top[1], bottom[1], bottom[0]], dtype=float)
+
+    def _corner_measurement_race_index(self, track_id, world_center):
+        canonical_id = self.canonical_track_id(track_id)
+        order = self.race_progression.order()
+        if canonical_id in order:
+            return int(order.index(canonical_id))
+
+        track = (
+            self.gate_memory.get_track_by_id(canonical_id)
+            if canonical_id is not None
+            else None
+        )
+        track_race_index = getattr(track, "race_order_index", None)
+        if track_race_index is not None:
+            return int(track_race_index)
+
+        if len(self.gt_gates) == 0:
+            return None
+        center = np.asarray(world_center, dtype=float).reshape(3)
+        if not np.all(np.isfinite(center)):
+            return None
+        distances = [
+            float(np.linalg.norm(center - np.asarray(gate, dtype=float).reshape(3)))
+            for gate in self.gt_gates
+        ]
+        return int(np.argmin(distances)) if min(distances) <= 4.0 else None
+
+    def _project_debug_gt_gate_corners(
+        self,
+        race_index,
+        camera_pose_world,
+        camera_matrix,
+        dist_coeffs,
+    ):
+        if race_index is None or not (0 <= int(race_index) < len(self.gt_gates)):
+            return None, None
+        gate_center = np.asarray(self.gt_gates[int(race_index)], dtype=float).reshape(3)
+        half = 0.75
+        corners_world = np.array([
+            gate_center + [-half, 0.0, half],
+            gate_center + [half, 0.0, half],
+            gate_center + [half, 0.0, -half],
+            gate_center + [-half, 0.0, -half],
+        ], dtype=float)
+        camera_pose_world = np.asarray(camera_pose_world, dtype=float).reshape(4, 4)
+        r_wc = camera_pose_world[:3, :3]
+        p_wc = camera_pose_world[:3, 3]
+        corners_camera = (r_wc.T @ (corners_world - p_wc).T).T
+        if not np.all(corners_camera[:, 2] > 0.0):
+            return gate_center, None
+        projected, _ = cv2.projectPoints(
+            corners_camera.reshape(-1, 1, 3),
+            np.zeros((3, 1), dtype=float),
+            np.zeros((3, 1), dtype=float),
+            np.asarray(camera_matrix, dtype=float).reshape(3, 3),
+            np.asarray(dist_coeffs, dtype=float).reshape(-1, 1),
+        )
+        return gate_center, self._ordered_image_quad(projected.reshape(4, 2))
+
+    @staticmethod
+    def _json_safe_number(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        return value if np.isfinite(value) else None
+
+    @classmethod
+    def _json_safe_array(cls, value):
+        array = np.asarray(value, dtype=float)
+        return [
+            cls._json_safe_number(item)
+            for item in array.reshape(-1)
+        ]
+
+    def record_corner_measurement(
+        self,
+        det,
+        result,
+        camera_matrix,
+        dist_coeffs,
+    ):
+        if result is None:
+            return None
+
+        raw_keypoints = np.asarray(
+            det.get("yolo_keypoints", np.full((4, 3), np.nan)),
+            dtype=float,
+        ).reshape(-1, 3)
+        if raw_keypoints.shape[0] < 4:
+            return None
+        keypoints_px = raw_keypoints[:4, :2].copy()
+        keypoint_conf = raw_keypoints[:4, 2].copy()
+        visibility = (
+            np.isfinite(keypoints_px).all(axis=1)
+            & np.isfinite(keypoint_conf)
+            & (keypoint_conf > 0.0)
+            & (keypoints_px[:, 0] >= 0.0)
+            & (keypoints_px[:, 0] < float(self.image_width))
+            & (keypoints_px[:, 1] >= 0.0)
+            & (keypoints_px[:, 1] < float(self.image_height))
+        )
+
+        rpy = np.asarray(
+            self.image_pose_snapshot_rpy_perception, dtype=float
+        ).reshape(3)
+        r_wb = self.perception_node._rpy_to_rotmat(*map(float, rpy))
+        r_body_camera = self.body_camera_matrix_for_mode(
+            self.perception_transform_mode
+        )
+        camera_pose_world = np.eye(4, dtype=float)
+        camera_pose_world[:3, :3] = r_wb @ r_body_camera
+        camera_pose_world[:3, 3] = (
+            self.image_pose_snapshot_position
+            + r_wb @ self.camera_offset_body
+        )
+
+        associated_track_id = result.get("track_id")
+        race_index = self._corner_measurement_race_index(
+            associated_track_id,
+            det.get("gate_center_world", np.full(3, np.nan)),
+        )
+        gt_center, projected_gt = self._project_debug_gt_gate_corners(
+            race_index,
+            camera_pose_world,
+            camera_matrix,
+            dist_coeffs,
+        )
+        residuals = (
+            keypoints_px - projected_gt
+            if projected_gt is not None
+            else np.full((4, 2), np.nan, dtype=float)
+        )
+        track = (
+            self.gate_memory.get_track_by_id(associated_track_id)
+            if associated_track_id is not None
+            else None
+        )
+        filtered_center = (
+            np.asarray(track.filtered_center_world, dtype=float).reshape(3)
+            if track is not None
+            and getattr(track, "filtered_center_world", None) is not None
+            else np.full(3, np.nan, dtype=float)
+        )
+
+        measurement = CornerMeasurement(
+            image_stamp=(self.image_stamp_sec, self.image_stamp_nanosec),
+            camera_pose_world=camera_pose_world,
+            keypoints_px=keypoints_px,
+            keypoint_conf=keypoint_conf,
+            visibility=visibility,
+            associated_track_id=associated_track_id,
+            race_index_candidate=race_index,
+        )
+        self.corner_measurements.append(measurement)
+        self.corner_measurements_frame.append(measurement)
+
+        bbox = np.asarray(
+            det.get("yolo_bbox", np.full(4, np.nan)), dtype=float
+        ).reshape(4)
+        record = {
+            "image_stamp": (
+                f"{self.image_stamp_sec}.{self.image_stamp_nanosec:09d}"
+            ),
+            "vehicle_pose_snapshot": {
+                "position": self._json_safe_array(self.image_pose_snapshot_position),
+                "rpy_raw_rad": self._json_safe_array(self.image_pose_snapshot_rpy_raw),
+                "rpy_perception_rad": self._json_safe_array(
+                    self.image_pose_snapshot_rpy_perception
+                ),
+                "pose_stamp": self._json_safe_number(
+                    self.pose_stamp_used_for_detection
+                ),
+            },
+            "camera_pose_world": self._json_safe_array(camera_pose_world),
+            "camera_intrinsics": self._json_safe_array(camera_matrix),
+            "dist_coeffs": self._json_safe_array(dist_coeffs),
+            "detection_index": int(
+                det.get("detection_index", det.get("processed_detection_index", -1))
+            ),
+            "associated_track_id": associated_track_id,
+            "race_index_candidate": race_index,
+            "expected_gate_index": race_index,
+            "memory_accepted": bool(result.get("accepted", False)),
+            "memory_result_reason": str(result.get("reason", "")),
+            "keypoints_px": self._json_safe_array(keypoints_px),
+            "keypoint_conf": self._json_safe_array(keypoint_conf),
+            "visibility": [bool(value) for value in visibility],
+            "bbox_xyxy": self._json_safe_array(bbox),
+            "bbox_confidence": self._json_safe_number(
+                det.get("yolo_box_confidence", det.get("yolo_confidence", np.nan))
+            ),
+            "pnp_world_estimate": self._json_safe_array(
+                det.get("gate_center_world", np.full(3, np.nan))
+            ),
+            "gate_memory_filtered_estimate": self._json_safe_array(filtered_center),
+            "gt_gate_center": (
+                self._json_safe_array(gt_center) if gt_center is not None else None
+            ),
+            "projected_gt_corners_px": (
+                self._json_safe_array(projected_gt)
+                if projected_gt is not None
+                else None
+            ),
+            "corner_residuals_px": (
+                self._json_safe_array(residuals)
+                if projected_gt is not None
+                else None
+            ),
+        }
+        self.corner_measurement_records_frame.append(record)
+        self.corner_measurement_count = len(self.corner_measurements_frame)
+        self.corner_measurements_log = json.dumps(
+            self.corner_measurement_records_frame,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return measurement
 
     def finalize_detection_flow_debug(self):
         parts = []
@@ -2153,6 +2542,18 @@ class AutonomyAPI:
         self.reset_pnp_selection_debug()
         self.reset_association_debug_log_fields()
         self.reset_lookahead_pipeline_debug()
+        self.corner_measurements_frame = []
+        self.corner_measurement_records_frame = []
+        self.corner_measurement_count = 0
+        self.corner_measurements_log = ""
+        self.perception_world_pose_source_used = str(
+            self.perception_world_pose_source
+        )
+        self.world_from_mavsdk = np.full(3, np.nan, dtype=float)
+        self.world_from_gazebo_truth = np.full(3, np.nan, dtype=float)
+        self.selected_world_estimate = np.full(3, np.nan, dtype=float)
+        self.selected_vs_mavsdk_world_delta = np.full(3, np.nan, dtype=float)
+        self.selected_vs_gazebo_world_delta = np.full(3, np.nan, dtype=float)
 
         process_wall_time = time.time()
         self.image_stamp_sec = int(image_stamp_sec)
@@ -2199,6 +2600,10 @@ class AutonomyAPI:
             self.last_processed_image_stamp = image_key
 
         snapshot = image_pose_snapshot if isinstance(image_pose_snapshot, dict) else {}
+        image_gazebo_pose = snapshot.get("gazebo_pose")
+        if not isinstance(image_gazebo_pose, dict):
+            image_gazebo_pose = gazebo_pose
+        self.image_gazebo_pose_snapshot = image_gazebo_pose
         snapshot_position = np.asarray(
             snapshot.get(
                 "position",
@@ -2270,7 +2675,7 @@ class AutonomyAPI:
         self.last_telemetry_rpy_raw_rad = telemetry_rpy_raw_rad.copy()
         self.telemetry_yaw_raw_deg = math.degrees(float(telemetry_rpy_raw_rad[2]))
         self.update_dynamic_gazebo_perception_yaw_correction(
-            gazebo_pose=gazebo_pose,
+            gazebo_pose=image_gazebo_pose,
             telemetry_yaw_raw_rad=float(telemetry_rpy_raw_rad[2]),
         )
         drone_rpy_for_perception = self.perception_rpy_for_mode(
@@ -2299,7 +2704,7 @@ class AutonomyAPI:
         ], dtype=float)
         self.detection_drone_yaw_deg = math.degrees(float(drone_rpy_for_perception[2]))
         self.capture_gazebo_pose_debug(
-            gazebo_pose=gazebo_pose,
+            gazebo_pose=image_gazebo_pose,
             mavsdk_pos=drone_pos,
             mavsdk_yaw_rad=float(telemetry_rpy_raw_rad[2]),
             process_wall_time=process_wall_time,
@@ -2398,16 +2803,29 @@ class AutonomyAPI:
                 ).reshape(3)
                 if not np.all(np.isfinite(gate_camera)):
                     continue
-                gate_world, gate_body, _ = self.transform_gate_camera_to_world(
+                transform_result = self.transform_gate_camera_to_world_for_pose_source(
                     gate_camera=gate_camera,
                     drone_pos=drone_pos,
                     telemetry_rpy_raw_rad=telemetry_rpy_raw_rad,
                     mode=self.perception_transform_mode,
                     r_body_camera=r_body_camera,
+                    gazebo_pose=image_gazebo_pose,
                 )
+                gate_world = transform_result["selected_world"]
+                gate_body = transform_result["gate_body"]
                 live_det["gate_center_body"] = gate_body.copy()
                 live_det["gate_center_cam"] = gate_body.copy()
                 live_det["gate_center_world"] = gate_world.copy()
+                live_det["world_from_mavsdk"] = transform_result[
+                    "world_from_mavsdk"
+                ].copy()
+                live_det["world_from_gazebo_truth"] = transform_result[
+                    "world_from_gazebo_truth"
+                ].copy()
+                live_det["selected_world_estimate"] = gate_world.copy()
+                live_det["perception_world_pose_source_used"] = transform_result[
+                    "source_used"
+                ]
                 live_det["camera_to_body_matrix_used"] = r_body_camera.copy()
                 live_det["body_to_world_method_used"] = self.perception_transform_mode
                 gate_normal_camera = np.asarray(
@@ -2417,12 +2835,16 @@ class AutonomyAPI:
                 if np.all(np.isfinite(gate_normal_camera)):
                     gate_normal_body = r_body_camera @ gate_normal_camera
                     live_det["gate_normal_body"] = gate_normal_body.copy()
-                    live_det["gate_normal_world"] = r_wb @ gate_normal_body
+                    live_det["gate_normal_world"] = (
+                        transform_result["selected_rotation_world_body"]
+                        @ gate_normal_body
+                    )
 
         detections = self.apply_diagnostic_far_depth_correction(
             detections=detections,
             drone_pos=drone_pos,
             telemetry_rpy_raw_rad=telemetry_rpy_raw_rad,
+            gazebo_pose=image_gazebo_pose,
         )
         det = detections[0]
 
@@ -2435,13 +2857,16 @@ class AutonomyAPI:
             gate_camera = np.asarray(det.get("gate_center_camera", np.full(3, np.nan)), dtype=float).reshape(3)
             if np.all(np.isfinite(gate_camera)):
                 r_body_camera = self.body_camera_matrix_for_mode(self.perception_transform_mode)
-                gate_world, gate_body, _ = self.transform_gate_camera_to_world(
+                transform_result = self.transform_gate_camera_to_world_for_pose_source(
                     gate_camera=gate_camera,
                     drone_pos=drone_pos,
                     telemetry_rpy_raw_rad=telemetry_rpy_raw_rad,
                     mode=self.perception_transform_mode,
                     r_body_camera=r_body_camera,
+                    gazebo_pose=image_gazebo_pose,
                 )
+                gate_world = transform_result["selected_world"]
+                gate_body = transform_result["gate_body"]
                 gate_normal_camera = np.asarray(
                     det.get("gate_normal_camera", np.full(3, np.nan)),
                     dtype=float,
@@ -2449,14 +2874,26 @@ class AutonomyAPI:
                 det["gate_center_body"] = gate_body.copy()
                 det["gate_center_cam"] = gate_body.copy()
                 det["gate_center_world"] = gate_world.copy()
+                det["world_from_mavsdk"] = transform_result[
+                    "world_from_mavsdk"
+                ].copy()
+                det["world_from_gazebo_truth"] = transform_result[
+                    "world_from_gazebo_truth"
+                ].copy()
+                det["selected_world_estimate"] = gate_world.copy()
+                det["perception_world_pose_source_used"] = transform_result[
+                    "source_used"
+                ]
                 det["camera_to_body_matrix_used"] = r_body_camera.copy()
                 det["body_to_world_method_used"] = self.perception_transform_mode
+                self.update_perception_world_pose_source_debug(transform_result)
                 if np.all(np.isfinite(gate_normal_camera)):
                     gate_normal_body = r_body_camera @ gate_normal_camera
-                    rpy = self.perception_rpy_for_mode(telemetry_rpy_raw_rad, self.perception_transform_mode)
-                    r_wb = self.perception_node._rpy_to_rotmat(float(rpy[0]), float(rpy[1]), float(rpy[2]))
                     det["gate_normal_body"] = gate_normal_body.copy()
-                    det["gate_normal_world"] = r_wb @ gate_normal_body
+                    det["gate_normal_world"] = (
+                        transform_result["selected_rotation_world_body"]
+                        @ gate_normal_body
+                    )
 
         self.gate_confidence = float(det["confidence"])
         raw_center = np.asarray(det["gate_center_world"], dtype=float).reshape(3)
@@ -2474,6 +2911,8 @@ class AutonomyAPI:
                     detections[1:],
                     frame_shape=frame.shape,
                     timestamp=now,
+                    camera_matrix=camera_matrix,
+                    dist_coeffs=dist_coeffs,
                 )
             self.update_gate_filter_summary_logs()
             self.update_lookahead_pipeline_debug()
@@ -2574,6 +3013,19 @@ class AutonomyAPI:
                 image_reason,
             )
             self.reset_transform_validation_debug()
+            print(f"[PERCEPTION REJECT] reason={image_reason} corners={self.last_ordered_image_corners}")
+            if len(detections) > 1:
+                self.add_supplemental_gate_detections(
+                    detections[1:],
+                    frame_shape=frame.shape,
+                    timestamp=now,
+                    camera_matrix=camera_matrix,
+                    dist_coeffs=dist_coeffs,
+                )
+            self.update_gate_filter_summary_logs()
+            self.update_lookahead_pipeline_debug()
+            self.update_detection_flow_debug(det, rejection_reason=image_reason)
+            self.finalize_detection_flow_debug()
             self.save_perception_debug_frame(
                 frame=frame,
                 timestamp=now,
@@ -2581,17 +3033,6 @@ class AutonomyAPI:
                 accepted=False,
                 rejection_reason=image_reason,
             )
-            print(f"[PERCEPTION REJECT] reason={image_reason} corners={self.last_ordered_image_corners}")
-            if len(detections) > 1:
-                self.add_supplemental_gate_detections(
-                    detections[1:],
-                    frame_shape=frame.shape,
-                    timestamp=now,
-                )
-            self.update_gate_filter_summary_logs()
-            self.update_lookahead_pipeline_debug()
-            self.update_detection_flow_debug(det, rejection_reason=image_reason)
-            self.finalize_detection_flow_debug()
             return {
                 "accepted": False,
                 "reason": image_reason,
@@ -2615,6 +3056,19 @@ class AutonomyAPI:
             self.last_perception_accepted = False
             self.last_perception_rejection_reason = reason
             self.reset_transform_validation_debug()
+            print(f"[PERCEPTION REJECT] reason={reason} raw_center={raw_center}")
+            if len(detections) > 1:
+                self.add_supplemental_gate_detections(
+                    detections[1:],
+                    frame_shape=frame.shape,
+                    timestamp=now,
+                    camera_matrix=camera_matrix,
+                    dist_coeffs=dist_coeffs,
+                )
+            self.update_gate_filter_summary_logs()
+            self.update_lookahead_pipeline_debug()
+            self.update_detection_flow_debug(det, rejection_reason=reason)
+            self.finalize_detection_flow_debug()
             self.save_perception_debug_frame(
                 frame=frame,
                 timestamp=now,
@@ -2622,17 +3076,6 @@ class AutonomyAPI:
                 accepted=False,
                 rejection_reason=reason,
             )
-            print(f"[PERCEPTION REJECT] reason={reason} raw_center={raw_center}")
-            if len(detections) > 1:
-                self.add_supplemental_gate_detections(
-                    detections[1:],
-                    frame_shape=frame.shape,
-                    timestamp=now,
-                )
-            self.update_gate_filter_summary_logs()
-            self.update_lookahead_pipeline_debug()
-            self.update_detection_flow_debug(det, rejection_reason=reason)
-            self.finalize_detection_flow_debug()
             return {
                 "accepted": False,
                 "reason": reason,
@@ -2653,19 +3096,14 @@ class AutonomyAPI:
             self.rejected_completed_this_lap = True
             self.target_rejected_completed = True
             self.reset_transform_validation_debug()
-            self.save_perception_debug_frame(
-                frame=frame,
-                timestamp=now,
-                track_id=None,
-                accepted=False,
-                rejection_reason="near_completed_landmark_this_lap",
-            )
             print(f"[PERCEPTION REJECT] reason=near_completed_landmark_this_lap raw_center={raw_center}")
             if len(detections) > 1:
                 self.add_supplemental_gate_detections(
                     detections[1:],
                     frame_shape=frame.shape,
                     timestamp=now,
+                    camera_matrix=camera_matrix,
+                    dist_coeffs=dist_coeffs,
                 )
             self.update_gate_filter_summary_logs()
             self.update_lookahead_pipeline_debug()
@@ -2673,6 +3111,13 @@ class AutonomyAPI:
                 det, rejection_reason="near_completed_landmark_this_lap"
             )
             self.finalize_detection_flow_debug()
+            self.save_perception_debug_frame(
+                frame=frame,
+                timestamp=now,
+                track_id=None,
+                accepted=False,
+                rejection_reason="near_completed_landmark_this_lap",
+            )
             return {
                 "accepted": False,
                 "reason": "near_completed_landmark_this_lap",
@@ -2732,13 +3177,6 @@ class AutonomyAPI:
                 self.compute_transform_validation_debug(drone_pos, drone_rpy_for_perception)
             else:
                 self.reset_transform_validation_debug()
-            self.save_perception_debug_frame(
-                frame=frame,
-                timestamp=now,
-                track_id=result.get("track_id"),
-                accepted=self.last_perception_accepted,
-                rejection_reason=self.last_perception_rejection_reason,
-            )
             print(
                 f"[MEM] reason={result['reason']} "
                 f"track_id={result['track_id']} "
@@ -2756,6 +3194,12 @@ class AutonomyAPI:
                     f"    id={tr.id}, center={tr.center}, hits={tr.hits}, "
                     f"stable={tr.is_stable}, score={tr.stability_score:.2f}"
             )
+        self.record_corner_measurement(
+            det=det,
+            result=result,
+            camera_matrix=camera_matrix,
+            dist_coeffs=dist_coeffs,
+        )
         self.update_detection_flow_debug(
             det,
             result=result,
@@ -2766,6 +3210,8 @@ class AutonomyAPI:
             detections[1:],
             frame_shape=frame.shape,
             timestamp=now,
+            camera_matrix=camera_matrix,
+            dist_coeffs=dist_coeffs,
         )
         if supplemental_result is not None and (
             supplemental_result.get("stable_now", False)
@@ -2779,9 +3225,27 @@ class AutonomyAPI:
         self.update_gate_filter_summary_logs()
         self.update_lookahead_pipeline_debug()
         self.finalize_detection_flow_debug()
+        if result is not None:
+            self.save_perception_debug_frame(
+                frame=frame,
+                timestamp=now,
+                track_id=result.get("track_id"),
+                accepted=bool(result.get("accepted", False)),
+                rejection_reason=(
+                    "" if result.get("accepted", False)
+                    else result.get("reason", "")
+                ),
+            )
         return result
 
-    def add_supplemental_gate_detections(self, detections, frame_shape, timestamp):
+    def add_supplemental_gate_detections(
+        self,
+        detections,
+        frame_shape,
+        timestamp,
+        camera_matrix,
+        dist_coeffs,
+    ):
         selected_result = None
         for det in detections:
             det_label = f"det{int(det.get('detection_index', det.get('processed_detection_index', -1)))}"
@@ -2834,6 +3298,13 @@ class AutonomyAPI:
                     or (result.get("committed", False) and not self.use_lookahead_gate_filter)
                 ):
                     self.accept_track_into_race_order(tr)
+
+            self.record_corner_measurement(
+                det=det,
+                result=result,
+                camera_matrix=camera_matrix,
+                dist_coeffs=dist_coeffs,
+            )
 
             if result is not None:
                 selected_result = result
@@ -3148,9 +3619,14 @@ class AutonomyAPI:
         self.gazebo_camera_yaw_deg = self._quaternion_xyzw_yaw_deg(
             self.gazebo_camera_quat_world
         )
+        gazebo_model_pos_planner = np.array([
+            self.gazebo_model_pos_world[1],
+            self.gazebo_model_pos_world[0],
+            self.gazebo_model_pos_world[2],
+        ], dtype=float)
         self.mavsdk_minus_gazebo_pos = (
             np.asarray(mavsdk_pos, dtype=float).reshape(3)
-            - self.gazebo_model_pos_world
+            - gazebo_model_pos_planner
         )
         self.mavsdk_minus_gazebo_yaw_deg = self._wrap_degrees(
             math.degrees(float(mavsdk_yaw_rad)) - self.gazebo_model_yaw_deg
@@ -3940,6 +4416,308 @@ class AutonomyAPI:
                 gt_error = float("nan")
             setattr(self, f"pnp_size_{size_label}_gt_error", gt_error)
 
+    def _debug_camera_pose_world(self):
+        r_body_camera = self.body_camera_matrix_for_mode(
+            self.perception_transform_mode
+        )
+        if self.perception_world_pose_source_used == "gazebo_truth_sim_only":
+            position, rotation = self._gazebo_model_pose_to_planner(
+                self.image_gazebo_pose_snapshot
+            )
+            if position is not None and rotation is not None:
+                return (
+                    position + rotation @ self.camera_offset_body,
+                    rotation @ r_body_camera,
+                )
+
+        rpy = np.asarray(
+            self.image_pose_snapshot_rpy_perception, dtype=float
+        ).reshape(3)
+        position = np.asarray(
+            self.image_pose_snapshot_position, dtype=float
+        ).reshape(3)
+        if not np.all(np.isfinite(rpy)) or not np.all(np.isfinite(position)):
+            return None, None
+        rotation = self.perception_node._rpy_to_rotmat(*map(float, rpy))
+        return (
+            position + rotation @ self.camera_offset_body,
+            rotation @ r_body_camera,
+        )
+
+    def _project_debug_gate_center(self, center_world):
+        center = self._vec3_for_debug(center_world)
+        camera_matrix = getattr(self, "last_camera_matrix", None)
+        if camera_matrix is None or not np.all(np.isfinite(center)):
+            return None, None
+        camera_position, camera_rotation = self._debug_camera_pose_world()
+        if camera_position is None or camera_rotation is None:
+            return None, None
+
+        half = 0.75
+        corners_world = np.array([
+            center + [-half, 0.0, half],
+            center + [half, 0.0, half],
+            center + [half, 0.0, -half],
+            center + [-half, 0.0, -half],
+        ], dtype=float)
+        points_world = np.vstack([corners_world, center])
+        points_camera = (
+            camera_rotation.T @ (points_world - camera_position).T
+        ).T
+        if not np.all(points_camera[:, 2] > 1e-6):
+            return None, None
+        projected, _ = cv2.projectPoints(
+            points_camera.reshape(-1, 1, 3),
+            np.zeros((3, 1), dtype=float),
+            np.zeros((3, 1), dtype=float),
+            np.asarray(camera_matrix, dtype=float).reshape(3, 3),
+            np.asarray(
+                getattr(self, "last_dist_coeffs", np.zeros((5, 1))),
+                dtype=float,
+            ).reshape(-1, 1),
+        )
+        projected = projected.reshape(-1, 2)
+        return projected[:4], projected[4]
+
+    @staticmethod
+    def _compact_overlay_reason(reason, max_len=34):
+        text = str(reason or "none").replace(" ", "_")
+        return text if len(text) <= max_len else text[:max_len - 1] + "~"
+
+    def _compute_gt_corner_rmse_debug(
+        self,
+        yolo_corners,
+        projected_gt_corners,
+        detection_race_idx,
+        rmse_gate_idx,
+    ):
+        metrics = {
+            "raw_indexed": float("nan"),
+            "ordered": float("nan"),
+            "best_permutation": float("nan"),
+            "center_error": float("nan"),
+            "order_warning": False,
+            "gate_index_match": False,
+        }
+        if detection_race_idx is None or rmse_gate_idx is None:
+            return metrics
+        try:
+            detection_race_idx = int(detection_race_idx)
+            rmse_gate_idx = int(rmse_gate_idx)
+        except (TypeError, ValueError):
+            return metrics
+        metrics["gate_index_match"] = detection_race_idx == rmse_gate_idx
+        if not metrics["gate_index_match"]:
+            return metrics
+
+        yolo = np.asarray(yolo_corners, dtype=float).reshape(4, 2)
+        gt_raw = np.asarray(projected_gt_corners, dtype=float).reshape(4, 2)
+        if not np.all(np.isfinite(yolo)) or not np.all(np.isfinite(gt_raw)):
+            return metrics
+
+        yolo_ordered = self._ordered_image_quad(yolo)
+        gt_ordered = self._ordered_image_quad(gt_raw)
+        metrics["raw_indexed"] = float(
+            np.sqrt(np.mean((yolo - gt_raw) ** 2))
+        )
+        metrics["ordered"] = float(
+            np.sqrt(np.mean((yolo_ordered - gt_ordered) ** 2))
+        )
+        metrics["best_permutation"] = min(
+            float(np.sqrt(np.mean((yolo - gt_raw[list(permutation)]) ** 2)))
+            for permutation in itertools.permutations(range(4))
+        )
+        metrics["center_error"] = float(
+            np.linalg.norm(np.mean(yolo, axis=0) - np.mean(gt_raw, axis=0))
+        )
+        best = metrics["best_permutation"]
+        raw = metrics["raw_indexed"]
+        metrics["order_warning"] = bool(
+            raw > best + 10.0 and raw > 1.5 * max(best, 1.0)
+        )
+        return metrics
+
+    def _debug_detection_style(self, entry):
+        role = str(entry.get("role", ""))
+        track_id = entry.get("track")
+        canonical_track = self.canonical_track_id(track_id)
+        active_id = self.canonical_track_id(self.active_target_track_id)
+        race_idx = entry.get("race_idx")
+        accepted = bool(entry.get("memory", False))
+        if role == "rejected" or entry.get("reason") and not accepted:
+            return "REJECTED", (0, 0, 255)
+        if track_id is not None and canonical_track == active_id:
+            return "ACTIVE", (0, 255, 0)
+        if (
+            accepted
+            and entry.get("state") == "stable"
+            and race_idx is not None
+            and int(race_idx) > self.current_gate_idx
+        ):
+            return "LOOKAHEAD", (255, 255, 0)
+        if role == "tentative_lookahead_target" and entry.get("state") == "stable":
+            return "LOOKAHEAD", (255, 255, 0)
+        return "IGNORED", (0, 255, 255)
+
+    def _draw_all_detection_overlays(self, canvas):
+        active_entry = None
+        for idx in sorted(self.perception_detection_flow_entries):
+            entry = self.perception_detection_flow_entries[idx]
+            style, color = self._debug_detection_style(entry)
+            keypoints = np.asarray(
+                entry.get("keypoints", np.full((4, 3), np.nan)), dtype=float
+            ).reshape(-1, 3)
+            points = keypoints[:4, :2] if keypoints.shape[0] >= 4 else None
+            if points is not None:
+                self._draw_debug_corners(
+                    canvas,
+                    points,
+                    color=color,
+                    prefix=f"Y{idx}.",
+                    connect=True,
+                )
+                finite = points[np.all(np.isfinite(points), axis=1)]
+            else:
+                finite = np.empty((0, 2), dtype=float)
+
+            bbox = np.asarray(
+                entry.get("bbox", np.full(4, np.nan)), dtype=float
+            ).reshape(4)
+            if np.all(np.isfinite(bbox)):
+                p0 = (int(round(bbox[0])), int(round(bbox[1])))
+                p1 = (int(round(bbox[2])), int(round(bbox[3])))
+                cv2.rectangle(canvas, p0, p1, color, 2)
+                label_origin = (p0[0], max(14, p0[1] - 5))
+            elif len(finite):
+                label_origin = (
+                    int(np.min(finite[:, 0])),
+                    max(14, int(np.min(finite[:, 1])) - 5),
+                )
+            else:
+                continue
+
+            center_world = np.asarray(
+                entry.get("corrected", np.full(3, np.nan)), dtype=float
+            ).reshape(3)
+            race_idx = entry.get("race_idx")
+            error_norm = float("nan")
+            if (
+                race_idx is not None
+                and 0 <= int(race_idx) < len(self.gt_gates)
+                and np.all(np.isfinite(center_world))
+            ):
+                error_norm = float(
+                    np.linalg.norm(
+                        center_world
+                        - np.asarray(self.gt_gates[int(race_idx)], dtype=float)
+                    )
+                )
+            track_text = "none" if entry.get("track") is None else entry["track"]
+            race_text = "?" if race_idx is None else race_idx
+            error_text = "nan" if not np.isfinite(error_norm) else f"{error_norm:.2f}"
+            reason = self._compact_overlay_reason(entry.get("reason", ""))
+            if style == "ACTIVE":
+                label = f"ACTIVE t={track_text} r={race_text} e={error_text}"
+                active_entry = entry
+            elif style == "LOOKAHEAD":
+                label = f"LH t={track_text} r={race_text} e={error_text}"
+            elif style == "IGNORED":
+                label = f"IGN t={track_text} r={race_text} {reason}"
+            else:
+                label = f"REJ {reason}"
+            cv2.putText(
+                canvas,
+                label,
+                label_origin,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                color,
+                1,
+                cv2.LINE_AA,
+            )
+
+            if len(finite):
+                center = np.mean(finite, axis=0)
+                cv2.drawMarker(
+                    canvas,
+                    tuple(np.rint(center).astype(int)),
+                    color,
+                    markerType=cv2.MARKER_CROSS,
+                    markerSize=12,
+                    thickness=1,
+                )
+
+            if race_idx is not None and 0 <= int(race_idx) < len(self.gt_gates):
+                gt_corners, _ = self._project_debug_gate_center(
+                    self.gt_gates[int(race_idx)]
+                )
+                self._draw_debug_corners(
+                    canvas,
+                    gt_corners,
+                    color=(255, 255, 255),
+                    prefix=f"G{int(race_idx)}.",
+                    connect=True,
+                    cross=True,
+                )
+
+        return active_entry
+
+    def _draw_planning_target_projections(self, canvas):
+        active_corners, active_center = self._project_debug_gate_center(
+            self.active_target_center
+        )
+        self._draw_debug_corners(
+            canvas,
+            active_corners,
+            color=(255, 0, 255),
+            prefix="",
+            connect=True,
+            cross=True,
+        )
+        if active_center is not None:
+            cv2.drawMarker(
+                canvas,
+                tuple(np.rint(active_center).astype(int)),
+                (255, 0, 255),
+                markerType=cv2.MARKER_DIAMOND,
+                markerSize=16,
+                thickness=2,
+            )
+
+        lookahead_ids = {
+            self.canonical_track_id(track_id)
+            for track_id in (
+                list(self.planning_lookahead_track_ids)
+                + list(self.tentative_lookahead_track_ids)
+            )
+        }
+        for track_id in lookahead_ids:
+            track = self.gate_memory.get_track_by_id(track_id)
+            if track is None:
+                continue
+            center = getattr(track, "filtered_center_world", None)
+            if center is None:
+                center = getattr(track, "center", None)
+            corners, projected_center = self._project_debug_gate_center(center)
+            color = (255, 255, 0) if getattr(track, "is_stable", False) else (0, 255, 255)
+            self._draw_debug_corners(
+                canvas,
+                corners,
+                color=color,
+                prefix="",
+                connect=True,
+                cross=True,
+            )
+            if projected_center is not None:
+                cv2.drawMarker(
+                    canvas,
+                    tuple(np.rint(projected_center).astype(int)),
+                    color,
+                    markerType=cv2.MARKER_DIAMOND,
+                    markerSize=12,
+                    thickness=1,
+                )
+
     def save_perception_debug_frame(
         self,
         frame,
@@ -3969,33 +4747,16 @@ class AutonomyAPI:
         candidate0_projected = self._corners_for_debug(self.pnp_candidate0_projected_corners)
         candidate1_projected = self._corners_for_debug(self.pnp_candidate1_projected_corners)
 
-        self._draw_debug_corners(canvas, raw, color=(0, 0, 255), prefix="yolo", connect=False)
-        self._draw_debug_corners(canvas, ordered, color=(0, 255, 0), prefix="sel", connect=True)
-        self._draw_debug_corners(canvas, debug_best, color=(255, 128, 0), prefix="best", connect=True)
-        self._draw_debug_corners(canvas, reprojected, color=(255, 0, 0), prefix="rep", connect=True, cross=True)
-        self._draw_debug_corners(canvas, candidate0_projected, color=(255, 255, 0), prefix="c0", connect=True, cross=True)
-        self._draw_debug_corners(canvas, candidate1_projected, color=(255, 0, 255), prefix="c1", connect=True, cross=True)
+        if self.debug_verbose_overlay:
+            self._draw_debug_corners(canvas, raw, color=(0, 0, 255), prefix="yolo", connect=False)
+            self._draw_debug_corners(canvas, ordered, color=(0, 255, 0), prefix="sel", connect=True)
+            self._draw_debug_corners(canvas, debug_best, color=(255, 128, 0), prefix="best", connect=True)
+            self._draw_debug_corners(canvas, reprojected, color=(255, 0, 0), prefix="rep", connect=True, cross=True)
+            self._draw_debug_corners(canvas, candidate0_projected, color=(255, 255, 0), prefix="c0", connect=True, cross=True)
+            self._draw_debug_corners(canvas, candidate1_projected, color=(255, 0, 255), prefix="c1", connect=True, cross=True)
 
-        if np.isfinite(self.last_quad_center_x) and np.isfinite(self.last_quad_center_y):
-            center_pt = (int(round(self.last_quad_center_x)), int(round(self.last_quad_center_y)))
-            cv2.drawMarker(
-                canvas,
-                center_pt,
-                (0, 255, 255),
-                markerType=cv2.MARKER_CROSS,
-                markerSize=18,
-                thickness=2,
-            )
-            cv2.putText(
-                canvas,
-                "quad_center",
-                (center_pt[0] + 6, center_pt[1] - 6),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (0, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
+        active_entry = self._draw_all_detection_overlays(canvas)
+        self._draw_planning_target_projections(canvas)
 
         gate_world = self._vec3_for_debug(self.last_gate_center_world_debug)
         gate_camera = self._vec3_for_debug(self.last_gate_center_camera)
@@ -4005,6 +4766,8 @@ class AutonomyAPI:
         expected_world = self._vec3_for_debug(self.expected_gate_world)
         axis_best_world = self._vec3_for_debug(self.camera_axis_sweep_best_world)
         live_error = self._vec3_for_debug(self.live_minus_expected)
+        mavsdk_pos = self._vec3_for_debug(self.image_pose_snapshot_position)
+        gazebo_pos = self._vec3_for_debug(self.gazebo_model_pos_world)
         track_label = "none" if track_id is None else str(track_id)
         active_status = (
             f"active_track={self.active_target_track_id}"
@@ -4012,10 +4775,12 @@ class AutonomyAPI:
             else "active_track=none"
         )
         status = "accepted" if accepted else f"rejected:{rejection_reason}"
-        overlay_lines = [
+        verbose_overlay_lines = [
             f"{status}",
             f"track_id={track_label} conf={self.gate_confidence:.3f} reproj={self.last_reprojection_error:.2f}px",
             f"lookahead={'on' if self.use_lookahead_gate_filter else 'off'} tentative={self.tentative_track_ids} stable={self.stable_track_ids} admitted={self.race_accepted_track_ids}",
+            f"drone_mavsdk=({mavsdk_pos[0]:.2f},{mavsdk_pos[1]:.2f},{mavsdk_pos[2]:.2f})",
+            f"drone_gazebo=({gazebo_pos[0]:.2f},{gazebo_pos[1]:.2f},{gazebo_pos[2]:.2f})",
             f"filter hits={self.track_observations} hist={self.track_history_len} stable={self.track_is_stable} score={self.track_stability_score:.2f} block={self.promotion_blocked_reason or 'none'}",
             f"filtered=({filtered[0]:.2f},{filtered[1]:.2f},{filtered[2]:.2f}) std={self.track_center_std_norm:.2f}",
             f"live={self.live_solver_name} fallback={self.pnp_fallback_reason or 'none'}",
@@ -4038,6 +4803,163 @@ class AutonomyAPI:
             f"tvec=({pnp_tvec[0]:.2f},{pnp_tvec[1]:.2f},{pnp_tvec[2]:.2f})",
             f"{active_status} t={timestamp:.3f}",
         ]
+        decision_entry = active_entry
+        if decision_entry is None and track_id is not None:
+            decision_entry = next(
+                (
+                    entry
+                    for entry in self.perception_detection_flow_entries.values()
+                    if entry.get("track") == track_id
+                ),
+                None,
+            )
+        if decision_entry is None and self.perception_detection_flow_entries:
+            decision_entry = self.perception_detection_flow_entries[
+                sorted(self.perception_detection_flow_entries)[0]
+            ]
+
+        if decision_entry is None:
+            decision_role = "rejected" if not accepted else "active"
+            decision_track = track_label
+            decision_race = "?"
+            decision_reason = rejection_reason or self.replan_reason or "none"
+            geometry_points = ordered
+        else:
+            style, _ = self._debug_detection_style(decision_entry)
+            decision_role = {
+                "ACTIVE": "active",
+                "LOOKAHEAD": "lookahead",
+                "IGNORED": "lookahead_ignored",
+                "REJECTED": "rejected",
+            }[style]
+            decision_track = (
+                "none"
+                if decision_entry.get("track") is None
+                else str(decision_entry.get("track"))
+            )
+            decision_race = (
+                "?"
+                if decision_entry.get("race_idx") is None
+                else str(decision_entry.get("race_idx"))
+            )
+            decision_reason = (
+                decision_entry.get("reason")
+                or self.tentative_lookahead_replan_blocked_reason
+                or self.promotion_blocked_reason
+                or self.replan_reason
+                or "none"
+            )
+            keypoints = np.asarray(
+                decision_entry.get("keypoints", np.full((4, 3), np.nan)),
+                dtype=float,
+            ).reshape(-1, 3)
+            geometry_points = keypoints[:4, :2] if keypoints.shape[0] >= 4 else ordered
+
+        span_w = span_h = quad_area = float("nan")
+        gt_metrics = {
+            "raw_indexed": float("nan"),
+            "ordered": float("nan"),
+            "best_permutation": float("nan"),
+            "center_error": float("nan"),
+            "order_warning": False,
+            "gate_index_match": False,
+        }
+        detection_race_idx = (
+            decision_entry.get("race_idx")
+            if decision_entry is not None
+            else None
+        )
+        debug_gt_idx = getattr(self, "debug_expected_gate_idx", None)
+        try:
+            debug_gt_idx = int(debug_gt_idx)
+        except (TypeError, ValueError, OverflowError):
+            debug_gt_idx = None
+        rmse_gate_idx = (
+            debug_gt_idx
+            if debug_gt_idx is not None
+            and 0 <= debug_gt_idx < len(self.gt_gates)
+            else detection_race_idx
+        )
+        if geometry_points is not None:
+            points = np.asarray(geometry_points, dtype=float).reshape(-1, 2)
+            if points.shape[0] >= 4 and np.all(np.isfinite(points[:4])):
+                points = points[:4]
+                span_w = 0.5 * (
+                    np.linalg.norm(points[1] - points[0])
+                    + np.linalg.norm(points[2] - points[3])
+                )
+                span_h = 0.5 * (
+                    np.linalg.norm(points[3] - points[0])
+                    + np.linalg.norm(points[2] - points[1])
+                )
+                quad_area = abs(float(cv2.contourArea(points.astype(np.float32))))
+                if rmse_gate_idx is not None and 0 <= int(rmse_gate_idx) < len(self.gt_gates):
+                    gt_corners, _ = self._project_debug_gate_center(
+                        self.gt_gates[int(rmse_gate_idx)]
+                    )
+                    if gt_corners is not None:
+                        gt_metrics = self._compute_gt_corner_rmse_debug(
+                            yolo_corners=points,
+                            projected_gt_corners=gt_corners,
+                            detection_race_idx=detection_race_idx,
+                            rmse_gate_idx=rmse_gate_idx,
+                        )
+
+        self.gt_rmse_px_raw_indexed = gt_metrics["raw_indexed"]
+        self.gt_rmse_px_ordered = gt_metrics["ordered"]
+        self.gt_rmse_px_best_permutation = gt_metrics["best_permutation"]
+        self.gt_center_err_px = gt_metrics["center_error"]
+        self.gt_corner_order_warning = gt_metrics["order_warning"]
+        self.rmse_gate_idx = rmse_gate_idx
+        self.detection_race_idx_for_rmse = detection_race_idx
+
+        compact_lines = [
+            "DECISION: "
+            f"role={decision_role} track={decision_track} race={decision_race} "
+            f"source={self.perception_world_pose_source_used} "
+            f"reason={self._compact_overlay_reason(decision_reason)}",
+            "GEOM: "
+            f"span_w_px={span_w:.1f} span_h_px={span_h:.1f} "
+            f"quad_area={quad_area:.0f}",
+        ]
+        if gt_metrics["gate_index_match"]:
+            compact_lines.append(
+                "GT: "
+                f"gt_rmse_px_ordered={gt_metrics['ordered']:.1f} "
+                f"best={gt_metrics['best_permutation']:.1f} "
+                f"raw={gt_metrics['raw_indexed']:.1f} "
+                f"center={gt_metrics['center_error']:.1f} "
+                f"order_warn={int(gt_metrics['order_warning'])}"
+            )
+        else:
+            compact_lines.append(
+                "GT: rmse=N/A "
+                f"rmse_gate_idx={rmse_gate_idx} "
+                f"detection_race_idx={detection_race_idx}"
+            )
+        verbose_overlay_lines.append(
+            "gt_corner_rmse "
+            f"raw_indexed={gt_metrics['raw_indexed']:.1f} "
+            f"ordered={gt_metrics['ordered']:.1f} "
+            f"best_permutation={gt_metrics['best_permutation']:.1f} "
+            f"center={gt_metrics['center_error']:.1f} "
+            f"warning={gt_metrics['order_warning']} "
+            f"rmse_gate_idx={rmse_gate_idx} "
+            f"detection_race_idx={detection_race_idx}"
+        )
+        if self.target_update_event:
+            shift = (
+                np.asarray(self.target_update_new, dtype=float).reshape(3)
+                - np.asarray(self.target_update_previous, dtype=float).reshape(3)
+            )
+            compact_lines.append(
+                "TARGET_SHIFT: "
+                f"dx={shift[0]:+.2f} dy={shift[1]:+.2f} dz={shift[2]:+.2f} "
+                f"norm={np.linalg.norm(shift):.2f}"
+            )
+        overlay_lines = (
+            verbose_overlay_lines if self.debug_verbose_overlay else compact_lines
+        )
         self._draw_debug_text_block(canvas, overlay_lines)
 
         safe_track = "none" if track_id is None else str(track_id)
@@ -4096,16 +5018,17 @@ class AutonomyAPI:
                 )
             else:
                 cv2.circle(canvas, xy, 4, color, -1)
-            cv2.putText(
-                canvas,
-                f"{prefix}{i}",
-                (xy[0] + 5, xy[1] - 5),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                color,
-                1,
-                cv2.LINE_AA,
-            )
+            if prefix:
+                cv2.putText(
+                    canvas,
+                    f"{prefix}{i}",
+                    (xy[0] + 5, xy[1] - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
         if connect and len(pts) >= 2:
             cv2.polylines(
                 canvas,

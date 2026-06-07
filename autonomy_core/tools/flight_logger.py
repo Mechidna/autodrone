@@ -199,6 +199,8 @@ class FlightLogger:
             "yolo_detection_confidences",
             "yolo_detection_bboxes",
             "yolo_detection_keypoints",
+            "corner_measurement_count",
+            "corner_measurements",
             "processed_detection_indices",
             "yolo_raw_count",
             "pnp_success_count",
@@ -406,6 +408,22 @@ class FlightLogger:
             "mavsdk_minus_gazebo_pos_z",
             "mavsdk_minus_gazebo_yaw_deg",
             "gazebo_pose_age_s",
+            "perception_world_pose_source_used",
+            "world_from_mavsdk_x",
+            "world_from_mavsdk_y",
+            "world_from_mavsdk_z",
+            "world_from_gazebo_truth_x",
+            "world_from_gazebo_truth_y",
+            "world_from_gazebo_truth_z",
+            "selected_world_estimate_x",
+            "selected_world_estimate_y",
+            "selected_world_estimate_z",
+            "selected_vs_mavsdk_world_delta_x",
+            "selected_vs_mavsdk_world_delta_y",
+            "selected_vs_mavsdk_world_delta_z",
+            "selected_vs_gazebo_world_delta_x",
+            "selected_vs_gazebo_world_delta_y",
+            "selected_vs_gazebo_world_delta_z",
             "gate_world_mavsdk_x",
             "gate_world_mavsdk_y",
             "gate_world_mavsdk_z",
@@ -912,6 +930,8 @@ class FlightLogger:
         yolo_detection_confidences="",
         yolo_detection_bboxes="",
         yolo_detection_keypoints="",
+        corner_measurement_count=0,
+        corner_measurements="",
         processed_detection_indices=None,
         yolo_raw_count=0,
         pnp_success_count=0,
@@ -1075,6 +1095,12 @@ class FlightLogger:
         mavsdk_minus_gazebo_pos=None,
         mavsdk_minus_gazebo_yaw_deg=np.nan,
         gazebo_pose_age_s=np.nan,
+        perception_world_pose_source_used="mavsdk",
+        world_from_mavsdk=None,
+        world_from_gazebo_truth=None,
+        selected_world_estimate=None,
+        selected_vs_mavsdk_world_delta=None,
+        selected_vs_gazebo_world_delta=None,
         gate_world_mavsdk=None,
         gate_world_gazebo=None,
         gate_world_mavsdk_error_to_gt=np.nan,
@@ -1365,6 +1391,15 @@ class FlightLogger:
         gazebo_camera_pos = self._vec3(gazebo_camera_pos)
         mavsdk_pos = self._vec3(mavsdk_pos)
         mavsdk_minus_gazebo_pos = self._vec3(mavsdk_minus_gazebo_pos)
+        world_from_mavsdk = self._vec3(world_from_mavsdk)
+        world_from_gazebo_truth = self._vec3(world_from_gazebo_truth)
+        selected_world_estimate = self._vec3(selected_world_estimate)
+        selected_vs_mavsdk_world_delta = self._vec3(
+            selected_vs_mavsdk_world_delta
+        )
+        selected_vs_gazebo_world_delta = self._vec3(
+            selected_vs_gazebo_world_delta
+        )
         gate_world_mavsdk = self._vec3(gate_world_mavsdk)
         gate_world_gazebo = self._vec3(gate_world_gazebo)
         gate_world_uncorrected = self._vec3(gate_world_uncorrected)
@@ -1573,6 +1608,8 @@ class FlightLogger:
             yolo_detection_confidences,
             yolo_detection_bboxes,
             yolo_detection_keypoints,
+            corner_measurement_count,
+            corner_measurements,
             "" if processed_detection_indices is None else " ".join(str(x) for x in processed_detection_indices),
             yolo_raw_count,
             pnp_success_count,
@@ -1782,6 +1819,22 @@ class FlightLogger:
             mavsdk_minus_gazebo_pos[2],
             mavsdk_minus_gazebo_yaw_deg,
             gazebo_pose_age_s,
+            perception_world_pose_source_used,
+            world_from_mavsdk[0],
+            world_from_mavsdk[1],
+            world_from_mavsdk[2],
+            world_from_gazebo_truth[0],
+            world_from_gazebo_truth[1],
+            world_from_gazebo_truth[2],
+            selected_world_estimate[0],
+            selected_world_estimate[1],
+            selected_world_estimate[2],
+            selected_vs_mavsdk_world_delta[0],
+            selected_vs_mavsdk_world_delta[1],
+            selected_vs_mavsdk_world_delta[2],
+            selected_vs_gazebo_world_delta[0],
+            selected_vs_gazebo_world_delta[1],
+            selected_vs_gazebo_world_delta[2],
             gate_world_mavsdk[0],
             gate_world_mavsdk[1],
             gate_world_mavsdk[2],

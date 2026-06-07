@@ -141,6 +141,7 @@ class PerceptionNode(Node):
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
             received_wall_time = time.time()
+            gazebo_pose_snapshot = self.latest_gazebo_pose_snapshot()
             pose_snapshot = None
             if self.telemetry is not None:
                 pose_snapshot = {
@@ -168,6 +169,7 @@ class PerceptionNode(Node):
                         getattr(self.telemetry, "attitude_sample_time", np.nan)
                     ),
                     "snapshot_wall_time": received_wall_time,
+                    "gazebo_pose": gazebo_pose_snapshot,
                 }
             with self.frame_lock:
                 self.frame = frame
@@ -498,7 +500,7 @@ async def track_orientation(drone):
 async def main():
     save_raw_dataset_frames = False
     raw_dataset_capture_hz = 5.0
-    startup_hover_s = 10.0
+    startup_hover_s = 5.0
     raw_dataset_saver = RawDatasetFrameSaver(
         enabled=save_raw_dataset_frames,
         capture_hz=raw_dataset_capture_hz,
@@ -1095,6 +1097,12 @@ async def main():
                 yolo_detection_confidences=getattr(autonomy, "yolo_detection_confidences", ""),
                 yolo_detection_bboxes=getattr(autonomy, "yolo_detection_bboxes", ""),
                 yolo_detection_keypoints=getattr(autonomy, "yolo_detection_keypoints", ""),
+                corner_measurement_count=getattr(
+                    autonomy, "corner_measurement_count", 0
+                ),
+                corner_measurements=getattr(
+                    autonomy, "corner_measurements_log", ""
+                ),
                 processed_detection_indices=getattr(autonomy, "processed_detection_indices", []),
                 yolo_raw_count=getattr(autonomy, "yolo_raw_count", 0),
                 pnp_success_count=getattr(autonomy, "pnp_success_count", 0),
@@ -1377,6 +1385,24 @@ async def main():
                     autonomy, "mavsdk_minus_gazebo_yaw_deg", float("nan")
                 ),
                 gazebo_pose_age_s=getattr(autonomy, "gazebo_pose_age_s", float("nan")),
+                perception_world_pose_source_used=getattr(
+                    autonomy, "perception_world_pose_source_used", "mavsdk"
+                ),
+                world_from_mavsdk=getattr(
+                    autonomy, "world_from_mavsdk", None
+                ),
+                world_from_gazebo_truth=getattr(
+                    autonomy, "world_from_gazebo_truth", None
+                ),
+                selected_world_estimate=getattr(
+                    autonomy, "selected_world_estimate", None
+                ),
+                selected_vs_mavsdk_world_delta=getattr(
+                    autonomy, "selected_vs_mavsdk_world_delta", None
+                ),
+                selected_vs_gazebo_world_delta=getattr(
+                    autonomy, "selected_vs_gazebo_world_delta", None
+                ),
                 gate_world_mavsdk=getattr(autonomy, "gate_world_mavsdk", None),
                 gate_world_gazebo=getattr(autonomy, "gate_world_gazebo", None),
                 gate_world_mavsdk_error_to_gt=getattr(
