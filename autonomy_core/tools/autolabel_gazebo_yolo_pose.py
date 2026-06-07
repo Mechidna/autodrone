@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import json
 import os
 import shutil
@@ -30,6 +31,7 @@ GATE_YAWS_RAD_GAZEBO = (
 )
 INNER_OPENING_M = 1.5
 OUTER_GATE_M = 2.7
+MIN_PARTIAL_BBOX_AREA_PX2 = 64.0
 CAMERA_OFFSET_BODY = np.array([0.12, 0.03, 0.242], dtype=float)
 ROLL_SIGN = -1.0
 PITCH_SIGN = -1.0
@@ -280,9 +282,77 @@ def inside_image(points_image, width, height):
     return bool(np.all((x >= 0.0) & (x < float(width)) & (y >= 0.0) & (y < float(height))))
 
 
-def yolo_pose_line(bbox_points_image, keypoints_image, width, height, class_id=0):
-    bbox_points_image = np.asarray(bbox_points_image, dtype=float).reshape(4, 2)
+def points_inside_image(points_image, width, height):
+    points_image = np.asarray(points_image, dtype=float).reshape(-1, 2)
+    return (
+        np.isfinite(points_image).all(axis=1)
+        & (points_image[:, 0] >= 0.0)
+        & (points_image[:, 0] < float(width))
+        & (points_image[:, 1] >= 0.0)
+        & (points_image[:, 1] < float(height))
+    )
+
+
+def clip_polygon_to_image(points_image, width, height):
+    polygon = [np.asarray(point, dtype=float) for point in np.asarray(points_image).reshape(-1, 2)]
+    boundaries = (
+        (0, 0.0, True),
+        (0, float(width - 1), False),
+        (1, 0.0, True),
+        (1, float(height - 1), False),
+    )
+
+    for axis, boundary, keep_greater in boundaries:
+        if not polygon:
+            break
+        clipped = []
+        previous = polygon[-1]
+        previous_inside = (
+            previous[axis] >= boundary if keep_greater else previous[axis] <= boundary
+        )
+        for current in polygon:
+            current_inside = (
+                current[axis] >= boundary if keep_greater else current[axis] <= boundary
+            )
+            if current_inside != previous_inside:
+                denominator = current[axis] - previous[axis]
+                if abs(denominator) > 1e-12:
+                    ratio = (boundary - previous[axis]) / denominator
+                    intersection = previous + ratio * (current - previous)
+                    intersection[axis] = boundary
+                    clipped.append(intersection)
+            if current_inside:
+                clipped.append(current)
+            previous = current
+            previous_inside = current_inside
+        polygon = clipped
+
+    return np.asarray(polygon, dtype=float).reshape(-1, 2)
+
+
+def bbox_corners_from_points(points_image):
+    points_image = np.asarray(points_image, dtype=float).reshape(-1, 2)
+    x_min = float(np.min(points_image[:, 0]))
+    x_max = float(np.max(points_image[:, 0]))
+    y_min = float(np.min(points_image[:, 1]))
+    y_max = float(np.max(points_image[:, 1]))
+    return np.array(
+        [[x_min, y_min], [x_max, y_min], [x_max, y_max], [x_min, y_max]],
+        dtype=float,
+    )
+
+
+def yolo_pose_line(
+    bbox_points_image,
+    keypoints_image,
+    keypoint_visibility,
+    width,
+    height,
+    class_id=0,
+):
+    bbox_points_image = np.asarray(bbox_points_image, dtype=float).reshape(-1, 2)
     keypoints_image = np.asarray(keypoints_image, dtype=float).reshape(4, 2)
+    keypoint_visibility = np.asarray(keypoint_visibility, dtype=bool).reshape(4)
     xs = bbox_points_image[:, 0]
     ys = bbox_points_image[:, 1]
 
@@ -297,8 +367,11 @@ def yolo_pose_line(bbox_points_image, keypoints_image, width, height, class_id=0
     h = (y_max - y_min) / float(height)
 
     values = [class_id, cx, cy, w, h]
-    for x, y in keypoints_image:
-        values.extend([float(x) / float(width), float(y) / float(height), 2])
+    for (x, y), visible in zip(keypoints_image, keypoint_visibility):
+        if visible:
+            values.extend([float(x) / float(width), float(y) / float(height), 2])
+        else:
+            values.extend([0.0, 0.0, 0])
 
     return " ".join(
         str(v) if isinstance(v, int) else f"{float(v):.8f}"
@@ -338,28 +411,95 @@ def draw_preview(image, labels):
     inner_colors = ((0, 255, 0), (255, 0, 0), (0, 255, 255))
     names = ("TL", "TR", "BR", "BL")
 
-    for gate_idx, bbox_points, keypoints in labels:
+    for label in labels:
+        gate_idx = label["gate_idx"]
+        bbox_points = label["bbox_points_image"]
+        keypoints = label["keypoints_image"]
+        keypoint_visibility = np.asarray(label["keypoint_visibility"], dtype=bool)
+        keypoints_clipped = np.asarray(label["projected_keypoints_clipped"], dtype=float)
         outer_color = outer_colors[gate_idx % len(outer_colors)]
         inner_color = inner_colors[gate_idx % len(inner_colors)]
         bbox_pts = np.round(bbox_points).astype(int).reshape(-1, 2)
         keypoint_pts = np.round(keypoints).astype(int).reshape(-1, 2)
 
         cv2.polylines(preview, [bbox_pts], isClosed=True, color=outer_color, thickness=2)
-        cv2.polylines(preview, [keypoint_pts], isClosed=True, color=inner_color, thickness=2)
+        visible_points = keypoint_pts[keypoint_visibility]
+        if len(visible_points) == 4:
+            cv2.polylines(preview, [visible_points], isClosed=True, color=inner_color, thickness=2)
         for point_idx, (x, y) in enumerate(keypoint_pts):
-            cv2.circle(preview, (int(x), int(y)), 4, inner_color, -1)
+            if keypoint_visibility[point_idx]:
+                cv2.circle(preview, (int(x), int(y)), 4, inner_color, -1)
+                marker = ""
+                text_origin = (int(x) + 4, int(y) - 4)
+            else:
+                clipped_x, clipped_y = np.round(keypoints_clipped[point_idx]).astype(int)
+                cv2.drawMarker(
+                    preview,
+                    (int(clipped_x), int(clipped_y)),
+                    (0, 0, 255),
+                    markerType=cv2.MARKER_TILTED_CROSS,
+                    markerSize=10,
+                    thickness=2,
+                )
+                marker = ":missing"
+                text_origin = (int(clipped_x) + 4, int(clipped_y) - 4)
             cv2.putText(
                 preview,
-                f"g{gate_idx}:{names[point_idx]}",
-                (int(x) + 4, int(y) - 4),
+                f"g{gate_idx}:{names[point_idx]}{marker}",
+                text_origin,
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.4,
-                inner_color,
+                inner_color if keypoint_visibility[point_idx] else (0, 0, 255),
                 1,
                 cv2.LINE_AA,
             )
 
     return preview
+
+
+def write_preview_sheets(preview_paths, output_root, sheet_size=25, thumb_width=320):
+    if not preview_paths:
+        return 0
+
+    sheets_dir = output_root / "preview_sheets"
+    sheets_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    for sheet_index, start in enumerate(range(0, len(preview_paths), sheet_size)):
+        paths = preview_paths[start:start + sheet_size]
+        thumbnails = []
+        for path in paths:
+            image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if image is None:
+                continue
+            scale = float(thumb_width) / float(image.shape[1])
+            thumb = cv2.resize(
+                image,
+                (thumb_width, max(1, int(round(image.shape[0] * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+            cv2.putText(
+                thumb,
+                path.name,
+                (6, 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+            thumbnails.append(thumb)
+        if not thumbnails:
+            continue
+        rows = []
+        for row_start in range(0, len(thumbnails), 5):
+            row_images = thumbnails[row_start:row_start + 5]
+            while len(row_images) < 5:
+                row_images.append(np.zeros_like(thumbnails[0]))
+            rows.append(cv2.hconcat(row_images))
+        sheet = cv2.vconcat(rows)
+        cv2.imwrite(str(sheets_dir / f"sheet_{sheet_index:03d}.jpg"), sheet)
+        written += 1
+    return written
 
 
 def split_name(index, val_ratio):
@@ -422,9 +562,11 @@ def print_first_frame_debug(metadata, candidates, selected_gate_idx, gazebo_rota
         center = np.asarray(candidate["gate_center_world"], dtype=float)
         right_axis = np.asarray(candidate["gate_right_axis_world"], dtype=float)
         corners = np.asarray(candidate["corners_image"], dtype=float)
+        clipped_corners = np.asarray(candidate["projected_keypoints_clipped"], dtype=float)
         center_text = np.array2string(center, precision=3, suppress_small=False)
         right_axis_text = np.array2string(right_axis, precision=3, suppress_small=False)
         corners_text = np.array2string(corners, precision=2, suppress_small=False)
+        clipped_text = np.array2string(clipped_corners, precision=2, suppress_small=False)
         status = "accepted" if candidate["accepted"] else f"rejected:{candidate['reason']}"
         print(
             f"[AUTOLABEL DEBUG] gate={gate_idx} "
@@ -433,7 +575,12 @@ def print_first_frame_debug(metadata, candidates, selected_gate_idx, gazebo_rota
             f"gate_right_axis_world={right_axis_text} "
             f"mean_camera_depth={depth:.3f} "
             f"status={status} "
-            f"projected_corners_px={corners_text}"
+            f"visible_keypoint_count={candidate['visible_keypoint_count']} "
+            f"partial_gate_label={candidate['partial_gate_label']} "
+            f"rejected_partial_reason={candidate['rejected_partial_reason']} "
+            f"projected_keypoints_raw={corners_text} "
+            f"projected_keypoints_clipped={clipped_text} "
+            f"bbox_clipped={candidate['bbox_clipped']}"
         )
         if gate_idx == 0:
             points_body = candidate.get("points_body", None)
@@ -459,7 +606,8 @@ def print_frame_summary_debug(frame_name, metadata, labels, gazebo_rotation_mode
     corrected_yaw = YAW_SIGN * float(raw_yaw) + YAW_OFFSET_RAD
 
     if labels:
-        selected_gate_idx, bbox_points, _ = labels[0]
+        selected_gate_idx = labels[0]["gate_idx"]
+        bbox_points = labels[0]["bbox_points_image"]
         bbox_points = np.asarray(bbox_points, dtype=float).reshape(4, 2)
         x_min = float(np.min(bbox_points[:, 0]))
         x_max = float(np.max(bbox_points[:, 0]))
@@ -492,6 +640,8 @@ def print_frame_summary_debug(frame_name, metadata, labels, gazebo_rotation_mode
 def build_labels(
     metadata,
     label_all_visible_gates=False,
+    allow_partial_gates=False,
+    min_partial_bbox_area_px2=MIN_PARTIAL_BBOX_AREA_PX2,
     order_image_corners=True,
     gazebo_rotation_mode="direct",
     gazebo_optical_mode="current",
@@ -545,13 +695,18 @@ def build_labels(
         mean_depth = float(np.mean(inner_corners_camera[:, 2]))
         accepted = True
         reason = ""
+        rejected_partial_reason = ""
         keypoints_image = np.full((4, 2), np.nan, dtype=float)
+        projected_keypoints_clipped = np.full((4, 2), np.nan, dtype=float)
+        keypoint_visibility = np.zeros(4, dtype=bool)
         bbox_points_image = np.full((4, 2), np.nan, dtype=float)
+        bbox_clipped = np.full(4, np.nan, dtype=float)
+        partial_gate_label = False
 
-        if not np.all(inner_corners_camera[:, 2] > 0.0):
+        if not allow_partial_gates and not np.all(inner_corners_camera[:, 2] > 0.0):
             accepted = False
             reason = "inner_corner_behind_camera"
-        elif not np.all(outer_corners_camera[:, 2] > 0.0):
+        elif not allow_partial_gates and not np.all(outer_corners_camera[:, 2] > 0.0):
             accepted = False
             reason = "outer_corner_behind_camera"
         else:
@@ -569,12 +724,60 @@ def build_labels(
                 keypoints_image = order_points_tl_tr_br_bl(keypoints_image)
                 bbox_points_image = order_points_tl_tr_br_bl(bbox_points_image)
 
-            if not inside_image(bbox_points_image, width, height):
-                accepted = False
-                reason = "outer_corner_outside_image"
+            keypoint_visibility = points_inside_image(keypoints_image, width, height)
+            keypoint_visibility &= np.asarray(inner_corners_camera[:, 2] > 0.0, dtype=bool)
+            projected_keypoints_clipped = np.column_stack(
+                [
+                    np.clip(keypoints_image[:, 0], 0.0, float(width - 1)),
+                    np.clip(keypoints_image[:, 1], 0.0, float(height - 1)),
+                ]
+            )
+
+            if allow_partial_gates:
+                visible_keypoint_count = int(np.sum(keypoint_visibility))
+                partial_gate_label = visible_keypoint_count < 4
+                if visible_keypoint_count < 2:
+                    accepted = False
+                    reason = "fewer_than_2_visible_keypoints"
+                    rejected_partial_reason = reason
+                else:
+                    positive_outer = bbox_points_image[
+                        np.asarray(outer_corners_camera[:, 2] > 0.0, dtype=bool)
+                    ]
+                    clipped_polygon = (
+                        clip_polygon_to_image(positive_outer, width, height)
+                        if len(positive_outer) >= 3
+                        else np.empty((0, 2), dtype=float)
+                    )
+                    if len(clipped_polygon) < 3:
+                        accepted = False
+                        reason = "projected_outer_gate_does_not_intersect_image"
+                        rejected_partial_reason = reason
+                    else:
+                        bbox_points_image = bbox_corners_from_points(clipped_polygon)
+                        x_min, y_min = bbox_points_image[0]
+                        x_max, y_max = bbox_points_image[2]
+                        bbox_clipped = np.array([x_min, y_min, x_max, y_max], dtype=float)
+                        bbox_area = float((x_max - x_min) * (y_max - y_min))
+                        if bbox_area < float(min_partial_bbox_area_px2):
+                            accepted = False
+                            reason = "clipped_bbox_area_too_small"
+                            rejected_partial_reason = reason
+            else:
+                if not inside_image(bbox_points_image, width, height):
+                    accepted = False
+                    reason = "outer_corner_outside_image"
+                else:
+                    x_min = float(np.min(bbox_points_image[:, 0]))
+                    x_max = float(np.max(bbox_points_image[:, 0]))
+                    y_min = float(np.min(bbox_points_image[:, 1]))
+                    y_max = float(np.max(bbox_points_image[:, 1]))
+                    bbox_clipped = np.array([x_min, y_min, x_max, y_max], dtype=float)
 
         candidate = {
             "gate_idx": gate_idx,
+            "gate_id": gate_idx,
+            "race_order": gate_idx,
             "gate_center_world": np.asarray(center, dtype=float).reshape(3),
             "gate_yaw_rad": float(yaw),
             "gate_right_axis_world": gate_right_axis(float(yaw)),
@@ -582,6 +785,13 @@ def build_labels(
             "points_camera": inner_corners_camera.copy(),
             "bbox_points_image": bbox_points_image,
             "corners_image": keypoints_image,
+            "projected_keypoints_raw": keypoints_image.copy(),
+            "projected_keypoints_clipped": projected_keypoints_clipped,
+            "keypoint_visibility": keypoint_visibility,
+            "visible_keypoint_count": int(np.sum(keypoint_visibility)),
+            "partial_gate_label": bool(partial_gate_label),
+            "rejected_partial_reason": rejected_partial_reason,
+            "bbox_clipped": bbox_clipped,
             "mean_depth": mean_depth,
             "accepted": accepted,
             "reason": reason,
@@ -589,7 +799,21 @@ def build_labels(
         candidates.append(candidate)
 
         if accepted:
-            labels.append((gate_idx, bbox_points_image, keypoints_image))
+            labels.append({
+                "gate_idx": gate_idx,
+                "gate_id": gate_idx,
+                "race_order": gate_idx,
+                "bbox_points_image": bbox_points_image.copy(),
+                "keypoints_image": keypoints_image.copy(),
+                "keypoint_visibility": keypoint_visibility.copy(),
+                "projected_keypoints_raw": keypoints_image.copy(),
+                "projected_keypoints_clipped": projected_keypoints_clipped.copy(),
+                "visible_keypoint_count": int(np.sum(keypoint_visibility)),
+                "partial_gate_label": bool(partial_gate_label),
+                "rejected_partial_reason": rejected_partial_reason,
+                "bbox_clipped": bbox_clipped.copy(),
+                "mean_depth": mean_depth,
+            })
 
     selected_gate_idx = None
     if labels and not label_all_visible_gates:
@@ -598,11 +822,7 @@ def build_labels(
             key=lambda candidate: candidate["mean_depth"],
         )
         selected_gate_idx = selected["gate_idx"]
-        labels = [(
-            selected["gate_idx"],
-            selected["bbox_points_image"],
-            selected["corners_image"],
-        )]
+        labels = [next(label for label in labels if label["gate_idx"] == selected_gate_idx)]
     elif labels:
         selected_gate_idx = "all_visible"
 
@@ -615,7 +835,32 @@ def build_labels(
             gazebo_optical_mode,
         )
 
-    return labels
+    return labels, candidates
+
+
+def _json_array(value):
+    return json.dumps(np.asarray(value, dtype=float).tolist(), separators=(",", ":"))
+
+
+def diagnostic_row(frame_name, candidate):
+    return {
+        "image_filename": frame_name,
+        "gate_id": candidate["gate_id"],
+        "race_order": candidate["race_order"],
+        "accepted": bool(candidate["accepted"]),
+        "rejection_reason": candidate["reason"],
+        "visible_keypoint_count": candidate["visible_keypoint_count"],
+        "partial_gate_label": bool(candidate["partial_gate_label"]),
+        "rejected_partial_reason": candidate["rejected_partial_reason"],
+        "mean_depth_m": candidate["mean_depth"],
+        "projected_keypoints_raw": _json_array(candidate["projected_keypoints_raw"]),
+        "projected_keypoints_clipped": _json_array(candidate["projected_keypoints_clipped"]),
+        "keypoint_visibility": json.dumps(
+            np.asarray(candidate["keypoint_visibility"], dtype=int).tolist(),
+            separators=(",", ":"),
+        ),
+        "bbox_clipped": _json_array(candidate["bbox_clipped"]),
+    }
 
 
 def process_dataset(args):
@@ -643,7 +888,10 @@ def process_dataset(args):
     processed = 0
     copied = 0
     labeled_gates = 0
+    partial_labeled_gates = 0
     preview_count = 0
+    preview_paths = []
+    diagnostic_rows = []
 
     for index, metadata_path in enumerate(metadata_paths):
         metadata = load_metadata(metadata_path)
@@ -652,13 +900,19 @@ def process_dataset(args):
             print(f"[WARN] missing image for {metadata_path.name}: {image_path}")
             continue
 
-        labels = build_labels(
+        labels, candidates = build_labels(
             metadata,
             label_all_visible_gates=args.label_all_visible_gates,
+            allow_partial_gates=args.allow_partial_gates,
+            min_partial_bbox_area_px2=args.min_partial_bbox_area_px2,
             order_image_corners=not args.no_image_order_corners,
             gazebo_rotation_mode=args.gazebo_rotation_mode,
             gazebo_optical_mode=args.gazebo_optical_mode,
             debug=(processed == 0),
+        )
+        diagnostic_rows.extend(
+            diagnostic_row(metadata["image_filename"], candidate)
+            for candidate in candidates
         )
         if processed < 10:
             print_frame_summary_debug(
@@ -670,6 +924,9 @@ def process_dataset(args):
             )
         processed += 1
         labeled_gates += len(labels)
+        partial_labeled_gates += sum(
+            int(label["partial_gate_label"]) for label in labels
+        )
 
         image = None
         if args.draw_preview:
@@ -680,6 +937,7 @@ def process_dataset(args):
                 preview = draw_preview(image, labels)
                 preview_path = output_root / "previews" / image_path.name
                 cv2.imwrite(str(preview_path), preview)
+                preview_paths.append(preview_path)
                 preview_count += 1
 
         if args.preview_only:
@@ -691,11 +949,12 @@ def process_dataset(args):
 
         shutil.copy2(image_path, output_image_path)
         with open(output_label_path, "w", encoding="utf-8") as f:
-            for _, bbox_points_image, keypoints_image in labels:
+            for label in labels:
                 f.write(
                     yolo_pose_line(
-                        bbox_points_image,
-                        keypoints_image,
+                        label["bbox_points_image"],
+                        label["keypoints_image"],
+                        label["keypoint_visibility"],
                         metadata["image_width"],
                         metadata["image_height"],
                     )
@@ -703,10 +962,39 @@ def process_dataset(args):
                 f.write("\n")
         copied += 1
 
+    preview_sheet_count = (
+        write_preview_sheets(preview_paths, output_root)
+        if args.draw_preview
+        else 0
+    )
+    diagnostics_path = output_root / "autolabel_diagnostics.csv"
+    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+    diagnostic_fields = [
+        "image_filename",
+        "gate_id",
+        "race_order",
+        "accepted",
+        "rejection_reason",
+        "visible_keypoint_count",
+        "partial_gate_label",
+        "rejected_partial_reason",
+        "mean_depth_m",
+        "projected_keypoints_raw",
+        "projected_keypoints_clipped",
+        "keypoint_visibility",
+        "bbox_clipped",
+    ]
+    with open(diagnostics_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=diagnostic_fields)
+        writer.writeheader()
+        writer.writerows(diagnostic_rows)
+
     print(
         f"[AUTOLABEL] processed={processed} images_copied={copied} "
-        f"labeled_gates={labeled_gates} previews={preview_count}"
+        f"labeled_gates={labeled_gates} partial_labeled_gates={partial_labeled_gates} "
+        f"previews={preview_count} preview_sheets={preview_sheet_count}"
     )
+    print(f"[AUTOLABEL] wrote {diagnostics_path}")
     if yaml_path is not None:
         print(f"[AUTOLABEL] wrote {yaml_path}")
 
@@ -722,6 +1010,16 @@ def parse_args():
     parser.add_argument("--preview-only", action="store_true")
     parser.add_argument("--max-preview", type=int, default=50)
     parser.add_argument("--label-all-visible-gates", action="store_true")
+    parser.add_argument(
+        "--allow-partial-gates",
+        action="store_true",
+        help="Label gates with at least two visible inner keypoints using 0 0 0 for missing points.",
+    )
+    parser.add_argument(
+        "--min-partial-bbox-area-px2",
+        type=float,
+        default=MIN_PARTIAL_BBOX_AREA_PX2,
+    )
     parser.add_argument("--no-image-order-corners", action="store_true")
     parser.add_argument(
         "--gazebo-rotation-mode",

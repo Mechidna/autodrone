@@ -66,7 +66,7 @@ class AutonomyAPI:
 
         self.gate_perception = GatePerception(
             gate_size=1.5,
-            yolo_model_path="/home/paolo/datasets/gazebo_gate_yolo_pose_lookahead/runs/gazebo_gate_pose_lookahead_50e/weights/best.pt",
+            yolo_model_path="/home/paolo/datasets/gazebo_gate_yolo_pose_ab_runs/partial/weights/best.pt",
             preprocess_mode="raw",
             yolo_conf=0.1,
             yolo_imgsz=640,
@@ -241,7 +241,7 @@ class AutonomyAPI:
         self.perception_transform_mode = "physical_direct_rad_x_mirror"
         # Diagnostic experiment only: compensate the measured far-range PnP
         # depth bias for detections classified as future/lookahead gates.
-        self.use_diagnostic_far_depth_correction = True
+        self.use_diagnostic_far_depth_correction = False
         self.perception_transform_modes = (
             "legacy_scaled_yaw",
             "direct_rad",
@@ -617,6 +617,16 @@ class AutonomyAPI:
         self.target_shift_z = float("nan")
         self.shift_replan_allowed = False
         self.shift_replan_suppressed_reason = ""
+        self.near_gate_suppression_overridden = False
+        self.near_gate_override_reason = ""
+        self.committed_target_error_to_filter = float("nan")
+        self.committed_target_xy_error_to_filter = float("nan")
+        self.committed_target_z_error_to_filter = float("nan")
+        self.committed_target_error_to_GT = float("nan")
+        self.latest_filter_error_to_GT = float("nan")
+        self.target_update_improvement_m = float("nan")
+        self.target_update_alpha_used = float("nan")
+        self.target_update_aggressive_correction_used = False
         self.pending_active_target_correction = None
         self.approach_start_position = None
         self.approach_vector = None
@@ -5888,6 +5898,16 @@ class AutonomyAPI:
         self.target_shift_z = float("nan")
         self.shift_replan_allowed = False
         self.shift_replan_suppressed_reason = ""
+        self.near_gate_suppression_overridden = False
+        self.near_gate_override_reason = ""
+        self.committed_target_error_to_filter = float("nan")
+        self.committed_target_xy_error_to_filter = float("nan")
+        self.committed_target_z_error_to_filter = float("nan")
+        self.committed_target_error_to_GT = float("nan")
+        self.latest_filter_error_to_GT = float("nan")
+        self.target_update_improvement_m = float("nan")
+        self.target_update_alpha_used = float("nan")
+        self.target_update_aggressive_correction_used = False
 
         if not self.use_perception:
             return False
@@ -5930,9 +5950,129 @@ class AutonomyAPI:
 
         planned = np.asarray(self.active_target_center_at_plan, dtype=float).reshape(3)
         self.active_target_latest_filtered_center = latest.copy()
-        self.active_target_shift_m = float(np.linalg.norm(latest - planned))
+        raw_shift = latest - planned
+        self.active_target_shift_m = float(np.linalg.norm(raw_shift))
+        self.committed_target_error_to_filter = self.active_target_shift_m
+        self.committed_target_xy_error_to_filter = float(
+            np.linalg.norm(raw_shift[:2])
+        )
+        self.committed_target_z_error_to_filter = float(abs(raw_shift[2]))
 
-        if self.active_target_shift_m <= self.active_target_shift_threshold_m:
+        current_pos = np.array([
+            self.telemetry.pos["x"],
+            self.telemetry.pos["y"],
+            self.telemetry.pos["z"],
+        ], dtype=float)
+        has_future_horizon_gate = self.current_target_idx + 1 < len(
+            self.active_target_gates
+        )
+        has_future_race_gate = (
+            self.race_gate_count is not None
+            and self.current_gate_idx < self.race_gate_count - 1
+        )
+        active_is_internal_passthrough = bool(
+            has_future_horizon_gate or has_future_race_gate
+        )
+
+        if 0 <= self.current_gate_idx < len(self.gt_gates):
+            expected_gt = np.asarray(
+                self.gt_gates[self.current_gate_idx], dtype=float
+            ).reshape(3)
+            if np.all(np.isfinite(expected_gt)):
+                self.committed_target_error_to_GT = float(
+                    np.linalg.norm(planned - expected_gt)
+                )
+                self.latest_filter_error_to_GT = float(
+                    np.linalg.norm(latest - expected_gt)
+                )
+                self.target_update_improvement_m = (
+                    self.committed_target_error_to_GT
+                    - self.latest_filter_error_to_GT
+                )
+
+        major_gt_improvement = bool(
+            np.isfinite(self.target_update_improvement_m)
+            and self.target_update_improvement_m > 0.30
+        )
+        if active_is_internal_passthrough:
+            latest_observation = (
+                track.obs_history[-1]
+                if len(getattr(track, "obs_history", [])) > 0
+                else None
+            )
+            recent_observation = bool(
+                latest_observation is not None
+                and time.time() - float(latest_observation.timestamp)
+                <= self.gate_memory.stale_time
+            )
+            latest_observation_accepted = bool(
+                recent_observation and not bool(latest_observation.is_outlier)
+            )
+            latest_innovation = float("inf")
+            if latest_observation is not None:
+                observation_center = np.asarray(
+                    latest_observation.center_world, dtype=float
+                ).reshape(3)
+                if np.all(np.isfinite(observation_center)):
+                    latest_innovation = float(
+                        np.linalg.norm(observation_center - latest)
+                    )
+            enough_history = bool(
+                getattr(track, "committed", False)
+                and int(getattr(track, "hits", 0))
+                >= self.planning_lookahead_min_hits
+                and int(getattr(track, "inlier_count", 0))
+                >= self.gate_memory.min_hits_for_stable
+            )
+            reasonable_innovation = bool(
+                np.isfinite(latest_innovation)
+                and latest_innovation
+                <= self.gate_memory.max_committed_match_distance
+            )
+            latest_valid, latest_invalid_reason = self.validate_candidate_target(
+                latest, current_pos, track_id=track_id
+            )
+            if not enough_history:
+                self.shift_replan_suppressed_reason = (
+                    "active_filter_insufficient_history"
+                )
+                return False
+            if not latest_observation_accepted:
+                self.shift_replan_suppressed_reason = (
+                    "active_filter_no_recent_accepted_detection"
+                )
+                return False
+            if not reasonable_innovation:
+                self.shift_replan_suppressed_reason = (
+                    f"active_filter_innovation_high:{latest_innovation:.3f}"
+                )
+                return False
+            if not latest_valid:
+                self.shift_replan_suppressed_reason = (
+                    f"active_filter_target_invalid:{latest_invalid_reason}"
+                )
+                return False
+
+            small_noise_shift = bool(
+                self.committed_target_xy_error_to_filter < 0.15
+                and self.committed_target_z_error_to_filter < 0.10
+            )
+            if small_noise_shift and not major_gt_improvement:
+                self.active_target_shift_frames = 0
+                self.shift_replan_suppressed_reason = "active_filter_small_noise"
+                return False
+
+            material_filter_correction = bool(
+                self.active_target_shift_m > self.active_target_shift_threshold_m
+                or self.committed_target_xy_error_to_filter > 0.35
+                or self.committed_target_z_error_to_filter > 0.25
+                or major_gt_improvement
+            )
+        else:
+            material_filter_correction = bool(
+                self.active_target_shift_m > self.active_target_shift_threshold_m
+            )
+        if not material_filter_correction:
             self.active_target_shift_frames = 0
             return False
 
@@ -5946,33 +6086,32 @@ class AutonomyAPI:
         if self.is_near_completed_gate(planned):
             return False
 
-        corrected_target = 0.7 * planned + 0.3 * latest
+        correction_alpha = 0.3
+        if active_is_internal_passthrough and np.isfinite(
+            self.target_update_improvement_m
+        ):
+            if self.target_update_improvement_m > 0.75:
+                correction_alpha = 0.7
+            elif self.target_update_improvement_m > 0.40:
+                correction_alpha = 0.5
+        self.target_update_alpha_used = correction_alpha
+        self.target_update_aggressive_correction_used = correction_alpha > 0.3
+        corrected_target = (
+            (1.0 - correction_alpha) * planned
+            + correction_alpha * latest
+        )
         proposed_shift = corrected_target - planned
         self.target_shift_xy = float(np.linalg.norm(proposed_shift[:2]))
         self.target_shift_z = float(abs(proposed_shift[2]))
-        current_pos = np.array([
-            self.telemetry.pos["x"],
-            self.telemetry.pos["y"],
-            self.telemetry.pos["z"],
-        ], dtype=float)
         self.distance_to_active_target_at_shift = float(
             np.linalg.norm(planned - current_pos)
         )
 
-        has_future_horizon_gate = self.current_target_idx + 1 < len(self.active_target_gates)
-        has_future_race_gate = (
-            self.race_gate_count is not None
-            and self.current_gate_idx < self.race_gate_count - 1
-        )
-        active_is_internal_passthrough = bool(
-            has_future_horizon_gate or has_future_race_gate
-        )
         planned_valid, _ = self.validate_planning_target(planned)
         planned_target_stale = bool(
             time.time() - self.replan_time > self.gate_memory.stale_time
         )
 
-        raw_shift = latest - planned
         if self.approach_vector is not None and np.all(np.isfinite(self.approach_vector)):
             approach = np.asarray(self.approach_vector, dtype=float).reshape(3)
             progress_shift = abs(float(np.dot(raw_shift, approach)))
@@ -5989,6 +6128,14 @@ class AutonomyAPI:
         proposed_horizontal_shift_large = bool(
             self.target_shift_xy > self.max_current_gate_target_shift_near_gate
         )
+        override_reasons = []
+        if self.committed_target_xy_error_to_filter > 0.35:
+            override_reasons.append("xy_error_to_filter")
+        if self.committed_target_z_error_to_filter > 0.25:
+            override_reasons.append("z_error_to_filter")
+        if major_gt_improvement:
+            override_reasons.append("gt_improvement")
+        near_gate_override_requested = bool(override_reasons)
 
         suppress_near_gate_shift = bool(
             self.freeze_current_gate_target_near_gate
@@ -5998,7 +6145,17 @@ class AutonomyAPI:
             and not crossing_change_large
             and planned_valid
             and not planned_target_stale
+            and not near_gate_override_requested
         )
+        if (
+            self.freeze_current_gate_target_near_gate
+            and active_is_internal_passthrough
+            and self.distance_to_active_target_at_shift
+            <= self.current_gate_freeze_distance
+            and near_gate_override_requested
+        ):
+            self.near_gate_suppression_overridden = True
+            self.near_gate_override_reason = "|".join(override_reasons)
         if suppress_near_gate_shift:
             self.pending_active_target_correction = None
             self.active_target_shift_suppressed = True
@@ -6026,7 +6183,11 @@ class AutonomyAPI:
             "[ACTIVE TARGET SHIFT] replan requested "
             f"track_id={track_id} shift={self.active_target_shift_m:.3f}m "
             f"frames={self.active_target_shift_frames} "
-            f"planned={planned} latest={latest} corrected={corrected_target}"
+            f"planned={planned} latest={latest} corrected={corrected_target} "
+            f"alpha={correction_alpha:.2f} "
+            f"improvement={self.target_update_improvement_m:.3f}m "
+            f"near_override={self.near_gate_suppression_overridden} "
+            f"override_reason={self.near_gate_override_reason or 'none'}"
         )
         return True
 

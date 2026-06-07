@@ -965,6 +965,36 @@ async def main():
                 shift_replan_suppressed_reason=getattr(
                     autonomy, "shift_replan_suppressed_reason", ""
                 ),
+                near_gate_suppression_overridden=getattr(
+                    autonomy, "near_gate_suppression_overridden", False
+                ),
+                near_gate_override_reason=getattr(
+                    autonomy, "near_gate_override_reason", ""
+                ),
+                committed_target_error_to_filter=getattr(
+                    autonomy, "committed_target_error_to_filter", float("nan")
+                ),
+                committed_target_xy_error_to_filter=getattr(
+                    autonomy, "committed_target_xy_error_to_filter", float("nan")
+                ),
+                committed_target_z_error_to_filter=getattr(
+                    autonomy, "committed_target_z_error_to_filter", float("nan")
+                ),
+                committed_target_error_to_GT=getattr(
+                    autonomy, "committed_target_error_to_GT", float("nan")
+                ),
+                latest_filter_error_to_GT=getattr(
+                    autonomy, "latest_filter_error_to_GT", float("nan")
+                ),
+                target_update_improvement_m=getattr(
+                    autonomy, "target_update_improvement_m", float("nan")
+                ),
+                target_update_alpha_used=getattr(
+                    autonomy, "target_update_alpha_used", float("nan")
+                ),
+                target_update_aggressive_correction_used=getattr(
+                    autonomy, "target_update_aggressive_correction_used", False
+                ),
                 active_target_center_at_plan=getattr(autonomy, "active_target_center_at_plan", None),
                 active_target_latest_filtered_center=getattr(autonomy, "active_target_latest_filtered_center", None),
                 target_update_event=getattr(autonomy, "target_update_event", False),
