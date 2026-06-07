@@ -50,9 +50,34 @@ def rad2deg(x):
     return x * 180.0 / math.pi
 
 
-def hover_command(autonomy):
-    yaw_rad = float(autonomy.telemetry.rpy["yaw"])
-    return 0.0, 0.0, yaw_rad, autonomy.tracker.thrust_hover
+def hover_command(autonomy, replan_hover=False):
+    telemetry_yaw = float(autonomy.telemetry.rpy["yaw"])
+    yaw_cmd = telemetry_yaw
+    yaw_source = "telemetry_fallback"
+    used_reference = False
+
+    if bool(getattr(autonomy, "has_commanded_yaw_reference", False)):
+        candidates = (
+            ("ref_yaw", getattr(autonomy, "ref_yaw", None)),
+            ("previous_yaw_cmd", getattr(autonomy, "previous_yaw_cmd", None)),
+            ("last_desired_yaw", getattr(autonomy, "last_desired_yaw", None)),
+            ("perception_hold_yaw", getattr(autonomy, "perception_hold_yaw", None)),
+        )
+        for source, value in candidates:
+            if value is not None and np.isfinite(value):
+                yaw_cmd = float(value)
+                yaw_source = source
+                used_reference = True
+                break
+
+    autonomy.hover_yaw_hold_reference_used = used_reference
+    autonomy.hover_yaw_seed_source = yaw_source
+    autonomy.hover_yaw_cmd_before_deg = math.degrees(telemetry_yaw)
+    autonomy.hover_yaw_cmd_after_deg = math.degrees(yaw_cmd)
+    autonomy.hover_yaw_used_telemetry_fallback = not used_reference
+    autonomy.replan_hover_yaw_continuity_used = bool(replan_hover and used_reference)
+
+    return 0.0, 0.0, yaw_cmd, autonomy.tracker.thrust_hover
 
 
 # -------------------------------------------------
@@ -689,6 +714,12 @@ async def main():
             hold_command = False
             stale_command_suppressed = False
             autonomy.last_perception_replan_trigger = False
+            autonomy.hover_yaw_hold_reference_used = False
+            autonomy.hover_yaw_seed_source = ""
+            autonomy.hover_yaw_cmd_before_deg = float("nan")
+            autonomy.hover_yaw_cmd_after_deg = float("nan")
+            autonomy.hover_yaw_used_telemetry_fallback = False
+            autonomy.replan_hover_yaw_continuity_used = False
 
             if loop_dt > 0.1:
                 print(f"[WARN] control loop gap {loop_dt:.3f}s; suppressing aggressive command.")
@@ -834,7 +865,10 @@ async def main():
             ):
                 roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = autonomy.attitude_control()
             elif hold_command or stale_command_suppressed:
-                roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = hover_command(autonomy)
+                roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = hover_command(
+                    autonomy,
+                    replan_hover=hold_command,
+                )
             else:
                 roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = autonomy.attitude_control()
 
@@ -985,6 +1019,24 @@ async def main():
                 yaw_cmd_after_unwrap_deg=math.degrees(getattr(autonomy, "yaw_cmd_after_unwrap", float("nan"))),
                 has_commanded_yaw_reference=getattr(autonomy, "has_commanded_yaw_reference", False),
                 yaw_rate_limited=getattr(autonomy, "yaw_rate_limited", False),
+                hover_yaw_hold_reference_used=getattr(
+                    autonomy, "hover_yaw_hold_reference_used", False
+                ),
+                hover_yaw_seed_source=getattr(
+                    autonomy, "hover_yaw_seed_source", ""
+                ),
+                hover_yaw_cmd_before_deg=getattr(
+                    autonomy, "hover_yaw_cmd_before_deg", float("nan")
+                ),
+                hover_yaw_cmd_after_deg=getattr(
+                    autonomy, "hover_yaw_cmd_after_deg", float("nan")
+                ),
+                hover_yaw_used_telemetry_fallback=getattr(
+                    autonomy, "hover_yaw_used_telemetry_fallback", False
+                ),
+                replan_hover_yaw_continuity_used=getattr(
+                    autonomy, "replan_hover_yaw_continuity_used", False
+                ),
                 post_completion_grace_active=getattr(autonomy, "post_completion_grace_active", False),
                 next_track_available_after_completion=getattr(autonomy, "next_track_available_after_completion", False),
                 skipped_target_clear_after_completion=getattr(autonomy, "skipped_target_clear_after_completion", False),
@@ -1126,6 +1178,48 @@ async def main():
                 ),
                 lookahead_promotion_blocked_reason=getattr(
                     autonomy, "promotion_blocked_reason", ""
+                ),
+                promotion_normal_race_order_failed=getattr(
+                    autonomy, "promotion_normal_race_order_failed", False
+                ),
+                promotion_fallback_previous_horizon_used=getattr(
+                    autonomy, "promotion_fallback_previous_horizon_used", False
+                ),
+                promotion_fallback_candidate_track_id=getattr(
+                    autonomy, "promotion_fallback_candidate_track_id", None
+                ),
+                promotion_fallback_candidate_center=getattr(
+                    autonomy, "promotion_fallback_candidate_center", None
+                ),
+                promotion_fallback_rejection_reason=getattr(
+                    autonomy, "promotion_fallback_rejection_reason", ""
+                ),
+                previous_horizon_track_ids_at_completion=getattr(
+                    autonomy, "previous_horizon_track_ids_at_completion", []
+                ),
+                previous_horizon_waypoint_types_at_completion=getattr(
+                    autonomy, "previous_horizon_waypoint_types_at_completion", ""
+                ),
+                promoted_track_source=getattr(
+                    autonomy, "promoted_track_source", ""
+                ),
+                promotion_candidate_hits=getattr(
+                    autonomy, "promotion_candidate_hits", 0
+                ),
+                promotion_candidate_inliers=getattr(
+                    autonomy, "promotion_candidate_inliers", 0
+                ),
+                promotion_candidate_outliers=getattr(
+                    autonomy, "promotion_candidate_outliers", 0
+                ),
+                promotion_candidate_camera_std=getattr(
+                    autonomy, "promotion_candidate_camera_std", float("nan")
+                ),
+                promotion_candidate_center_std=getattr(
+                    autonomy, "promotion_candidate_center_std", float("nan")
+                ),
+                promotion_candidate_stability_blocker=getattr(
+                    autonomy, "promotion_candidate_stability_blocker", ""
                 ),
                 race_order_after_merge=getattr(autonomy, "race_order_after_merge", []),
                 tentative_track_ids=getattr(autonomy, "tentative_track_ids", []),

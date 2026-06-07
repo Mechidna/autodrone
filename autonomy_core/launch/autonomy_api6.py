@@ -189,6 +189,12 @@ class AutonomyAPI:
         self.perception_hold_position = None
         self.perception_hold_yaw = 0.0
         self.has_commanded_yaw_reference = False
+        self.hover_yaw_hold_reference_used = False
+        self.hover_yaw_seed_source = ""
+        self.hover_yaw_cmd_before_deg = float("nan")
+        self.hover_yaw_cmd_after_deg = float("nan")
+        self.hover_yaw_used_telemetry_fallback = False
+        self.replan_hover_yaw_continuity_used = False
         self.no_active_target = False
         self.no_target_control_mode = ""
         self.hold_anchor_source = ""
@@ -211,6 +217,20 @@ class AutonomyAPI:
         self.previous_horizon_waypoint_types = ""
         self.promotion_blocked_reason = ""
         self.pending_lookahead_handoff = None
+        self.promotion_normal_race_order_failed = False
+        self.promotion_fallback_previous_horizon_used = False
+        self.promotion_fallback_candidate_track_id = None
+        self.promotion_fallback_candidate_center = np.full(3, np.nan, dtype=float)
+        self.promotion_fallback_rejection_reason = ""
+        self.previous_horizon_track_ids_at_completion = []
+        self.previous_horizon_waypoint_types_at_completion = ""
+        self.promoted_track_source = ""
+        self.promotion_candidate_hits = 0
+        self.promotion_candidate_inliers = 0
+        self.promotion_candidate_outliers = 0
+        self.promotion_candidate_camera_std = float("nan")
+        self.promotion_candidate_center_std = float("nan")
+        self.promotion_candidate_stability_blocker = ""
         self.target_clear_reason = ""
         self.post_completion_grace_suppressed = False
         self.use_passthrough_gate_velocities = True
@@ -385,6 +405,20 @@ class AutonomyAPI:
         self.track_stability_score = float("nan")
         self.promotion_reason = ""
         self.promotion_blocked_reason = ""
+        self.promotion_normal_race_order_failed = False
+        self.promotion_fallback_previous_horizon_used = False
+        self.promotion_fallback_candidate_track_id = None
+        self.promotion_fallback_candidate_center = np.full(3, np.nan, dtype=float)
+        self.promotion_fallback_rejection_reason = ""
+        self.previous_horizon_track_ids_at_completion = []
+        self.previous_horizon_waypoint_types_at_completion = ""
+        self.promoted_track_source = ""
+        self.promotion_candidate_hits = 0
+        self.promotion_candidate_inliers = 0
+        self.promotion_candidate_outliers = 0
+        self.promotion_candidate_camera_std = float("nan")
+        self.promotion_candidate_center_std = float("nan")
+        self.promotion_candidate_stability_blocker = ""
         self.selected_target_source = ""
         self.last_raw_image_corners = None
         self.last_ordered_image_corners = None
@@ -4622,6 +4656,163 @@ class AutonomyAPI:
             f"raw={raw.tolist()} filtered={filtered.tolist()}"
         )
 
+    def _record_promotion_candidate_stability(self, tr):
+        if tr is None:
+            return
+        self.promotion_candidate_hits = int(getattr(tr, "hits", 0))
+        self.promotion_candidate_inliers = int(getattr(tr, "inlier_count", 0))
+        self.promotion_candidate_outliers = int(getattr(tr, "outlier_count", 0))
+        camera_std = np.asarray(
+            getattr(tr, "center_camera_std", np.full(3, np.nan)), dtype=float
+        ).reshape(3)
+        center_std = np.asarray(
+            getattr(tr, "center_world_std", np.full(3, np.nan)), dtype=float
+        ).reshape(3)
+        self.promotion_candidate_camera_std = (
+            float(np.linalg.norm(camera_std))
+            if np.all(np.isfinite(camera_std))
+            else float("nan")
+        )
+        self.promotion_candidate_center_std = (
+            float(np.linalg.norm(center_std))
+            if np.all(np.isfinite(center_std))
+            else float("nan")
+        )
+        self.promotion_candidate_stability_blocker = str(
+            getattr(tr, "promotion_blocked_reason", "") or ""
+        )
+
+    def _try_previous_horizon_promotion_fallback(
+        self,
+        vehicle_pos,
+        completed_track_id,
+        completed_center,
+    ):
+        self.promotion_fallback_previous_horizon_used = False
+        self.promotion_fallback_rejection_reason = ""
+
+        handoff = self.pending_lookahead_handoff
+        if handoff is None:
+            self.promotion_fallback_rejection_reason = "previous_horizon_has_no_future_track"
+            return False
+
+        track_id = self.canonical_track_id(handoff.get("track_id"))
+        center = np.asarray(
+            handoff.get("center", np.full(3, np.nan)), dtype=float
+        ).reshape(3)
+        waypoint_type = str(handoff.get("waypoint_type", "") or "")
+        self.promotion_fallback_candidate_track_id = track_id
+        self.promotion_fallback_candidate_center = center.copy()
+
+        tr = self.gate_memory.get_track_by_id(track_id) if track_id is not None else None
+        self._record_promotion_candidate_stability(tr)
+
+        def reject(reason):
+            self.promotion_fallback_rejection_reason = str(reason)
+            self.promotion_blocked_reason = str(reason)
+            print(
+                "[LOOKAHEAD HANDOFF FALLBACK] rejected "
+                f"track_id={track_id} center={center.tolist()} reason={reason}"
+            )
+            return False
+
+        if track_id is None or track_id < 0:
+            return reject("fallback_invalid_track_id")
+        if track_id == self.canonical_track_id(completed_track_id):
+            return reject("fallback_is_completed_track")
+        if tr is None:
+            return reject("fallback_track_missing")
+        if not bool(getattr(tr, "committed", False)):
+            return reject("fallback_track_not_committed")
+        if waypoint_type not in ("soft_tentative", "hard_stable"):
+            return reject(f"fallback_invalid_previous_waypoint_type:{waypoint_type}")
+        if int(getattr(tr, "hits", 0)) < int(self.planning_lookahead_min_hits):
+            return reject(
+                f"fallback_insufficient_hits:{int(getattr(tr, 'hits', 0))}"
+                f"<{int(self.planning_lookahead_min_hits)}"
+            )
+        valid, reason = self.validate_planning_target(center)
+        if not valid:
+            return reject(f"fallback_invalid_target:{reason}")
+        if self.is_near_completed_gate(center):
+            return reject("fallback_near_completed_gate")
+
+        vehicle_pos = np.asarray(vehicle_pos, dtype=float).reshape(3)
+        completed_center = np.asarray(completed_center, dtype=float).reshape(3)
+        previous_gate_idx = self.current_gate_idx - 1
+        expected_next = None
+        race_direction = None
+        if (
+            0 <= previous_gate_idx < len(self.gt_gates)
+            and 0 <= self.current_gate_idx < len(self.gt_gates)
+        ):
+            previous_gt = np.asarray(self.gt_gates[previous_gate_idx], dtype=float).reshape(3)
+            expected_next = np.asarray(
+                self.gt_gates[self.current_gate_idx], dtype=float
+            ).reshape(3)
+            race_direction = expected_next - previous_gt
+        elif self.approach_vector is not None:
+            race_direction = np.asarray(self.approach_vector, dtype=float).reshape(3)
+        else:
+            race_direction = center - completed_center
+
+        direction_norm = float(np.linalg.norm(race_direction))
+        if not np.isfinite(direction_norm) or direction_norm < 1e-6:
+            return reject("fallback_race_direction_unavailable")
+        race_direction = race_direction / direction_norm
+        completed_progress = float(np.dot(center - completed_center, race_direction))
+        vehicle_progress = float(np.dot(center - vehicle_pos, race_direction))
+        if completed_progress <= 0.0:
+            return reject(f"fallback_not_ahead_of_completed_gate:{completed_progress:.2f}")
+        if vehicle_progress <= 0.0:
+            return reject(f"fallback_behind_vehicle:{vehicle_progress:.2f}")
+        if expected_next is not None:
+            expected_error = float(np.linalg.norm(center - expected_next))
+            if expected_error > float(self.max_gate_jump):
+                return reject(
+                    f"fallback_too_far_from_expected_next:{expected_error:.2f}"
+                    f">{float(self.max_gate_jump):.2f}"
+                )
+
+        valid, reason = self.validate_candidate_target(
+            center, vehicle_pos, track_id=track_id
+        )
+        if not valid:
+            return reject(f"fallback_candidate_invalid:{reason}")
+        if self.race_progression.predefined_order is not None:
+            return reject("fallback_cannot_modify_predefined_race_order")
+
+        if track_id not in self.race_accepted_track_ids:
+            self.race_accepted_track_ids.append(track_id)
+        order = [
+            self.canonical_track_id(tid)
+            for tid in self.race_progression.inferred_order
+            if self.canonical_track_id(tid) != track_id
+        ]
+        insert_at = min(max(int(self.race_progression.cursor), 0), len(order))
+        order.insert(insert_at, track_id)
+        self.race_progression.inferred_order = order
+        self.race_order_track_ids = list(order)
+        self.race_admitted_track_ids = list(self.race_accepted_track_ids)
+        setattr(tr, "race_order_index", int(self.current_gate_idx))
+
+        handoff["source"] = "previous_horizon_fallback"
+        self.pending_lookahead_handoff = handoff
+        self.next_track_after_completion_id = track_id
+        self.next_track_available_after_completion = True
+        self.promotion_fallback_previous_horizon_used = True
+        self.promotion_fallback_rejection_reason = ""
+        self.promotion_blocked_reason = ""
+        print(
+            "[LOOKAHEAD HANDOFF FALLBACK] accepted "
+            f"track_id={track_id} center={center.tolist()} "
+            f"hits={self.promotion_candidate_hits} "
+            f"inliers={self.promotion_candidate_inliers} "
+            f"outliers={self.promotion_candidate_outliers} "
+            f"stability_blocker={self.promotion_candidate_stability_blocker or 'none'}"
+        )
+        return True
+
     def reset_crossing_debug(self):
         self.crossing_true_gate_center = np.full(3, np.nan, dtype=float)
         self.crossing_vehicle_position = np.full(3, np.nan, dtype=float)
@@ -5058,6 +5249,20 @@ class AutonomyAPI:
             self.promoted_track_id = None
             self.promoted_track_center = np.full(3, np.nan, dtype=float)
             self.promotion_blocked_reason = ""
+            self.promotion_normal_race_order_failed = False
+            self.promotion_fallback_previous_horizon_used = False
+            self.promotion_fallback_candidate_track_id = None
+            self.promotion_fallback_candidate_center = np.full(3, np.nan, dtype=float)
+            self.promotion_fallback_rejection_reason = ""
+            self.previous_horizon_track_ids_at_completion = []
+            self.previous_horizon_waypoint_types_at_completion = ""
+            self.promoted_track_source = ""
+            self.promotion_candidate_hits = 0
+            self.promotion_candidate_inliers = 0
+            self.promotion_candidate_outliers = 0
+            self.promotion_candidate_camera_std = float("nan")
+            self.promotion_candidate_center_std = float("nan")
+            self.promotion_candidate_stability_blocker = ""
             self.gate_completion_triggered = False
             self.reset_crossing_debug()
             self.completion_reason = ""
@@ -5166,6 +5371,12 @@ class AutonomyAPI:
             self.completed_gate_track_id = track_id
             self.previous_horizon_track_ids = list(self.planning_horizon_track_ids)
             self.previous_horizon_waypoint_types = self.planning_horizon_waypoint_types
+            self.previous_horizon_track_ids_at_completion = list(
+                self.previous_horizon_track_ids
+            )
+            self.previous_horizon_waypoint_types_at_completion = str(
+                self.previous_horizon_waypoint_types
+            )
             self.pending_lookahead_handoff = None
             if track_id in self.previous_horizon_track_ids:
                 completed_horizon_idx = self.previous_horizon_track_ids.index(track_id)
@@ -5190,7 +5401,11 @@ class AutonomyAPI:
                                 self.active_target_gates[next_horizon_idx], dtype=float
                             ).reshape(3).copy(),
                             "waypoint_type": next_type,
+                            "source": "race_order",
                         }
+                        self._record_promotion_candidate_stability(
+                            self.gate_memory.get_track_by_id(next_id)
+                        )
             if 0 <= self.current_gate_idx < len(self.gt_gates):
                 true_center = np.asarray(
                     self.gt_gates[self.current_gate_idx], dtype=float
@@ -5262,14 +5477,28 @@ class AutonomyAPI:
                     self.pending_lookahead_handoff.get("track_id")
                 )
                 if self.next_track_after_completion_id is None:
+                    self.promotion_normal_race_order_failed = True
                     self.promotion_blocked_reason = "next_race_order_track_missing"
-                    self.pending_lookahead_handoff = None
+                    self._try_previous_horizon_promotion_fallback(
+                        vehicle_pos=pos,
+                        completed_track_id=track_id,
+                        completed_center=target,
+                    )
                 elif handoff_id != self.canonical_track_id(self.next_track_after_completion_id):
+                    self.promotion_normal_race_order_failed = True
                     self.promotion_blocked_reason = (
                         f"handoff_not_next_race_track:{handoff_id}!="
                         f"{self.next_track_after_completion_id}"
                     )
                     self.pending_lookahead_handoff = None
+            elif self.next_track_after_completion_id is None:
+                self.promotion_normal_race_order_failed = True
+                self.promotion_blocked_reason = "next_race_order_track_missing"
+                self._try_previous_horizon_promotion_fallback(
+                    vehicle_pos=pos,
+                    completed_track_id=track_id,
+                    completed_center=target,
+                )
 
             installed_next_target = False
             if self.next_track_available_after_completion:
@@ -5282,6 +5511,15 @@ class AutonomyAPI:
                 )
 
             if installed_next_target and len(self.active_target_gates) > 0:
+                if self.promoted_lookahead_to_active:
+                    self.promoted_track_source = str(
+                        (
+                            self.pending_lookahead_handoff
+                            or {}
+                        ).get("source", "race_order")
+                    )
+                elif self.next_track_available_after_completion:
+                    self.promoted_track_source = "race_order"
                 self.active_target_source = (
                     "next_track_after_completion"
                     if self.next_track_available_after_completion
