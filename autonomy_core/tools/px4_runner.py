@@ -599,7 +599,7 @@ async def main():
             break
 
     use_perception = True
-    autonomy = AutonomyAPI(use_perception=use_perception, race_gate_count=3)
+    autonomy = AutonomyAPI(use_perception=use_perception, race_gate_count=None)
     autonomy.telemetry = telemetry
 
     # -------------------------------------------------
@@ -937,9 +937,29 @@ async def main():
                 replan_started = time.time()
                 print(f"[REPLAN] start t={replan_started:.3f}")
                 try:
-                    ok = autonomy.path_plan(
-                        replan_reason=requested_replan_reason
+                    future_only_replan = requested_replan_reason in (
+                        "tentative_lookahead_new_candidate",
+                        "tentative_lookahead_shift",
                     )
+                    maybe_future_only_replan = (
+                        requested_replan_reason == "new_committed_or_stable_gate"
+                    )
+                    if future_only_replan:
+                        autonomy.build_pending_suffix_for_future_only_replan(
+                            requested_replan_reason
+                        )
+                        ok = True
+                    elif (
+                        maybe_future_only_replan
+                        and autonomy.build_pending_suffix_for_future_only_replan(
+                            requested_replan_reason
+                        )
+                    ):
+                        ok = True
+                    else:
+                        ok = autonomy.path_plan(
+                            replan_reason=requested_replan_reason
+                        )
                 except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
                     ok = False
                     print(
@@ -1372,6 +1392,24 @@ async def main():
                 internal_gate_velocity_nonzero=getattr(autonomy, "internal_gate_velocity_nonzero", False),
                 terminal_velocity_mode=getattr(autonomy, "terminal_velocity_mode", ""),
                 replan_reason=getattr(autonomy, "replan_reason", ""),
+                pending_suffix_created=getattr(autonomy, "pending_suffix_created", False),
+                pending_suffix_install_attempted=getattr(
+                    autonomy, "pending_suffix_install_attempted", False
+                ),
+                pending_suffix_installed=getattr(autonomy, "pending_suffix_installed", False),
+                pending_suffix_rejected_reason=getattr(
+                    autonomy, "pending_suffix_rejected_reason", ""
+                ),
+                pending_suffix_track_ids=getattr(autonomy, "pending_suffix_track_ids", []),
+                pending_suffix_splice_track_id=getattr(
+                    autonomy, "pending_suffix_splice_track_id", None
+                ),
+                pending_suffix_start_speed=getattr(
+                    autonomy, "pending_suffix_start_speed", float("nan")
+                ),
+                future_only_replan_preserved_active_segment=getattr(
+                    autonomy, "future_only_replan_preserved_active_segment", False
+                ),
                 no_target_roll_source=getattr(autonomy, "no_target_roll_source", ""),
                 no_target_pitch_source=getattr(autonomy, "no_target_pitch_source", ""),
                 horizontal_hold_disabled_after_completion=getattr(autonomy, "horizontal_hold_disabled_after_completion", False),
