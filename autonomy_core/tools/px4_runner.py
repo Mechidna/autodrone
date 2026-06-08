@@ -1,5 +1,6 @@
 # px4_runner.py
 import asyncio
+import copy
 import hashlib
 import json
 import math
@@ -78,6 +79,79 @@ def hover_command(autonomy, replan_hover=False):
     autonomy.replan_hover_yaw_continuity_used = bool(replan_hover and used_reference)
 
     return 0.0, 0.0, yaw_cmd, autonomy.tracker.thrust_hover
+
+
+def trajectory_status(autonomy, now=None):
+    now = time.time() if now is None else float(now)
+    planner = getattr(autonomy, "planner", None)
+    active_waypoints = getattr(autonomy, "active_waypoints", None)
+    total_time = float(getattr(planner, "total_time", 0.0)) if planner is not None else 0.0
+    start_time = float(getattr(autonomy, "trajectory_start_time", 0.0))
+    has_coefficients = getattr(planner, "coeffs", None) is not None
+    has_waypoints = active_waypoints is not None and len(active_waypoints) >= 2
+    has_trajectory = bool(
+        planner is not None
+        and has_coefficients
+        and has_waypoints
+        and total_time > 0.0
+        and start_time > 0.0
+    )
+
+    if not has_trajectory:
+        return {
+            "valid": False,
+            "time_remaining": float("nan"),
+            "expired_s": float("nan"),
+        }
+
+    elapsed = max(0.0, now - start_time)
+    time_remaining = total_time - elapsed
+    expired_s = max(0.0, -time_remaining)
+    max_holdover_s = max(
+        0.0, float(getattr(autonomy, "max_trajectory_holdover_s", 0.75))
+    )
+    return {
+        "valid": expired_s <= max_holdover_s,
+        "time_remaining": time_remaining,
+        "expired_s": expired_s,
+    }
+
+
+def snapshot_trajectory_state(autonomy):
+    fields = (
+        "active_waypoints",
+        "active_times",
+        "active_target_gates",
+        "active_target_track_ids",
+        "current_target_idx",
+        "current_target_gate",
+        "current_gate_pos",
+        "active_target_track_id",
+        "last_valid_target",
+        "active_target_center",
+        "active_target_center_at_plan",
+        "active_target_latest_filtered_center",
+        "trajectory_start_time",
+        "time_elapsed",
+        "p_ref",
+        "v_ref",
+        "a_ref",
+        "planning_horizon_track_ids",
+        "planning_horizon_waypoint_count",
+        "planning_horizon_waypoints",
+        "planning_horizon_waypoint_types",
+        "_planning_target_waypoint_types",
+    )
+    state = {name: copy.deepcopy(getattr(autonomy, name, None)) for name in fields}
+    state["planner"] = copy.deepcopy(autonomy.planner)
+    return state
+
+
+def restore_trajectory_state(autonomy, state):
+    autonomy.planner = state["planner"]
+    for name, value in state.items():
+        if name != "planner":
+            setattr(autonomy, name, value)
 
 
 # -------------------------------------------------
@@ -694,6 +768,7 @@ async def main():
                 await asyncio.sleep(0.02)
 
         autonomy.seed_yaw_hold(float(telemetry.rpy["yaw"]), reason="after_startup_hover")
+        last_command_sent_time = time.time()
     except OffboardError as e:
         print(f"Offboard start failed: {e._result.result}")
         await drone.action.disarm()
@@ -715,6 +790,11 @@ async def main():
             replan_duration = 0.0
             hold_command = False
             stale_command_suppressed = False
+            autonomy.replan_in_progress = False
+            autonomy.continued_previous_trajectory_during_replan = False
+            autonomy.hover_due_to_replan = False
+            autonomy.hover_due_to_stale_command = False
+            autonomy.hover_due_to_no_valid_trajectory = False
             autonomy.last_perception_replan_trigger = False
             autonomy.hover_yaw_hold_reference_used = False
             autonomy.hover_yaw_seed_source = ""
@@ -724,8 +804,7 @@ async def main():
             autonomy.replan_hover_yaw_continuity_used = False
 
             if loop_dt > 0.1:
-                print(f"[WARN] control loop gap {loop_dt:.3f}s; suppressing aggressive command.")
-                stale_command_suppressed = True
+                print(f"[WARN] control loop gap {loop_dt:.3f}s.")
 
             if use_camera:
                 (
@@ -843,10 +922,30 @@ async def main():
                 or time.time() - autonomy.replan_time > 0.3
             ):
                 replan_requested = True
-                hold_command = True
+                previous_status = trajectory_status(autonomy)
+                autonomy.previous_trajectory_valid = previous_status["valid"]
+                autonomy.previous_trajectory_time_remaining = previous_status[
+                    "time_remaining"
+                ]
+                autonomy.trajectory_expired_s = previous_status["expired_s"]
+                autonomy.replan_in_progress = True
+                previous_trajectory_state = (
+                    snapshot_trajectory_state(autonomy)
+                    if previous_status["valid"]
+                    else None
+                )
                 replan_started = time.time()
                 print(f"[REPLAN] start t={replan_started:.3f}")
-                ok = autonomy.path_plan(replan_reason=requested_replan_reason)
+                try:
+                    ok = autonomy.path_plan(
+                        replan_reason=requested_replan_reason
+                    )
+                except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+                    ok = False
+                    print(
+                        "[REPLAN] planning failed with numeric/configuration "
+                        f"error: {exc}"
+                    )
                 replan_duration = time.time() - replan_started
                 print(
                     f"[REPLAN] end duration={replan_duration:.3f}s "
@@ -856,20 +955,84 @@ async def main():
                 )
                 if not ok:
                     print("Replan requested, but no valid gates available yet.")
+                    if previous_trajectory_state is not None:
+                        restore_trajectory_state(
+                            autonomy,
+                            previous_trajectory_state,
+                        )
+                        print(
+                            "[REPLAN] restored previous valid trajectory after "
+                            "planning failure."
+                        )
 
             # -------------------------------------------------
             # 3) Track current trajectory (or hover if none yet)
             # -------------------------------------------------
-            if (
-                (hold_command or stale_command_suppressed)
-                and use_perception
-                and len(getattr(autonomy, "active_target_gates", [])) == 0
-            ):
-                roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = autonomy.attitude_control()
-            elif hold_command or stale_command_suppressed:
+            command_stale_age_s = max(0.0, time.time() - last_command_sent_time)
+            autonomy.command_stale_age_s = command_stale_age_s
+            stale_threshold_s = max(
+                0.0,
+                float(
+                    getattr(
+                        autonomy,
+                        "command_stale_safety_threshold_s",
+                        0.5,
+                    )
+                ),
+            )
+            stale_command_suppressed = command_stale_age_s > stale_threshold_s
+            current_status = trajectory_status(autonomy)
+            if not replan_requested:
+                autonomy.previous_trajectory_valid = current_status["valid"]
+                autonomy.previous_trajectory_time_remaining = current_status[
+                    "time_remaining"
+                ]
+                autonomy.trajectory_expired_s = current_status["expired_s"]
+
+            explicit_failsafe_active = bool(
+                getattr(autonomy, "explicit_failsafe_active", False)
+            )
+            continue_previous = bool(
+                replan_requested
+                and autonomy.previous_trajectory_valid
+                and getattr(
+                    autonomy,
+                    "continue_previous_trajectory_during_replan",
+                    True,
+                )
+                and not stale_command_suppressed
+                and not explicit_failsafe_active
+            )
+
+            should_hover = False
+            if explicit_failsafe_active:
+                should_hover = True
+            elif stale_command_suppressed:
+                should_hover = True
+                autonomy.hover_due_to_stale_command = True
+            elif current_status["valid"]:
+                autonomy.continued_previous_trajectory_during_replan = (
+                    continue_previous
+                )
+            else:
+                should_hover = bool(
+                    not replan_requested
+                    or getattr(
+                        autonomy,
+                        "hover_on_replan_without_valid_trajectory",
+                        True,
+                    )
+                )
+                autonomy.hover_due_to_no_valid_trajectory = should_hover
+                autonomy.hover_due_to_replan = bool(
+                    should_hover and replan_requested
+                )
+
+            hold_command = should_hover
+            if should_hover:
                 roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = hover_command(
                     autonomy,
-                    replan_hover=hold_command,
+                    replan_hover=autonomy.hover_due_to_replan,
                 )
             else:
                 roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = autonomy.attitude_control()
@@ -915,6 +1078,33 @@ async def main():
                 replan_duration=replan_duration,
                 hold_command=hold_command,
                 stale_command_suppressed=stale_command_suppressed,
+                replan_in_progress=getattr(autonomy, "replan_in_progress", False),
+                continued_previous_trajectory_during_replan=getattr(
+                    autonomy,
+                    "continued_previous_trajectory_during_replan",
+                    False,
+                ),
+                hover_due_to_replan=getattr(autonomy, "hover_due_to_replan", False),
+                hover_due_to_stale_command=getattr(
+                    autonomy, "hover_due_to_stale_command", False
+                ),
+                hover_due_to_no_valid_trajectory=getattr(
+                    autonomy, "hover_due_to_no_valid_trajectory", False
+                ),
+                previous_trajectory_valid=getattr(
+                    autonomy, "previous_trajectory_valid", False
+                ),
+                previous_trajectory_time_remaining=getattr(
+                    autonomy,
+                    "previous_trajectory_time_remaining",
+                    float("nan"),
+                ),
+                trajectory_expired_s=getattr(
+                    autonomy, "trajectory_expired_s", float("nan")
+                ),
+                command_stale_age_s=getattr(
+                    autonomy, "command_stale_age_s", float("nan")
+                ),
                 plan_mode=getattr(autonomy, "last_plan_mode", None),
                 plan_start_gate_idx=getattr(autonomy, "last_plan_start_gate_idx", None),
                 plan_end_gate_idx=getattr(autonomy, "last_plan_end_gate_idx", None),
@@ -1758,6 +1948,7 @@ async def main():
                     thrust_value=thrust_cmd,
                 )
             )
+            last_command_sent_time = time.time()
 
             print(
                 f"cmd | roll={rad2deg(roll_cmd):6.2f} deg "
