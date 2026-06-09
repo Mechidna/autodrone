@@ -1061,6 +1061,10 @@ async def main():
             if active_gate_idx is None:
                 active_gate_idx = getattr(autonomy, "target_gate_idx", None)
 
+            flight_logger.log_installed_plan_rows(
+                getattr(autonomy, "installed_plan_export_rows", [])
+            )
+
             flight_logger.log(
                 telemetry=telemetry,
                 roll_cmd=roll_cmd,
@@ -1073,6 +1077,7 @@ async def main():
                 target=target,
                 mode=mode,
                 active_gate_idx=active_gate_idx,
+                active_plan_id=getattr(autonomy, "active_plan_id", 0),
                 loop_dt=loop_dt,
                 replan_requested=replan_requested,
                 replan_duration=replan_duration,

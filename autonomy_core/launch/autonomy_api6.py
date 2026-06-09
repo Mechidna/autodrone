@@ -127,6 +127,10 @@ class AutonomyAPI:
         self.active_target_gates = []
         self.active_target_track_ids = []
         self.current_target_idx = 0
+        self.active_plan_id = 0
+        self.installed_plan_sample_count = 160
+        self.installed_plan_export_rows = []
+        self.installed_plan_export_plan_id = None
 
         # Race progress is a sequence cursor over persistent gate track IDs.
         # Landmark memory stays forever; passing a gate never deletes it.
@@ -739,6 +743,60 @@ class AutonomyAPI:
             times.append(T)
 
         return np.asarray(times, dtype=float)
+
+    def record_installed_plan_for_export(self, plan_source, replan_reason):
+        planner = self.planner
+        total_time = float(getattr(planner, "total_time", 0.0))
+        if planner is None or total_time <= 0.0 or getattr(planner, "coeffs", None) is None:
+            return
+
+        self.active_plan_id += 1
+        plan_id = int(self.active_plan_id)
+        sample_count = max(2, int(self.installed_plan_sample_count))
+        active_times = (
+            ""
+            if self.active_times is None
+            else " ".join(
+                f"{float(t):.6f}"
+                for t in np.asarray(self.active_times, dtype=float).reshape(-1)
+            )
+        )
+        active_track_ids = " ".join(str(x) for x in self.active_target_track_ids)
+        waypoint_types = str(self.planning_horizon_waypoint_types or "")
+
+        rows = []
+        for tau in np.linspace(0.0, total_time, sample_count):
+            tau = float(tau)
+            try:
+                p, v, a, _, _ = planner.sample_full(tau)
+            except AttributeError:
+                p, v, a = planner.sample(tau)
+            rows.append({
+                "plan_id": plan_id,
+                "plan_source": str(plan_source or ""),
+                "replan_reason": str(replan_reason or ""),
+                "tau": tau,
+                "x": float(p[0]),
+                "y": float(p[1]),
+                "z": float(p[2]),
+                "vx": float(v[0]),
+                "vy": float(v[1]),
+                "vz": float(v[2]),
+                "ax": float(a[0]),
+                "ay": float(a[1]),
+                "az": float(a[2]),
+                "active_times": active_times,
+                "active_target_track_ids": active_track_ids,
+                "planning_horizon_waypoint_types": waypoint_types,
+            })
+
+        self.installed_plan_export_rows = rows
+        self.installed_plan_export_plan_id = plan_id
+        print(
+            "[PLAN EXPORT] "
+            f"plan_id={plan_id} source={plan_source} "
+            f"samples={len(rows)} total_time={total_time:.3f}s"
+        )
 
     def compute_final_exit_velocity(self, gates, default_speed=2.5):
         if len(gates) >= 2:
@@ -6808,6 +6866,10 @@ class AutonomyAPI:
         self.active_waypoints = waypoints.copy()
         self.active_times = np.asarray(times_opt, dtype=float).copy()
         self.trajectory_start_time = time.time()
+        self.record_installed_plan_for_export(
+            plan_source="normal_path_plan",
+            replan_reason=replan_reason,
+        )
 
         if not self.use_perception:
             self.last_planned_gate_idx = self.current_gate_idx

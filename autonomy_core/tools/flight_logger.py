@@ -1,6 +1,7 @@
 import csv
 import time
 import math
+from pathlib import Path
 import numpy as np
 
 
@@ -8,6 +9,29 @@ class FlightLogger:
     def __init__(self, filename="flight_log.csv"):
         self.log_file = open(filename, "w", newline="")
         self.writer = csv.writer(self.log_file)
+        log_path = Path(filename)
+        plans_path = log_path.with_name(f"{log_path.stem}_plans.csv")
+        self.plan_log_file = open(plans_path, "w", newline="")
+        self.plan_writer = csv.writer(self.plan_log_file)
+        self.logged_plan_ids = set()
+        self.plan_writer.writerow([
+            "plan_id",
+            "plan_source",
+            "replan_reason",
+            "tau",
+            "x",
+            "y",
+            "z",
+            "vx",
+            "vy",
+            "vz",
+            "ax",
+            "ay",
+            "az",
+            "active_times",
+            "active_target_track_ids",
+            "planning_horizon_waypoint_types",
+        ])
 
         self.writer.writerow([
             "t",
@@ -38,6 +62,7 @@ class FlightLogger:
             "tracking_err_norm",
             "mode",
             "active_gate_idx",
+            "active_plan_id",
             "loop_dt",
             "replan_requested",
             "replan_duration",
@@ -795,6 +820,41 @@ class FlightLogger:
             out[:n, :] = arr[:n, :]
         return out
 
+    def log_installed_plan_rows(self, rows):
+        if not rows:
+            return
+
+        try:
+            plan_id = int(rows[0].get("plan_id"))
+        except (TypeError, ValueError):
+            return
+
+        if plan_id in self.logged_plan_ids:
+            return
+
+        for row in rows:
+            self.plan_writer.writerow([
+                row.get("plan_id", ""),
+                row.get("plan_source", ""),
+                row.get("replan_reason", ""),
+                row.get("tau", np.nan),
+                row.get("x", np.nan),
+                row.get("y", np.nan),
+                row.get("z", np.nan),
+                row.get("vx", np.nan),
+                row.get("vy", np.nan),
+                row.get("vz", np.nan),
+                row.get("ax", np.nan),
+                row.get("ay", np.nan),
+                row.get("az", np.nan),
+                row.get("active_times", ""),
+                row.get("active_target_track_ids", ""),
+                row.get("planning_horizon_waypoint_types", ""),
+            ])
+
+        self.logged_plan_ids.add(plan_id)
+        self.plan_log_file.flush()
+
     def log(
         self,
         telemetry,
@@ -808,6 +868,7 @@ class FlightLogger:
         target=None,
         mode=None,
         active_gate_idx=None,
+        active_plan_id=0,
         loop_dt=np.nan,
         replan_requested=False,
         replan_duration=0.0,
@@ -1465,6 +1526,7 @@ class FlightLogger:
             err_norm,
             mode,
             active_gate_idx,
+            active_plan_id,
             loop_dt,
             bool(replan_requested),
             replan_duration,
@@ -2176,9 +2238,11 @@ class FlightLogger:
         ])
 
         self.log_file.flush()
+        self.plan_log_file.flush()
 
         self.last_t = now
         self.last_vel = vel.copy()
 
     def close(self):
         self.log_file.close()
+        self.plan_log_file.close()
