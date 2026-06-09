@@ -1195,6 +1195,21 @@ async def main():
                 target_update_aggressive_correction_used=getattr(
                     autonomy, "target_update_aggressive_correction_used", False
                 ),
+                gt_behavior_dependency_used=getattr(
+                    autonomy, "gt_behavior_dependency_used", False
+                ),
+                gt_behavior_dependency_reason=getattr(
+                    autonomy, "gt_behavior_dependency_reason", ""
+                ),
+                terminal_extension_source=getattr(
+                    autonomy, "terminal_extension_source", ""
+                ),
+                post_completion_direction_source=getattr(
+                    autonomy, "post_completion_direction_source", ""
+                ),
+                active_shift_gt_debug_only=getattr(
+                    autonomy, "active_shift_gt_debug_only", False
+                ),
                 active_target_center_at_plan=getattr(autonomy, "active_target_center_at_plan", None),
                 active_target_latest_filtered_center=getattr(autonomy, "active_target_latest_filtered_center", None),
                 target_update_event=getattr(autonomy, "target_update_event", False),

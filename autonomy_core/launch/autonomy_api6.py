@@ -691,6 +691,7 @@ class AutonomyAPI:
         self.target_shift_z = float("nan")
         self.shift_replan_allowed = False
         self.shift_replan_suppressed_reason = ""
+        self.active_shift_gt_debug_only = False
         self.near_gate_suppression_overridden = False
         self.near_gate_override_reason = ""
         self.committed_target_error_to_filter = float("nan")
@@ -701,6 +702,11 @@ class AutonomyAPI:
         self.target_update_improvement_m = float("nan")
         self.target_update_alpha_used = float("nan")
         self.target_update_aggressive_correction_used = False
+        self.gt_behavior_dependency_used = False
+        self.gt_behavior_dependency_reason = ""
+        self.terminal_extension_source = ""
+        self.post_completion_direction_source = ""
+        self.active_shift_gt_debug_only = False
         self.pending_active_target_correction = None
         self.approach_start_position = None
         self.approach_vector = None
@@ -974,28 +980,71 @@ class AutonomyAPI:
 
         return velocities
 
+    def gt_navigation_enabled(self):
+        return not self.use_perception
+
     def is_final_race_gate(self):
         if self.race_gate_count is not None:
             return self.current_gate_idx >= int(self.race_gate_count) - 1
-        return self.current_gate_idx >= len(self.gt_gates) - 1
+        if self.use_perception:
+            return False
+        if self.gt_navigation_enabled():
+            return self.current_gate_idx >= len(self.gt_gates) - 1
+        return False
 
     def compute_terminal_passthrough_extension(self, current_pos, current_gate):
         current_pos = np.asarray(current_pos, dtype=float).reshape(3)
         current_gate = np.asarray(current_gate, dtype=float).reshape(3)
 
         direction = None
+        self.terminal_extension_source = ""
         next_gate_idx = self.current_gate_idx + 1
-        next_gate_exists = next_gate_idx < len(self.gt_gates)
-        if self.race_gate_count is not None:
+        next_gate_exists = (
+            self.gt_navigation_enabled()
+            and next_gate_idx < len(self.gt_gates)
+        )
+        if self.race_gate_count is not None and self.gt_navigation_enabled():
             next_gate_exists = next_gate_exists and next_gate_idx < int(self.race_gate_count)
         if next_gate_exists:
             direction = np.asarray(self.gt_gates[next_gate_idx], dtype=float).reshape(3) - current_gate
-        elif self.approach_vector is not None:
+            self.terminal_extension_source = "gt_next_gate"
+            self.gt_behavior_dependency_used = True
+            self.gt_behavior_dependency_reason = "terminal_extension_gt_next_gate"
+        if direction is None and self.last_gate_normal_world is not None:
+            normal = np.asarray(self.last_gate_normal_world, dtype=float).reshape(3)
+            if np.all(np.isfinite(normal)):
+                direction = normal
+                self.terminal_extension_source = "perception_gate_normal"
+        if direction is None and len(self.completed_gate_positions_this_cycle) > 0:
+            previous = np.asarray(
+                self.completed_gate_positions_this_cycle[-1],
+                dtype=float,
+            ).reshape(3)
+            direction = current_gate - previous
+            self.terminal_extension_source = "previous_completed_to_current_gate"
+        if direction is None and self.approach_vector is not None:
             approach = np.asarray(self.approach_vector, dtype=float).reshape(3)
             if np.all(np.isfinite(approach)):
                 direction = approach
+                self.terminal_extension_source = "approach_vector"
+        if direction is None:
+            velocity = np.array([
+                self.telemetry.vel["vx"],
+                self.telemetry.vel["vy"],
+                self.telemetry.vel["vz"],
+            ], dtype=float)
+            if np.all(np.isfinite(velocity)) and float(np.linalg.norm(velocity)) > 1e-6:
+                direction = velocity
+                self.terminal_extension_source = "current_velocity"
         if direction is None or not np.all(np.isfinite(direction)):
             direction = current_gate - current_pos
+            self.terminal_extension_source = "vehicle_to_current_gate"
+        if (
+            self.terminal_extension_source != "gt_next_gate"
+            and np.all(np.isfinite(direction))
+            and float(np.dot(direction, current_gate - current_pos)) < 0.0
+        ):
+            direction = -direction
 
         norm = float(np.linalg.norm(direction))
         if norm < 1e-6:
@@ -5987,6 +6036,8 @@ class AutonomyAPI:
         expected_next = None
         race_direction = None
         if (
+            self.gt_navigation_enabled()
+            and
             0 <= previous_gate_idx < len(self.gt_gates)
             and 0 <= self.current_gate_idx < len(self.gt_gates)
         ):
@@ -5995,10 +6046,15 @@ class AutonomyAPI:
                 self.gt_gates[self.current_gate_idx], dtype=float
             ).reshape(3)
             race_direction = expected_next - previous_gt
+            self.post_completion_direction_source = "gt_expected_next"
+            self.gt_behavior_dependency_used = True
+            self.gt_behavior_dependency_reason = "previous_horizon_fallback_gt_expected_next"
         elif self.approach_vector is not None:
             race_direction = np.asarray(self.approach_vector, dtype=float).reshape(3)
+            self.post_completion_direction_source = "approach_vector"
         else:
             race_direction = center - completed_center
+            self.post_completion_direction_source = "completed_gate_to_candidate"
 
         direction_norm = float(np.linalg.norm(race_direction))
         if not np.isfinite(direction_norm) or direction_norm < 1e-6:
@@ -6129,16 +6185,23 @@ class AutonomyAPI:
         previous_gate_idx = self.current_gate_idx - 1
         expected_next = None
         if (
+            self.gt_navigation_enabled()
+            and
             0 <= previous_gate_idx < len(self.gt_gates)
             and 0 <= self.current_gate_idx < len(self.gt_gates)
         ):
             previous_gt = np.asarray(self.gt_gates[previous_gate_idx], dtype=float).reshape(3)
             expected_next = np.asarray(self.gt_gates[self.current_gate_idx], dtype=float).reshape(3)
             race_direction = expected_next - previous_gt
+            self.post_completion_direction_source = "gt_expected_next"
+            self.gt_behavior_dependency_used = True
+            self.gt_behavior_dependency_reason = "post_completion_fallback_gt_expected_next"
         elif self.approach_vector is not None:
             race_direction = np.asarray(self.approach_vector, dtype=float).reshape(3)
+            self.post_completion_direction_source = "approach_vector"
         else:
             race_direction = center - completed_center
+            self.post_completion_direction_source = "completed_gate_to_candidate"
 
         direction_norm = float(np.linalg.norm(race_direction))
         if not np.isfinite(direction_norm) or direction_norm < 1e-6:
@@ -6646,6 +6709,7 @@ class AutonomyAPI:
             self.post_completion_candidate_track_id = None
             self.post_completion_candidate_rejected_reason = ""
             self.race_order_after_post_completion_fallback = []
+            self.post_completion_direction_source = ""
             self.gate_completion_triggered = False
             self.reset_crossing_debug()
             self.completion_reason = ""
@@ -6988,6 +7052,13 @@ class AutonomyAPI:
         self.planning_horizon_waypoints = ""
         self.planning_horizon_waypoint_types = "start"
         self._planning_target_waypoint_types = []
+        self.gt_behavior_dependency_used = False
+        self.gt_behavior_dependency_reason = ""
+        self.terminal_extension_source = ""
+        self.post_completion_direction_source = ""
+        if self.gt_navigation_enabled():
+            self.gt_behavior_dependency_used = True
+            self.gt_behavior_dependency_reason = "explicit_gt_navigation"
         self.future_track_visible_before_completion = False
         self.future_track_blocked_reason = ""
         self.horizon_build_cursor = self.race_progression.cursor
@@ -7600,10 +7671,15 @@ class AutonomyAPI:
                     self.committed_target_error_to_GT
                     - self.latest_filter_error_to_GT
                 )
+                if self.use_perception:
+                    self.active_shift_gt_debug_only = True
 
         major_gt_improvement = bool(
             np.isfinite(self.target_update_improvement_m)
             and self.target_update_improvement_m > 0.30
+        )
+        major_gt_improvement_behavior = bool(
+            self.gt_navigation_enabled() and major_gt_improvement
         )
         if active_is_internal_passthrough:
             latest_observation = (
@@ -7668,7 +7744,7 @@ class AutonomyAPI:
                 self.committed_target_xy_error_to_filter < 0.15
                 and self.committed_target_z_error_to_filter < 0.10
             )
-            if small_noise_shift and not major_gt_improvement:
+            if small_noise_shift and not major_gt_improvement_behavior:
                 self.active_target_shift_frames = 0
                 self.shift_replan_suppressed_reason = "active_filter_small_noise"
                 return False
@@ -7677,7 +7753,7 @@ class AutonomyAPI:
                 self.active_target_shift_m > self.active_target_shift_threshold_m
                 or self.committed_target_xy_error_to_filter > 0.35
                 or self.committed_target_z_error_to_filter > 0.25
-                or major_gt_improvement
+                or major_gt_improvement_behavior
             )
         else:
             material_filter_correction = bool(
@@ -7698,8 +7774,10 @@ class AutonomyAPI:
             return False
 
         correction_alpha = 0.3
-        if active_is_internal_passthrough and np.isfinite(
-            self.target_update_improvement_m
+        if (
+            active_is_internal_passthrough
+            and self.gt_navigation_enabled()
+            and np.isfinite(self.target_update_improvement_m)
         ):
             if self.target_update_improvement_m > 0.75:
                 correction_alpha = 0.7
@@ -7739,13 +7817,22 @@ class AutonomyAPI:
         proposed_horizontal_shift_large = bool(
             self.target_shift_xy > self.max_current_gate_target_shift_near_gate
         )
+        very_near_gate = bool(self.distance_to_active_target_at_shift <= 1.0)
+        very_near_small_applied_shift = bool(
+            very_near_gate
+            and self.target_shift_xy < 0.25
+            and self.target_shift_z < 0.15
+            and not crossing_change_large
+        )
         override_reasons = []
-        if self.committed_target_xy_error_to_filter > 0.35:
-            override_reasons.append("xy_error_to_filter")
-        if self.committed_target_z_error_to_filter > 0.25:
-            override_reasons.append("z_error_to_filter")
-        if major_gt_improvement:
-            override_reasons.append("gt_improvement")
+        if proposed_horizontal_shift_large:
+            override_reasons.append("large_applied_xy_shift")
+        if self.target_shift_z > 0.25:
+            override_reasons.append("large_applied_z_shift")
+        if major_gt_improvement_behavior and self.target_shift_xy > 0.20:
+            override_reasons.append("gt_improvement_with_material_applied_shift")
+        if crossing_change_large:
+            override_reasons.append("crossing_change_large")
         near_gate_override_requested = bool(override_reasons)
 
         suppress_near_gate_shift = bool(
@@ -7756,7 +7843,7 @@ class AutonomyAPI:
             and not crossing_change_large
             and planned_valid
             and not planned_target_stale
-            and not near_gate_override_requested
+            and (not near_gate_override_requested or very_near_small_applied_shift)
         )
         if (
             self.freeze_current_gate_target_near_gate
