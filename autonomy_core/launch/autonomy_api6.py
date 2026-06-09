@@ -105,6 +105,18 @@ class AutonomyAPI:
         self.replan_time = 0.0
         self.trajectory_start_time = 0.0
         self.time_elapsed = 0.0
+        self.wall_tau = 0.0
+        self.previous_sample_tau_used = 0.0
+        self.previous_sample_tau_plan_id = None
+        self.reference_progress_tau_lead_s = 0.25
+        self.vehicle_nearest_tau_on_plan = float("nan")
+        self.sample_tau_progress_limited = False
+        self.sample_tau_before_progress_limit = float("nan")
+        self.sample_tau_after_progress_limit = float("nan")
+        self.reference_tau_lead_s = float("nan")
+        self.reference_progress_lead_m = float("nan")
+        self.reference_virtual_clock_enabled = False
+        self.reference_projection_sample_count = 100
         self.continue_previous_trajectory_during_replan = True
         self.max_trajectory_holdover_s = 0.75
         self.hover_on_replan_without_valid_trajectory = True
@@ -131,6 +143,13 @@ class AutonomyAPI:
         self.installed_plan_sample_count = 160
         self.installed_plan_export_rows = []
         self.installed_plan_export_plan_id = None
+        self.plan_geometric_validation_failed = False
+        self.plan_geometric_fallback_used = False
+        self.plan_validation_failed_segment_idx = -1
+        self.plan_max_backward_progress_m = 0.0
+        self.plan_max_overshoot_m = 0.0
+        self.plan_negative_progress_velocity_count = 0
+        self.plan_validation_failure_reason = ""
 
         # Race progress is a sequence cursor over persistent gate track IDs.
         # Landmark memory stays forever; passing a gate never deletes it.
@@ -251,9 +270,13 @@ class AutonomyAPI:
         self.promotion_candidate_camera_std = float("nan")
         self.promotion_candidate_center_std = float("nan")
         self.promotion_candidate_stability_blocker = ""
+        self.post_completion_candidate_promoted = False
+        self.post_completion_candidate_track_id = None
+        self.post_completion_candidate_rejected_reason = ""
+        self.race_order_after_post_completion_fallback = []
         self.target_clear_reason = ""
         self.post_completion_grace_suppressed = False
-        self.use_passthrough_gate_velocities = True
+        self.use_passthrough_gate_velocities = False
         self.pass_through_speed = 3
         self.use_planning_lookahead_tracks = True
         self.use_raw_rejected_planning_lookahead = False
@@ -461,6 +484,10 @@ class AutonomyAPI:
         self.promotion_candidate_camera_std = float("nan")
         self.promotion_candidate_center_std = float("nan")
         self.promotion_candidate_stability_blocker = ""
+        self.post_completion_candidate_promoted = False
+        self.post_completion_candidate_track_id = None
+        self.post_completion_candidate_rejected_reason = ""
+        self.race_order_after_post_completion_fallback = []
         self.selected_target_source = ""
         self.last_raw_image_corners = None
         self.last_ordered_image_corners = None
@@ -797,6 +824,117 @@ class AutonomyAPI:
             f"plan_id={plan_id} source={plan_source} "
             f"samples={len(rows)} total_time={total_time:.3f}s"
         )
+
+    def reset_plan_geometric_validation_debug(self):
+        self.plan_geometric_validation_failed = False
+        self.plan_geometric_fallback_used = False
+        self.plan_validation_failed_segment_idx = -1
+        self.plan_max_backward_progress_m = 0.0
+        self.plan_max_overshoot_m = 0.0
+        self.plan_negative_progress_velocity_count = 0
+        self.plan_validation_failure_reason = ""
+
+    def validate_minimum_snap_geometry(
+        self,
+        planner,
+        waypoints,
+        samples_per_segment=80,
+        backward_tolerance_m=0.15,
+        overshoot_tolerance_m=0.35,
+        negative_velocity_tolerance=4,
+        endpoint_margin_fraction=0.08,
+    ):
+        waypoints = np.asarray(waypoints, dtype=float)
+        times = np.asarray(getattr(planner, "times", []), dtype=float).reshape(-1)
+        segment_starts = np.asarray(
+            getattr(planner, "segment_starts", []), dtype=float
+        ).reshape(-1)
+        if len(waypoints) < 2 or len(times) != len(waypoints) - 1:
+            return False, {
+                "segment_idx": -1,
+                "max_backward_progress_m": 0.0,
+                "max_overshoot_m": 0.0,
+                "negative_progress_velocity_count": 0,
+                "reason": "invalid_validation_inputs",
+            }
+
+        worst = {
+            "segment_idx": -1,
+            "max_backward_progress_m": 0.0,
+            "max_overshoot_m": 0.0,
+            "negative_progress_velocity_count": 0,
+            "reason": "",
+        }
+
+        for segment_idx in range(len(times)):
+            p0 = waypoints[segment_idx]
+            p1 = waypoints[segment_idx + 1]
+            delta = p1 - p0
+            segment_length = float(np.linalg.norm(delta))
+            if not np.isfinite(segment_length) or segment_length < 1e-6:
+                continue
+            direction = delta / segment_length
+            duration = float(times[segment_idx])
+            segment_start = float(segment_starts[segment_idx])
+            sample_count = max(3, int(samples_per_segment))
+            progress_values = []
+            negative_velocity_count = 0
+
+            for tau in np.linspace(0.0, duration, sample_count):
+                p, v, _ = planner.sample(segment_start + float(tau))
+                progress = float(np.dot(p - p0, direction))
+                progress_values.append(progress)
+                s_dot = float(np.dot(v, direction))
+                normalized_tau = float(tau) / duration if duration > 1e-6 else 1.0
+                if (
+                    normalized_tau < 1.0 - float(endpoint_margin_fraction)
+                    and s_dot < -1e-3
+                ):
+                    negative_velocity_count += 1
+
+            max_backward = 0.0
+            max_seen = progress_values[0]
+            for progress in progress_values[1:]:
+                max_backward = max(max_backward, max_seen - progress)
+                max_seen = max(max_seen, progress)
+
+            min_progress = min(progress_values)
+            max_progress = max(progress_values)
+            max_overshoot = max(
+                0.0,
+                max_progress - segment_length,
+                -min_progress,
+            )
+
+            failed_reasons = []
+            if max_backward > backward_tolerance_m:
+                failed_reasons.append("backward_progress")
+            if max_overshoot > overshoot_tolerance_m:
+                failed_reasons.append("segment_overshoot")
+            if negative_velocity_count > int(negative_velocity_tolerance):
+                failed_reasons.append("negative_progress_velocity")
+
+            if (
+                max_backward > worst["max_backward_progress_m"]
+                or max_overshoot > worst["max_overshoot_m"]
+                or negative_velocity_count > worst["negative_progress_velocity_count"]
+            ):
+                worst = {
+                    "segment_idx": int(segment_idx),
+                    "max_backward_progress_m": float(max_backward),
+                    "max_overshoot_m": float(max_overshoot),
+                    "negative_progress_velocity_count": int(negative_velocity_count),
+                    "reason": ",".join(failed_reasons),
+                }
+
+            if failed_reasons:
+                worst["segment_idx"] = int(segment_idx)
+                worst["reason"] = ",".join(failed_reasons)
+                return False, worst
+
+        if not worst["reason"]:
+            worst["reason"] = "ok"
+        return True, worst
 
     def compute_final_exit_velocity(self, gates, default_speed=2.5):
         if len(gates) >= 2:
@@ -5572,6 +5710,108 @@ class AutonomyAPI:
         self.last_target_z_clamped = True
         return p_ref, v_ref, a_ref
 
+    def nearest_tau_on_active_plan_xy(self, position):
+        planner = self.planner
+        total_time = float(getattr(planner, "total_time", 0.0))
+        if planner is None or total_time <= 0.0:
+            return float("nan"), float("nan")
+
+        position = np.asarray(position, dtype=float).reshape(3)
+        if not np.all(np.isfinite(position)):
+            return float("nan"), float("nan")
+
+        sample_count = max(2, int(self.reference_projection_sample_count))
+        best_tau = float("nan")
+        best_distance = float("inf")
+        best_point = None
+        for tau in np.linspace(0.0, total_time, sample_count):
+            p, _, _ = planner.sample(float(tau))
+            p = np.asarray(p, dtype=float).reshape(3)
+            if not np.all(np.isfinite(p)):
+                continue
+            distance = float(np.linalg.norm(p[:2] - position[:2]))
+            if distance < best_distance:
+                best_distance = distance
+                best_tau = float(tau)
+                best_point = p
+
+        if best_point is None:
+            return float("nan"), float("nan")
+
+        progress_lead_m = float("nan")
+        if np.isfinite(self.sample_tau_after_progress_limit):
+            sample_p, _, _ = planner.sample(float(self.sample_tau_after_progress_limit))
+            sample_p = np.asarray(sample_p, dtype=float).reshape(3)
+            progress_lead_m = float(np.linalg.norm(sample_p[:2] - best_point[:2]))
+
+        return best_tau, progress_lead_m
+
+    def state_position_array(self, state):
+        pos = getattr(state, "pos", None)
+        if isinstance(pos, dict):
+            return np.array([pos["x"], pos["y"], pos["z"]], dtype=float)
+        return np.asarray(pos, dtype=float).reshape(3)
+
+    def compute_reference_sample_tau(self, wall_tau, state):
+        planner_total_time = float(getattr(self.planner, "total_time", 0.0))
+        wall_tau = max(0.0, float(wall_tau))
+        sample_tau = min(wall_tau, planner_total_time)
+
+        self.wall_tau = wall_tau
+        self.vehicle_nearest_tau_on_plan = float("nan")
+        self.sample_tau_progress_limited = False
+        self.sample_tau_before_progress_limit = sample_tau
+        self.sample_tau_after_progress_limit = sample_tau
+        self.reference_tau_lead_s = float("nan")
+        self.reference_progress_lead_m = float("nan")
+        self.reference_virtual_clock_enabled = False
+
+        if self.previous_sample_tau_plan_id != self.active_plan_id:
+            self.previous_sample_tau_used = 0.0
+            self.previous_sample_tau_plan_id = self.active_plan_id
+
+        race_complete = (
+            self.race_gate_count is not None
+            and self.current_gate_idx >= int(self.race_gate_count)
+        )
+        should_limit = (
+            self.use_perception
+            and self.planner is not None
+            and planner_total_time > 0.0
+            and len(self.active_target_gates) > 0
+            and not race_complete
+        )
+        if should_limit:
+            position = self.state_position_array(state)
+            vehicle_tau, _ = self.nearest_tau_on_active_plan_xy(position)
+            self.vehicle_nearest_tau_on_plan = vehicle_tau
+            if np.isfinite(vehicle_tau):
+                self.reference_virtual_clock_enabled = True
+                allowed_tau = min(
+                    planner_total_time,
+                    vehicle_tau + float(self.reference_progress_tau_lead_s),
+                )
+                sample_tau = min(sample_tau, allowed_tau)
+                self.sample_tau_progress_limited = (
+                    self.sample_tau_before_progress_limit - sample_tau > 1e-6
+                )
+
+        sample_tau = max(float(self.previous_sample_tau_used), float(sample_tau))
+        sample_tau = min(sample_tau, planner_total_time)
+        self.previous_sample_tau_used = sample_tau
+        self.sample_tau_after_progress_limit = sample_tau
+        self.reference_tau_lead_s = (
+            sample_tau - self.vehicle_nearest_tau_on_plan
+            if np.isfinite(self.vehicle_nearest_tau_on_plan)
+            else float("nan")
+        )
+        if self.reference_virtual_clock_enabled:
+            _, progress_lead_m = self.nearest_tau_on_active_plan_xy(
+                self.state_position_array(state)
+            )
+            self.reference_progress_lead_m = progress_lead_m
+        return sample_tau
+
     def get_committed_waypoints(self):
         committed = self.gate_memory.get_committed_centers()
         return [np.asarray(p, dtype=float) for p in committed]
@@ -5809,6 +6049,141 @@ class AutonomyAPI:
         self.promotion_blocked_reason = ""
         print(
             "[LOOKAHEAD HANDOFF FALLBACK] accepted "
+            f"track_id={track_id} center={center.tolist()} "
+            f"hits={self.promotion_candidate_hits} "
+            f"inliers={self.promotion_candidate_inliers} "
+            f"outliers={self.promotion_candidate_outliers} "
+            f"stability_blocker={self.promotion_candidate_stability_blocker or 'none'}"
+        )
+        return True
+
+    def _try_post_completion_current_candidate_fallback(
+        self,
+        vehicle_pos,
+        completed_track_id,
+        completed_center,
+    ):
+        self.post_completion_candidate_promoted = False
+        self.post_completion_candidate_track_id = None
+        self.post_completion_candidate_rejected_reason = ""
+        self.race_order_after_post_completion_fallback = []
+
+        def reject(reason):
+            self.post_completion_candidate_rejected_reason = str(reason)
+            self.promotion_blocked_reason = str(reason)
+            print(
+                "[POST COMPLETION CANDIDATE FALLBACK] rejected "
+                f"track_id={self.post_completion_candidate_track_id} reason={reason}"
+            )
+            return False
+
+        if self.race_progression.predefined_order is not None:
+            return reject("fallback_cannot_modify_predefined_race_order")
+
+        # Refresh after marking the completed track so current-candidate selection
+        # no longer treats the just-completed gate as eligible.
+        self.refresh_race_order_from_memory()
+
+        candidate_ids = [
+            self.canonical_track_id(track_id)
+            for track_id in self.current_gate_candidate_track_ids
+            if self.canonical_track_id(track_id) is not None
+        ]
+        candidate_ids = list(dict.fromkeys(candidate_ids))
+        if len(candidate_ids) != 1:
+            return reject(f"fallback_candidate_count_not_one:{len(candidate_ids)}")
+
+        track_id = candidate_ids[0]
+        self.post_completion_candidate_track_id = track_id
+        if self.selected_current_track_id is not None:
+            selected_id = self.canonical_track_id(self.selected_current_track_id)
+            if selected_id != track_id:
+                return reject(f"fallback_selected_candidate_mismatch:{selected_id}!={track_id}")
+        if track_id == self.canonical_track_id(completed_track_id):
+            return reject("fallback_is_completed_track")
+        if track_id in self.completed_track_ids_this_cycle:
+            return reject("fallback_track_already_completed")
+        if (
+            self.race_gate_count is not None
+            and track_id not in self.race_accepted_track_ids
+            and len(self.race_accepted_track_ids) >= int(self.race_gate_count)
+        ):
+            return reject("fallback_race_gate_count_reached")
+
+        tr = self.gate_memory.get_track_by_id(track_id)
+        self._record_promotion_candidate_stability(tr)
+        if tr is None:
+            return reject("fallback_track_missing")
+        if not bool(getattr(tr, "committed", False)):
+            return reject("fallback_track_not_committed")
+
+        center = np.asarray(tr.center, dtype=float).reshape(3)
+        valid, reason = self.validate_planning_target(center)
+        if not valid:
+            return reject(f"fallback_invalid_target:{reason}")
+        if self.is_near_completed_gate(center, radius=self.gate_memory.duplicate_merge_radius):
+            return reject("fallback_duplicate_of_completed_gate")
+
+        vehicle_pos = np.asarray(vehicle_pos, dtype=float).reshape(3)
+        completed_center = np.asarray(completed_center, dtype=float).reshape(3)
+        previous_gate_idx = self.current_gate_idx - 1
+        expected_next = None
+        if (
+            0 <= previous_gate_idx < len(self.gt_gates)
+            and 0 <= self.current_gate_idx < len(self.gt_gates)
+        ):
+            previous_gt = np.asarray(self.gt_gates[previous_gate_idx], dtype=float).reshape(3)
+            expected_next = np.asarray(self.gt_gates[self.current_gate_idx], dtype=float).reshape(3)
+            race_direction = expected_next - previous_gt
+        elif self.approach_vector is not None:
+            race_direction = np.asarray(self.approach_vector, dtype=float).reshape(3)
+        else:
+            race_direction = center - completed_center
+
+        direction_norm = float(np.linalg.norm(race_direction))
+        if not np.isfinite(direction_norm) or direction_norm < 1e-6:
+            return reject("fallback_race_direction_unavailable")
+        race_direction = race_direction / direction_norm
+        completed_progress = float(np.dot(center - completed_center, race_direction))
+        vehicle_progress = float(np.dot(center - vehicle_pos, race_direction))
+        if completed_progress <= 0.0:
+            return reject(f"fallback_not_ahead_of_completed_gate:{completed_progress:.2f}")
+        if vehicle_progress <= 0.0:
+            return reject(f"fallback_behind_vehicle:{vehicle_progress:.2f}")
+        if expected_next is not None:
+            expected_error = float(np.linalg.norm(center - expected_next))
+            if expected_error > float(self.max_gate_jump):
+                return reject(
+                    f"fallback_too_far_from_expected_next:{expected_error:.2f}"
+                    f">{float(self.max_gate_jump):.2f}"
+                )
+
+        valid, reason = self.validate_candidate_target(center, vehicle_pos, track_id=track_id)
+        if not valid:
+            return reject(f"fallback_candidate_invalid:{reason}")
+
+        if track_id not in self.race_accepted_track_ids:
+            self.race_accepted_track_ids.append(track_id)
+        order = [
+            self.canonical_track_id(tid)
+            for tid in self.race_progression.inferred_order
+            if self.canonical_track_id(tid) != track_id
+        ]
+        insert_at = min(max(int(self.race_progression.cursor), 0), len(order))
+        order.insert(insert_at, track_id)
+        self.race_progression.inferred_order = order
+        self.race_order_track_ids = list(order)
+        self.race_admitted_track_ids = list(self.race_accepted_track_ids)
+        self.race_order_after_post_completion_fallback = list(order)
+        setattr(tr, "race_order_index", int(self.current_gate_idx))
+
+        self.next_track_after_completion_id = track_id
+        self.next_track_available_after_completion = True
+        self.post_completion_candidate_promoted = True
+        self.post_completion_candidate_rejected_reason = ""
+        self.promotion_blocked_reason = ""
+        print(
+            "[POST COMPLETION CANDIDATE FALLBACK] accepted "
             f"track_id={track_id} center={center.tolist()} "
             f"hits={self.promotion_candidate_hits} "
             f"inliers={self.promotion_candidate_inliers} "
@@ -6267,6 +6642,10 @@ class AutonomyAPI:
             self.promotion_candidate_camera_std = float("nan")
             self.promotion_candidate_center_std = float("nan")
             self.promotion_candidate_stability_blocker = ""
+            self.post_completion_candidate_promoted = False
+            self.post_completion_candidate_track_id = None
+            self.post_completion_candidate_rejected_reason = ""
+            self.race_order_after_post_completion_fallback = []
             self.gate_completion_triggered = False
             self.reset_crossing_debug()
             self.completion_reason = ""
@@ -6483,11 +6862,17 @@ class AutonomyAPI:
                 if self.next_track_after_completion_id is None:
                     self.promotion_normal_race_order_failed = True
                     self.promotion_blocked_reason = "next_race_order_track_missing"
-                    self._try_previous_horizon_promotion_fallback(
+                    fallback_used = self._try_previous_horizon_promotion_fallback(
                         vehicle_pos=pos,
                         completed_track_id=track_id,
                         completed_center=target,
                     )
+                    if not fallback_used:
+                        self._try_post_completion_current_candidate_fallback(
+                            vehicle_pos=pos,
+                            completed_track_id=track_id,
+                            completed_center=target,
+                        )
                 elif handoff_id != self.canonical_track_id(self.next_track_after_completion_id):
                     self.promotion_normal_race_order_failed = True
                     self.promotion_blocked_reason = (
@@ -6498,11 +6883,17 @@ class AutonomyAPI:
             elif self.next_track_after_completion_id is None:
                 self.promotion_normal_race_order_failed = True
                 self.promotion_blocked_reason = "next_race_order_track_missing"
-                self._try_previous_horizon_promotion_fallback(
+                fallback_used = self._try_previous_horizon_promotion_fallback(
                     vehicle_pos=pos,
                     completed_track_id=track_id,
                     completed_center=target,
                 )
+                if not fallback_used:
+                    self._try_post_completion_current_candidate_fallback(
+                        vehicle_pos=pos,
+                        completed_track_id=track_id,
+                        completed_center=target,
+                    )
 
             installed_next_target = False
             if self.next_track_available_after_completion:
@@ -6627,6 +7018,7 @@ class AutonomyAPI:
         self.current_gate_treated_as_terminal = False
         self.first_segment_terminal_velocity_zero = False
         self.first_segment_min_v_ref_predicted = float("nan")
+        self.reset_plan_geometric_validation_debug()
 
         pos = np.array([
             self.telemetry.pos["x"],
@@ -6639,6 +7031,46 @@ class AutonomyAPI:
             self.telemetry.vel["vy"],
             self.telemetry.vel["vz"],
         ], dtype=float)
+        previous_plan_state = {
+            "active_target_gates": [g.copy() for g in self.active_target_gates],
+            "active_target_track_ids": list(self.active_target_track_ids),
+            "current_target_idx": int(self.current_target_idx),
+            "current_gate_pos": None
+            if self.current_gate_pos is None
+            else np.asarray(self.current_gate_pos, dtype=float).copy(),
+            "last_valid_target": None
+            if self.last_valid_target is None
+            else np.asarray(self.last_valid_target, dtype=float).copy(),
+            "active_target_track_id": self.active_target_track_id,
+            "active_target_center_at_plan": None
+            if self.active_target_center_at_plan is None
+            else np.asarray(self.active_target_center_at_plan, dtype=float).copy(),
+        }
+
+        def restore_previous_plan_state():
+            self.active_target_gates = [
+                g.copy() for g in previous_plan_state["active_target_gates"]
+            ]
+            self.active_target_track_ids = list(
+                previous_plan_state["active_target_track_ids"]
+            )
+            self.current_target_idx = int(previous_plan_state["current_target_idx"])
+            self.current_gate_pos = (
+                None
+                if previous_plan_state["current_gate_pos"] is None
+                else previous_plan_state["current_gate_pos"].copy()
+            )
+            self.last_valid_target = (
+                None
+                if previous_plan_state["last_valid_target"] is None
+                else previous_plan_state["last_valid_target"].copy()
+            )
+            self.active_target_track_id = previous_plan_state["active_target_track_id"]
+            self.active_target_center_at_plan = (
+                None
+                if previous_plan_state["active_target_center_at_plan"] is None
+                else previous_plan_state["active_target_center_at_plan"].copy()
+            )
 
         waypoints, target_gates, target_track_ids = self.build_waypoint_horizon(
             pos,
@@ -6834,7 +7266,8 @@ class AutonomyAPI:
         # outer time optimizer caused second-scale offboard loop stalls in
         # perception mode, so online replans use the deterministic allocation.
         times_opt = times_init
-        self.planner.update(
+        candidate_planner = MultiSegmentMinimumSnapPlanner()
+        candidate_planner.update(
             waypoints=waypoints,
             times=times_opt,
             v_start=vel,
@@ -6845,6 +7278,177 @@ class AutonomyAPI:
             j_end=np.zeros(3, dtype=float),
             waypoint_velocities=waypoint_velocities,
         )
+        validation_ok, validation_debug = self.validate_minimum_snap_geometry(
+            candidate_planner,
+            waypoints,
+        )
+        selected_waypoints = np.asarray(waypoints, dtype=float).copy()
+        selected_target_gates = [np.asarray(g, dtype=float).copy() for g in target_gates]
+        selected_target_track_ids = list(target_track_ids)
+        selected_target_waypoint_types = list(target_waypoint_types)
+        selected_waypoint_velocities = waypoint_velocities
+        self.reset_plan_geometric_validation_debug()
+
+        if not validation_ok:
+            self.plan_geometric_validation_failed = True
+            self.plan_validation_failed_segment_idx = int(validation_debug["segment_idx"])
+            self.plan_max_backward_progress_m = float(
+                validation_debug["max_backward_progress_m"]
+            )
+            self.plan_max_overshoot_m = float(validation_debug["max_overshoot_m"])
+            self.plan_negative_progress_velocity_count = int(
+                validation_debug["negative_progress_velocity_count"]
+            )
+            self.plan_validation_failure_reason = str(validation_debug["reason"])
+            print(
+                "[PLAN GEOMETRY] candidate failed "
+                f"segment={self.plan_validation_failed_segment_idx} "
+                f"backward={self.plan_max_backward_progress_m:.3f}m "
+                f"overshoot={self.plan_max_overshoot_m:.3f}m "
+                f"neg_v_count={self.plan_negative_progress_velocity_count} "
+                f"reason={self.plan_validation_failure_reason}"
+            )
+
+        if not validation_ok and len(target_gates) > 1:
+            fallback_target_gates = [np.asarray(target_gates[0], dtype=float).copy()]
+            fallback_target_track_ids = [target_track_ids[0]]
+            fallback_target_waypoint_types = [
+                target_waypoint_types[0] if len(target_waypoint_types) > 0 else "hard_current"
+            ]
+            fallback_terminal_extension_used = False
+            fallback_terminal_extension_point = np.full(3, np.nan, dtype=float)
+
+            if (
+                self.use_perception
+                and self.use_terminal_passthrough_extension
+                and not self.is_final_race_gate()
+            ):
+                extension = self.compute_terminal_passthrough_extension(
+                    pos,
+                    fallback_target_gates[0],
+                )
+                if extension is not None and np.all(np.isfinite(extension)):
+                    fallback_target_gates.append(
+                        np.asarray(extension, dtype=float).reshape(3)
+                    )
+                    fallback_target_track_ids.append(-2)
+                    fallback_target_waypoint_types.append("terminal_extension")
+                    fallback_terminal_extension_used = True
+                    fallback_terminal_extension_point = np.asarray(
+                        extension,
+                        dtype=float,
+                    ).reshape(3).copy()
+
+            fallback_waypoints = np.vstack([pos] + fallback_target_gates)
+            fallback_times = self.allocate_segment_times(
+                fallback_waypoints,
+                current_vel=vel,
+                vmax=2.5,
+                amax=2.0,
+                T_min=1.0,
+            )
+            fallback_waypoint_velocities = (
+                self.compute_passthrough_waypoint_velocities(fallback_waypoints)
+                if self.use_perception
+                else None
+            )
+            fallback_planner = MultiSegmentMinimumSnapPlanner()
+            fallback_planner.update(
+                waypoints=fallback_waypoints,
+                times=fallback_times,
+                v_start=vel,
+                v_end=v_end,
+                a_start=np.zeros(3, dtype=float),
+                a_end=np.zeros(3, dtype=float),
+                j_start=np.zeros(3, dtype=float),
+                j_end=np.zeros(3, dtype=float),
+                waypoint_velocities=fallback_waypoint_velocities,
+            )
+            fallback_ok, fallback_debug = self.validate_minimum_snap_geometry(
+                fallback_planner,
+                fallback_waypoints,
+            )
+            if fallback_ok:
+                print(
+                    "[PLAN GEOMETRY] active-gate-only fallback accepted "
+                    f"track_ids={fallback_target_track_ids} times={fallback_times}"
+                )
+                candidate_planner = fallback_planner
+                times_opt = fallback_times
+                selected_waypoints = fallback_waypoints.copy()
+                selected_target_gates = [
+                    np.asarray(g, dtype=float).copy()
+                    for g in fallback_target_gates
+                ]
+                selected_target_track_ids = list(fallback_target_track_ids)
+                selected_target_waypoint_types = list(fallback_target_waypoint_types)
+                selected_waypoint_velocities = fallback_waypoint_velocities
+                self.plan_geometric_fallback_used = True
+                self.terminal_passthrough_extension_used = fallback_terminal_extension_used
+                self.terminal_passthrough_extension_point = fallback_terminal_extension_point
+            else:
+                print(
+                    "[PLAN GEOMETRY] active-gate-only fallback failed "
+                    f"segment={fallback_debug['segment_idx']} "
+                    f"backward={fallback_debug['max_backward_progress_m']:.3f}m "
+                    f"overshoot={fallback_debug['max_overshoot_m']:.3f}m "
+                    f"neg_v_count={fallback_debug['negative_progress_velocity_count']} "
+                    f"reason={fallback_debug['reason']}"
+                )
+                self.plan_validation_failed_segment_idx = int(fallback_debug["segment_idx"])
+                self.plan_max_backward_progress_m = float(
+                    fallback_debug["max_backward_progress_m"]
+                )
+                self.plan_max_overshoot_m = float(fallback_debug["max_overshoot_m"])
+                self.plan_negative_progress_velocity_count = int(
+                    fallback_debug["negative_progress_velocity_count"]
+                )
+                self.plan_validation_failure_reason = (
+                    f"fallback_failed:{fallback_debug['reason']}"
+                )
+                restore_previous_plan_state()
+                self.last_plan_finished_at = time.time()
+                self.last_plan_duration = self.last_plan_finished_at - plan_start
+                return False
+        elif not validation_ok:
+            restore_previous_plan_state()
+            self.last_plan_finished_at = time.time()
+            self.last_plan_duration = self.last_plan_finished_at - plan_start
+            return False
+
+        self.planner = candidate_planner
+        waypoints = selected_waypoints
+        target_gates = selected_target_gates
+        target_track_ids = selected_target_track_ids
+        target_waypoint_types = selected_target_waypoint_types
+        waypoint_velocities = selected_waypoint_velocities
+        self.active_target_gates = [g.copy() for g in target_gates]
+        self.active_target_track_ids = list(target_track_ids)
+        self.current_target_idx = 0
+        self.current_gate_treated_as_terminal = len(target_gates) == 1
+        self.first_segment_terminal_velocity_zero = self.current_gate_treated_as_terminal
+        self.post_completion_horizon_has_future = len(target_gates) >= 2
+        self.waypoint_velocity_log = np.full((3, 3), np.nan, dtype=float)
+        if waypoint_velocities is not None:
+            for i in range(min(3, len(waypoint_velocities))):
+                self.waypoint_velocity_log[i] = waypoint_velocities[i]
+        self.planning_horizon_track_ids = list(target_track_ids)
+        self.planning_horizon_waypoint_count = int(len(waypoints))
+        self.planning_horizon_waypoints = ";".join(
+            f"{i}:{wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f}"
+            for i, wp in enumerate(np.asarray(waypoints, dtype=float))
+        )
+        self.planning_horizon_waypoint_types = " ".join(
+            ["start"] + list(target_waypoint_types)
+        )
+        self._planning_target_waypoint_types = list(target_waypoint_types)
+        if self.use_perception and len(target_gates) > 0:
+            self.last_valid_target = target_gates[0].copy()
+            self.active_target_track_id = target_track_ids[0] if len(target_track_ids) > 0 else None
+            self.next_valid_target_found = True
+            self.active_target_cleared = False
+            self.set_active_perception_target_geometry(target_gates[0], pos)
+            self.active_target_center_at_plan = target_gates[0].copy()
 
         if len(times_opt) > 0 and float(times_opt[0]) > 0.0:
             first_segment_speeds = []
@@ -6855,6 +7459,13 @@ class AutonomyAPI:
 
         print("fixed segment times:", times_opt)
         print("fixed total horizon:", float(np.sum(times_opt)))
+        print("plan_geometric_validation_failed:", self.plan_geometric_validation_failed)
+        print("plan_geometric_fallback_used:", self.plan_geometric_fallback_used)
+        print("plan_validation_failed_segment_idx:", self.plan_validation_failed_segment_idx)
+        print("plan_max_backward_progress_m:", self.plan_max_backward_progress_m)
+        print("plan_max_overshoot_m:", self.plan_max_overshoot_m)
+        print("plan_negative_progress_velocity_count:", self.plan_negative_progress_velocity_count)
+        print("plan_validation_failure_reason:", self.plan_validation_failure_reason)
         print("post_completion_horizon_has_future:", self.post_completion_horizon_has_future)
         print("terminal_passthrough_extension_used:", self.terminal_passthrough_extension_used)
         print("terminal_passthrough_extension_point:", self.terminal_passthrough_extension_point)
@@ -6866,6 +7477,8 @@ class AutonomyAPI:
         self.active_waypoints = waypoints.copy()
         self.active_times = np.asarray(times_opt, dtype=float).copy()
         self.trajectory_start_time = time.time()
+        self.previous_sample_tau_used = 0.0
+        self.previous_sample_tau_plan_id = None
         self.record_installed_plan_for_export(
             plan_source="normal_path_plan",
             replan_reason=replan_reason,
@@ -7447,7 +8060,8 @@ class AutonomyAPI:
             self.yaw_target_source = "current_yaw"
             return 0.0, 0.0, current_yaw_rad, self.tracker.thrust_hover
 
-        self.time_elapsed = time.time() - self.trajectory_start_time
+        wall_tau = time.time() - self.trajectory_start_time
+        self.time_elapsed = self.compute_reference_sample_tau(wall_tau, state)
         p_ref, v_ref, a_ref = self.planner.sample(self.time_elapsed)
         if self.use_perception:
             p_ref, v_ref, a_ref = self.clamp_reference_altitude(p_ref, v_ref, a_ref)

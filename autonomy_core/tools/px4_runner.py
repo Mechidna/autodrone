@@ -133,6 +133,9 @@ def snapshot_trajectory_state(autonomy):
         "active_target_latest_filtered_center",
         "trajectory_start_time",
         "time_elapsed",
+        "wall_tau",
+        "previous_sample_tau_used",
+        "previous_sample_tau_plan_id",
         "p_ref",
         "v_ref",
         "a_ref",
@@ -1371,6 +1374,49 @@ async def main():
                 first_segment_min_v_ref_predicted=getattr(
                     autonomy, "first_segment_min_v_ref_predicted", float("nan")
                 ),
+                wall_tau=getattr(autonomy, "wall_tau", float("nan")),
+                vehicle_nearest_tau_on_plan=getattr(
+                    autonomy, "vehicle_nearest_tau_on_plan", float("nan")
+                ),
+                sample_tau_progress_limited=getattr(
+                    autonomy, "sample_tau_progress_limited", False
+                ),
+                sample_tau_before_progress_limit=getattr(
+                    autonomy, "sample_tau_before_progress_limit", float("nan")
+                ),
+                sample_tau_after_progress_limit=getattr(
+                    autonomy, "sample_tau_after_progress_limit", float("nan")
+                ),
+                reference_tau_lead_s=getattr(
+                    autonomy, "reference_tau_lead_s", float("nan")
+                ),
+                reference_progress_lead_m=getattr(
+                    autonomy, "reference_progress_lead_m", float("nan")
+                ),
+                reference_virtual_clock_enabled=getattr(
+                    autonomy, "reference_virtual_clock_enabled", False
+                ),
+                plan_geometric_validation_failed=getattr(
+                    autonomy, "plan_geometric_validation_failed", False
+                ),
+                plan_geometric_fallback_used=getattr(
+                    autonomy, "plan_geometric_fallback_used", False
+                ),
+                plan_validation_failed_segment_idx=getattr(
+                    autonomy, "plan_validation_failed_segment_idx", -1
+                ),
+                plan_max_backward_progress_m=getattr(
+                    autonomy, "plan_max_backward_progress_m", 0.0
+                ),
+                plan_max_overshoot_m=getattr(
+                    autonomy, "plan_max_overshoot_m", 0.0
+                ),
+                plan_negative_progress_velocity_count=getattr(
+                    autonomy, "plan_negative_progress_velocity_count", 0
+                ),
+                plan_validation_failure_reason=getattr(
+                    autonomy, "plan_validation_failure_reason", ""
+                ),
                 passthrough_velocity_enabled=getattr(autonomy, "passthrough_velocity_enabled", False),
                 passthrough_speed_used=getattr(autonomy, "passthrough_speed_used", float("nan")),
                 waypoint_velocity_log=getattr(autonomy, "waypoint_velocity_log", None),
@@ -1453,6 +1499,18 @@ async def main():
                 ),
                 promotion_candidate_stability_blocker=getattr(
                     autonomy, "promotion_candidate_stability_blocker", ""
+                ),
+                post_completion_candidate_promoted=getattr(
+                    autonomy, "post_completion_candidate_promoted", False
+                ),
+                post_completion_candidate_track_id=getattr(
+                    autonomy, "post_completion_candidate_track_id", None
+                ),
+                post_completion_candidate_rejected_reason=getattr(
+                    autonomy, "post_completion_candidate_rejected_reason", ""
+                ),
+                race_order_after_post_completion_fallback=getattr(
+                    autonomy, "race_order_after_post_completion_fallback", []
                 ),
                 race_order_after_merge=getattr(autonomy, "race_order_after_merge", []),
                 tentative_track_ids=getattr(autonomy, "tentative_track_ids", []),
