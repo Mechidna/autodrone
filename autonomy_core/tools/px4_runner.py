@@ -1392,6 +1392,12 @@ async def main():
                 pending_suffix_splice_track_id=getattr(
                     autonomy, "pending_suffix_splice_track_id", None
                 ),
+                pending_suffix_splice_tau=getattr(
+                    autonomy, "pending_suffix_splice_tau", float("nan")
+                ),
+                pending_suffix_splice_target_idx=getattr(
+                    autonomy, "pending_suffix_splice_target_idx", -1
+                ),
                 pending_suffix_cleared_reason=getattr(
                     autonomy, "pending_suffix_cleared_reason", ""
                 ),

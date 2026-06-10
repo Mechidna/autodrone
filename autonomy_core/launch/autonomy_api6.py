@@ -686,6 +686,8 @@ class AutonomyAPI:
         self.pending_suffix_waypoints = None
         self.pending_suffix_times = None
         self.pending_suffix_splice_track_id = None
+        self.pending_suffix_splice_tau = float("nan")
+        self.pending_suffix_splice_target_idx = -1
         self.pending_suffix_splice_state = None
         self.pending_suffix_created_reason = ""
         self.pending_suffix_valid = False
@@ -6555,6 +6557,8 @@ class AutonomyAPI:
         self.pending_suffix_waypoints = None
         self.pending_suffix_times = None
         self.pending_suffix_splice_track_id = None
+        self.pending_suffix_splice_tau = float("nan")
+        self.pending_suffix_splice_target_idx = -1
         self.pending_suffix_splice_state = None
         self.pending_suffix_created_reason = ""
         self.pending_suffix_valid = False
@@ -6562,6 +6566,15 @@ class AutonomyAPI:
         self.pending_suffix_rejected_reason = reason
         self.pending_suffix_waypoint_types = []
         self.pending_suffix_cleared_reason = reason
+
+    def active_target_crossing_tau(self, target_idx):
+        if self.active_times is None:
+            return float("nan")
+        times = np.asarray(self.active_times, dtype=float).reshape(-1)
+        target_idx = int(target_idx)
+        if target_idx < 0 or target_idx >= len(times):
+            return float("nan")
+        return float(np.sum(times[:target_idx + 1]))
 
     def prepare_pending_suffix_for_future_only_replan(self, replan_reason):
         """
@@ -6605,7 +6618,7 @@ class AutonomyAPI:
         if self.current_target_idx >= len(active_times):
             self.pending_suffix_rejected_reason = "missing_active_crossing_time"
             return False
-        splice_tau = float(active_times[self.current_target_idx])
+        splice_tau = self.active_target_crossing_tau(self.current_target_idx)
         planner_total = float(getattr(self.planner, "total_time", 0.0))
         if not np.isfinite(splice_tau) or splice_tau < 0.0 or splice_tau > planner_total + 1e-6:
             self.pending_suffix_rejected_reason = "invalid_splice_tau"
@@ -6784,6 +6797,8 @@ class AutonomyAPI:
         self.pending_suffix_times = np.asarray(suffix_times, dtype=float).copy()
         self.pending_suffix_waypoint_types = list(future_waypoint_types)
         self.pending_suffix_splice_track_id = active_track_id
+        self.pending_suffix_splice_tau = float(splice_tau)
+        self.pending_suffix_splice_target_idx = int(self.current_target_idx)
         self.pending_suffix_splice_state = {
             "tau": splice_tau,
             "p": p_splice.copy(),
@@ -6876,6 +6891,8 @@ class AutonomyAPI:
         self.pending_suffix_installed = True
         self.pending_suffix_rejected_reason = ""
         installed_splice_track_id = completed_id
+        installed_splice_tau = float(self.pending_suffix_splice_tau)
+        installed_splice_target_idx = int(self.pending_suffix_splice_target_idx)
         self.record_installed_plan_for_export(
             plan_source="pending_suffix_install",
             replan_reason=self.pending_suffix_created_reason,
@@ -6883,6 +6900,8 @@ class AutonomyAPI:
         self._reset_pending_suffix_state("installed")
         self.pending_suffix_installed = True
         self.pending_suffix_splice_track_id = installed_splice_track_id
+        self.pending_suffix_splice_tau = installed_splice_tau
+        self.pending_suffix_splice_target_idx = installed_splice_target_idx
         self.pending_suffix_cleared_reason = "installed"
         self.pending_suffix_rejected_reason = ""
         print(
