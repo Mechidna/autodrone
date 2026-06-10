@@ -872,11 +872,14 @@ async def main():
             # Current active target passed
             gate_changed = autonomy.advance_gate_if_needed(threshold=1.0)
             if gate_changed:
-                print("Active target advanced -> replanning.")
-                should_replan = True
-                requested_replan_reason = "active_target_advanced"
-                if use_perception:
-                    autonomy.last_perception_replan_trigger = True
+                if getattr(autonomy, "gate_completion_replan_required", True):
+                    print("Active target advanced -> replanning.")
+                    should_replan = True
+                    requested_replan_reason = "active_target_advanced"
+                    if use_perception:
+                        autonomy.last_perception_replan_trigger = True
+                else:
+                    print("Active target advanced -> continuing existing installed plan.")
 
             if (
                 use_perception
@@ -940,9 +943,59 @@ async def main():
                 replan_started = time.time()
                 print(f"[REPLAN] start t={replan_started:.3f}")
                 try:
-                    ok = autonomy.path_plan(
-                        replan_reason=requested_replan_reason
+                    future_only_replan_reasons = (
+                        "tentative_lookahead_new_candidate",
+                        "tentative_lookahead_shift",
+                        "new_committed_or_stable_gate",
                     )
+                    if requested_replan_reason in future_only_replan_reasons:
+                        ok = autonomy.prepare_pending_suffix_for_future_only_replan(
+                            requested_replan_reason
+                        )
+                        autonomy.replan_time = time.time()
+                        if ok:
+                            print(
+                                "[REPLAN] future-only lookahead preserved active "
+                                "planner; pending suffix updated."
+                            )
+                        else:
+                            print(
+                                "[REPLAN] pending suffix not created: "
+                                f"{getattr(autonomy, 'pending_suffix_rejected_reason', '')}"
+                            )
+                            suffix_rejection = getattr(
+                                autonomy, "pending_suffix_rejected_reason", ""
+                            )
+                            full_replan_rejections = {
+                                "missing_active_planner",
+                                "missing_active_horizon",
+                                "invalid_current_target_idx",
+                                "invalid_active_track_id",
+                                "missing_active_crossing_time",
+                                "invalid_splice_tau",
+                                "non_finite_splice_state",
+                                "active_target_changed",
+                                "active_target_center_changed",
+                            }
+                            if suffix_rejection in full_replan_rejections:
+                                print(
+                                    "[REPLAN] future-only update affects active "
+                                    "segment; falling back to full path_plan."
+                                )
+                                ok = autonomy.path_plan(
+                                    replan_reason=requested_replan_reason
+                                )
+                            else:
+                                autonomy.future_only_replan_preserved_active_segment = True
+                                autonomy.future_only_replan_reason = requested_replan_reason
+                                autonomy.replan_suppressed_reason = (
+                                    f"future_only_suffix_not_created:{suffix_rejection}"
+                                )
+                                ok = True
+                    else:
+                        ok = autonomy.path_plan(
+                            replan_reason=requested_replan_reason
+                        )
                 except (ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
                     ok = False
                     print(
@@ -1074,6 +1127,31 @@ async def main():
                 pitch_cmd=pitch_cmd,
                 yaw_cmd=yaw_cmd,
                 thrust_cmd=thrust_cmd,
+                tracker_velocity_input=getattr(
+                    autonomy, "tracker_velocity_input", None
+                ),
+                tracker_velocity_was_sanitized=getattr(
+                    autonomy, "tracker_velocity_was_sanitized", False
+                ),
+                tracker_e_p=getattr(autonomy, "tracker_e_p", None),
+                tracker_e_v=getattr(autonomy, "tracker_e_v", None),
+                tracker_a_ref=getattr(autonomy, "tracker_a_ref", None),
+                tracker_a_fb=getattr(autonomy, "tracker_a_fb", None),
+                tracker_a_cmd_raw=getattr(autonomy, "tracker_a_cmd_raw", None),
+                tracker_a_cmd_limited=getattr(
+                    autonomy, "tracker_a_cmd_limited", None
+                ),
+                thrust_raw_before_clamp=getattr(
+                    autonomy, "thrust_raw_before_clamp", np.nan
+                ),
+                thrust_cmd_after_clamp=getattr(
+                    autonomy, "thrust_cmd_after_clamp", np.nan
+                ),
+                thrust_limited=getattr(autonomy, "thrust_limited", False),
+                vertical_thrust_after_tilt=getattr(
+                    autonomy, "vertical_thrust_after_tilt", np.nan
+                ),
+                hover_thrust=getattr(autonomy, "hover_thrust", np.nan),
                 p_ref=p_ref,
                 v_ref=v_ref,
                 a_ref=a_ref,
@@ -1287,6 +1365,45 @@ async def main():
                 skipped_target_clear_after_completion=getattr(autonomy, "skipped_target_clear_after_completion", False),
                 next_track_after_completion_id=getattr(autonomy, "next_track_after_completion_id", None),
                 next_target_installed_same_cycle=getattr(autonomy, "next_target_installed_same_cycle", False),
+                continued_existing_plan_after_completion=getattr(
+                    autonomy, "continued_existing_plan_after_completion", False
+                ),
+                continued_existing_plan_track_id=getattr(
+                    autonomy, "continued_existing_plan_track_id", None
+                ),
+                continued_existing_plan_from_idx=getattr(
+                    autonomy, "continued_existing_plan_from_idx", -1
+                ),
+                continued_existing_plan_to_idx=getattr(
+                    autonomy, "continued_existing_plan_to_idx", -1
+                ),
+                gate_completion_replan_required=getattr(
+                    autonomy, "gate_completion_replan_required", True
+                ),
+                pending_suffix_created=getattr(
+                    autonomy, "pending_suffix_created", False
+                ),
+                pending_suffix_installed=getattr(
+                    autonomy, "pending_suffix_installed", False
+                ),
+                pending_suffix_rejected_reason=getattr(
+                    autonomy, "pending_suffix_rejected_reason", ""
+                ),
+                pending_suffix_splice_track_id=getattr(
+                    autonomy, "pending_suffix_splice_track_id", None
+                ),
+                pending_suffix_cleared_reason=getattr(
+                    autonomy, "pending_suffix_cleared_reason", ""
+                ),
+                future_only_replan_preserved_active_segment=getattr(
+                    autonomy, "future_only_replan_preserved_active_segment", False
+                ),
+                future_only_replan_reason=getattr(
+                    autonomy, "future_only_replan_reason", ""
+                ),
+                replan_suppressed_reason=getattr(
+                    autonomy, "replan_suppressed_reason", ""
+                ),
                 target_clear_reason=getattr(autonomy, "target_clear_reason", ""),
                 post_completion_grace_suppressed=getattr(autonomy, "post_completion_grace_suppressed", False),
                 planning_horizon_track_ids=getattr(autonomy, "planning_horizon_track_ids", []),
@@ -1431,6 +1548,20 @@ async def main():
                 ),
                 plan_validation_failure_reason=getattr(
                     autonomy, "plan_validation_failure_reason", ""
+                ),
+                plan_z_corridor_failed=getattr(
+                    autonomy, "plan_z_corridor_failed", False
+                ),
+                plan_min_z=getattr(autonomy, "plan_min_z", float("nan")),
+                plan_max_z=getattr(autonomy, "plan_max_z", float("nan")),
+                plan_z_undershoot_m=getattr(
+                    autonomy, "plan_z_undershoot_m", 0.0
+                ),
+                plan_z_fallback_reason=getattr(
+                    autonomy, "plan_z_fallback_reason", ""
+                ),
+                plan_z_start_below_safe_min=getattr(
+                    autonomy, "plan_z_start_below_safe_min", False
                 ),
                 passthrough_velocity_enabled=getattr(autonomy, "passthrough_velocity_enabled", False),
                 passthrough_speed_used=getattr(autonomy, "passthrough_speed_used", float("nan")),

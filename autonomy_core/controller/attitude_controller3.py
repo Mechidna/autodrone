@@ -148,10 +148,10 @@ class RPGHighLevelTracker:
         # RPG-style high-level acceleration command:
         # a_fb + a_ref + gravity compensation. :contentReference[oaicite:2]{index=2}
         a_fb = self.Kp * e_p + self.Kv * e_v
-        a_cmd_no_g = ref.acc + a_fb
+        a_cmd_raw_no_g = ref.acc + a_fb
 
         # Saturate translational demand to something your drone can actually do
-        a_cmd_no_g = self._limit_acceleration(a_cmd_no_g)
+        a_cmd_no_g = self._limit_acceleration(a_cmd_raw_no_g)
 
         # Add gravity compensation (z-up world frame)
         a_des = a_cmd_no_g + np.array([0.0, 0.0, self.g], dtype=float)
@@ -175,7 +175,8 @@ class RPGHighLevelTracker:
         # Collective thrust:
         # RPG computes commanded thrust from desired accel projected onto current body z axis. :contentReference[oaicite:3]{index=3}
         # For PX4 normalized thrust, a practical approximation is to map desired vertical accel to normalized thrust.
-        thrust_cmd = self.thrust_hover + self.thrust_from_acc_gain * a_cmd_no_g[2]
+        thrust_raw_before_clamp = self.thrust_hover + self.thrust_from_acc_gain * a_cmd_no_g[2]
+        thrust_cmd = thrust_raw_before_clamp
         thrust_cmd = clamp(thrust_cmd, self.thrust_min, self.thrust_max)
 
         # r1, p1, y1 = rotmat_to_euler_zyx(R_des)
@@ -188,12 +189,18 @@ class RPGHighLevelTracker:
         debug = {
             "e_p": e_p,
             "e_v": e_v,
+            "a_ref": ref.acc,
             "a_fb": a_fb,
+            "a_cmd_raw_no_g": a_cmd_raw_no_g,
             "a_cmd_no_g": a_cmd_no_g,
             "a_des": a_des,
             "z_b_des": z_b_des,
             "R_des": R_des,
             "yaw_des_from_R": yaw_des_from_R,
+            "thrust_raw_before_clamp": thrust_raw_before_clamp,
+            "thrust_cmd_after_clamp": thrust_cmd,
+            "thrust_limited": bool(thrust_cmd != thrust_raw_before_clamp),
+            "hover_thrust": self.thrust_hover,
         }
 
         return roll_des, pitch_des, yaw_cmd, thrust_cmd, debug

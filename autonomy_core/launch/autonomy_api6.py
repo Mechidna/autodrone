@@ -150,6 +150,12 @@ class AutonomyAPI:
         self.plan_max_overshoot_m = 0.0
         self.plan_negative_progress_velocity_count = 0
         self.plan_validation_failure_reason = ""
+        self.plan_z_corridor_failed = False
+        self.plan_min_z = float("nan")
+        self.plan_max_z = float("nan")
+        self.plan_z_undershoot_m = 0.0
+        self.plan_z_fallback_reason = ""
+        self.plan_z_start_below_safe_min = False
 
         # Race progress is a sequence cursor over persistent gate track IDs.
         # Landmark memory stays forever; passing a gate never deletes it.
@@ -670,6 +676,27 @@ class AutonomyAPI:
         self.completed_gate_track_id = None
         self.yaw_target_source = ""
         self.target_retained_after_completion = False
+        self.continued_existing_plan_after_completion = False
+        self.continued_existing_plan_track_id = None
+        self.continued_existing_plan_from_idx = -1
+        self.continued_existing_plan_to_idx = -1
+        self.gate_completion_replan_required = True
+        self.pending_suffix_planner = None
+        self.pending_suffix_track_ids = []
+        self.pending_suffix_waypoints = None
+        self.pending_suffix_times = None
+        self.pending_suffix_splice_track_id = None
+        self.pending_suffix_splice_state = None
+        self.pending_suffix_created_reason = ""
+        self.pending_suffix_valid = False
+        self.pending_suffix_created = False
+        self.pending_suffix_installed = False
+        self.pending_suffix_rejected_reason = ""
+        self.pending_suffix_waypoint_types = []
+        self.pending_suffix_cleared_reason = ""
+        self.future_only_replan_preserved_active_segment = False
+        self.future_only_replan_reason = ""
+        self.replan_suppressed_reason = ""
         self.next_valid_target_found = False
         self.valid_candidate_count = 0
         self.active_target_center = None
@@ -707,6 +734,19 @@ class AutonomyAPI:
         self.terminal_extension_source = ""
         self.post_completion_direction_source = ""
         self.active_shift_gt_debug_only = False
+        self.tracker_velocity_input = np.full(3, np.nan, dtype=float)
+        self.tracker_velocity_was_sanitized = False
+        self.tracker_e_p = np.full(3, np.nan, dtype=float)
+        self.tracker_e_v = np.full(3, np.nan, dtype=float)
+        self.tracker_a_ref = np.full(3, np.nan, dtype=float)
+        self.tracker_a_fb = np.full(3, np.nan, dtype=float)
+        self.tracker_a_cmd_raw = np.full(3, np.nan, dtype=float)
+        self.tracker_a_cmd_limited = np.full(3, np.nan, dtype=float)
+        self.thrust_raw_before_clamp = float("nan")
+        self.thrust_cmd_after_clamp = float("nan")
+        self.thrust_limited = False
+        self.vertical_thrust_after_tilt = float("nan")
+        self.hover_thrust = float("nan")
         self.pending_active_target_correction = None
         self.approach_start_position = None
         self.approach_vector = None
@@ -839,6 +879,12 @@ class AutonomyAPI:
         self.plan_max_overshoot_m = 0.0
         self.plan_negative_progress_velocity_count = 0
         self.plan_validation_failure_reason = ""
+        self.plan_z_corridor_failed = False
+        self.plan_min_z = float("nan")
+        self.plan_max_z = float("nan")
+        self.plan_z_undershoot_m = 0.0
+        self.plan_z_fallback_reason = ""
+        self.plan_z_start_below_safe_min = False
 
     def validate_minimum_snap_geometry(
         self,
@@ -849,6 +895,8 @@ class AutonomyAPI:
         overshoot_tolerance_m=0.35,
         negative_velocity_tolerance=4,
         endpoint_margin_fraction=0.08,
+        z_corridor_tolerance_m=0.05,
+        z_endpoint_undershoot_tolerance_m=0.20,
     ):
         waypoints = np.asarray(waypoints, dtype=float)
         times = np.asarray(getattr(planner, "times", []), dtype=float).reshape(-1)
@@ -861,6 +909,10 @@ class AutonomyAPI:
                 "max_backward_progress_m": 0.0,
                 "max_overshoot_m": 0.0,
                 "negative_progress_velocity_count": 0,
+                "plan_min_z": float("nan"),
+                "plan_max_z": float("nan"),
+                "z_undershoot_m": 0.0,
+                "z_start_below_safe_min": False,
                 "reason": "invalid_validation_inputs",
             }
 
@@ -869,8 +921,15 @@ class AutonomyAPI:
             "max_backward_progress_m": 0.0,
             "max_overshoot_m": 0.0,
             "negative_progress_velocity_count": 0,
+            "plan_min_z": float("nan"),
+            "plan_max_z": float("nan"),
+            "z_undershoot_m": 0.0,
+            "z_start_below_safe_min": False,
             "reason": "",
         }
+        plan_min_z = float("inf")
+        plan_max_z = float("-inf")
+        worst_z_undershoot = 0.0
 
         for segment_idx in range(len(times)):
             p0 = waypoints[segment_idx]
@@ -884,12 +943,18 @@ class AutonomyAPI:
             segment_start = float(segment_starts[segment_idx])
             sample_count = max(3, int(samples_per_segment))
             progress_values = []
+            z_values = []
             negative_velocity_count = 0
 
             for tau in np.linspace(0.0, duration, sample_count):
                 p, v, _ = planner.sample(segment_start + float(tau))
                 progress = float(np.dot(p - p0, direction))
                 progress_values.append(progress)
+                z = float(p[2])
+                z_values.append(z)
+                if np.isfinite(z):
+                    plan_min_z = min(plan_min_z, z)
+                    plan_max_z = max(plan_max_z, z)
                 s_dot = float(np.dot(v, direction))
                 normalized_tau = float(tau) / duration if duration > 1e-6 else 1.0
                 if (
@@ -906,11 +971,27 @@ class AutonomyAPI:
 
             min_progress = min(progress_values)
             max_progress = max(progress_values)
+            min_z = min(z_values) if z_values else float("nan")
             max_overshoot = max(
                 0.0,
                 max_progress - segment_length,
                 -min_progress,
             )
+            z_start = float(p0[2])
+            z_end = float(p1[2])
+            z_start_below_safe_min = bool(
+                np.isfinite(z_start)
+                and z_start < float(self.safe_min_target_z)
+            )
+            if z_start_below_safe_min:
+                segment_floor = z_start - float(z_corridor_tolerance_m)
+            else:
+                segment_floor = max(
+                    float(self.safe_min_target_z) - float(z_corridor_tolerance_m),
+                    min(z_start, z_end) - float(z_endpoint_undershoot_tolerance_m),
+                )
+            z_undershoot = max(0.0, segment_floor - min_z) if np.isfinite(min_z) else 0.0
+            worst_z_undershoot = max(worst_z_undershoot, z_undershoot)
 
             failed_reasons = []
             if max_backward > backward_tolerance_m:
@@ -919,27 +1000,44 @@ class AutonomyAPI:
                 failed_reasons.append("segment_overshoot")
             if negative_velocity_count > int(negative_velocity_tolerance):
                 failed_reasons.append("negative_progress_velocity")
+            if z_undershoot > 0.0:
+                failed_reasons.append("z_corridor")
 
             if (
                 max_backward > worst["max_backward_progress_m"]
                 or max_overshoot > worst["max_overshoot_m"]
                 or negative_velocity_count > worst["negative_progress_velocity_count"]
+                or z_undershoot > worst["z_undershoot_m"]
             ):
                 worst = {
                     "segment_idx": int(segment_idx),
                     "max_backward_progress_m": float(max_backward),
                     "max_overshoot_m": float(max_overshoot),
                     "negative_progress_velocity_count": int(negative_velocity_count),
+                    "plan_min_z": float(plan_min_z),
+                    "plan_max_z": float(plan_max_z),
+                    "z_undershoot_m": float(z_undershoot),
+                    "z_start_below_safe_min": bool(z_start_below_safe_min),
                     "reason": ",".join(failed_reasons),
                 }
 
             if failed_reasons:
                 worst["segment_idx"] = int(segment_idx)
+                worst["plan_min_z"] = float(plan_min_z)
+                worst["plan_max_z"] = float(plan_max_z)
+                worst["z_undershoot_m"] = float(z_undershoot)
+                worst["z_start_below_safe_min"] = bool(z_start_below_safe_min)
                 worst["reason"] = ",".join(failed_reasons)
                 return False, worst
 
         if not worst["reason"]:
             worst["reason"] = "ok"
+        worst["plan_min_z"] = float(plan_min_z) if np.isfinite(plan_min_z) else float("nan")
+        worst["plan_max_z"] = float(plan_max_z) if np.isfinite(plan_max_z) else float("nan")
+        worst["z_undershoot_m"] = float(worst_z_undershoot)
+        worst["z_start_below_safe_min"] = bool(
+            np.any(waypoints[:-1, 2] < float(self.safe_min_target_z))
+        )
         return True, worst
 
     def compute_final_exit_velocity(self, gates, default_speed=2.5):
@@ -1212,7 +1310,11 @@ class AutonomyAPI:
                 self.horizon_track_decisions[track_id] = "excluded:completed_this_lap"
                 continue
 
-            is_hard_lookahead = bool(getattr(tr, "committed", False) or getattr(tr, "is_stable", False))
+            is_hard_lookahead = bool(getattr(tr, "is_stable", False))
+            is_committed_unstable = bool(
+                getattr(tr, "committed", False)
+                and not getattr(tr, "is_stable", False)
+            )
             if is_hard_lookahead:
                 center_source = getattr(tr, "center", None)
             else:
@@ -1267,7 +1369,11 @@ class AutonomyAPI:
                     self.tentative_lookahead_rejection_reason = reason
                     self.horizon_track_decisions[track_id] = f"excluded:{reason}"
                     continue
-                waypoint_type = "soft_tentative"
+                waypoint_type = (
+                    "soft_committed_unstable"
+                    if is_committed_unstable
+                    else "soft_tentative"
+                )
 
             target_gates.append(center.copy())
             target_track_ids.append(track_id)
@@ -1276,12 +1382,12 @@ class AutonomyAPI:
             existing_points.append(center.copy())
             self.planning_lookahead_track_ids.append(track_id)
             self.horizon_track_decisions[track_id] = f"included:{waypoint_type}"
-            if waypoint_type == "soft_tentative":
+            if waypoint_type in ("soft_committed_unstable", "soft_tentative"):
                 self.tentative_lookahead_used = True
                 self.tentative_lookahead_track_ids.append(track_id)
-                lookahead_sources.append("tentative_track")
+                lookahead_sources.append(waypoint_type)
             else:
-                lookahead_sources.append("stable_track")
+                lookahead_sources.append("hard_stable")
             remaining -= 1
 
         if allow_raw_candidates and remaining > 0:
@@ -2603,7 +2709,7 @@ class AutonomyAPI:
             track_id = self.canonical_track_id(getattr(tr, "id", None))
             if track_id is None:
                 continue
-            if bool(getattr(tr, "committed", False) or getattr(tr, "is_stable", False)):
+            if bool(getattr(tr, "is_stable", False)):
                 continue
             center = getattr(tr, "filtered_center_world", None)
             if center is None:
@@ -6017,7 +6123,7 @@ class AutonomyAPI:
             return reject("fallback_track_missing")
         if not bool(getattr(tr, "committed", False)):
             return reject("fallback_track_not_committed")
-        if waypoint_type not in ("soft_tentative", "hard_stable"):
+        if waypoint_type not in ("soft_committed_unstable", "soft_tentative", "hard_stable"):
             return reject(f"fallback_invalid_previous_waypoint_type:{waypoint_type}")
         if int(getattr(tr, "hits", 0)) < int(self.planning_lookahead_min_hits):
             return reject(
@@ -6353,7 +6459,437 @@ class AutonomyAPI:
         self.active_target_cleared = True
         self.next_valid_target_found = False
         self.target_retained_after_completion = False
+        self._reset_pending_suffix_state(f"active_target_cleared:{reason}")
         print(f"[TARGET CLEAR] perception active target cleared reason={reason}")
+
+    def _continue_existing_plan_after_completion(self, completed_track_id, next_track_id):
+        """
+        Advance active-target metadata to the next target already contained in
+        the installed plan. This intentionally preserves the planner and its
+        clock so the inter-gate segment after completion is not regenerated.
+        """
+        self.continued_existing_plan_after_completion = False
+        self.continued_existing_plan_track_id = None
+        self.continued_existing_plan_from_idx = -1
+        self.continued_existing_plan_to_idx = -1
+        self.gate_completion_replan_required = True
+
+        if self.planner is None:
+            return False
+        if self.active_times is None:
+            return False
+        if completed_track_id is None or next_track_id is None:
+            return False
+        if len(self.active_target_track_ids) == 0 or len(self.active_target_gates) == 0:
+            return False
+
+        completed_id = self.canonical_track_id(completed_track_id)
+        next_id = self.canonical_track_id(next_track_id)
+        canonical_ids = [
+            self.canonical_track_id(track_id)
+            for track_id in self.active_target_track_ids
+        ]
+
+        if completed_id not in canonical_ids:
+            return False
+
+        completed_idx = canonical_ids.index(completed_id)
+        next_idx = completed_idx + 1
+        if next_idx >= len(canonical_ids):
+            return False
+        if canonical_ids[next_idx] != next_id:
+            return False
+        if next_idx >= len(self.active_target_gates):
+            return False
+
+        active_times = np.asarray(self.active_times, dtype=float).reshape(-1)
+        if next_idx >= len(active_times):
+            return False
+
+        next_gate = np.asarray(self.active_target_gates[next_idx], dtype=float).reshape(3)
+        if not np.all(np.isfinite(next_gate)):
+            return False
+
+        self.current_target_idx = next_idx
+        self.active_target_track_id = next_id
+        self.current_gate_pos = next_gate.copy()
+        self.last_valid_target = next_gate.copy()
+        self.active_target_center_at_plan = next_gate.copy()
+        self.active_target_source = "continued_existing_plan_after_completion"
+        self.next_valid_target_found = True
+        self.next_target_installed_same_cycle = True
+        self.target_retained_after_completion = True
+        self.active_target_cleared = False
+        self.no_active_target = False
+        self.completed_gate_reference_blocked = False
+        self.target_clear_reason = ""
+        self.skipped_target_clear_after_completion = True
+        self.post_completion_grace_until = 0.0
+        self.post_completion_grace_active = False
+        self.post_completion_grace_suppressed = True
+        self.set_active_perception_target_geometry(
+            next_gate,
+            np.array([
+                self.telemetry.pos["x"],
+                self.telemetry.pos["y"],
+                self.telemetry.pos["z"],
+            ], dtype=float),
+        )
+
+        self.continued_existing_plan_after_completion = True
+        self.continued_existing_plan_track_id = next_id
+        self.continued_existing_plan_from_idx = completed_idx
+        self.continued_existing_plan_to_idx = next_idx
+        self.gate_completion_replan_required = False
+        print(
+            "[TARGET ADVANCE] continuing existing installed plan "
+            f"completed_track_id={completed_id} next_track_id={next_id} "
+            f"idx={completed_idx}->{next_idx}"
+        )
+        return True
+
+    def _reset_pending_suffix_state(self, rejected_reason=""):
+        reason = str(rejected_reason or "")
+        self.pending_suffix_planner = None
+        self.pending_suffix_track_ids = []
+        self.pending_suffix_waypoints = None
+        self.pending_suffix_times = None
+        self.pending_suffix_splice_track_id = None
+        self.pending_suffix_splice_state = None
+        self.pending_suffix_created_reason = ""
+        self.pending_suffix_valid = False
+        self.pending_suffix_created = False
+        self.pending_suffix_rejected_reason = reason
+        self.pending_suffix_waypoint_types = []
+        self.pending_suffix_cleared_reason = reason
+
+    def prepare_pending_suffix_for_future_only_replan(self, replan_reason):
+        """
+        Build a future-only suffix from the current active-gate crossing state.
+        This must not replace the active planner or reset its timing.
+        """
+        self._reset_pending_suffix_state()
+        self.pending_suffix_installed = False
+        self.future_only_replan_preserved_active_segment = False
+        self.future_only_replan_reason = str(replan_reason or "")
+        self.replan_suppressed_reason = ""
+
+        if replan_reason not in (
+            "tentative_lookahead_new_candidate",
+            "tentative_lookahead_shift",
+            "new_committed_or_stable_gate",
+        ):
+            self.pending_suffix_rejected_reason = "not_future_only_replan"
+            return False
+        if not self.use_perception:
+            self.pending_suffix_rejected_reason = "perception_disabled"
+            return False
+        if self.planner is None or getattr(self.planner, "coeffs", None) is None:
+            self.pending_suffix_rejected_reason = "missing_active_planner"
+            return False
+        if self.active_times is None or len(self.active_target_gates) == 0:
+            self.pending_suffix_rejected_reason = "missing_active_horizon"
+            return False
+        if not (0 <= self.current_target_idx < len(self.active_target_track_ids)):
+            self.pending_suffix_rejected_reason = "invalid_current_target_idx"
+            return False
+
+        active_track_id = self.canonical_track_id(
+            self.active_target_track_ids[self.current_target_idx]
+        )
+        if active_track_id is None or active_track_id < 0:
+            self.pending_suffix_rejected_reason = "invalid_active_track_id"
+            return False
+
+        active_times = np.asarray(self.active_times, dtype=float).reshape(-1)
+        if self.current_target_idx >= len(active_times):
+            self.pending_suffix_rejected_reason = "missing_active_crossing_time"
+            return False
+        splice_tau = float(active_times[self.current_target_idx])
+        planner_total = float(getattr(self.planner, "total_time", 0.0))
+        if not np.isfinite(splice_tau) or splice_tau < 0.0 or splice_tau > planner_total + 1e-6:
+            self.pending_suffix_rejected_reason = "invalid_splice_tau"
+            return False
+
+        try:
+            p_splice, v_splice, a_splice, j_splice, s_splice = self.planner.sample_full(splice_tau)
+        except AttributeError:
+            p_splice, v_splice, a_splice = self.planner.sample(splice_tau)
+            j_splice = np.zeros(3, dtype=float)
+            s_splice = np.zeros(3, dtype=float)
+        p_splice = np.asarray(p_splice, dtype=float).reshape(3)
+        v_splice = np.asarray(v_splice, dtype=float).reshape(3)
+        a_splice = np.asarray(a_splice, dtype=float).reshape(3)
+        j_splice = np.asarray(j_splice, dtype=float).reshape(3)
+        s_splice = np.asarray(s_splice, dtype=float).reshape(3)
+        if not (
+            np.all(np.isfinite(p_splice))
+            and np.all(np.isfinite(v_splice))
+            and np.all(np.isfinite(a_splice))
+            and np.all(np.isfinite(j_splice))
+        ):
+            self.pending_suffix_rejected_reason = "non_finite_splice_state"
+            return False
+
+        snapshot = {
+            "active_target_gates": [g.copy() for g in self.active_target_gates],
+            "active_target_track_ids": list(self.active_target_track_ids),
+            "current_target_idx": int(self.current_target_idx),
+            "current_gate_pos": None
+            if self.current_gate_pos is None
+            else np.asarray(self.current_gate_pos, dtype=float).copy(),
+            "last_valid_target": None
+            if self.last_valid_target is None
+            else np.asarray(self.last_valid_target, dtype=float).copy(),
+            "active_target_track_id": self.active_target_track_id,
+            "active_target_center_at_plan": None
+            if self.active_target_center_at_plan is None
+            else np.asarray(self.active_target_center_at_plan, dtype=float).copy(),
+            "active_target_source": self.active_target_source,
+            "active_waypoints": None
+            if self.active_waypoints is None
+            else np.asarray(self.active_waypoints, dtype=float).copy(),
+            "active_times": None
+            if self.active_times is None
+            else np.asarray(self.active_times, dtype=float).copy(),
+            "trajectory_start_time": self.trajectory_start_time,
+            "previous_sample_tau_used": self.previous_sample_tau_used,
+            "previous_sample_tau_plan_id": self.previous_sample_tau_plan_id,
+            "planner": self.planner,
+            "active_plan_id": self.active_plan_id,
+            "race_cursor": self.race_progression.cursor,
+            "race_lap": self.race_progression.lap,
+        }
+
+        pos = np.array([
+            self.telemetry.pos["x"],
+            self.telemetry.pos["y"],
+            self.telemetry.pos["z"],
+        ], dtype=float)
+
+        try:
+            _, target_gates, target_track_ids = self.build_waypoint_horizon(
+                pos,
+                max_gates_ahead=3,
+            )
+            target_waypoint_types = list(
+                self._planning_target_waypoint_types[:len(target_track_ids)]
+            )
+        finally:
+            self.active_target_gates = [
+                g.copy() for g in snapshot["active_target_gates"]
+            ]
+            self.active_target_track_ids = list(snapshot["active_target_track_ids"])
+            self.current_target_idx = int(snapshot["current_target_idx"])
+            self.current_gate_pos = (
+                None
+                if snapshot["current_gate_pos"] is None
+                else snapshot["current_gate_pos"].copy()
+            )
+            self.last_valid_target = (
+                None
+                if snapshot["last_valid_target"] is None
+                else snapshot["last_valid_target"].copy()
+            )
+            self.active_target_track_id = snapshot["active_target_track_id"]
+            self.active_target_center_at_plan = (
+                None
+                if snapshot["active_target_center_at_plan"] is None
+                else snapshot["active_target_center_at_plan"].copy()
+            )
+            self.active_target_source = snapshot["active_target_source"]
+            self.active_waypoints = (
+                None
+                if snapshot["active_waypoints"] is None
+                else snapshot["active_waypoints"].copy()
+            )
+            self.active_times = (
+                None
+                if snapshot["active_times"] is None
+                else snapshot["active_times"].copy()
+            )
+            self.trajectory_start_time = snapshot["trajectory_start_time"]
+            self.previous_sample_tau_used = snapshot["previous_sample_tau_used"]
+            self.previous_sample_tau_plan_id = snapshot["previous_sample_tau_plan_id"]
+            self.planner = snapshot["planner"]
+            self.active_plan_id = snapshot["active_plan_id"]
+            self.race_progression.cursor = snapshot["race_cursor"]
+            self.race_progression.lap = snapshot["race_lap"]
+
+        target_track_ids = [
+            self.canonical_track_id(tid) for tid in target_track_ids
+        ]
+        if len(target_track_ids) == 0 or target_track_ids[0] != active_track_id:
+            self.pending_suffix_rejected_reason = "active_target_changed"
+            return False
+        current_active_gate = np.asarray(
+            self.active_target_gates[self.current_target_idx], dtype=float
+        ).reshape(3)
+        proposed_active_gate = np.asarray(target_gates[0], dtype=float).reshape(3)
+        if (
+            not np.all(np.isfinite(current_active_gate))
+            or not np.all(np.isfinite(proposed_active_gate))
+            or float(np.linalg.norm(proposed_active_gate - current_active_gate)) > 0.25
+        ):
+            self.pending_suffix_rejected_reason = "active_target_center_changed"
+            return False
+        if len(target_gates) < 2:
+            self.pending_suffix_rejected_reason = "no_future_suffix_targets"
+            return False
+
+        future_gates = [
+            np.asarray(gate, dtype=float).reshape(3).copy()
+            for gate in target_gates[1:]
+        ]
+        future_track_ids = list(target_track_ids[1:])
+        future_waypoint_types = list(target_waypoint_types[1:])
+        if len(future_gates) == 0 or len(future_track_ids) == 0:
+            self.pending_suffix_rejected_reason = "empty_future_suffix"
+            return False
+
+        suffix_waypoints = np.vstack([p_splice] + future_gates)
+        suffix_times = self.allocate_segment_times(
+            suffix_waypoints,
+            current_vel=v_splice,
+            vmax=2.5,
+            amax=2.0,
+            T_min=1.0,
+        )
+        waypoint_velocities = self.compute_passthrough_waypoint_velocities(suffix_waypoints)
+        suffix_planner = MultiSegmentMinimumSnapPlanner()
+        suffix_planner.update(
+            waypoints=suffix_waypoints,
+            times=suffix_times,
+            v_start=v_splice,
+            v_end=np.zeros(3, dtype=float),
+            a_start=a_splice,
+            a_end=np.zeros(3, dtype=float),
+            j_start=j_splice,
+            j_end=np.zeros(3, dtype=float),
+            waypoint_velocities=waypoint_velocities,
+        )
+        validation_ok, validation_debug = self.validate_minimum_snap_geometry(
+            suffix_planner,
+            suffix_waypoints,
+        )
+        if not validation_ok:
+            self.pending_suffix_rejected_reason = (
+                f"validation_failed:{validation_debug.get('reason', '')}"
+            )
+            return False
+
+        self.pending_suffix_planner = suffix_planner
+        self.pending_suffix_track_ids = list(future_track_ids)
+        self.pending_suffix_waypoints = suffix_waypoints.copy()
+        self.pending_suffix_times = np.asarray(suffix_times, dtype=float).copy()
+        self.pending_suffix_waypoint_types = list(future_waypoint_types)
+        self.pending_suffix_splice_track_id = active_track_id
+        self.pending_suffix_splice_state = {
+            "tau": splice_tau,
+            "p": p_splice.copy(),
+            "v": v_splice.copy(),
+            "a": a_splice.copy(),
+            "j": j_splice.copy(),
+            "s": s_splice.copy(),
+        }
+        self.pending_suffix_created_reason = str(replan_reason)
+        self.pending_suffix_valid = True
+        self.pending_suffix_created = True
+        self.pending_suffix_rejected_reason = ""
+        self.pending_suffix_cleared_reason = ""
+        self.future_only_replan_preserved_active_segment = True
+        self.replan_suppressed_reason = "future_only_pending_suffix_created"
+        print(
+            "[PENDING SUFFIX] created "
+            f"reason={replan_reason} splice_track_id={active_track_id} "
+            f"future_track_ids={future_track_ids}"
+        )
+        return True
+
+    def _install_pending_suffix_after_completion(self, completed_track_id, next_track_id, pos):
+        self.pending_suffix_installed = False
+        if not self.pending_suffix_valid or self.pending_suffix_planner is None:
+            if not self.pending_suffix_rejected_reason:
+                self.pending_suffix_rejected_reason = "no_valid_pending_suffix"
+            return False
+
+        completed_id = self.canonical_track_id(completed_track_id)
+        next_id = self.canonical_track_id(next_track_id)
+        if self.canonical_track_id(self.pending_suffix_splice_track_id) != completed_id:
+            self._reset_pending_suffix_state("splice_track_mismatch")
+            return False
+        if len(self.pending_suffix_track_ids) == 0:
+            self.pending_suffix_rejected_reason = "suffix_has_no_targets"
+            return False
+        if next_id is not None and self.canonical_track_id(self.pending_suffix_track_ids[0]) != next_id:
+            self.pending_suffix_rejected_reason = "first_suffix_track_not_next_target"
+            return False
+
+        suffix_start = np.asarray(self.pending_suffix_waypoints[0], dtype=float).reshape(3)
+        pos = np.asarray(pos, dtype=float).reshape(3)
+        if float(np.linalg.norm(pos - suffix_start)) > 2.0:
+            self.pending_suffix_rejected_reason = "vehicle_far_from_suffix_start"
+            return False
+
+        self.planner = self.pending_suffix_planner
+        self.active_waypoints = np.asarray(self.pending_suffix_waypoints, dtype=float).copy()
+        self.active_times = np.asarray(self.pending_suffix_times, dtype=float).copy()
+        self.active_target_track_ids = list(self.pending_suffix_track_ids)
+        self.active_target_gates = [
+            np.asarray(g, dtype=float).reshape(3).copy()
+            for g in self.active_waypoints[1:]
+        ]
+        self.current_target_idx = 0
+        self.current_gate_pos = self.active_target_gates[0].copy()
+        self.last_valid_target = self.current_gate_pos.copy()
+        self.active_target_track_id = self.canonical_track_id(
+            self.active_target_track_ids[0]
+        )
+        self.active_target_center_at_plan = self.current_gate_pos.copy()
+        self.active_target_source = "pending_suffix_after_completion"
+        self.next_valid_target_found = True
+        self.next_target_installed_same_cycle = True
+        self.target_retained_after_completion = True
+        self.active_target_cleared = False
+        self.no_active_target = False
+        self.completed_gate_reference_blocked = False
+        self.skipped_target_clear_after_completion = True
+        self.target_clear_reason = ""
+        self.post_completion_grace_until = 0.0
+        self.post_completion_grace_active = False
+        self.post_completion_grace_suppressed = True
+        self.planning_horizon_track_ids = list(self.pending_suffix_track_ids)
+        self.planning_horizon_waypoint_count = int(len(self.active_waypoints))
+        self.planning_horizon_waypoints = ";".join(
+            f"{i}:{wp[0]:.2f},{wp[1]:.2f},{wp[2]:.2f}"
+            for i, wp in enumerate(self.active_waypoints)
+        )
+        waypoint_types = list(getattr(self, "pending_suffix_waypoint_types", []))
+        if len(waypoint_types) != len(self.active_target_track_ids):
+            waypoint_types = ["pending_suffix"] * len(self.active_target_track_ids)
+        self.planning_horizon_waypoint_types = " ".join(["start"] + waypoint_types)
+        self._planning_target_waypoint_types = list(waypoint_types)
+        self.trajectory_start_time = time.time()
+        self.previous_sample_tau_used = 0.0
+        self.previous_sample_tau_plan_id = None
+        self.set_active_perception_target_geometry(self.current_gate_pos, pos)
+        self.pending_suffix_installed = True
+        self.pending_suffix_rejected_reason = ""
+        installed_splice_track_id = completed_id
+        self.record_installed_plan_for_export(
+            plan_source="pending_suffix_install",
+            replan_reason=self.pending_suffix_created_reason,
+        )
+        self._reset_pending_suffix_state("installed")
+        self.pending_suffix_installed = True
+        self.pending_suffix_splice_track_id = installed_splice_track_id
+        self.pending_suffix_cleared_reason = "installed"
+        self.pending_suffix_rejected_reason = ""
+        print(
+            "[PENDING SUFFIX] installed "
+            f"splice_track_id={completed_id} track_ids={self.active_target_track_ids}"
+        )
+        return True
 
     # -------------------------------------------------------------------------
     # Target / horizon building
@@ -6710,6 +7246,12 @@ class AutonomyAPI:
             self.post_completion_candidate_rejected_reason = ""
             self.race_order_after_post_completion_fallback = []
             self.post_completion_direction_source = ""
+            self.continued_existing_plan_after_completion = False
+            self.continued_existing_plan_track_id = None
+            self.continued_existing_plan_from_idx = -1
+            self.continued_existing_plan_to_idx = -1
+            self.gate_completion_replan_required = True
+            self.pending_suffix_installed = False
             self.gate_completion_triggered = False
             self.reset_crossing_debug()
             self.completion_reason = ""
@@ -6747,6 +7289,7 @@ class AutonomyAPI:
                 self.active_target_source = "last_valid_target"
 
             if target is None:
+                self._reset_pending_suffix_state("no_active_target")
                 self.distance_to_active_target = float("nan")
                 self.active_gate_idx_after = self.current_gate_idx
                 self.race_cursor_after = self.race_progression.cursor
@@ -6841,7 +7384,7 @@ class AutonomyAPI:
                         if next_horizon_idx + 1 < len(waypoint_types)
                         else ""
                     )
-                    if next_type in ("soft_tentative", "hard_stable"):
+                    if next_type in ("soft_committed_unstable", "soft_tentative", "hard_stable"):
                         self.pending_lookahead_handoff = {
                             "track_id": next_id,
                             "center": np.asarray(
@@ -6961,16 +7504,33 @@ class AutonomyAPI:
 
             installed_next_target = False
             if self.next_track_available_after_completion:
+                installed_next_target = self._continue_existing_plan_after_completion(
+                    completed_track_id=track_id,
+                    next_track_id=self.next_track_after_completion_id,
+                )
+
+            if not installed_next_target:
+                installed_next_target = self._install_pending_suffix_after_completion(
+                    completed_track_id=track_id,
+                    next_track_id=self.next_track_after_completion_id,
+                    pos=pos,
+                )
+
+            if not installed_next_target and self.next_track_available_after_completion:
                 installed_next_target = self.path_plan(
                     replan_reason="gate_completed_next_track_available"
                 )
-            elif self.use_planning_lookahead_tracks:
+            elif not installed_next_target and self.use_planning_lookahead_tracks:
                 installed_next_target = self.path_plan(
                     replan_reason="gate_completed_planning_lookahead"
                 )
 
             if installed_next_target and len(self.active_target_gates) > 0:
-                if self.promoted_lookahead_to_active:
+                if self.continued_existing_plan_after_completion:
+                    self.promoted_track_source = "existing_installed_plan"
+                elif self.pending_suffix_installed:
+                    self.promoted_track_source = "pending_suffix"
+                elif self.promoted_lookahead_to_active:
                     self.promoted_track_source = str(
                         (
                             self.pending_lookahead_handoff
@@ -6979,11 +7539,15 @@ class AutonomyAPI:
                     )
                 elif self.next_track_available_after_completion:
                     self.promoted_track_source = "race_order"
-                self.active_target_source = (
-                    "next_track_after_completion"
-                    if self.next_track_available_after_completion
-                    else "planning_lookahead_after_completion"
-                )
+                if (
+                    not self.continued_existing_plan_after_completion
+                    and not self.pending_suffix_installed
+                ):
+                    self.active_target_source = (
+                        "next_track_after_completion"
+                        if self.next_track_available_after_completion
+                        else "planning_lookahead_after_completion"
+                    )
                 self.next_target_installed_same_cycle = True
                 self.skipped_target_clear_after_completion = True
                 self.target_retained_after_completion = True
@@ -7047,6 +7611,9 @@ class AutonomyAPI:
         self.last_plan_start_gate_idx = self.current_gate_idx if not self.use_perception else None
         self.last_plan_end_gate_idx = None
         self.replan_time = time.time()
+        self.future_only_replan_preserved_active_segment = False
+        self.future_only_replan_reason = ""
+        self.replan_suppressed_reason = ""
         self.planning_horizon_track_ids = []
         self.planning_horizon_waypoint_count = 0
         self.planning_horizon_waypoints = ""
@@ -7360,6 +7927,63 @@ class AutonomyAPI:
         selected_waypoint_velocities = waypoint_velocities
         self.reset_plan_geometric_validation_debug()
 
+        if (
+            not validation_ok
+            and "z_corridor" in str(validation_debug.get("reason", ""))
+            and np.isfinite(float(vel[2]))
+            and float(vel[2]) < 0.0
+        ):
+            z_retry_vel = np.asarray(vel, dtype=float).reshape(3).copy()
+            original_vz = float(z_retry_vel[2])
+            z_retry_vel[2] = 0.0
+            z_retry_planner = MultiSegmentMinimumSnapPlanner()
+            z_retry_planner.update(
+                waypoints=waypoints,
+                times=times_opt,
+                v_start=z_retry_vel,
+                v_end=v_end,
+                a_start=np.zeros(3, dtype=float),
+                a_end=np.zeros(3, dtype=float),
+                j_start=np.zeros(3, dtype=float),
+                j_end=np.zeros(3, dtype=float),
+                waypoint_velocities=waypoint_velocities,
+            )
+            z_retry_ok, z_retry_debug = self.validate_minimum_snap_geometry(
+                z_retry_planner,
+                waypoints,
+            )
+            if z_retry_ok:
+                print(
+                    "[PLAN GEOMETRY] z-corridor retry accepted "
+                    f"v_start_z {original_vz:.3f}->0.000"
+                )
+                candidate_planner = z_retry_planner
+                validation_ok = True
+                validation_debug = z_retry_debug
+                self.plan_z_fallback_reason = (
+                    f"v_start_z_clamped_to_zero:{original_vz:.3f}"
+                )
+            else:
+                print(
+                    "[PLAN GEOMETRY] z-corridor retry failed "
+                    f"v_start_z {original_vz:.3f}->0.000 "
+                    f"reason={z_retry_debug['reason']} "
+                    f"min_z={z_retry_debug['plan_min_z']:.3f}"
+                )
+                self.plan_z_fallback_reason = (
+                    f"v_start_z_retry_failed:{z_retry_debug['reason']}"
+                )
+
+        if validation_ok:
+            self.plan_min_z = float(validation_debug.get("plan_min_z", np.nan))
+            self.plan_max_z = float(validation_debug.get("plan_max_z", np.nan))
+            self.plan_z_undershoot_m = float(
+                validation_debug.get("z_undershoot_m", 0.0)
+            )
+            self.plan_z_start_below_safe_min = bool(
+                validation_debug.get("z_start_below_safe_min", False)
+            )
+
         if not validation_ok:
             self.plan_geometric_validation_failed = True
             self.plan_validation_failed_segment_idx = int(validation_debug["segment_idx"])
@@ -7371,12 +7995,23 @@ class AutonomyAPI:
                 validation_debug["negative_progress_velocity_count"]
             )
             self.plan_validation_failure_reason = str(validation_debug["reason"])
+            self.plan_z_corridor_failed = "z_corridor" in self.plan_validation_failure_reason
+            self.plan_min_z = float(validation_debug.get("plan_min_z", np.nan))
+            self.plan_max_z = float(validation_debug.get("plan_max_z", np.nan))
+            self.plan_z_undershoot_m = float(
+                validation_debug.get("z_undershoot_m", 0.0)
+            )
+            self.plan_z_start_below_safe_min = bool(
+                validation_debug.get("z_start_below_safe_min", False)
+            )
             print(
                 "[PLAN GEOMETRY] candidate failed "
                 f"segment={self.plan_validation_failed_segment_idx} "
                 f"backward={self.plan_max_backward_progress_m:.3f}m "
                 f"overshoot={self.plan_max_overshoot_m:.3f}m "
                 f"neg_v_count={self.plan_negative_progress_velocity_count} "
+                f"min_z={self.plan_min_z:.3f}m "
+                f"z_undershoot={self.plan_z_undershoot_m:.3f}m "
                 f"reason={self.plan_validation_failure_reason}"
             )
 
@@ -7455,6 +8090,14 @@ class AutonomyAPI:
                 selected_target_waypoint_types = list(fallback_target_waypoint_types)
                 selected_waypoint_velocities = fallback_waypoint_velocities
                 self.plan_geometric_fallback_used = True
+                self.plan_min_z = float(fallback_debug.get("plan_min_z", np.nan))
+                self.plan_max_z = float(fallback_debug.get("plan_max_z", np.nan))
+                self.plan_z_undershoot_m = float(
+                    fallback_debug.get("z_undershoot_m", 0.0)
+                )
+                self.plan_z_start_below_safe_min = bool(
+                    fallback_debug.get("z_start_below_safe_min", False)
+                )
                 self.terminal_passthrough_extension_used = fallback_terminal_extension_used
                 self.terminal_passthrough_extension_point = fallback_terminal_extension_point
             else:
@@ -7473,6 +8116,17 @@ class AutonomyAPI:
                 self.plan_max_overshoot_m = float(fallback_debug["max_overshoot_m"])
                 self.plan_negative_progress_velocity_count = int(
                     fallback_debug["negative_progress_velocity_count"]
+                )
+                self.plan_z_corridor_failed = "z_corridor" in str(
+                    fallback_debug.get("reason", "")
+                )
+                self.plan_min_z = float(fallback_debug.get("plan_min_z", np.nan))
+                self.plan_max_z = float(fallback_debug.get("plan_max_z", np.nan))
+                self.plan_z_undershoot_m = float(
+                    fallback_debug.get("z_undershoot_m", 0.0)
+                )
+                self.plan_z_start_below_safe_min = bool(
+                    fallback_debug.get("z_start_below_safe_min", False)
                 )
                 self.plan_validation_failure_reason = (
                     f"fallback_failed:{fallback_debug['reason']}"
@@ -7537,6 +8191,12 @@ class AutonomyAPI:
         print("plan_max_overshoot_m:", self.plan_max_overshoot_m)
         print("plan_negative_progress_velocity_count:", self.plan_negative_progress_velocity_count)
         print("plan_validation_failure_reason:", self.plan_validation_failure_reason)
+        print("plan_z_corridor_failed:", self.plan_z_corridor_failed)
+        print("plan_min_z:", self.plan_min_z)
+        print("plan_max_z:", self.plan_max_z)
+        print("plan_z_undershoot_m:", self.plan_z_undershoot_m)
+        print("plan_z_fallback_reason:", self.plan_z_fallback_reason)
+        print("plan_z_start_below_safe_min:", self.plan_z_start_below_safe_min)
         print("post_completion_horizon_has_future:", self.post_completion_horizon_has_future)
         print("terminal_passthrough_extension_used:", self.terminal_passthrough_extension_used)
         print("terminal_passthrough_extension_point:", self.terminal_passthrough_extension_point)
@@ -8042,6 +8702,56 @@ class AutonomyAPI:
         self.has_commanded_yaw_reference = True
         return limited
 
+    def record_tracker_control_debug(self, state, dbg, roll_cmd, pitch_cmd, thrust_cmd):
+        def vec(name):
+            value = None if dbg is None else dbg.get(name)
+            if value is None:
+                return np.full(3, np.nan, dtype=float)
+            arr = np.asarray(value, dtype=float).reshape(-1)
+            if arr.size < 3:
+                out = np.full(3, np.nan, dtype=float)
+                out[:arr.size] = arr
+                return out
+            return arr[:3].copy()
+
+        raw_velocity = np.array([
+            self.telemetry.vel["vx"],
+            self.telemetry.vel["vy"],
+            self.telemetry.vel["vz"],
+        ], dtype=float)
+        velocity_input = np.asarray(state.vel, dtype=float).reshape(3)
+
+        self.tracker_velocity_input = velocity_input.copy()
+        self.tracker_velocity_was_sanitized = bool(
+            not np.all(np.isfinite(raw_velocity))
+            or not np.allclose(
+                np.nan_to_num(raw_velocity, nan=0.0, posinf=0.0, neginf=0.0),
+                velocity_input,
+                equal_nan=False,
+            )
+        )
+        self.tracker_e_p = vec("e_p")
+        self.tracker_e_v = vec("e_v")
+        self.tracker_a_ref = vec("a_ref")
+        self.tracker_a_fb = vec("a_fb")
+        self.tracker_a_cmd_raw = vec("a_cmd_raw_no_g")
+        self.tracker_a_cmd_limited = vec("a_cmd_no_g")
+        self.thrust_raw_before_clamp = float(
+            dbg.get("thrust_raw_before_clamp", np.nan) if dbg is not None else np.nan
+        )
+        self.thrust_cmd_after_clamp = float(
+            dbg.get("thrust_cmd_after_clamp", thrust_cmd) if dbg is not None else thrust_cmd
+        )
+        self.thrust_limited = bool(
+            dbg.get("thrust_limited", False) if dbg is not None else False
+        )
+        self.hover_thrust = float(
+            dbg.get("hover_thrust", self.tracker.thrust_hover) if dbg is not None else self.tracker.thrust_hover
+        )
+        self.vertical_thrust_after_tilt = float(
+            thrust_cmd * math.cos(float(roll_cmd)) * math.cos(float(pitch_cmd))
+        )
+
     def hold_no_target_control(self, state, current_yaw_rad):
         """
         Perception-only safety fallback for "no valid next gate".
@@ -8105,6 +8815,7 @@ class AutonomyAPI:
         if self.post_completion_grace_active:
             roll_cmd = 0.0
             pitch_cmd = 0.0
+        self.record_tracker_control_debug(state, dbg, roll_cmd, pitch_cmd, thrust_cmd)
 
         print("No active perception target; damping velocity and holding altitude/yaw.")
         print("state pos:", state.pos)
@@ -8204,6 +8915,7 @@ class AutonomyAPI:
         roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd, dbg = self.tracker.update(state, ref)
         roll_cmd = -roll_cmd
         pitch_cmd = -pitch_cmd
+        self.record_tracker_control_debug(state, dbg, roll_cmd, pitch_cmd, thrust_cmd)
 
         print("state pos:", state.pos)
         print("ref pos:", ref.pos)
