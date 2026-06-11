@@ -115,6 +115,86 @@ Acceptance criteria:
 - No planner, controller, YOLO, PnP, race progression, or logging behavior changes.
 - No files under `third_party/PyAIPilotExample/**` are modified, formatted, moved, renamed, deleted, generated, or committed.
 
+## Phase 0.25 - PyAIPilotExample Protocol Evidence Addendum
+
+Priority: P0.
+
+Purpose:
+
+- Capture concrete protocol facts from the read-only `third_party/PyAIPilotExample/**` reference files before implementation.
+- Convert the example-code findings into explicit adapter risks and decision gates.
+- Keep this phase docs/tooling-only; no runtime behavior changes.
+
+Primary files to update:
+
+- `docs/competition_adapter_plan.md`
+- `docs/competition_adapter_phase0_inventory.md`
+- Optional: `scripts/check_protected_paths.sh` if still missing.
+
+Implementation tasks:
+
+- Read, but do not modify, these reference files:
+  - `third_party/PyAIPilotExample/vision_rx.py`
+  - `third_party/PyAIPilotExample/mavlink_rx.py`
+  - `third_party/PyAIPilotExample/controller.py`
+  - `third_party/PyAIPilotExample/timesync.py`
+  - `third_party/PyAIPilotExample/setup.py`
+  - `third_party/PyAIPilotExample/main.py`
+
+- Record the following reference-code facts in the Phase 0 inventory:
+  - `main.py` defaults MAVLink simulator access to `SIM_SERVER_UDP_IP = "127.0.0.1"` and `SIM_SERVER_UDP_PORT = 14550`.
+  - `setup.py` creates the MAVLink connection with `mavutil.mavlink_connection("udpin:%s:%s" % (server_ip, server_udp_port))`.
+  - `setup.py` calls `sim_conn.wait_heartbeat()` before creating the MAVLink RX, timesync, vision RX, and controller components.
+  - `setup.py` constructs `TimeSync(sim_conn, shared_data)` directly; it does not call `TimeSync.create_timesync(...)`, so the reference code as written does not appear to start the timesync thread.
+  - `vision_rx.py` binds the UDP vision socket to `0.0.0.0:5600`.
+  - `vision_rx.py` uses header format little-endian `<IHHIIQ`, whose fields are `frame_id`, `chunk_id`, `total_chunks`, `jpeg_size`, `payload_size`, and `sim_time_ns`.
+  - `vision_rx.py` uses `struct.calcsize("<IHHIIQ")` for header size, receives up to `65536` bytes per UDP datagram, and reassembles chunks by `frame_id`.
+  - `vision_rx.py` concatenates chunks in `chunk_id` order, decodes JPEG bytes with `cv2.imdecode(..., cv2.IMREAD_COLOR)`, and passes an OpenCV BGR image to `process_frame(...)`.
+  - The reference vision receiver does not validate all fields required by this plan; adapter implementation must still validate header length, chunk IDs, total chunks, JPEG size, payload size, duplicate chunks, stale incomplete frames, and decode failures.
+  - `mavlink_rx.py` polls `recv_match(blocking=False)` and sleeps `0.001` seconds when no message is available.
+  - Candidate telemetry messages in `mavlink_rx.py` include `HEARTBEAT`, `TIMESYNC`, `ATTITUDE`, `LOCAL_POSITION_NED`, `ODOMETRY`, `HIGHRES_IMU`, `ENCAPSULATED_DATA`, `ACTUATOR_OUTPUT_STATUS`, `COLLISION`, and `DATA_TRANSMISSION_HANDSHAKE`.
+  - `mavlink_rx.py` reads `ATTITUDE` roll, pitch, yaw, rollspeed, pitchspeed, yawspeed, and `time_boot_ms`.
+  - `mavlink_rx.py` reads `LOCAL_POSITION_NED` fields `x`, `y`, `z`, `vx`, `vy`, `vz`, and `time_boot_ms`.
+  - `mavlink_rx.py` reads `ODOMETRY` position, quaternion, velocity, body rates, `time_usec`, and `reset_counter`.
+  - `ENCAPSULATED_DATA` may contain race status and track information; record it during observe mode but do not feed track/gate positions into autonomy behavior unless separately approved.
+  - `mavlink_rx.py` decodes race status with struct `<BQqqIq`.
+  - `mavlink_rx.py` decodes track gate data as NED position, NED orientation quaternion, width, and height.
+  - `timesync.py` defines `TIMESYNC_REQUEST_HZ = 10` and sends `timesync_send(now, 0)` with `now = time.time_ns()`.
+  - `controller.py` command examples include `SET_ACTUATOR_CONTROL_TARGET`, `SET_ATTITUDE_TARGET`, `SET_POSITION_TARGET_LOCAL_NED`, arm, and simulator reset command `31000`.
+  - `controller.py` `SET_ATTITUDE_TARGET` example uses body rates in `rad/s`, normalized thrust `0.0 .. 1.0`, type mask `ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE`, and dummy quaternion `[1, 0, 0, 0]`.
+  - `controller.py` `SET_POSITION_TARGET_LOCAL_NED` example uses `MAV_FRAME_LOCAL_NED`, velocity fields, and masks ignored position, acceleration, yaw, and yaw-rate fields.
+  - `controller.py` default `Controller.update()` calls motor-control output, not the attitude-target or position-target example paths.
+  - `controller.py` has `CONTROL_HZ = 250`, which exceeds the VADR-TS-002 command-rate limit and must not be copied into competition command publishing.
+  - `requirements.txt` lists reference dependencies including `pymavlink`, `opencv-python`, `numpy`, `matplotlib`, and `keyboard`; Phase 0.25 does not install dependencies.
+
+- Add an explicit Phase 5 precondition:
+  - Before implementing `SET_ATTITUDE_TARGET` mapping, document whether existing `AutonomyAPI.attitude_control()` returns attitude angles, body rates, yaw angle, yaw rate, normalized efforts, or another convention.
+  - If tuple semantics are unclear, stop Phase 5 and add a command-semantics note before coding the MAVLink mapping.
+
+- Add an explicit Phase 4 observe-mode requirement:
+  - Observe mode must record exact MAVLink message names, IDs, fields, field samples, rates, timestamp sources, system/component IDs, and whether `LOCAL_POSITION_NED` or `ODOMETRY` provides usable position and velocity.
+  - Do not assume local position/odometry just because `mavlink_rx.py` has handlers for those messages.
+
+- Add an explicit race/track-data caution:
+  - Simulator-provided race status may be logged for diagnostics.
+  - Simulator-provided track/gate geometry must not be used as a replacement for perception/gate-memory behavior in this adapter branch unless rules/specs explicitly allow it and a separate behavior change is approved.
+
+Acceptance criteria:
+
+- `docs/competition_adapter_phase0_inventory.md` has a “PyAIPilotExample protocol evidence” section.
+- `docs/competition_adapter_plan.md` contains this Phase 0.25 section or an equivalent addendum.
+- Phase 4 and Phase 5 decision gates include the telemetry and command-semantics clarifications above.
+- No runtime files are modified.
+- No files under `third_party/PyAIPilotExample/**` are modified, formatted, moved, renamed, deleted, generated into, staged, or committed.
+- If `scripts/check_protected_paths.sh` is added, it is non-runtime tooling only and does not install hooks automatically.
+
+Do not change:
+
+- Adapter implementation.
+- Existing runners.
+- Planner, controller, YOLO, PnP, perception, race progression, logging, or Gazebo diagnostics.
+- Files under `third_party/PyAIPilotExample/**`.
+
 ## Phase 0.5 - Minimal Gazebo Guard Skeleton
 
 Priority: P0.
@@ -302,6 +382,8 @@ Verification tasks before finalizing adapter behavior:
 - Treat `third_party/PyAIPilotExample/mavlink_rx.py` as read-only reference code; do not patch it to expose fields, alter timing, or simplify tests.
 - Run `observe` mode against the live simulator before building out command-enabled behavior and record the exact MAVLink message names, IDs, fields, rates, and timestamps emitted by the simulator.
 - This inventory can be performed by a minimal standalone observe script or a thin early runner skeleton; the full `competition_runner.py` does not need to exist yet.
+- Observe mode must record message IDs, system/component IDs, field samples, timestamp sources, observed rates, and freshness for each relevant MAVLink message.
+- Observe mode must specifically record whether `LOCAL_POSITION_NED` or `ODOMETRY` is emitted and whether either message provides usable position and velocity for the current planner/controller assumptions.
 - Cross-check VADR-TS-002 telemetry expectations, including `ATTITUDE`, `HIGHRES_IMU`, `TIMESYNC`, `HEARTBEAT`, command messages, orientation, linear velocities, and system status flags.
 - Specifically verify whether usable local position or odometry exists.
 - Record whether velocity is world-frame NED or body-frame.
@@ -312,6 +394,7 @@ Verification tasks before finalizing adapter behavior:
 Telemetry discovery gate:
 
 - Do not assume local position/odometry exists just because the current runtime needs it.
+- Do not assume local position/odometry exists just because `third_party/PyAIPilotExample/mavlink_rx.py` has handlers for `LOCAL_POSITION_NED` and `ODOMETRY`.
 - If the live simulator emits usable local position/odometry, implement the thin adapter mapping from that message into `VehicleState`.
 - If the live simulator does not emit usable local position/odometry, stop before command enablement and create a separate P0 state-estimation/VIO/EKF plan.
 - Do not hide missing position by fabricating position from stale data, gate observations, or Gazebo truth.
@@ -362,11 +445,14 @@ Primary files to add:
 Implementation tasks:
 
 - Accept either the raw tuple `(roll, pitch, yaw, thrust)` or `ControlCommand`.
+- Before implementing the MAVLink mapping, document whether existing `AutonomyAPI.attitude_control()` outputs roll/pitch/yaw attitude angles, body rates, yaw angle, yaw rate, normalized efforts, or another convention.
+- If tuple semantics are unclear, stop Phase 5 and add a command-semantics note before coding the MAVLink adapter.
 - Validate finite values and expected units.
 - After comparing with the simulator example, record the confirmed units and ranges for roll, pitch, yaw, and thrust, including radians versus degrees and normalized thrust versus any simulator-specific thrust field.
 - Convert roll/pitch/yaw into the MAVLink `SET_ATTITUDE_TARGET` representation required by the simulator.
 - Verify whether the simulator expects attitude quaternion fields, body-rate fields, ignored fields via type mask, or a combination.
 - Verify roll/pitch/yaw units and frame semantics before constructing the quaternion or attitude target payload.
+- Compare the existing tuple semantics against the read-only `controller.py` evidence that its `SET_ATTITUDE_TARGET` example ignores attitude quaternion and uses body rates plus normalized thrust.
 - Preserve the existing thrust value except for protocol-level field formatting or clamping already required by MAVLink message validity.
 - Attach timestamps, sequence counters, target system/component, and type masks if required by the MAVLink library or simulator example.
 - Enforce command publication rate strictly below `100 Hz`.
