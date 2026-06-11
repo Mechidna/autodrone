@@ -38,6 +38,13 @@ from autonomy_core.perception.gate_memory import GateMemory
 from autonomy_core.perception.corner_measurement import CornerMeasurement
 from autonomy_core.perception.gate_pipeline import build_detection_flow_debug_fields
 from autonomy_core.launch.race_progression import RaceProgression
+from autonomy_core.racing.race_admission import (
+    accept_track_into_race_order as accept_track_into_race_order_impl,
+    apply_landmark_merge_event as apply_landmark_merge_event_impl,
+    assign_race_order_from_progress as assign_race_order_from_progress_impl,
+    refresh_landmark_merges as refresh_landmark_merges_impl,
+    refresh_race_order_from_memory as refresh_race_order_from_memory_impl,
+)
 from dataclasses import dataclass
 
 
@@ -5257,312 +5264,19 @@ class AutonomyAPI:
         return canonical_track_id_impl(self, track_id)
 
     def apply_landmark_merge_event(self, merge_event):
-        self.duplicate_radius_used = self.gate_memory.duplicate_merge_radius
-        self.pairwise_committed_track_distances = ";".join(
-            f"{a}-{b}:{d:.2f}" for a, b, d in self.gate_memory.last_pairwise_distances
-        )
-        self.merge_candidate_pairs = ";".join(
-            f"{a}-{b}:{d:.2f}" for a, b, d in self.gate_memory.last_merge_candidate_pairs
-        )
-        self.merge_blocked_reason = self.gate_memory.last_merge_blocked_reason
-        if not merge_event or not merge_event.get("merged", False):
-            self.merged_into_track_id = None
-            self.duplicate_merge_reason = ""
-            self.suspected_duplicate_track = False
-            return
-
-        source_id = int(merge_event["source_id"])
-        target_id = int(merge_event["target_id"])
-        self.track_id_aliases[source_id] = target_id
-        self.merged_into_track_id = target_id
-        self.duplicate_merge_reason = merge_event.get("reason", "")
-        self.suspected_duplicate_track = True
-
-        source_completed = source_id in self.completed_track_ids_this_cycle
-        self.completed_track_ids_this_cycle.discard(source_id)
-        if source_completed:
-            self.completed_track_ids_this_cycle.add(target_id)
-        self.race_accepted_track_ids = [
-            self.canonical_track_id(tid) for tid in self.race_accepted_track_ids
-        ]
-        deduped = []
-        for tid in self.race_accepted_track_ids:
-            if tid is not None and tid not in deduped:
-                deduped.append(tid)
-        self.race_accepted_track_ids = deduped
-
-        self.race_progression.inferred_order = [
-            self.canonical_track_id(tid) for tid in self.race_progression.inferred_order
-        ]
-        order = []
-        for tid in self.race_progression.inferred_order:
-            if tid is not None and tid not in order:
-                order.append(tid)
-        self.race_progression.inferred_order = order
-        if self.race_progression.cursor > len(order):
-            self.race_progression.cursor = len(order)
-
-        if source_id in self.active_target_track_ids:
-            self.clear_active_perception_target(reason="active_target_merged_duplicate")
+        return apply_landmark_merge_event_impl(self, merge_event)
 
     def refresh_landmark_merges(self):
-        merge_event = self.gate_memory.merge_duplicate_committed_tracks()
-        self.apply_landmark_merge_event(merge_event)
-        return merge_event
+        return refresh_landmark_merges_impl(self)
 
     def accept_track_into_race_order(self, tr):
-        self.race_order_inserted = False
-        self.race_order_rejected_reason = ""
-        if tr is None or not tr.committed:
-            self.race_order_rejected_reason = "track_not_committed"
-            return False
-
-        if self.use_lookahead_gate_filter and not getattr(tr, "is_stable", False):
-            self.race_order_rejected_reason = getattr(
-                tr,
-                "promotion_blocked_reason",
-                "track_not_stable",
-            ) or "track_not_stable"
-            self.rejected_track_temporary_vs_permanent = "temporary"
-            self.active_target_admission_status = "pending_stability"
-            print(
-                f"TRACK {tr.id} blocked from promotion: "
-                f"reason={self.race_order_rejected_reason}"
-            )
-            return False
-
-        track_id = self.canonical_track_id(tr.id)
-        self.track_id = track_id
-        self.landmark_uncertainty = self.gate_memory.track_uncertainty(track_id)
-        canonical_track = self.gate_memory.get_track_by_id(track_id)
-        self.track_observations = 0 if canonical_track is None else canonical_track.hits
-        self.rejected_track_temporary_vs_permanent = ""
-
-        if track_id in self.race_accepted_track_ids:
-            self.active_target_admission_status = "accepted"
-            return True
-
-        if self.track_observations < self.gate_memory.commit_hits:
-            self.race_order_rejected_reason = "insufficient_observations"
-            self.rejected_track_temporary_vs_permanent = "temporary"
-            return False
-
-        if (
-            np.isfinite(self.landmark_uncertainty)
-            and self.landmark_uncertainty > self.gate_memory.duplicate_merge_radius
-        ):
-            self.race_order_rejected_reason = f"landmark_uncertainty_too_high:{self.landmark_uncertainty:.2f}"
-            self.rejected_track_temporary_vs_permanent = "temporary"
-            return False
-
-        if self.race_gate_count is not None and len(self.race_accepted_track_ids) >= self.race_gate_count:
-            self.race_order_rejected_reason = "race_gate_count_reached"
-            self.rejected_track_temporary_vs_permanent = "temporary"
-            return False
-
-        if self.is_near_completed_gate(tr.center, radius=self.gate_memory.duplicate_merge_radius):
-            self.race_order_rejected_reason = "near_completed_unique_gate"
-            self.rejected_track_temporary_vs_permanent = "temporary"
-            self.suspected_duplicate_track = True
-            return False
-
-        duplicate = None
-        for accepted_id in self.race_accepted_track_ids:
-            accepted = self.gate_memory.get_track_by_id(accepted_id)
-            if accepted is None:
-                continue
-            dist = float(np.linalg.norm(tr.center - accepted.center))
-            if dist < self.gate_memory.duplicate_merge_radius:
-                duplicate = accepted
-                break
-        if duplicate is not None:
-            self.gate_memory.merge_track_into(track_id, duplicate.id, reason="race_order_duplicate")
-            self.apply_landmark_merge_event(self.gate_memory.last_merge_event)
-            self.race_order_rejected_reason = "duplicate_of_accepted_race_gate"
-            self.rejected_track_temporary_vs_permanent = "merged"
-            self.suspected_duplicate_track = True
-            return False
-
-        self.race_accepted_track_ids.append(track_id)
-        self.race_order_inserted = True
-        self.active_target_admission_status = "accepted"
-        self.race_admitted_track_ids = list(self.race_accepted_track_ids)
-        print(
-            f"TRACK {track_id} admitted to race candidate pool; "
-            "sequence index assigned by geometric progress"
-        )
-        return True
+        return accept_track_into_race_order_impl(self, tr)
 
     def assign_race_order_from_progress(self, committed_tracks):
-        """Assign uncompleted tracks without letting a farther gate take the current slot."""
-        current_pos = np.array([
-            self.telemetry.pos["x"],
-            self.telemetry.pos["y"],
-            self.telemetry.pos["z"],
-        ], dtype=float)
-        previous_idx = int(self.current_gate_idx)
-        candidates = []
-        rejected = []
-
-        for tr in committed_tracks:
-            track_id = self.canonical_track_id(tr.id)
-            center_source = getattr(tr, "filtered_center_world", None)
-            if center_source is None:
-                center_source = getattr(tr, "center", None)
-            if track_id is None or center_source is None:
-                continue
-            center = np.asarray(center_source, dtype=float).reshape(3)
-            valid, reason = self.validate_planning_target(center)
-            if not valid:
-                rejected.append((track_id, reason))
-                continue
-            if track_id in self.completed_track_ids_this_cycle or self.is_near_completed_gate(center):
-                rejected.append((track_id, "completed_gate"))
-                continue
-            candidates.append({
-                "track": tr,
-                "track_id": track_id,
-                "center": center,
-                "distance": float(np.linalg.norm(center - current_pos)),
-                "progress": float("nan"),
-            })
-
-        candidates.sort(key=lambda item: (item["distance"], item["track_id"]))
-        self.current_gate_candidate_track_ids = [item["track_id"] for item in candidates]
-        self.selected_current_track_id = candidates[0]["track_id"] if candidates else None
-        self.rejected_current_track_ids = [
-            item["track_id"] for item in candidates[1:]
-        ] + [track_id for track_id, _ in rejected]
-
-        if len(candidates) >= 2:
-            nearest = candidates[0]["center"]
-            farthest = max(candidates[1:], key=lambda item: item["distance"])["center"]
-            course_direction = farthest - nearest
-            norm = float(np.linalg.norm(course_direction))
-            if norm > 1e-6:
-                course_direction /= norm
-                if float(np.dot(nearest - current_pos, course_direction)) < 0.0:
-                    course_direction *= -1.0
-            else:
-                course_direction = (nearest - current_pos) / max(
-                    float(np.linalg.norm(nearest - current_pos)), 1e-6
-                )
-        elif len(candidates) == 1:
-            course_direction = candidates[0]["center"] - current_pos
-            course_direction /= max(float(np.linalg.norm(course_direction)), 1e-6)
-        else:
-            course_direction = np.array([0.0, 1.0, 0.0], dtype=float)
-
-        for item in candidates:
-            item["progress"] = float(np.dot(item["center"] - current_pos, course_direction))
-
-        if candidates:
-            current = candidates[0]
-            future = sorted(
-                candidates[1:],
-                key=lambda item: (item["progress"], item["distance"], item["track_id"]),
-            )
-            assigned = [current] + future
-        else:
-            assigned = []
-
-        assigned_index = {
-            item["track_id"]: previous_idx + rank
-            for rank, item in enumerate(assigned)
-        }
-        self.future_lookahead_track_ids = [
-            item["track_id"] for item in assigned[1:]
-        ]
-
-        existing_order = [
-            self.canonical_track_id(track_id)
-            for track_id in self.race_progression.inferred_order
-        ]
-        completed_prefix = []
-        for track_id in existing_order[:previous_idx]:
-            if track_id is not None and track_id not in completed_prefix:
-                completed_prefix.append(track_id)
-
-        contiguous_order = list(completed_prefix)
-        missing_preceding = False
-        for item in assigned:
-            track_id = item["track_id"]
-            if missing_preceding or track_id not in self.race_accepted_track_ids:
-                missing_preceding = True
-                continue
-            contiguous_order.append(track_id)
-
-        self.race_progression.inferred_order = contiguous_order
-        self.race_progression.cursor = min(
-            max(int(self.race_progression.cursor), previous_idx),
-            len(contiguous_order),
-        )
-
-        rejection_parts = []
-        for item in assigned[1:]:
-            rejection_parts.append(
-                f"track{item['track_id']}:farther_than_current_track{self.selected_current_track_id}"
-            )
-        rejection_parts.extend(f"track{track_id}:{reason}" for track_id, reason in rejected)
-        self.current_selection_rejection_reason = ";".join(rejection_parts)
-
-        debug_parts = []
-        for rank, item in enumerate(assigned):
-            track_id = item["track_id"]
-            race_idx = assigned_index[track_id]
-            if rank == 0:
-                reason = "selected_nearest_valid_current_candidate"
-            elif track_id in self.race_accepted_track_ids:
-                reason = "future_gate_progress_order"
-            else:
-                reason = "future_gate_pending_race_admission"
-            if track_id in self.race_accepted_track_ids and track_id not in contiguous_order:
-                reason += "|withheld_until_preceding_gate_admitted"
-            center = item["center"]
-            debug_parts.append(
-                f"track{track_id}:center={center[0]:.2f}/{center[1]:.2f}/{center[2]:.2f},"
-                f"dist={item['distance']:.2f},progress={item['progress']:.2f},"
-                f"score={-item['progress']:.2f},prev_active={previous_idx},"
-                f"assigned={race_idx},reason={reason}"
-            )
-        for track_id, reason in rejected:
-            debug_parts.append(
-                f"track{track_id}:prev_active={previous_idx},assigned=None,reason=rejected:{reason}"
-            )
-        self.race_order_assignment_debug = ";".join(debug_parts)
-        if debug_parts:
-            print("[RACE ORDER ASSIGNMENT] " + self.race_order_assignment_debug)
+        return assign_race_order_from_progress_impl(self, committed_tracks)
 
     def refresh_race_order_from_memory(self):
-        self.refresh_landmark_merges()
-        committed_tracks = self.gate_memory.get_committed_tracks()
-        stable_tracks = self.gate_memory.get_stable_tracks()
-        self.update_gate_filter_summary_logs()
-        self.committed_track_centers_log = ";".join(
-            f"{tr.id}:{tr.center[0]:.2f},{tr.center[1]:.2f},{tr.center[2]:.2f}:h{tr.hits}"
-            for tr in committed_tracks
-        )
-        tracks_for_admission = stable_tracks if self.use_lookahead_gate_filter else committed_tracks
-        for tr in tracks_for_admission:
-            self.accept_track_into_race_order(tr)
-
-        self.assign_race_order_from_progress(committed_tracks)
-        valid_ids = {tr.id for tr in committed_tracks}
-        order = []
-        for tid in self.race_progression.inferred_order:
-            tid = self.canonical_track_id(tid)
-            if tid is None or tid not in valid_ids:
-                continue
-            if tid not in self.race_accepted_track_ids:
-                continue
-            if tid not in order:
-                order.append(tid)
-        self.race_progression.inferred_order = order
-        if self.race_progression.cursor > len(order):
-            self.race_progression.cursor = len(order)
-        self.race_order_track_ids = self.race_progression.order()
-        self.race_order_after_merge = list(self.race_order_track_ids)
-        return committed_tracks
+        return refresh_race_order_from_memory_impl(self)
 
     def clamp_reference_altitude(self, p_ref, v_ref, a_ref):
         self.last_target_z_clamped = False
