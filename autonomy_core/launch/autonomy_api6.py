@@ -29,6 +29,13 @@ from autonomy_core.planning.target_validation import (
     validate_perception_gate_center as validate_perception_gate_center_impl,
     validate_planning_target as validate_planning_target_impl,
 )
+from autonomy_core.planning.target_horizon import (
+    _append_planning_lookahead_targets as append_planning_lookahead_targets_impl,
+    build_waypoint_horizon as build_waypoint_horizon_impl,
+    build_waypoint_horizon_from_gt as build_waypoint_horizon_from_gt_impl,
+    build_waypoint_horizon_from_memory as build_waypoint_horizon_from_memory_impl,
+    finalize_planning_horizon_debug as finalize_planning_horizon_debug_impl,
+)
 from autonomy_core.planning.minimum_snap_planner_multi_time_optimized import MultiSegmentMinimumSnapPlanner
 from autonomy_core.launch.get_telemetry import GetTelemetry
 from autonomy_core.controller.attitude_controller3 import RPGHighLevelTracker
@@ -1131,215 +1138,18 @@ class AutonomyAPI:
         max_gates_ahead,
         allow_raw_candidates,
     ):
-        self.append_lookahead_called = True
-        self.append_lookahead_input_track_ids = [
-            int(getattr(tr, "id", -1))
-            for tr in sorted(self.gate_memory.tracks, key=lambda tr: tr.id)
-        ]
-        self.append_lookahead_selected_track_ids = []
-        self.append_lookahead_selected_centers = ""
-        self.append_lookahead_selected_types = ""
-        initial_selected_count = len(target_track_ids)
-        if not self.use_planning_lookahead_tracks:
-            self.tentative_lookahead_rejection_reason = "append_disabled"
-            return target_gates, target_track_ids, target_waypoint_types
-
-        remaining = int(max_gates_ahead) - len(target_gates)
-        if remaining <= 0:
-            self.tentative_lookahead_rejection_reason = "append_no_remaining_slots"
-            return target_gates, target_track_ids, target_waypoint_types
-
-        now = time.time()
-        self.prune_raw_planning_lookahead_candidates(now=now)
-        selected_ids = {tid for tid in target_track_ids if tid is not None and tid >= 0}
-        existing_points = [np.asarray(g, dtype=float).reshape(3) for g in target_gates]
-        self.planning_lookahead_track_ids = []
-        lookahead_sources = []
-
-        all_tracks = sorted(self.gate_memory.tracks, key=lambda tr: tr.id)
-        for tr in all_tracks:
-            if remaining <= 0:
-                break
-            track_id = self.canonical_track_id(tr.id)
-            if track_id is None or track_id in selected_ids:
-                if track_id is not None and track_id in selected_ids:
-                    self.horizon_track_decisions.setdefault(
-                        track_id, "included:hard_current_or_stable"
-                    )
-                continue
-            if track_id in self.completed_track_ids_this_cycle:
-                self.horizon_rejected_track_ids.append(track_id)
-                self.horizon_rejection_reason = "completed_this_lap"
-                self.horizon_track_decisions[track_id] = "excluded:completed_this_lap"
-                continue
-
-            is_hard_lookahead = bool(getattr(tr, "is_stable", False))
-            is_committed_unstable = bool(
-                getattr(tr, "committed", False)
-                and not getattr(tr, "is_stable", False)
-            )
-            if is_hard_lookahead:
-                center_source = getattr(tr, "center", None)
-            else:
-                center_source = getattr(tr, "filtered_center_world", None)
-                if center_source is None:
-                    center_source = getattr(tr, "center", None)
-            if center_source is None:
-                self.horizon_rejected_track_ids.append(track_id)
-                self.horizon_rejection_reason = "lookahead_missing_center"
-                self.horizon_track_decisions[track_id] = "excluded:lookahead_missing_center"
-                continue
-            center, reason = self._planning_target_safe_center(center_source)
-            if center is None:
-                self.horizon_rejected_track_ids.append(track_id)
-                self.horizon_rejection_reason = reason
-                self.horizon_track_decisions[track_id] = f"excluded:{reason}"
-                continue
-            waypoint_type = "hard_stable"
-            if is_hard_lookahead:
-                if tr.hits < self.planning_lookahead_min_hits:
-                    self.horizon_rejected_track_ids.append(track_id)
-                    self.horizon_rejection_reason = "lookahead_insufficient_hits"
-                    self.horizon_track_decisions[track_id] = "excluded:lookahead_insufficient_hits"
-                    continue
-                if self.is_near_completed_gate(center):
-                    self.horizon_rejected_track_ids.append(track_id)
-                    self.horizon_rejection_reason = "lookahead_completed_this_lap"
-                    self.horizon_track_decisions[track_id] = "excluded:lookahead_completed_this_lap"
-                    continue
-                if any(float(np.linalg.norm(center - p)) < self.gate_memory.commit_radius for p in existing_points):
-                    self.horizon_rejected_track_ids.append(track_id)
-                    self.horizon_rejection_reason = "lookahead_duplicate_selected"
-                    self.horizon_track_decisions[track_id] = "excluded:lookahead_duplicate_selected"
-                    continue
-                if float(np.linalg.norm(center - current_pos)) > self.max_detection_range:
-                    self.horizon_rejected_track_ids.append(track_id)
-                    self.horizon_rejection_reason = "lookahead_too_far"
-                    self.horizon_track_decisions[track_id] = "excluded:lookahead_too_far"
-                    continue
-            else:
-                reason = self._tentative_lookahead_rejection(
-                    tr=tr,
-                    track_id=track_id,
-                    center=center,
-                    current_pos=current_pos,
-                    selected_ids=selected_ids,
-                    existing_points=existing_points,
-                )
-                if reason:
-                    self.horizon_rejected_track_ids.append(track_id)
-                    self.horizon_rejection_reason = reason
-                    self.tentative_lookahead_rejection_reason = reason
-                    self.horizon_track_decisions[track_id] = f"excluded:{reason}"
-                    continue
-                waypoint_type = (
-                    "soft_committed_unstable"
-                    if is_committed_unstable
-                    else "soft_tentative"
-                )
-
-            target_gates.append(center.copy())
-            target_track_ids.append(track_id)
-            target_waypoint_types.append(waypoint_type)
-            selected_ids.add(track_id)
-            existing_points.append(center.copy())
-            self.planning_lookahead_track_ids.append(track_id)
-            self.horizon_track_decisions[track_id] = f"included:{waypoint_type}"
-            if waypoint_type in ("soft_committed_unstable", "soft_tentative"):
-                self.tentative_lookahead_used = True
-                self.tentative_lookahead_track_ids.append(track_id)
-                lookahead_sources.append(waypoint_type)
-            else:
-                lookahead_sources.append("hard_stable")
-            remaining -= 1
-
-        if allow_raw_candidates and remaining > 0:
-            for candidate in self.raw_planning_lookahead_candidates:
-                if remaining <= 0:
-                    break
-                center, reason = self._planning_target_safe_center(candidate["center"])
-                if center is None:
-                    self.horizon_rejection_reason = reason
-                    continue
-                if self.is_near_completed_gate(center):
-                    self.horizon_rejection_reason = "raw_lookahead_completed_this_lap"
-                    continue
-                if any(float(np.linalg.norm(center - p)) < self.gate_memory.commit_radius for p in existing_points):
-                    self.horizon_rejection_reason = "raw_lookahead_duplicate_selected"
-                    continue
-                if float(np.linalg.norm(center - current_pos)) > self.max_detection_range:
-                    self.horizon_rejection_reason = "raw_lookahead_too_far"
-                    continue
-
-                target_gates.append(center.copy())
-                target_track_ids.append(-1)
-                target_waypoint_types.append("soft_tentative")
-                existing_points.append(center.copy())
-                lookahead_sources.append("raw_rejected_clamped")
-                remaining -= 1
-
-        appended_ids = target_track_ids[initial_selected_count:]
-        appended_gates = target_gates[initial_selected_count:]
-        appended_types = target_waypoint_types[initial_selected_count:]
-        self.append_lookahead_selected_track_ids = list(appended_ids)
-        self.append_lookahead_selected_centers = ";".join(
-            f"{track_id}:{gate[0]:.2f},{gate[1]:.2f},{gate[2]:.2f}"
-            for gate, track_id in zip(appended_gates, appended_ids)
+        return append_planning_lookahead_targets_impl(
+            self,
+            current_pos,
+            target_gates,
+            target_track_ids,
+            target_waypoint_types,
+            max_gates_ahead,
+            allow_raw_candidates,
         )
-        self.append_lookahead_selected_types = " ".join(str(t) for t in appended_types)
-        if (
-            int(getattr(self, "tentative_lookahead_eligible_count", 0)) > 0
-            and not self.tentative_lookahead_used
-            and not self.tentative_lookahead_rejection_reason
-        ):
-            self.tentative_lookahead_rejection_reason = (
-                self.horizon_rejection_reason
-                or "eligible_tentative_not_selected"
-            )
-        self.planning_lookahead_used = len(lookahead_sources) > 0
-        self.planning_lookahead_source = " ".join(lookahead_sources)
-        return target_gates, target_track_ids, target_waypoint_types
 
     def finalize_planning_horizon_debug(self):
-        selected = {
-            self.canonical_track_id(tid)
-            for tid in self.active_target_track_ids + self.planning_lookahead_track_ids
-            if tid is not None
-        }
-        parts = []
-        for tr in sorted(self.gate_memory.tracks, key=lambda item: item.id):
-            tid = self.canonical_track_id(tr.id)
-            center = getattr(tr, "filtered_center_world", None)
-            if center is None:
-                center = getattr(tr, "center", np.full(3, np.nan))
-            center = np.asarray(center, dtype=float).reshape(3)
-            state = "stable" if getattr(tr, "is_stable", False) else "tentative"
-            decision = self.horizon_track_decisions.get(tid)
-            if decision is None:
-                decision = (
-                    "included:selected_horizon"
-                    if tid in selected
-                    else "excluded:not_selected_by_race_or_lookahead_policy"
-                )
-            parts.append(
-                f"track{tid}:state={state},center={center[0]:.2f}/{center[1]:.2f}/{center[2]:.2f},"
-                f"decision={decision}"
-            )
-        self.planning_track_horizon_debug = ";".join(parts)
-        active_center = (
-            np.asarray(self.active_target_center, dtype=float).reshape(3)
-            if self.active_target_center is not None
-            else np.full(3, np.nan)
-        )
-        self.planning_cycle_debug = (
-            f"gate_idx={self.current_gate_idx},active_track={self.active_target_track_id},"
-            f"active={active_center[0]:.2f}/{active_center[1]:.2f}/{active_center[2]:.2f},"
-            f"lookahead_ids={'/'.join(map(str,self.planning_lookahead_track_ids))},"
-            f"lookahead_centers={self.append_lookahead_selected_centers},"
-            f"types={self.planning_horizon_waypoint_types},"
-            f"tracks={self.planning_track_horizon_debug}"
-        )
-        print("[PLANNING FLOW] " + self.planning_cycle_debug)
+        return finalize_planning_horizon_debug_impl(self)
 
     # -------------------------------------------------------------------------
     # Perception / memory
@@ -6027,290 +5837,25 @@ class AutonomyAPI:
         return self.gt_gates[self.current_gate_idx].copy()
 
     def build_waypoint_horizon_from_memory(self, current_pos, max_gates_ahead=3):
-        """
-        Build planning horizon from explicit race progression.
-
-        No spatial coordinate is used to order gates. A predefined race order
-        wins if supplied; otherwise committed track IDs are appended in
-        discovery order and the progression cursor advances through that list.
-
-        Returns:
-            waypoints: np.ndarray shape (N,3)
-            target_gates: list[np.ndarray]
-            target_track_ids: list[int]
-        """
-        committed_tracks = self.refresh_race_order_from_memory()
-        self.race_progression.update_clearance(current_pos, self.gate_memory.get_track_by_id)
-        self.target_rejected_completed = False
-        self.rejected_wrong_order = False
-        self.rejected_duplicate = False
-        self.rejected_completed_this_lap = False
-        self.candidate_track_id = None
-        self.candidate_center = None
-        self.candidate_order_score = float("nan")
-        self.lap_reset_triggered = False
-        self.next_valid_target_found = False
-        self.valid_candidate_count = 0
-        self.selected_next_gate_track_id = None
-        self.selected_next_gate_stability_score = float("nan")
-        self.selected_target_source = ""
-        self.horizon_build_cursor = self.race_progression.cursor
-        self.horizon_available_order = []
-        self.horizon_selected_track_ids = []
-        self.horizon_rejected_track_ids = []
-        self.horizon_rejection_reason = ""
-        self.planning_lookahead_track_ids = []
-        self.planning_lookahead_source = ""
-        self.planning_lookahead_used = False
-        self.tentative_lookahead_used = False
-        self.tentative_lookahead_track_ids = []
-        self.tentative_lookahead_centers = ""
-        self.tentative_lookahead_rejection_reason = ""
-        self.append_lookahead_called = False
-        self.append_lookahead_input_track_ids = []
-        self.append_lookahead_selected_track_ids = []
-        self.append_lookahead_selected_centers = ""
-        self.append_lookahead_selected_types = ""
-        self.horizon_track_decisions = {}
-        self.planning_track_horizon_debug = ""
-        self.planning_cycle_debug = ""
-
-        if len(committed_tracks) == 0:
-            self.planning_horizon_waypoint_types = "start"
-            self._planning_target_waypoint_types = []
-            return np.array([current_pos], dtype=float), [], []
-
-        order = self.race_progression.order()
-        self.horizon_available_order = list(order)
-        target_tracks = []
-        target_center_overrides = {}
-        selected_track_ids = set()
-        first_selected_order_idx = None
-
-        if (
-            self.race_progression.cursor < len(order)
-            and self.selected_current_track_id is not None
-            and self.canonical_track_id(order[self.race_progression.cursor])
-            != self.canonical_track_id(self.selected_current_track_id)
-        ):
-            blocked_id = self.canonical_track_id(order[self.race_progression.cursor])
-            self.horizon_rejected_track_ids.append(blocked_id)
-            self.horizon_rejection_reason = "farther_future_track_cannot_be_hard_current"
-            self.current_selection_rejection_reason = (
-                f"track{blocked_id}:farther_future_track_cannot_be_hard_current;"
-                f"selected_current_track={self.selected_current_track_id}"
-            )
-            self.horizon_track_decisions[blocked_id] = (
-                "excluded:farther_future_track_cannot_be_hard_current"
-            )
-            self.planning_horizon_waypoint_types = "start"
-            self._planning_target_waypoint_types = []
-            return np.array([current_pos], dtype=float), [], []
-
-        for order_idx in range(self.race_progression.cursor, len(order)):
-            if len(target_tracks) >= max_gates_ahead:
-                break
-
-            track_id = order[order_idx]
-            if track_id in selected_track_ids:
-                continue
-
-            tr = self.gate_memory.get_track_by_id(track_id)
-            handoff = self.pending_lookahead_handoff
-            is_handoff = bool(
-                handoff is not None
-                and self.canonical_track_id(handoff.get("track_id")) == self.canonical_track_id(track_id)
-            )
-            if tr is None or (not tr.committed and not is_handoff):
-                self.horizon_rejected_track_ids.append(track_id)
-                self.horizon_rejection_reason = "order_track_not_committed"
-                self.horizon_track_decisions[track_id] = "excluded:order_track_not_committed"
-                if is_handoff:
-                    self.promotion_blocked_reason = "handoff_track_missing_or_not_committed"
-                # Sequence integrity matters more than horizon length. With a
-                # predefined race order, do not skip an unavailable next gate
-                # and accidentally plan to a later gate.
-                break
-            if (
-                self.use_lookahead_gate_filter
-                and not getattr(tr, "is_stable", False)
-                and track_id not in self.race_accepted_track_ids
-                and not is_handoff
-            ):
-                self.last_perception_accepted = False
-                self.last_perception_rejection_reason = "track_not_stable"
-                self.active_target_admission_status = "pending_stability"
-                self.horizon_rejected_track_ids.append(track_id)
-                self.horizon_rejection_reason = "track_not_stable"
-                self.horizon_track_decisions[track_id] = "excluded:track_not_stable"
-                print(
-                    f"[TARGET REJECT] reason=track_not_stable "
-                    f"track_id={tr.id} blocked={getattr(tr, 'promotion_blocked_reason', '')}"
-                )
-                self.promotion_blocked_reason = (
-                    getattr(tr, "promotion_blocked_reason", "")
-                    or "track_not_stable"
-                )
-                break
-            candidate_center = (
-                np.asarray(handoff["center"], dtype=float).reshape(3)
-                if is_handoff
-                else np.asarray(tr.center, dtype=float).reshape(3)
-            )
-            valid, reason = self.validate_planning_target(candidate_center)
-            if not valid:
-                self.last_perception_accepted = False
-                self.last_perception_rejection_reason = reason
-                self.horizon_rejected_track_ids.append(track_id)
-                self.horizon_rejection_reason = reason
-                self.horizon_track_decisions[track_id] = f"excluded:{reason}"
-                if is_handoff:
-                    self.promotion_blocked_reason = f"planning_target_invalid:{reason}"
-                print(f"[TARGET REJECT] reason={reason} track_id={tr.id} center={tr.center}")
-                break
-            if self.is_near_completed_gate(candidate_center):
-                self.last_perception_accepted = False
-                self.last_perception_rejection_reason = "already_completed_landmark"
-                self.target_rejected_completed = True
-                self.rejected_completed_this_lap = True
-                self.horizon_rejected_track_ids.append(track_id)
-                self.horizon_rejection_reason = "already_completed_landmark"
-                self.horizon_track_decisions[track_id] = "excluded:already_completed_landmark"
-                if is_handoff:
-                    self.promotion_blocked_reason = "already_completed_landmark"
-                print(f"[TARGET REJECT] reason=already_completed_landmark track_id={tr.id} center={tr.center}")
-                continue
-            if track_id not in self.race_accepted_track_ids and not is_handoff:
-                self.last_perception_accepted = False
-                self.last_perception_rejection_reason = "track_not_admitted_to_race"
-                self.active_target_admission_status = "rejected"
-                self.horizon_rejected_track_ids.append(track_id)
-                self.horizon_rejection_reason = "track_not_admitted_to_race"
-                self.horizon_track_decisions[track_id] = "excluded:track_not_admitted_to_race"
-                print(f"[TARGET REJECT] reason=track_not_admitted_to_race track_id={tr.id} center={tr.center}")
-                continue
-            valid, reason = self.validate_candidate_target(candidate_center, current_pos, track_id=tr.id)
-            if not valid:
-                self.last_perception_accepted = False
-                self.last_perception_rejection_reason = reason
-                self.horizon_rejected_track_ids.append(track_id)
-                self.horizon_rejection_reason = reason
-                self.horizon_track_decisions[track_id] = f"excluded:{reason}"
-                if is_handoff:
-                    self.promotion_blocked_reason = f"candidate_target_invalid:{reason}"
-                print(f"[TARGET REJECT] reason={reason} track_id={tr.id} center={tr.center}")
-                continue
-            target_tracks.append(tr)
-            if is_handoff:
-                target_center_overrides[track_id] = candidate_center.copy()
-                self.promoted_lookahead_to_active = True
-                self.promoted_track_id = track_id
-                self.promoted_track_center = candidate_center.copy()
-                self.promotion_blocked_reason = ""
-                self.active_target_admission_status = "promoted_lookahead"
-                print(
-                    "[LOOKAHEAD HANDOFF] promoted "
-                    f"track_id={track_id} center={candidate_center.tolist()} "
-                    f"previous_ids={self.previous_horizon_track_ids} "
-                    f"previous_types={self.previous_horizon_waypoint_types}"
-                )
-            self.horizon_track_decisions[track_id] = (
-                "included:hard_current" if len(target_tracks) == 1 else "included:hard_stable"
-            )
-            selected_track_ids.add(track_id)
-            self.valid_candidate_count += 1
-            if len(target_tracks) == 1:
-                self.selected_next_gate_track_id = tr.id
-                self.selected_next_gate_stability_score = float(getattr(tr, "stability_score", np.nan))
-                self.selected_target_source = "stable_track" if getattr(tr, "is_stable", False) else "race_admitted_track"
-                print(
-                    f"TRACK {tr.id} selected as next target: "
-                    f"score={self.selected_next_gate_stability_score:.2f} "
-                    f"source={self.selected_target_source}"
-                )
-            if first_selected_order_idx is None:
-                first_selected_order_idx = order_idx
-
-        target_gates = [
-            target_center_overrides.get(tr.id, tr.center).copy()
-            for tr in target_tracks
-        ]
-        target_track_ids = [tr.id for tr in target_tracks]
-        target_waypoint_types = [
-            "hard_current" if i == 0 else "hard_stable"
-            for i in range(len(target_gates))
-        ]
-
-        if len(target_gates) == 0:
-            self.planning_horizon_waypoint_types = "start"
-            self._planning_target_waypoint_types = []
-            return np.array([current_pos], dtype=float), [], []
-
-        target_gates, target_track_ids, target_waypoint_types = self._append_planning_lookahead_targets(
-            current_pos=np.asarray(current_pos, dtype=float).reshape(3),
-            target_gates=target_gates,
-            target_track_ids=target_track_ids,
-            target_waypoint_types=target_waypoint_types,
+        return build_waypoint_horizon_from_memory_impl(
+            self,
+            current_pos,
             max_gates_ahead=max_gates_ahead,
-            allow_raw_candidates=True,
         )
-        self.update_lookahead_pipeline_debug()
-        self.horizon_selected_track_ids = list(target_track_ids)
-        self.planning_horizon_waypoint_types = " ".join(["start"] + target_waypoint_types)
-        self._planning_target_waypoint_types = list(target_waypoint_types)
-
-        if len(target_tracks) == 0:
-            if len(target_gates) == 0:
-                self.planning_horizon_waypoint_types = "start"
-                self._planning_target_waypoint_types = []
-                return np.array([current_pos], dtype=float), [], []
-
-        if first_selected_order_idx is not None:
-            self.race_progression.cursor = first_selected_order_idx
-
-        if len(target_gates) > 0:
-            self.last_valid_target = target_gates[0].copy()
-            self.active_target_source = "memory_track"
-            first_track = self.gate_memory.get_track_by_id(target_track_ids[0]) if target_track_ids[0] >= 0 else None
-            if first_track is None or target_track_ids[0] not in self.race_accepted_track_ids:
-                self.selected_target_source = "planning_lookahead"
-            else:
-                self.selected_target_source = (
-                    "stable_track" if getattr(first_track, "is_stable", False) else "race_admitted_track"
-                )
-            self.active_target_track_id = target_track_ids[0]
-            self.next_valid_target_found = True
-
-        return np.vstack([current_pos] + target_gates), target_gates, target_track_ids
 
     def build_waypoint_horizon_from_gt(self, current_pos, max_gates_ahead=3):
-        if not self.use_perception:
-            max_gates_ahead = 1
-
-        remaining_gates = self.gt_gates[self.current_gate_idx:self.current_gate_idx + max_gates_ahead]
-        if len(remaining_gates) == 0:
-            self.planning_horizon_waypoint_types = "start"
-            self._planning_target_waypoint_types = []
-            return np.array([current_pos], dtype=float), [], []
-
-        target_gates = [np.asarray(g, dtype=float) for g in remaining_gates]
-        target_track_ids = [-1] * len(target_gates)  # no memory-track IDs in GT mode
-        target_waypoint_types = ["hard_current"] + ["hard_stable"] * max(0, len(target_gates) - 1)
-        self.planning_horizon_waypoint_types = " ".join(["start"] + target_waypoint_types)
-        self._planning_target_waypoint_types = list(target_waypoint_types)
-        return np.vstack([current_pos] + target_gates), target_gates, target_track_ids
+        return build_waypoint_horizon_from_gt_impl(
+            self,
+            current_pos,
+            max_gates_ahead=max_gates_ahead,
+        )
 
     def build_waypoint_horizon(self, current_pos, max_gates_ahead=3):
-        """
-        Unified horizon builder.
-        Returns:
-            waypoints: np.ndarray shape (N,3)
-            target_gates: list[np.ndarray]
-            target_track_ids: list[int]
-        """
-        if self.use_perception:
-            return self.build_waypoint_horizon_from_memory(current_pos, max_gates_ahead=max_gates_ahead)
-        return self.build_waypoint_horizon_from_gt(current_pos, max_gates_ahead=max_gates_ahead)
+        return build_waypoint_horizon_impl(
+            self,
+            current_pos,
+            max_gates_ahead=max_gates_ahead,
+        )
 
     # -------------------------------------------------------------------------
     # Gate advancement
