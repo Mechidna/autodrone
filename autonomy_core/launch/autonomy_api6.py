@@ -52,6 +52,11 @@ from autonomy_core.racing.race_admission import (
     refresh_landmark_merges as refresh_landmark_merges_impl,
     refresh_race_order_from_memory as refresh_race_order_from_memory_impl,
 )
+from autonomy_core.racing.gate_advancement import (
+    clear_active_perception_target as clear_active_perception_target_impl,
+    compute_gate_pass_geometry as compute_gate_pass_geometry_impl,
+    reset_crossing_debug as reset_crossing_debug_impl,
+)
 from dataclasses import dataclass
 
 
@@ -5603,105 +5608,13 @@ class AutonomyAPI:
         return True
 
     def reset_crossing_debug(self):
-        self.crossing_true_gate_center = np.full(3, np.nan, dtype=float)
-        self.crossing_vehicle_position = np.full(3, np.nan, dtype=float)
-        self.crossing_error = np.full(3, np.nan, dtype=float)
-        self.crossing_lateral_error_xz = float("nan")
+        return reset_crossing_debug_impl(self)
 
     def compute_gate_pass_geometry(self, position, target):
-        position = np.asarray(position, dtype=float).reshape(3)
-        target = np.asarray(target, dtype=float).reshape(3)
-
-        if self.approach_vector is None or not np.all(np.isfinite(self.approach_vector)):
-            self.gate_progress_along_approach = float("nan")
-            self.gate_lateral_error = float("nan")
-            self.gate_plane_crossed = False
-            return False, "missing_approach_vector"
-
-        rel = position - target
-        progress = float(np.dot(rel, self.approach_vector))
-        lateral_vec = rel - progress * self.approach_vector
-        lateral_error = float(np.linalg.norm(lateral_vec))
-
-        previous_progress = self.previous_gate_progress_along_approach
-        crossed = previous_progress is not None and previous_progress <= 0.0 <= progress
-
-        self.gate_progress_along_approach = progress
-        self.gate_lateral_error = lateral_error
-        self.gate_plane_crossed = bool(crossed)
-
-        passed_beyond = progress > self.gate_progress_threshold
-        inside_gate_radius = lateral_error < self.gate_pass_radius
-        complete = inside_gate_radius and (passed_beyond or crossed)
-
-        self.previous_gate_progress_along_approach = progress
-
-        if complete:
-            self.near_gate_but_not_crossed = False
-            return True, "crossed_gate_plane" if crossed else "past_gate_center"
-
-        if self.distance_to_active_target <= self.race_progression.pass_radius:
-            self.near_gate_but_not_crossed = True
-            if not inside_gate_radius:
-                return False, f"lateral_error_too_large:{lateral_error:.2f}"
-            return False, f"not_past_gate_plane:{progress:.2f}"
-
-        self.near_gate_but_not_crossed = False
-        return False, "not_near_gate"
+        return compute_gate_pass_geometry_impl(self, position, target)
 
     def clear_active_perception_target(self, reason=""):
-        """
-        Remove the completed/stale perception target from all navigation hooks.
-
-        This is deliberately perception-only. If no valid next gate is
-        available, the controller should hold stable attitude instead of
-        continuing to track or yaw toward the completed gate.
-        """
-        if not self.use_perception:
-            return
-
-        self.target_clear_reason = reason
-
-        self.active_target_gates = []
-        self.active_target_track_ids = []
-        self.current_target_idx = 0
-        self.current_target_gate = None
-        self.current_gate_pos = None
-        self.last_valid_target = None
-        self.active_waypoints = None
-        self.active_times = None
-        self.p_ref = None
-        self.v_ref = None
-        self.a_ref = None
-        self.active_target_center = None
-        self.active_target_center_at_plan = None
-        self.active_target_latest_filtered_center = None
-        self.active_target_shift_m = float("nan")
-        self.active_target_shift_frames = 0
-        self.active_target_shift_replan_triggered = False
-        self.pending_active_target_correction = None
-        self.approach_start_position = None
-        pos = np.array([
-            self.telemetry.pos["x"],
-            self.telemetry.pos["y"],
-            self.telemetry.pos["z"],
-        ], dtype=float)
-        self.perception_hold_position = pos.copy()
-        telemetry_yaw = float(self.telemetry.rpy["yaw"])
-        self.perception_hold_yaw = self.get_perception_yaw_hold_reference(telemetry_yaw)
-        if reason in ("gate_completed", "completed_target_in_control"):
-            self.post_completion_grace_until = time.time() + self.no_target_grace_s
-            self.post_completion_grace_active = True
-        self.hold_anchor = np.array([pos[0], pos[1], pos[2]], dtype=float)
-        self.hold_anchor_source = "completion_altitude"
-        self.completed_gate_reference_blocked = True
-        self.active_target_source = "cleared"
-        self.active_target_track_id = None
-        self.active_target_cleared = True
-        self.next_valid_target_found = False
-        self.target_retained_after_completion = False
-        self._reset_pending_suffix_state(f"active_target_cleared:{reason}")
-        print(f"[TARGET CLEAR] perception active target cleared reason={reason}")
+        return clear_active_perception_target_impl(self, reason)
 
     def _continue_existing_plan_after_completion(self, completed_track_id, next_track_id):
         """
