@@ -904,62 +904,285 @@ Risks:
 - Perception code is highly coupled to debug overlays and Gazebo truth diagnostics.
 - Moving transform helpers before frame contracts are explicit may hide frame bugs.
 
-## Phase 9 - Extract Race And Target Selection Helpers
+## Phase 9A - Extract Target Validation Helpers
 
 Purpose:
-Separate race-order, candidate validation, and target/horizon selection from unrelated control/perception code.
+Separate low-risk target ID and candidate validation helpers before any race
+progression, horizon building, or gate advancement code is moved.
+
+Phase 9 hard rules:
+
+- Do not modify `px4_runner.py` or `flight_logger.py` in Phase 9A unless
+  absolutely necessary for import compatibility.
+- Do not change race progression semantics, target thresholds, duplicate
+  filtering, `GateMemory` behavior, planner behavior, suffix behavior,
+  perception behavior, or logging schema in any Phase 9 subphase.
+- Keep `AutonomyAPI` wrappers for all moved methods until a later explicit
+  compatibility phase changes public API shape.
+
+Hard gates:
+
+- Do not start Phase 9B until Phase 9A passes full sim acceptance.
+- Do not start Phase 9C until Phase 9B passes full sim acceptance.
+- Do not start Phase 9D until Phase 9C passes full sim acceptance.
 
 Files to edit:
 
-- Verify target module in Phase 1 inventory. Likely one of:
-  - `autonomy_core/planning/target_horizon.py`
-  - `autonomy_core/racing/target_selection.py`
-  - keep inside `trajectory_manager.py` if coupling is still high
+- `autonomy_core/planning/target_validation.py`
 - `autonomy_core/launch/autonomy_api6.py`
 
 Files not to edit:
 
-- `autonomy_core/launch/race_progression.py`, unless import-only changes are needed
 - `px4_runner.py`
 - `flight_logger.py`
+- `autonomy_core/launch/race_progression.py`
+- planner solve/install modules
+- perception modules
+- suffix modules
 
-Expected behavior:
+Methods allowed to move:
 
-- Race progression remains sequence-based over persistent gate track IDs.
-- Landmark memory is not deleted when a gate is passed.
-- Predefined race order behavior remains unchanged.
-
-Candidate move or wrap:
-
+- `canonical_track_id(...)`
 - `validate_perception_gate_center(...)`
 - `is_near_completed_gate(...)`
 - `find_duplicate_committed_track(...)`
 - `validate_planning_target(...)`
 - `validate_candidate_target(...)`
-- `canonical_track_id(...)`
-- landmark merge helpers
-- race-order assignment helpers
+
+Methods not allowed to move:
+
+- `advance_gate_if_needed(...)`
 - `build_waypoint_horizon_from_memory(...)`
 - `build_waypoint_horizon_from_gt(...)`
 - `build_waypoint_horizon(...)`
-- `advance_gate_if_needed(...)` internals if safe
+- `_append_planning_lookahead_targets(...)`
+- race-order assignment helpers
+- landmark merge helpers
+- suffix install/continuation helpers
 
 Validation commands:
 
 ```bash
+python3 -m py_compile autonomy_core/planning/target_validation.py
 python3 -m py_compile autonomy_core/launch/autonomy_api6.py
+python3 - <<'PY'
+from autonomy_core.launch.autonomy_api6 import AutonomyAPI
+api = AutonomyAPI(use_perception=False, race_gate_count=3)
+print(api.canonical_track_id("3"))
+PY
 ```
 
-Success criteria:
+Full-sim acceptance requirement:
 
-- Gate advancement behavior remains unchanged.
-- Race-order log/debug fields remain populated.
-- No target skipping or duplicate target regression is introduced.
+- Same scenario as the Phase 7R acceptance run must complete all 3 gates.
+- No target skipping, duplicate target regression, or threshold behavior change
+  may appear in logs.
+- Validation and duplicate debug/log fields must remain populated with the same
+  names and semantics.
 
 Risks:
 
-- Candidate filtering, race order, and perception memory are tightly coupled.
-- This phase may need to be split after Phase 1 inventory.
+- Even validation helpers read many facade fields, so wrappers should stay thin.
+- Duplicate checks can indirectly affect race order if any threshold or ID
+  canonicalization changes.
+
+## Phase 9B - Extract Landmark Merge / Race Admission Helpers
+
+Purpose:
+Move only landmark merge and race-admission helper logic after target validation
+has proven behavior-preserving in sim.
+
+Files to edit:
+
+- `autonomy_core/racing/race_admission.py`
+- `autonomy_core/launch/autonomy_api6.py`
+
+Files not to edit:
+
+- `px4_runner.py`
+- `flight_logger.py`
+- planner solve/install modules
+- perception modules
+- suffix modules
+- horizon building modules
+
+Methods allowed to move:
+
+- `apply_landmark_merge_event(...)`
+- `refresh_landmark_merges(...)`
+- `accept_track_into_race_order(...)`
+- `assign_race_order_from_progress(...)`
+- `refresh_race_order_from_memory(...)`
+
+Methods not allowed to move:
+
+- target validation helpers not already moved in Phase 9A
+- `build_waypoint_horizon_from_memory(...)`
+- `build_waypoint_horizon_from_gt(...)`
+- `build_waypoint_horizon(...)`
+- `_append_planning_lookahead_targets(...)`
+- `advance_gate_if_needed(...)`
+- gate-completion and post-completion fallback helpers
+
+Validation commands:
+
+```bash
+python3 -m py_compile autonomy_core/racing/race_admission.py
+python3 -m py_compile autonomy_core/launch/autonomy_api6.py
+python3 - <<'PY'
+from autonomy_core.launch.autonomy_api6 import AutonomyAPI
+api = AutonomyAPI(use_perception=False, race_gate_count=3)
+print(api.race_progression.order())
+PY
+```
+
+Full-sim acceptance requirement:
+
+- Only start after Phase 9A passes sim.
+- Same scenario must complete all 3 gates.
+- Track IDs must become tentative, race-admitted/race-order, active, and
+  completed in the same sequence as the accepted baseline.
+- All race-order debug/log fields must remain populated with the same names and
+  meanings.
+
+Risks:
+
+- Landmark merge behavior and race admission are tightly coupled to perception
+  memory and duplicate filtering.
+- A small ordering change can alter active target selection several cycles later.
+
+## Phase 9C - Extract Horizon Building Helpers
+
+Purpose:
+Move waypoint horizon construction only after validation and race admission have
+passed sim independently, while preserving planner behavior.
+
+Files to edit:
+
+- `autonomy_core/planning/target_horizon.py`
+- `autonomy_core/launch/autonomy_api6.py`
+
+Files not to edit:
+
+- `px4_runner.py`
+- `flight_logger.py`
+- `autonomy_core/launch/race_progression.py`
+- perception modules
+- suffix modules
+- controller/control modules
+- planner solve/install logic unless import-only changes are unavoidable
+
+Methods allowed to move:
+
+- `build_waypoint_horizon_from_memory(...)`
+- `build_waypoint_horizon_from_gt(...)`
+- `build_waypoint_horizon(...)`
+- `_append_planning_lookahead_targets(...)`
+- `finalize_planning_horizon_debug(...)`
+
+Methods not allowed to move:
+
+- `path_plan(...)`
+- planner solve/install logic
+- `advance_gate_if_needed(...)`
+- gate-completion and post-completion fallback helpers
+- suffix creation/install helpers
+- race progression mutation methods
+
+Validation commands:
+
+```bash
+python3 -m py_compile autonomy_core/planning/target_horizon.py
+python3 -m py_compile autonomy_core/launch/autonomy_api6.py
+python3 - <<'PY'
+from autonomy_core.launch.autonomy_api6 import AutonomyAPI
+api = AutonomyAPI(use_perception=False, race_gate_count=3)
+print(hasattr(api, "build_waypoint_horizon"))
+PY
+```
+
+Full-sim acceptance requirement:
+
+- Only start after Phase 9B passes sim.
+- Same scenario must complete all 3 gates.
+- Planner waypoints, active target track IDs, waypoint types, and horizon debug
+  strings must remain compatible with the baseline.
+- No planner timing, suffix, or validation behavior may change.
+
+Risks:
+
+- Horizon building bridges perception memory, race order, planner input, and
+  suffix planning.
+- Debug strings are consumed downstream, so formatting changes can break log
+  comparisons even if flight behavior appears unchanged.
+
+## Phase 9D - Extract Gate Completion / Advancement Helpers
+
+Purpose:
+Move gate completion and advancement helper logic only after the lower-risk
+Phase 9A-9C extractions pass sim. This is the highest-risk part of Phase 9.
+
+Files to edit:
+
+- `autonomy_core/racing/gate_advancement.py`
+- `autonomy_core/launch/autonomy_api6.py`
+
+Files not to edit:
+
+- `px4_runner.py`
+- `flight_logger.py`
+- planner solve/install modules
+- perception modules
+- suffix modules unless import-only compatibility is unavoidable
+- controller/control modules
+
+Methods allowed to move:
+
+- `advance_gate_if_needed(...)` internals
+- `compute_gate_pass_geometry(...)`
+- `reset_crossing_debug(...)`
+- `clear_active_perception_target(...)`
+- `_continue_existing_plan_after_completion(...)`
+- post-completion fallback helpers
+
+Methods not allowed to move:
+
+- `path_plan(...)`
+- planner solve/install logic
+- horizon building helpers not already moved in Phase 9C
+- suffix creation/install logic
+- perception update/admission logic
+- command/control logic
+
+Validation commands:
+
+```bash
+python3 -m py_compile autonomy_core/racing/gate_advancement.py
+python3 -m py_compile autonomy_core/launch/autonomy_api6.py
+python3 - <<'PY'
+from autonomy_core.launch.autonomy_api6 import AutonomyAPI
+api = AutonomyAPI(use_perception=False, race_gate_count=3)
+print(hasattr(api, "advance_gate_if_needed"))
+PY
+```
+
+Full-sim acceptance requirement:
+
+- Only start after Phase 9C passes sim.
+- Same scenario must complete all 3 gates.
+- Gate-completion priority must remain unchanged:
+  1. same-plan continuation
+  2. pending suffix install
+  3. normal full replan fallback
+- Race cursor/lap, completed gate IDs, no-target fallback, and post-completion
+  grace/debug fields must match baseline semantics.
+
+Risks:
+
+- This subphase can change vehicle progression, replan timing, no-target state,
+  and suffix install behavior with a small state-ordering mistake.
+- Treat any uncertain helper as `verify-in-next-phase` rather than forcing the
+  extraction.
 
 ## Phase 10 - Extract Gazebo Diagnostics
 

@@ -21,6 +21,14 @@ from autonomy_core.planning.suffix_planner import (
     prepare_pending_suffix_for_future_only_replan as prepare_pending_suffix_for_future_only_replan_impl,
     reset_pending_suffix_state as reset_pending_suffix_state_impl,
 )
+from autonomy_core.planning.target_validation import (
+    canonical_track_id as canonical_track_id_impl,
+    find_duplicate_committed_track as find_duplicate_committed_track_impl,
+    is_near_completed_gate as is_near_completed_gate_impl,
+    validate_candidate_target as validate_candidate_target_impl,
+    validate_perception_gate_center as validate_perception_gate_center_impl,
+    validate_planning_target as validate_planning_target_impl,
+)
 from autonomy_core.planning.minimum_snap_planner_multi_time_optimized import MultiSegmentMinimumSnapPlanner
 from autonomy_core.launch.get_telemetry import GetTelemetry
 from autonomy_core.controller.attitude_controller3 import RPGHighLevelTracker
@@ -5221,117 +5229,32 @@ class AutonomyAPI:
             )
 
     def validate_perception_gate_center(self, center, current_pos):
-        center = np.asarray(center, dtype=float).reshape(3)
-        current_pos = np.asarray(current_pos, dtype=float).reshape(3)
-
-        if not np.all(np.isfinite(center)):
-            return False, "non_finite_center"
-
-        if center[2] < self.safe_min_target_z:
-            return False, f"z_below_safe_min:{center[2]:.2f}"
-
-        if center[2] > self.safe_max_target_z:
-            return False, f"z_above_safe_max:{center[2]:.2f}"
-
-        dist = float(np.linalg.norm(center - current_pos))
-        if dist > self.max_detection_range:
-            return False, f"detection_too_far:{dist:.2f}"
-
-        if self.last_valid_target is not None:
-            jump = float(np.linalg.norm(center - self.last_valid_target))
-            if jump > self.max_gate_jump:
-                return False, f"gate_jump_too_large:{jump:.2f}"
-
-        return True, ""
+        return validate_perception_gate_center_impl(self, center, current_pos)
 
     def is_near_completed_gate(self, center, radius=None):
-        center = np.asarray(center, dtype=float).reshape(3)
-        radius = self.completed_gate_position_radius if radius is None else float(radius)
-        for completed in self.completed_gate_positions_this_cycle:
-            if float(np.linalg.norm(center - completed)) < radius:
-                return True
-        return False
+        return is_near_completed_gate_impl(self, center, radius=radius)
 
     def find_duplicate_committed_track(self, center, track_id=None, radius=None):
-        center = np.asarray(center, dtype=float).reshape(3)
-        radius = self.gate_memory.commit_radius if radius is None else float(radius)
-        for tr in self.gate_memory.get_committed_tracks():
-            if track_id is not None and tr.id == track_id:
-                continue
-            if float(np.linalg.norm(center - tr.center)) < radius:
-                return tr
-        return None
-
-    def validate_planning_target(self, center):
-        center = np.asarray(center, dtype=float).reshape(3)
-        if not np.all(np.isfinite(center)):
-            return False, "non_finite_target"
-        if center[2] < self.safe_min_target_z:
-            return False, f"target_z_below_safe_min:{center[2]:.2f}"
-        if center[2] > self.safe_max_target_z:
-            return False, f"target_z_above_safe_max:{center[2]:.2f}"
-        return True, ""
-
-    def validate_candidate_target(self, center, current_pos, track_id=None):
-        """
-        Generic perception target validation.
-
-        This deliberately avoids course geometry assumptions. It only rejects
-        unsafe/numeric targets, completed landmarks, duplicate landmarks, and
-        candidate jumps that are implausible given elapsed time since the last
-        completed gate.
-        """
-        center = np.asarray(center, dtype=float).reshape(3)
-        current_pos = np.asarray(current_pos, dtype=float).reshape(3)
-        self.candidate_track_id = track_id
-        self.candidate_center = center.copy()
-        self.candidate_order_score = float("nan")
-
-        valid, reason = self.validate_planning_target(center)
-        if not valid:
-            self.rejected_wrong_order = True
-            return False, reason
-
-        if self.is_near_completed_gate(center):
-            self.rejected_completed_this_lap = True
-            return False, "completed_this_lap"
-
-        duplicate = self.find_duplicate_committed_track(
+        return find_duplicate_committed_track_impl(
+            self,
             center,
             track_id=track_id,
-            radius=self.gate_memory.commit_radius,
+            radius=radius,
         )
-        if duplicate is not None:
-            self.rejected_duplicate = True
-            return False, f"duplicate_committed_track:{duplicate.id}"
 
-        dist_from_vehicle = float(np.linalg.norm(center - current_pos))
-        self.candidate_order_score = -dist_from_vehicle
-        if dist_from_vehicle > self.max_detection_range:
-            self.rejected_wrong_order = True
-            return False, f"candidate_too_far_from_vehicle:{dist_from_vehicle:.2f}"
+    def validate_planning_target(self, center):
+        return validate_planning_target_impl(self, center)
 
-        if (
-            self.last_completed_valid_gate_position is not None
-            and self.last_completed_valid_gate_time is not None
-        ):
-            elapsed = max(0.0, time.time() - self.last_completed_valid_gate_time)
-            jump = float(np.linalg.norm(center - self.last_completed_valid_gate_position))
-            max_jump = self.gate_jump_margin + self.max_plausible_gate_speed * elapsed
-            self.candidate_order_score = max_jump - jump
-            if jump > max_jump:
-                self.rejected_wrong_order = True
-                return False, f"kinematic_jump_too_large:{jump:.2f}>{max_jump:.2f}"
-
-        return True, ""
+    def validate_candidate_target(self, center, current_pos, track_id=None):
+        return validate_candidate_target_impl(
+            self,
+            center,
+            current_pos,
+            track_id=track_id,
+        )
 
     def canonical_track_id(self, track_id):
-        if track_id is None:
-            return None
-        track_id = int(track_id)
-        while track_id in self.track_id_aliases:
-            track_id = int(self.track_id_aliases[track_id])
-        return track_id
+        return canonical_track_id_impl(self, track_id)
 
     def apply_landmark_merge_event(self, merge_event):
         self.duplicate_radius_used = self.gate_memory.duplicate_merge_radius
