@@ -5,6 +5,7 @@ import os
 import cv2
 import json
 import itertools
+from autonomy_core.control.attitude_control import compute_tracker_control_debug_fields
 from autonomy_core.core.state_adapter import vehicle_state_from_telemetry
 from autonomy_core.planning.plan_validator import (
     reset_plan_geometric_validation_debug as reset_plan_geometric_validation_debug_fields,
@@ -27,6 +28,7 @@ from autonomy_core.perception.gate_perception_yolo import GatePerception
 from autonomy_core.perception.gate_perception_node import GatePerceptionNode
 from autonomy_core.perception.gate_memory import GateMemory
 from autonomy_core.perception.corner_measurement import CornerMeasurement
+from autonomy_core.perception.gate_pipeline import build_detection_flow_debug_fields
 from autonomy_core.launch.race_progression import RaceProgression
 from dataclasses import dataclass
 
@@ -2458,76 +2460,22 @@ class AutonomyAPI:
         return measurement
 
     def finalize_detection_flow_debug(self):
-        parts = []
-        yolo_confidence = []
-        quad_area_px2 = []
-        old_area_confidence = []
-        memory_confidence_used = []
-        memory_admission_threshold = []
-        memory_admission_passed = []
-        pnp_camera_original = []
-        pnp_camera_depth_corrected = []
-        depth_correction_factor = []
-        world_original = []
-        world_depth_corrected = []
-        for idx in sorted(self.perception_detection_flow_entries):
-            e = self.perception_detection_flow_entries[idx]
-            vec = lambda v: "/".join(f"{x:.2f}" for x in np.asarray(v, dtype=float).reshape(3))
-            yolo_confidence.append(f"det{idx}:{e.get('yolo_confidence', np.nan):.3f}")
-            quad_area_px2.append(f"det{idx}:{e.get('quad_area_px2', np.nan):.1f}")
-            old_area_confidence.append(f"det{idx}:{e.get('old_area_confidence', np.nan):.3f}")
-            memory_confidence_used.append(f"det{idx}:{e.get('memory_confidence', np.nan):.3f}")
-            memory_admission_threshold.append(
-                f"det{idx}:{e.get('memory_admission_threshold', np.nan):.3f}"
-            )
-            memory_admission_passed.append(
-                f"det{idx}:{int(bool(e.get('memory_admission_passed', False)))}"
-            )
-            pnp_camera_original.append(
-                f"det{idx}:{vec(e.get('pnp_camera_original', np.full(3,np.nan)))}"
-            )
-            pnp_camera_depth_corrected.append(
-                f"det{idx}:{vec(e.get('pnp_camera_depth_corrected', np.full(3,np.nan)))}"
-            )
-            depth_correction_factor.append(
-                f"det{idx}:{e.get('depth_correction_factor', 1.0):.6f}"
-            )
-            world_original.append(
-                f"det{idx}:{vec(e.get('world_original', np.full(3,np.nan)))}"
-            )
-            world_depth_corrected.append(
-                f"det{idx}:{vec(e.get('world_depth_corrected', np.full(3,np.nan)))}"
-            )
-            parts.append(
-                f"det{idx}:yolo={e.get('yolo_confidence', np.nan):.3f},"
-                f"area_px2={e.get('quad_area_px2', np.nan):.1f},"
-                f"old_area_conf={e.get('old_area_confidence', np.nan):.3f},"
-                f"mem_conf={e.get('memory_confidence', np.nan):.3f},"
-                f"mem_pass={int(bool(e.get('memory_admission_passed', False)))},"
-                f"pnp={int(bool(e.get('pnp')))},"
-                f"cam={vec(e.get('cam', np.full(3,np.nan)))},"
-                f"raw={vec(e.get('raw', np.full(3,np.nan)))},"
-                f"corrected={vec(e.get('corrected', np.full(3,np.nan)))},"
-                f"depth_diag_future={int(bool(e.get('diagnostic_far_depth_is_future', False)))},"
-                f"depth_diag_class={e.get('diagnostic_far_depth_classification','')},"
-                f"depth_factor={e.get('depth_correction_factor', 1.0):.6f},"
-                f"track={e.get('track')},mem={int(bool(e.get('memory')))},"
-                f"state={e.get('state','')},race={e.get('race_idx')},"
-                f"role={e.get('role','')},reason={e.get('reason','')}"
-            )
-        self.perception_detection_flow = ";".join(parts)
-        self.yolo_confidence = ";".join(yolo_confidence)
-        self.quad_area_px2 = ";".join(quad_area_px2)
-        self.old_area_confidence = ";".join(old_area_confidence)
-        self.memory_confidence_used = ";".join(memory_confidence_used)
-        self.memory_admission_threshold = ";".join(memory_admission_threshold)
-        self.memory_admission_passed = ";".join(memory_admission_passed)
-        self.pnp_camera_original = ";".join(pnp_camera_original)
-        self.pnp_camera_depth_corrected = ";".join(pnp_camera_depth_corrected)
-        self.depth_correction_factor = ";".join(depth_correction_factor)
-        self.world_original = ";".join(world_original)
-        self.world_depth_corrected = ";".join(world_depth_corrected)
-        if parts:
+        fields = build_detection_flow_debug_fields(
+            self.perception_detection_flow_entries
+        )
+        self.perception_detection_flow = fields["perception_detection_flow"]
+        self.yolo_confidence = fields["yolo_confidence"]
+        self.quad_area_px2 = fields["quad_area_px2"]
+        self.old_area_confidence = fields["old_area_confidence"]
+        self.memory_confidence_used = fields["memory_confidence_used"]
+        self.memory_admission_threshold = fields["memory_admission_threshold"]
+        self.memory_admission_passed = fields["memory_admission_passed"]
+        self.pnp_camera_original = fields["pnp_camera_original"]
+        self.pnp_camera_depth_corrected = fields["pnp_camera_depth_corrected"]
+        self.depth_correction_factor = fields["depth_correction_factor"]
+        self.world_original = fields["world_original"]
+        self.world_depth_corrected = fields["world_depth_corrected"]
+        if fields["has_detection_flow_parts"]:
             print("[DETECTION FLOW] " + self.perception_detection_flow)
 
     def add_lookahead_pipeline_reason(self, label, reason):
@@ -8223,54 +8171,28 @@ class AutonomyAPI:
         return limited
 
     def record_tracker_control_debug(self, state, dbg, roll_cmd, pitch_cmd, thrust_cmd):
-        def vec(name):
-            value = None if dbg is None else dbg.get(name)
-            if value is None:
-                return np.full(3, np.nan, dtype=float)
-            arr = np.asarray(value, dtype=float).reshape(-1)
-            if arr.size < 3:
-                out = np.full(3, np.nan, dtype=float)
-                out[:arr.size] = arr
-                return out
-            return arr[:3].copy()
-
-        raw_velocity = np.array([
-            self.telemetry.vel["vx"],
-            self.telemetry.vel["vy"],
-            self.telemetry.vel["vz"],
-        ], dtype=float)
-        velocity_input = np.asarray(state.vel, dtype=float).reshape(3)
-
-        self.tracker_velocity_input = velocity_input.copy()
-        self.tracker_velocity_was_sanitized = bool(
-            not np.all(np.isfinite(raw_velocity))
-            or not np.allclose(
-                np.nan_to_num(raw_velocity, nan=0.0, posinf=0.0, neginf=0.0),
-                velocity_input,
-                equal_nan=False,
-            )
+        fields = compute_tracker_control_debug_fields(
+            self.telemetry,
+            state,
+            dbg,
+            roll_cmd,
+            pitch_cmd,
+            thrust_cmd,
+            self.tracker.thrust_hover,
         )
-        self.tracker_e_p = vec("e_p")
-        self.tracker_e_v = vec("e_v")
-        self.tracker_a_ref = vec("a_ref")
-        self.tracker_a_fb = vec("a_fb")
-        self.tracker_a_cmd_raw = vec("a_cmd_raw_no_g")
-        self.tracker_a_cmd_limited = vec("a_cmd_no_g")
-        self.thrust_raw_before_clamp = float(
-            dbg.get("thrust_raw_before_clamp", np.nan) if dbg is not None else np.nan
-        )
-        self.thrust_cmd_after_clamp = float(
-            dbg.get("thrust_cmd_after_clamp", thrust_cmd) if dbg is not None else thrust_cmd
-        )
-        self.thrust_limited = bool(
-            dbg.get("thrust_limited", False) if dbg is not None else False
-        )
-        self.hover_thrust = float(
-            dbg.get("hover_thrust", self.tracker.thrust_hover) if dbg is not None else self.tracker.thrust_hover
-        )
-        self.vertical_thrust_after_tilt = float(
-            thrust_cmd * math.cos(float(roll_cmd)) * math.cos(float(pitch_cmd))
-        )
+        self.tracker_velocity_input = fields["tracker_velocity_input"]
+        self.tracker_velocity_was_sanitized = fields["tracker_velocity_was_sanitized"]
+        self.tracker_e_p = fields["tracker_e_p"]
+        self.tracker_e_v = fields["tracker_e_v"]
+        self.tracker_a_ref = fields["tracker_a_ref"]
+        self.tracker_a_fb = fields["tracker_a_fb"]
+        self.tracker_a_cmd_raw = fields["tracker_a_cmd_raw"]
+        self.tracker_a_cmd_limited = fields["tracker_a_cmd_limited"]
+        self.thrust_raw_before_clamp = fields["thrust_raw_before_clamp"]
+        self.thrust_cmd_after_clamp = fields["thrust_cmd_after_clamp"]
+        self.thrust_limited = fields["thrust_limited"]
+        self.hover_thrust = fields["hover_thrust"]
+        self.vertical_thrust_after_tilt = fields["vertical_thrust_after_tilt"]
 
     def hold_no_target_control(self, state, current_yaw_rad):
         """
