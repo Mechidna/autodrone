@@ -1,5 +1,7 @@
 # AutonomyAPI Refactor Plan
 
+User notes: "Ultralytics is inside ~/drone_ws/.venv_ctrl. Use: source ~/drone_ws/.venv_ctrl/bin/activate"
+
 ## Purpose
 
 Refactor `autonomy_core/launch/autonomy_api6.py` from a large monolithic runtime file into smaller modules with clear boundaries while preserving current behavior.
@@ -711,6 +713,8 @@ Risks:
 
 ## Phase 7 - Extract Control Boundary
 
+Failed previous implementation see /home/paolo/autonomy_core/flight logs/phase 7 logs failed
+
 Purpose:
 Prepare for future MPC by separating current control policy from the facade, without implementing MPC.
 
@@ -766,6 +770,89 @@ Risks:
 
 - Sign errors in roll/pitch are easy to introduce.
 - Yaw unwrapping/rate limiting state depends on previous command fields.
+
+## Phase 7R - Control Boundary Recovery
+
+Purpose:
+Recover from the failed Phase 7 simulation by restoring behavior-preserving
+scope before any perception extraction begins.
+
+Failure summary:
+
+- The previous Phase 7 implementation failed behavior preservation in sim.
+- Phase 6 completed all 3 gates; failed Phase 7 completed only 2 gates.
+- During the failed Phase 7 run, later-gate perception/admission regressed while
+  control yaw/no-target helpers had been extracted.
+- Treat this as a refactor failure, not as permission to change yaw behavior.
+
+Hard rule:
+
+- Do not patch yaw selection, perception-loss yaw hold, active-target yaw
+  priority, rate limiting, no-target behavior, or controller behavior as part of
+  the refactor.
+- If yaw behavior is wrong, fix it in a separate bugfix phase with its own sim
+  baseline and acceptance criteria.
+
+Recovery scope:
+
+- Restore or redo Phase 7 narrowly.
+- Add `autonomy_core/control/attitude_control.py` only as a low-risk control
+  boundary.
+- Extract only `record_tracker_control_debug(...)` internals or similarly
+  non-commanding debug-field calculation if it can be moved without changing
+  command outputs.
+- Keep `AutonomyAPI.record_tracker_control_debug(...)` as the public/state-writing
+  wrapper and preserve all logger-visible field names and values.
+
+Do not extract in Phase 7R:
+
+- `attitude_control(...)`
+- `hold_no_target_control(...)`
+- `get_perception_yaw_hold_reference(...)`
+- `seed_yaw_hold(...)`
+- `continuous_yaw_command(...)`
+- Any helper that computes or mutates roll, pitch, yaw, thrust, yaw hold state,
+  perception hold state, active target state, planner reference timing, or
+  no-target fallback state.
+
+Files to edit:
+
+- `autonomy_core/control/attitude_control.py`
+- `autonomy_core/launch/autonomy_api6.py`
+
+Files not to edit:
+
+- `px4_runner.py`
+- `flight_logger.py`
+- planner/perception modules
+- `autonomy_core/controller/attitude_controller3.py`
+
+Validation commands:
+
+```bash
+python3 -m py_compile autonomy_core/control/attitude_control.py
+python3 -m py_compile autonomy_core/launch/autonomy_api6.py
+python3 - <<'PY'
+from autonomy_core.launch.autonomy_api6 import AutonomyAPI
+api = AutonomyAPI(use_perception=False, race_gate_count=3)
+cmd = api.attitude_control()
+print(cmd)
+PY
+```
+
+Full-sim acceptance before Phase 8:
+
+- Phase 7R must complete all 3 gates in the same sim scenario that Phase 6
+  completed.
+- The later gate must become tentative, race-admitted/race-order, active, and
+  completed as in Phase 6.
+- `yaw_target_source` behavior during the gate-2 approach must not regress from
+  the Phase 6 baseline.
+- Runner and logger schemas must remain compatible.
+
+Phase 8 block:
+
+- Do not start Phase 8 until Phase 7R passes the full sim acceptance check.
 
 ## Phase 8 - Extract Perception Pipeline
 
