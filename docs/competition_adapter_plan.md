@@ -680,6 +680,14 @@ Phase 8.25A status:
 - No runtime constants, PnP scoring, gate admission thresholds, clearance behavior, race progression, live transport, or command publication behavior were changed.
 - Any fixes remain deferred to a separate Phase 8.25B or later behavior-reviewed phase.
 
+Phase 8.25B status:
+
+- Complete for passive geometry helper centralization and no-behavior-change cleanup.
+- `RuntimeCompetitionConfig` exposes official meter helpers, inner/outer half extents, drone chassis meters, and planar inner-gate object points.
+- Active YOLO default gate size and object-point construction now reference the official inner-square helpers while preserving the same `1.5 m` default and `+/-0.75 m` planar model points.
+- Behavior-sensitive values remain unchanged: duplicate merge sizing, association/commit radii, race pass/clear radii, low-gate crossing proxies, legacy perception defaults, and logger field names.
+- Phase 8.5 remains separate and not started; Phase 4B remains blocked pending real receive-only competition simulator telemetry evidence.
+
 ## Phase 8.5 - PX4/Gazebo Surrogate Competition Harness
 
 Priority: P1 surrogate confidence only; does not unblock Phase 4B.

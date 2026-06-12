@@ -1,5 +1,6 @@
 import importlib
 import math
+from pathlib import Path
 import sys
 import unittest
 
@@ -72,6 +73,53 @@ class CompetitionConfigTests(unittest.TestCase):
         self.assertEqual(config.drone_chassis_width_mm, 280)
         self.assertEqual(config.drone_chassis_height_mm, 160)
         self.assertEqual(config.race_max_duration_s, 480)
+
+    def test_official_geometry_meter_helpers(self):
+        from autonomy_core.core.competition_config import RuntimeCompetitionConfig
+
+        config = RuntimeCompetitionConfig()
+
+        self.assertEqual(config.gate_outer_square_m, 2.7)
+        self.assertEqual(config.gate_inner_square_m, 1.5)
+        self.assertEqual(config.gate_depth_m, 0.26)
+        self.assertEqual(config.gate_outer_half_extent_m, 1.35)
+        self.assertEqual(config.gate_inner_half_extent_m, 0.75)
+        self.assertEqual(config.drone_chassis_m, (0.28, 0.28, 0.16))
+
+    def test_official_inner_gate_object_points_match_yolo_convention(self):
+        from autonomy_core.core.competition_config import (
+            RuntimeCompetitionConfig,
+            planar_square_object_points_m,
+        )
+
+        config = RuntimeCompetitionConfig()
+        expected = (
+            (-0.75, 0.75, 0.0),
+            (0.75, 0.75, 0.0),
+            (0.75, -0.75, 0.0),
+            (-0.75, -0.75, 0.0),
+        )
+
+        self.assertEqual(config.gate_inner_object_points_m, expected)
+        self.assertEqual(planar_square_object_points_m(config.gate_inner_square_m), expected)
+
+    def test_runtime_config_scaffold_gate_size_tracks_official_inner_square(self):
+        from autonomy_core.core.competition_config import RuntimeCompetitionConfig
+        from autonomy_core.core.config import PerceptionConfig
+
+        self.assertEqual(
+            PerceptionConfig().gate_size,
+            RuntimeCompetitionConfig().gate_inner_square_m,
+        )
+
+    def test_active_yolo_source_uses_official_inner_gate_helpers_without_importing_yolo(self):
+        root = Path(__file__).resolve().parents[1]
+        yolo_source = (root / "autonomy_core/perception/gate_perception_yolo.py").read_text()
+        api_source = (root / "autonomy_core/launch/autonomy_api6.py").read_text()
+
+        self.assertIn("gate_size=VADR_TS_002.gate_inner_square_m", yolo_source)
+        self.assertIn("planar_square_object_points_m(gate_size)", yolo_source)
+        self.assertIn("gate_size=VADR_TS_002.gate_inner_square_m", api_source)
 
     def test_vision_header_constants_are_explicit(self):
         from autonomy_core.core.competition_config import RuntimeCompetitionConfig

@@ -4,11 +4,13 @@ from scipy.spatial.transform import Rotation as R
 from collections import deque
 from ultralytics import YOLO
 
+from autonomy_core.core.competition_config import VADR_TS_002, planar_square_object_points_m
+
 
 class GatePerception:
 
     def __init__(self,
-                 gate_size=1.5,
+                 gate_size=VADR_TS_002.gate_inner_square_m,
                  smoothing_window=5,
                  max_failures=10,
                  yolo_model_path=None,
@@ -51,13 +53,10 @@ class GatePerception:
         # TII keypoint labels are inner opening corners, so use the inner opening size.
         # Competition/spec gate: inner opening = 1.5 m x 1.5 m.
         # If you switch back to HSV outer-frame contour detection, use gate_size=2.7 instead.
-        s = gate_size / 2.0
-        self.model_points = np.array([
-            [-s,  s, 0],  # TL inner corner
-            [ s,  s, 0],  # TR inner corner
-            [ s, -s, 0],  # BR inner corner
-            [-s, -s, 0],  # BL inner corner
-        ], dtype=np.float32)
+        self.model_points = np.array(
+            planar_square_object_points_m(gate_size),
+            dtype=np.float32,
+        )
 
         print("Model points:")
         print(self.model_points)
@@ -919,13 +918,7 @@ class GatePerception:
 
     @staticmethod
     def model_points_for_size(gate_size: float):
-        s = float(gate_size) / 2.0
-        return np.array([
-            [-s,  s, 0],
-            [ s,  s, 0],
-            [ s, -s, 0],
-            [-s, -s, 0],
-        ], dtype=np.float32)
+        return np.array(planar_square_object_points_m(gate_size), dtype=np.float32)
 
     def solve_pnp_gate_size_sweep(self, image_points, camera_matrix, dist_coeffs, sizes=(1.90, 2.00, 2.10)):
         image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 1, 2)

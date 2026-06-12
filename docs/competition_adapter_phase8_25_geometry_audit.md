@@ -110,7 +110,7 @@ Missing or deferred coverage:
 - No deterministic test currently covers whether `pnp_size_190/200/210` logging remains meaningful after the active YOLO sweep moved to `1.40/1.50/1.60`.
 - No deterministic test currently covers explicit drone/chassis clearance because runtime logic does not use those dimensions.
 
-## Proposed Phase 8.25B Follow-Up
+## Phase 8.25A Proposed Phase 8.25B Follow-Up
 
 Do not silently change the values below in Phase 8.25A. A follow-up should be
 small, reviewed, and fixture-backed because these values can alter PnP pose,
@@ -126,3 +126,43 @@ Suggested Phase 8.25B scope:
 - Decide whether `GateMemory.estimated_gate_size = 2.0` is a behavior threshold that should remain as-is, or a stale physical assumption that needs a separate admission/merge behavior test.
 - Decide whether `pnp_size_190/200/210` log fields should be generalized or supplemented without breaking existing logger schema.
 - Defer any explicit drone/chassis clearance behavior until a separate behavior phase; adding such a check would change race progression semantics.
+
+## Phase 8.25B Cleanup Results
+
+Status: complete for passive centralization and no-behavior-change cleanup.
+
+Centralized passive helpers added to `autonomy_core/core/competition_config.py`:
+
+- `millimeters_to_meters(...)`
+- `planar_square_object_points_m(...)`
+- `RuntimeCompetitionConfig.gate_outer_square_m`
+- `RuntimeCompetitionConfig.gate_inner_square_m`
+- `RuntimeCompetitionConfig.gate_depth_m`
+- `RuntimeCompetitionConfig.gate_outer_half_extent_m`
+- `RuntimeCompetitionConfig.gate_inner_half_extent_m`
+- `RuntimeCompetitionConfig.drone_chassis_m`
+- `RuntimeCompetitionConfig.gate_inner_object_points_m`
+
+Safe replacements made with no numeric behavior change:
+
+- `autonomy_core/core/config.py` now derives `PerceptionConfig.gate_size` from `VADR_TS_002.gate_inner_square_m`; the value remains `1.5 m`.
+- `autonomy_core/perception/gate_perception_yolo.py` now derives its default `gate_size` from `VADR_TS_002.gate_inner_square_m`; the value remains `1.5 m`.
+- `autonomy_core/perception/gate_perception_yolo.py` now builds planar square model points through `planar_square_object_points_m(gate_size)`; the default object points remain `+/-0.75 m` inner-corner points with `z = 0`.
+- `autonomy_core/launch/autonomy_api6.py` now passes `VADR_TS_002.gate_inner_square_m` into the active YOLO `GatePerception` constructor; the value remains `1.5 m`.
+
+Deterministic tests added:
+
+- Official meter helpers assert `2.7 m`, `1.5 m`, `0.26 m`, `1.35 m`, `0.75 m`, and `0.28 x 0.28 x 0.16 m`.
+- Official inner-gate object points assert the active YOLO planar convention without importing YOLO, GPU code, or model weights.
+- The runtime config scaffold test asserts `PerceptionConfig.gate_size` tracks `RuntimeCompetitionConfig.gate_inner_square_m`.
+- A source-level test asserts the active YOLO file and `AutonomyAPI` constructor reference the official inner-square helper without importing `gate_perception_yolo`.
+
+Intentionally unchanged behavior-sensitive values:
+
+- `GateMemory.estimated_gate_size = 2.0` and `duplicate_merge_radius = max(5.0, 2.5 * estimated_gate_size)` remain unchanged because they affect duplicate committed-track merge behavior and race admission.
+- `association_radius`, `commit_radius`, `new_track_block_radius`, `completed_gate_position_radius`, `pass_radius`, `clear_radius`, `gate_pass_radius`, current-gate freeze distance, and race-admission thresholds remain unchanged because they affect target admission, clearance, race progression, and low-gate crossing behavior.
+- Legacy `gate_perception.py`, `gate_perception_orange.py`, and `synthetic_pnp_sanity.py` geometry defaults remain unchanged because they are old diagnostic/perception paths and changing them could alter non-competition behavior or tool expectations.
+- `pnp_size_190/200/210` logger fields remain unchanged because renaming or generalizing them would change logger schema compatibility.
+- Gate depth and drone chassis constants remain passive only; no explicit aperture/chassis clearance behavior was added.
+
+A later perception/planning behavior phase must decide whether stale legacy PnP defaults, duplicate-merge sizing, and pass/clearance proxies should change. Any such change needs focused fixtures because it can alter PnP pose, target admission, duplicate merging, clearance, logging interpretation, or race progression.

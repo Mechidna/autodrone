@@ -6,6 +6,7 @@ import cv2
 import json
 import itertools
 from autonomy_core.control.attitude_control import compute_tracker_control_debug_fields
+from autonomy_core.core.competition_config import VADR_TS_002
 from autonomy_core.debug.gazebo_diagnostics import (
     _gazebo_model_pose_to_planner as gazebo_model_pose_to_planner_impl,
     capture_gazebo_pose_debug as capture_gazebo_pose_debug_impl,
@@ -118,7 +119,7 @@ class AutonomyAPI:
         self.camera_offset_body = np.array([0.12, 0.03, 0.242], dtype=float)
 
         self.gate_perception = GatePerception(
-            gate_size=1.5,
+            gate_size=VADR_TS_002.gate_inner_square_m,
             yolo_model_path="/home/paolo/datasets/gazebo_gate_yolo_pose_ab_runs/partial/weights/best.pt",
             preprocess_mode="raw",
             yolo_conf=0.1,

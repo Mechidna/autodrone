@@ -8,6 +8,8 @@ later behavior-preserving phase with explicit default parity checks.
 from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
+from autonomy_core.core.competition_config import VADR_TS_002
+
 
 Vector3 = Tuple[float, float, float]
 GateList = Tuple[Vector3, ...]
@@ -87,7 +89,7 @@ class PerceptionConfig:
     """Perception, transform, and GateMemory defaults copied for future wiring."""
 
     camera_offset_body: Vector3 = (0.12, 0.03, 0.242)
-    gate_size: float = 1.5
+    gate_size: float = VADR_TS_002.gate_inner_square_m
     yolo_model_path: str = (
         "/home/paolo/datasets/gazebo_gate_yolo_pose_ab_runs/partial/weights/best.pt"
     )

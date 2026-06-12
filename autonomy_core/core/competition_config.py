@@ -13,6 +13,22 @@ from typing import Tuple
 
 Matrix3x3 = Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]
 Vector3 = Tuple[float, float, float]
+ObjectPoints4 = Tuple[Vector3, Vector3, Vector3, Vector3]
+
+
+def millimeters_to_meters(value_mm: float) -> float:
+    return float(value_mm) / 1000.0
+
+
+def planar_square_object_points_m(square_size_m: float) -> ObjectPoints4:
+    """Return TL, TR, BR, BL planar square points in meters."""
+    half = float(square_size_m) / 2.0
+    return (
+        (-half, half, 0.0),
+        (half, half, 0.0),
+        (half, -half, 0.0),
+        (-half, -half, 0.0),
+    )
 
 
 @dataclass(frozen=True)
@@ -84,6 +100,38 @@ class RuntimeCompetitionConfig:
         return math.radians(self.camera_tilt_up_deg)
 
     @property
+    def gate_outer_square_m(self) -> float:
+        return millimeters_to_meters(self.gate_outer_square_mm)
+
+    @property
+    def gate_inner_square_m(self) -> float:
+        return millimeters_to_meters(self.gate_inner_square_mm)
+
+    @property
+    def gate_depth_m(self) -> float:
+        return millimeters_to_meters(self.gate_depth_mm)
+
+    @property
+    def gate_outer_half_extent_m(self) -> float:
+        return self.gate_outer_square_m / 2.0
+
+    @property
+    def gate_inner_half_extent_m(self) -> float:
+        return self.gate_inner_square_m / 2.0
+
+    @property
+    def drone_chassis_m(self) -> Vector3:
+        return (
+            millimeters_to_meters(self.drone_chassis_length_mm),
+            millimeters_to_meters(self.drone_chassis_width_mm),
+            millimeters_to_meters(self.drone_chassis_height_mm),
+        )
+
+    @property
+    def gate_inner_object_points_m(self) -> ObjectPoints4:
+        return planar_square_object_points_m(self.gate_inner_square_m)
+
+    @property
     def physics_period_s(self) -> float:
         return 1.0 / self.physics_rate_hz
 
@@ -133,8 +181,11 @@ PYAIPILOT_EXAMPLE_REFERENCE = PyAIPilotExampleReferenceConfig()
 
 
 __all__ = [
+    "ObjectPoints4",
     "PYAIPILOT_EXAMPLE_REFERENCE",
     "PyAIPilotExampleReferenceConfig",
     "RuntimeCompetitionConfig",
     "VADR_TS_002",
+    "millimeters_to_meters",
+    "planar_square_object_points_m",
 ]
