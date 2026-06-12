@@ -502,6 +502,7 @@ Primary files to add:
 - Create `autonomy_core/runtime/__init__.py` if the package does not exist.
 - Optional transport wrappers in `autonomy_core/runtime/competition_mavlink.py` and `autonomy_core/runtime/competition_vision_udp.py`.
 - Tests such as `tests/test_competition_runner_dry_run.py` for import-safe or fake-transport behavior.
+- Phase 6A fake-transport runner note: `docs/competition_adapter_phase6a_runner_skeleton.md`.
 
 Runner responsibilities:
 
@@ -525,6 +526,13 @@ Runner modes:
 - `command_dry_run`: full pipeline but command adapter does not send UDP commands.
 - `command_live`: full pipeline with command sending enabled, only after explicit operator selection outside submitted timed runs.
 - `race`: autonomous timed-run mode with no human interaction after start and bounded logging.
+
+Phase 6A status:
+
+- Add only an import-safe runner skeleton with fake/injected transports.
+- Do not implement live MAVLink transport or live UDP vision transport.
+- Do not enable `command_live` or `race`; these modes must fail closed in Phase 6A.
+- `command_dry_run` may build dry-run command candidates through the Phase 5A adapter, but command publication remains blocked because Phase 4B lacks real competition telemetry evidence.
 
 Minimum runner logs:
 
