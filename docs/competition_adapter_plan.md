@@ -375,6 +375,7 @@ Primary files to add:
 - `autonomy_core/core/competition_state_adapter.py`
 - Optional transport helper, for example `autonomy_core/runtime/competition_mavlink.py`.
 - Tests such as `tests/test_competition_state_adapter.py`.
+- Phase 4B evidence review note: `docs/competition_adapter_phase4b_telemetry_evidence.md`.
 
 Verification tasks before finalizing adapter behavior:
 
@@ -395,6 +396,7 @@ Telemetry discovery gate:
 
 - Do not assume local position/odometry exists just because the current runtime needs it.
 - Do not assume local position/odometry exists just because `third_party/PyAIPilotExample/mavlink_rx.py` has handlers for `LOCAL_POSITION_NED` and `ODOMETRY`.
+- If no live receive-only observe output is available, Phase 4B remains blocked; do not finalize adapter behavior or proceed toward command-enabled phases.
 - If the live simulator emits usable local position/odometry, implement the thin adapter mapping from that message into `VehicleState`.
 - If the live simulator does not emit usable local position/odometry, stop before command enablement and create a separate P0 state-estimation/VIO/EKF plan.
 - Do not hide missing position by fabricating position from stale data, gate observations, or Gazebo truth.
@@ -427,6 +429,9 @@ Do not change:
 - `autonomy_core/core/state_adapter.py::vehicle_state_from_telemetry(...)` behavior.
 - Internal planner/controller state convention.
 - Planner behavior to compensate for missing telemetry.
+
+Note for user, run this locally when the simulator is running:
+- PYTHONDONTWRITEBYTECODE=1 python3 -B -m autonomy_core.tools.competition_mavlink_observe --endpoint udpin:127.0.0.1:14550 --duration-s 30
 
 ## Phase 5 - Command Adapter For MAVLink SET_ATTITUDE_TARGET
 
