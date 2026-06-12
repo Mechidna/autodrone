@@ -723,6 +723,15 @@ Acceptance criteria:
 - Harness logs frame rate, packetization errors, telemetry freshness, command candidate rate, and command-blocked reasons.
 - Results are explicitly documented as surrogate-only and cannot satisfy Phase 4B.
 
+Phase 8.5A status:
+
+- Scaffold implemented in `autonomy_core/runtime/px4_gazebo_surrogate_harness.py`.
+- The scaffold converts PX4/MAVSDK estimated telemetry samples into fake runner-accepted MAVLink-like messages and packetizes pre-encoded JPEG bytes into fake VADR `<IHHIIQ` packets.
+- The scaffold feeds `CompetitionRunner` only through injected fake transports and keeps `command_dry_run` no-send.
+- `command_live` and `race` remain fail-closed; no live competition transport or command publication was added.
+- Documentation is available in `docs/competition_adapter_phase8_5_px4_gazebo_surrogate_harness.md`.
+- This is scaffold/deterministic-test coverage only; no real PX4/Gazebo surrogate run was performed, Phase 8.5 is not fully complete, Phase 4B remains blocked, and Phase 9 was not started.
+
 ## Phase 9 - Offline Replay And Dry-Run Bring-Up
 
 Priority: P1.
