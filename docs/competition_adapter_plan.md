@@ -672,6 +672,14 @@ Acceptance criteria:
 - Any stale or ambiguous geometry usage is listed before behavior tuning or perception-result interpretation.
 - No scoring or progression behavior changes are made in this phase.
 
+Phase 8.25A status:
+
+- Complete as a read-only audit in `docs/competition_adapter_phase8_25_geometry_audit.md`.
+- Official gate/drone dimensions are centralized passively in `autonomy_core/core/competition_config.py`.
+- Active YOLO PnP geometry, legacy stale geometry, duplicate-merge geometry assumptions, clearance proxies, and logging/debug geometry fields are inventoried.
+- No runtime constants, PnP scoring, gate admission thresholds, clearance behavior, race progression, live transport, or command publication behavior were changed.
+- Any fixes remain deferred to a separate Phase 8.25B or later behavior-reviewed phase.
+
 ## Phase 8.5 - PX4/Gazebo Surrogate Competition Harness
 
 Priority: P1 surrogate confidence only; does not unblock Phase 4B.
