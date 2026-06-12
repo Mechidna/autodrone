@@ -27,6 +27,16 @@ GAZEBO_TRUTH_KEY_PARTS = (
     "gazebo_camera",
     "gazebo_truth",
     "latest_gazebo_pose",
+    "gazebo_tf",
+    "gazebo_transform",
+    "gazebo_frame_transform",
+    "image_gazebo_pose_snapshot",
+    "image_pose_snapshot",
+)
+
+GAZEBO_ONLY_TRUTH_FLAG_KEYS = (
+    "use_diagnostic_far_depth_correction",
+    "diagnostic_far_depth_correction",
 )
 
 
@@ -55,6 +65,13 @@ def _assert_no_gazebo_truth_fields(value: Any, *, context: str, path: str = "") 
         for key, child in value.items():
             child_path = _path_join(path, key)
             key_lower = str(key).lower()
+            if key_lower in GAZEBO_ONLY_TRUTH_FLAG_KEYS:
+                if bool(child):
+                    raise CompetitionGuardError(
+                        f"{context} enables Gazebo-only diagnostic field "
+                        f"{child_path!r}"
+                    )
+                continue
             if any(part in key_lower for part in GAZEBO_TRUTH_KEY_PARTS):
                 if _is_nonempty(child):
                     raise CompetitionGuardError(
@@ -163,13 +180,13 @@ class CompetitionGuard:
     def perception_update_kwargs(self, **kwargs: Any) -> dict[str, Any]:
         """Return perception kwargs with a guaranteed competition-safe gazebo_pose."""
 
+        self.assert_no_gazebo_truth_fields(
+            kwargs,
+            context="competition perception update kwargs",
+        )
         self.assert_no_gazebo_pose(
             kwargs.get("gazebo_pose"),
             context="competition perception update kwargs",
-        )
-        self.assert_no_gazebo_truth_fields(
-            kwargs.get("image_pose_snapshot"),
-            context="competition image_pose_snapshot",
         )
         safe_kwargs = dict(kwargs)
         safe_kwargs["gazebo_pose"] = None
@@ -182,4 +199,5 @@ __all__ = [
     "CompetitionGuardError",
     "GAZEBO_TRUTH_POSE_SOURCE",
     "GAZEBO_TRUTH_KEY_PARTS",
+    "GAZEBO_ONLY_TRUTH_FLAG_KEYS",
 ]

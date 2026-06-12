@@ -579,6 +579,13 @@ Primary files to add or update:
 - `autonomy_core/runtime/competition_runner.py`
 - Optional guarded hook in `AutonomyAPI` if the runner-level guard cannot cover all paths.
 - Tests such as `tests/test_competition_gazebo_guard.py`.
+- Phase 7 guard note: `docs/competition_adapter_phase7_gazebo_guard.md`.
+
+Phase 7 status:
+
+- Implemented for the current competition runner boundary.
+- No live transport, command publication, telemetry readiness, or command readiness is claimed.
+- Existing `px4_runner.py`, `AutonomyAPI`, Gazebo diagnostics, and logger schema remain unchanged.
 
 Guard requirements:
 
@@ -633,13 +640,74 @@ Acceptance criteria:
 - Tests use fake clocks for rate/freshness checks.
 - Tests fail loudly on unit or frame-convention ambiguity.
 
+## Phase 8.25 - Early Gate Geometry Constants Audit
+
+Priority: P1 before interpreting perception or surrogate results.
+
+Purpose:
+
+- Audit gate and drone geometry constants before using offline replay, Gazebo/PX4 surrogate runs, or perception dry-run output to judge behavior.
+- Prevent perception conclusions from being based on stale gate dimensions while preserving current PnP scoring behavior.
+
+Implementation tasks:
+
+- Read-only audit current PnP object points, gate-size constants, gate-clearance assumptions, and drone-size assumptions.
+- Compare current constants to VADR-TS-002: `2700 mm` outer square, `1500 mm` inner square, `260 mm` depth, drone `280 mm x 280 mm x 160 mm`.
+- Record every file and constant that already matches the spec.
+- Record every file and constant that appears stale or ambiguous.
+- If updates are needed, update only centralized constants and deterministic fixtures first.
+- Do not change PnP candidate scoring, gate admission thresholds, low-gate crossing behavior, or race progression.
+
+Acceptance criteria:
+
+- Early geometry audit output is available before Phase 8.5 surrogate interpretation.
+- Official gate/drone dimensions are recorded in one central config path or explicitly mapped to existing constants.
+- Any stale or ambiguous geometry usage is listed before behavior tuning or perception-result interpretation.
+- No scoring or progression behavior changes are made in this phase.
+
+## Phase 8.5 - PX4/Gazebo Surrogate Competition Harness
+
+Priority: P1 surrogate confidence only; does not unblock Phase 4B.
+
+Purpose:
+
+- Use PX4/Gazebo as a surrogate to validate competition runner wiring, timing pressure, camera packetization, state mapping, and dry-run command candidates when the real competition simulator is unavailable.
+- Keep surrogate evidence explicitly separate from real competition simulator evidence.
+
+Scope:
+
+- Use PX4/MAVSDK estimated telemetry only; do not feed Gazebo model pose, Gazebo camera pose, Gazebo TF, or Gazebo truth into competition runner inputs.
+- Configure or approximate the Gazebo camera to the VADR-TS-002 model: `640x360`, `fx=fy=320`, `cx=320`, `cy=180`, zero distortion, same body/camera origin, and `20 deg` upward tilt.
+- Convert PX4/MAVSDK telemetry into MAVLink-like fake messages accepted by `CompetitionRunner` injected transports.
+- JPEG-encode and packetize Gazebo camera frames into fake VADR `<IHHIIQ` vision packets.
+- Feed telemetry and vision into `CompetitionRunner` through injected transports only.
+- Keep command adapter in dry-run mode; `command_live` and `race` remain disabled.
+- Label all logs and artifacts as PX4/Gazebo surrogate evidence, not competition simulator evidence.
+
+Non-goals:
+
+- Do not mark Phase 4B complete from PX4/Gazebo data.
+- Do not claim competition telemetry readiness, command readiness, or race readiness.
+- Do not add live competition MAVLink transport or live competition UDP vision transport.
+- Do not send heartbeats, setpoints, actuator commands, attitude targets, position targets, or any MAVLink command from the competition runner.
+- Do not use Gazebo truth to fabricate state, gate position, or command readiness.
+
+Acceptance criteria:
+
+- Surrogate harness can run with command publication disabled.
+- Runner inputs are produced through fake/injected transports, not direct production sockets.
+- Gazebo-truth guard remains active and rejects any Gazebo truth metadata that reaches the competition runner.
+- Harness logs frame rate, packetization errors, telemetry freshness, command candidate rate, and command-blocked reasons.
+- Results are explicitly documented as surrogate-only and cannot satisfy Phase 4B.
+
 ## Phase 9 - Offline Replay And Dry-Run Bring-Up
 
 Priority: P1.
 
 Purpose:
 
-- Validate adapter behavior progressively before command-enabled runs.
+- Validate adapter behavior progressively before command-enabled runs, using real competition simulator evidence where simulator stages are required.
+- Keep PX4/Gazebo surrogate evidence in Phase 8.5; do not use it to satisfy competition simulator observe, vision, command, or live stages.
 
 Stage 1: import/static validation.
 
@@ -664,6 +732,7 @@ Stage 3: simulator observe mode.
 - Verify whether local position/odometry is available.
 - Stop here and scope a P0 state-estimation plan if usable local position/odometry is absent.
 - Do not ingest vision and do not send commands.
+- This stage requires the real competition simulator or an official equivalent; PX4/Gazebo surrogate output does not satisfy it.
 
 Stage 4: simulator vision dry-run.
 
@@ -671,6 +740,7 @@ Stage 4: simulator vision dry-run.
 - Pass frames into perception with official camera metadata and `gazebo_pose=None`.
 - Log frame rate, dropped chunks, decode failures, and perception update count.
 - Do not send commands.
+- This stage requires the real competition simulator or an official equivalent; Phase 8.5 only provides surrogate confidence.
 
 Stage 5: simulator command dry-run.
 
@@ -678,6 +748,7 @@ Stage 5: simulator command dry-run.
 - Verify command units and rate below `100 Hz`.
 - Verify stale telemetry/image rejects command candidates.
 - Do not send UDP command messages.
+- This stage requires real competition telemetry and command-semantics evidence; PX4/Gazebo does not prove competition command acceptance.
 
 Stage 6: live command output under external safety controls.
 
@@ -728,16 +799,16 @@ Priority: P1 before submitted timed runs.
 
 Purpose:
 
-- Ensure constants match VADR-TS-002 without changing scoring behavior prematurely.
-- Audit these constants early enough that dry-run perception results are not interpreted against stale geometry.
+- Perform the final pre-submission geometry audit after the early Phase 8.25 audit and any fixture/constant updates.
+- Ensure submitted-run constants match VADR-TS-002 without changing scoring behavior prematurely.
 
 Implementation tasks:
 
-- Perform a read-only audit early in the adapter branch before final PnP validation, even if fixes remain P1.
+- Re-run the Phase 8.25 geometry audit before submitted/timed attempts.
 - Audit PnP object points and gate-size constants.
 - Audit gate-clearance and drone-size assumptions.
 - Compare current constants to VADR-TS-002: `2700 mm` outer square, `1500 mm` inner square, `260 mm` depth, drone `280 mm x 280 mm x 160 mm`.
-- Update constants/fixtures first if old dimensions are present.
+- Confirm any earlier constant/fixture updates are still in effect.
 - Add tests that assert official geometry constants are used where the adapter or PnP model expects them.
 
 Acceptance criteria:
@@ -788,10 +859,13 @@ Use this order for Codex implementation tasks:
 9. Add `competition_runner.py` in `observe`, `vision_dry_run`, and `command_dry_run` modes before any live command mode.
 10. Expand the hard Gazebo-truth guard and run guard tests before command-enabled simulator runs.
 11. Run deterministic adapter tests.
-12. Run offline replay validation against saved frames and telemetry.
-13. Enable live command output below `100 Hz` only after heartbeat, telemetry freshness, image timing, Gazebo guard, and command units are verified.
-14. Add bounded race logging, no-human-interaction safeguards, and the `8 min` submitted-run timer.
-15. Complete the gate-geometry audit and update constants/fixtures before submitted runs.
+12. Run the Phase 8.25 early gate/drone geometry audit before interpreting perception or surrogate output.
+13. Build the Phase 8.5 PX4/Gazebo surrogate harness if the real competition simulator remains unavailable; keep results labeled surrogate-only.
+14. Run offline replay validation against saved frames and telemetry.
+15. Run real competition simulator observe/vision/command dry-run stages when available; PX4/Gazebo surrogate output does not satisfy Phase 4B or Phase 9 simulator stages.
+16. Enable live command output below `100 Hz` only after heartbeat, telemetry freshness, image timing, Gazebo guard, and command units are verified against the real competition simulator or an official equivalent.
+17. Add bounded race logging, no-human-interaction safeguards, and the `8 min` submitted-run timer.
+18. Complete the final Phase 11 gate-geometry audit before submitted runs.
 
 ## Definition Of Done For The Adapter Branch
 

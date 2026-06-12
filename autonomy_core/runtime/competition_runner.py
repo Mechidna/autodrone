@@ -79,6 +79,7 @@ class CompetitionRunnerConfig:
     target_system: int = 1
     target_component: int = 1
     perception_world_pose_source: Optional[str] = None
+    startup_metadata: Any = None
     safety: CompetitionRunnerSafetyConfig = field(
         default_factory=CompetitionRunnerSafetyConfig
     )
@@ -272,6 +273,16 @@ class CompetitionRunner:
 
     def _assert_startup_safety(self) -> None:
         safety = self.config.safety
+        try:
+            self.guard.assert_competition_safe(
+                perception_world_pose_source=self.config.perception_world_pose_source,
+                runner_inputs=self.config.startup_metadata,
+                mode=self.mode.value,
+                command_enabled=safety.command_publication_enabled,
+            )
+        except CompetitionGuardError as exc:
+            raise CompetitionRunnerSafetyError(str(exc)) from exc
+
         if self.mode in LIVE_COMMAND_MODES:
             raise CompetitionRunnerSafetyError(
                 f"{self.mode.value} is not enabled in the Phase 6A runner skeleton"
@@ -289,15 +300,6 @@ class CompetitionRunner:
                 # This mode may still build fake dry-run candidates, but it cannot
                 # be interpreted as command readiness.
                 pass
-
-        try:
-            self.guard.assert_competition_safe(
-                perception_world_pose_source=self.config.perception_world_pose_source,
-                mode=self.mode.value,
-                command_enabled=False,
-            )
-        except CompetitionGuardError as exc:
-            raise CompetitionRunnerSafetyError(str(exc)) from exc
 
     def _process_telemetry(
         self,

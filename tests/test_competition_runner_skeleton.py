@@ -10,6 +10,10 @@ from autonomy_core.perception.competition_image_adapter import (
     pack_vision_packet,
 )
 from autonomy_core.runtime.competition_guard import GAZEBO_TRUTH_POSE_SOURCE
+from autonomy_core.runtime.competition_guard import (
+    CompetitionGuard,
+    CompetitionGuardError,
+)
 from autonomy_core.runtime.competition_runner import (
     CompetitionRunner,
     CompetitionRunnerConfig,
@@ -71,6 +75,22 @@ class FakeVisionTransport:
         packets = self.packets
         self.packets = []
         return packets
+
+
+class FakeFrame:
+    def __init__(self, **kwargs):
+        self.kwargs = dict(kwargs)
+
+    def update_gate_memory_kwargs(self):
+        return dict(self.kwargs)
+
+
+class FakeImageAdapter:
+    def __init__(self, frame):
+        self.frame = frame
+
+    def process_packet(self, _packet):
+        return self.frame
 
 
 class FakeAutonomy:
@@ -151,6 +171,20 @@ class CompetitionRunnerSkeletonTests(unittest.TestCase):
                 with self.assertRaises(CompetitionRunnerSafetyError):
                     CompetitionRunner(config=CompetitionRunnerConfig(mode=mode))
 
+    def test_live_command_modes_reject_gazebo_truth_before_fail_closed_mode(self):
+        for mode in (CompetitionRunnerMode.COMMAND_LIVE, CompetitionRunnerMode.RACE):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(
+                    CompetitionRunnerSafetyError,
+                    "gazebo_truth_sim_only",
+                ):
+                    CompetitionRunner(
+                        config=CompetitionRunnerConfig(
+                            mode=mode,
+                            perception_world_pose_source=GAZEBO_TRUTH_POSE_SOURCE,
+                        )
+                    )
+
     def test_command_publication_flag_is_rejected_even_in_dry_run_mode(self):
         with self.assertRaises(CompetitionRunnerSafetyError):
             CompetitionRunner(
@@ -161,6 +195,37 @@ class CompetitionRunnerSkeletonTests(unittest.TestCase):
                     ),
                 )
             )
+
+    def test_startup_metadata_rejects_gazebo_truth_paths(self):
+        with self.assertRaisesRegex(
+            CompetitionRunnerSafetyError,
+            "Gazebo truth field",
+        ):
+            CompetitionRunner(
+                config=CompetitionRunnerConfig(
+                    mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    startup_metadata={
+                        "image_metadata": {
+                            "gazebo_camera_pos_world": [1.0, 2.0, 3.0],
+                        }
+                    },
+                )
+            )
+
+    def test_noncompetition_guard_allows_gazebo_diagnostics_at_runner_boundary(self):
+        runner = CompetitionRunner(
+            config=CompetitionRunnerConfig(
+                mode=CompetitionRunnerMode.OBSERVE,
+                perception_world_pose_source=GAZEBO_TRUTH_POSE_SOURCE,
+                startup_metadata={"use_diagnostic_far_depth_correction": True},
+            ),
+            guard=CompetitionGuard(competition_mode=False),
+        )
+
+        result = runner.step()
+
+        self.assertFalse(result.command_publication_allowed)
+        self.assertIn("observe_mode_no_commands", result.command_blocked_reasons)
 
     def test_gazebo_truth_source_is_rejected_at_startup(self):
         with self.assertRaises(CompetitionRunnerSafetyError):
@@ -240,6 +305,49 @@ class CompetitionRunnerSkeletonTests(unittest.TestCase):
         self.assertIsNone(update_kwargs["image_pose_snapshot"])
         self.assertFalse(result.command_candidate_attempted)
         self.assertEqual(vision_transport.calls, 1)
+
+    def test_vision_dry_run_rejects_non_none_gazebo_pose_before_fake_autonomy(self):
+        autonomy = FakeAutonomy()
+        image_adapter = FakeImageAdapter(
+            FakeFrame(
+                frame="frame",
+                gazebo_pose={"gazebo_model_pos_world": [1.0, 2.0, 3.0]},
+                image_pose_snapshot=None,
+            )
+        )
+        runner = CompetitionRunner(
+            config=CompetitionRunnerConfig(mode=CompetitionRunnerMode.VISION_DRY_RUN),
+            image_adapter=image_adapter,
+            autonomy=autonomy,
+            clock=FakeClock(225.0),
+        )
+
+        with self.assertRaises(CompetitionGuardError):
+            runner.step(vision_packets=[b"fake"])
+
+        self.assertEqual(autonomy.perception_updates, [])
+
+    def test_vision_dry_run_rejects_gazebo_metadata_before_fake_autonomy(self):
+        autonomy = FakeAutonomy()
+        image_adapter = FakeImageAdapter(
+            FakeFrame(
+                frame="frame",
+                gazebo_pose=None,
+                image_pose_snapshot=None,
+                image_metadata={"gazebo_tf": {"map": "base_link"}},
+            )
+        )
+        runner = CompetitionRunner(
+            config=CompetitionRunnerConfig(mode=CompetitionRunnerMode.VISION_DRY_RUN),
+            image_adapter=image_adapter,
+            autonomy=autonomy,
+            clock=FakeClock(226.0),
+        )
+
+        with self.assertRaises(CompetitionGuardError):
+            runner.step(vision_packets=[b"fake"])
+
+        self.assertEqual(autonomy.perception_updates, [])
 
     def test_command_dry_run_builds_candidate_but_publication_stays_blocked(self):
         clock = FakeClock(300.0)

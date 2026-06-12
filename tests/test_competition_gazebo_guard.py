@@ -43,6 +43,33 @@ class CompetitionGuardTests(unittest.TestCase):
         with self.assertRaises(CompetitionGuardError):
             guard.assert_competition_safe(image_metadata=metadata)
 
+    def test_rejects_gazebo_camera_tf_and_pose_snapshot_metadata(self):
+        guard = CompetitionGuard()
+        forbidden_metadata = [
+            {"gazebo_camera_quat_world": [0.0, 0.0, 0.0, 1.0]},
+            {"gazebo_tf": {"map": "base_link"}},
+            {"gazebo_transform": {"translation": [1.0, 2.0, 3.0]}},
+            {"image_pose_snapshot": {"pose": "gazebo-only"}},
+            {"nested": {"image_gazebo_pose_snapshot": {"pose": "truth"}}},
+        ]
+
+        for metadata in forbidden_metadata:
+            with self.subTest(metadata=metadata):
+                with self.assertRaises(CompetitionGuardError):
+                    guard.assert_competition_safe(image_metadata=metadata)
+
+    def test_rejects_enabled_diagnostic_far_depth_correction(self):
+        guard = CompetitionGuard()
+
+        with self.assertRaises(CompetitionGuardError):
+            guard.assert_competition_safe(
+                runner_inputs={"use_diagnostic_far_depth_correction": True}
+            )
+
+        guard.assert_competition_safe(
+            runner_inputs={"use_diagnostic_far_depth_correction": False}
+        )
+
     def test_command_enabled_mode_rejects_gazebo_truth_inputs(self):
         guard = CompetitionGuard()
 
@@ -68,8 +95,17 @@ class CompetitionGuardTests(unittest.TestCase):
         guard.assert_competition_safe(
             perception_world_pose_source=GAZEBO_TRUTH_POSE_SOURCE,
             gazebo_pose={"gazebo_model_pos_world": [1.0, 2.0, 3.0]},
+            image_metadata={"gazebo_tf": {"map": "base_link"}},
+            runner_inputs={"use_diagnostic_far_depth_correction": True},
             command_enabled=True,
         )
+
+        kwargs = guard.perception_update_kwargs(
+            frame="frame",
+            gazebo_pose={"gazebo_model_pos_world": [1.0, 2.0, 3.0]},
+            image_pose_snapshot={"pose": "gazebo-only"},
+        )
+        self.assertIsNone(kwargs["gazebo_pose"])
 
 
 if __name__ == "__main__":
