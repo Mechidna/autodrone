@@ -100,6 +100,8 @@ class CompetitionCommandAdapterTests(unittest.TestCase):
         with self.assertRaises(CompetitionCommandAdapterError):
             autonomy_attitude_command_from_tuple((0.0, math.nan, 0.0, 0.5))
         with self.assertRaises(CompetitionCommandAdapterError):
+            autonomy_attitude_command_from_tuple((math.inf, 0.0, 0.0, 0.5))
+        with self.assertRaises(CompetitionCommandAdapterError):
             autonomy_attitude_command_from_tuple((0.0, 0.0, 0.0, 1.1))
         with self.assertRaises(CompetitionCommandAdapterError):
             autonomy_attitude_command_from_tuple((0.0, 0.0, 0.0))

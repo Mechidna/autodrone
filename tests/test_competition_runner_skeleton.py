@@ -381,6 +381,54 @@ class CompetitionRunnerSkeletonTests(unittest.TestCase):
         self.assertEqual(runner.stats.command_publications_attempted, 0)
         self.assertEqual(runner.stats.command_publications_sent, 0)
 
+    def test_command_dry_run_processes_fake_telemetry_image_and_candidate_no_send(self):
+        clock = FakeClock(350.0)
+        fake_frame = np.zeros((360, 640, 3), dtype=np.uint8)
+        image_adapter = CompetitionImageAdapter(
+            clock=clock,
+            jpeg_decoder=lambda _jpeg: fake_frame,
+        )
+        packet = pack_vision_packet(
+            frame_id=3,
+            chunk_id=0,
+            total_chunks=1,
+            jpeg_size=4,
+            payload=b"jpeg",
+            sim_time_ns=2_000_000_001,
+        )
+        autonomy = FakeAutonomy()
+        runner = CompetitionRunner(
+            config=CompetitionRunnerConfig(mode=CompetitionRunnerMode.COMMAND_DRY_RUN),
+            image_adapter=image_adapter,
+            autonomy=autonomy,
+            clock=clock,
+        )
+
+        result = runner.step(
+            telemetry_messages=[
+                FakeMessage("HEARTBEAT", 0, base_mode=0),
+                local_position_message(),
+                attitude_message(),
+            ],
+            vision_packets=[packet],
+        )
+
+        self.assertEqual(result.telemetry_messages_processed, 3)
+        self.assertEqual(result.vision_packets_processed, 1)
+        self.assertEqual(result.vision_frames_completed, 1)
+        self.assertEqual(result.perception_update_calls, 1)
+        self.assertEqual(len(autonomy.perception_updates), 1)
+        self.assertTrue(result.command_candidate_attempted)
+        self.assertIsNotNone(result.command_result)
+        self.assertTrue(result.command_result.accepted)
+        self.assertFalse(result.command_result.fields.send_ready)
+        self.assertFalse(result.command_publication_allowed)
+        self.assertIn("phase6a_no_command_publication", result.command_blocked_reasons)
+        self.assertIn("phase4b_telemetry_evidence_missing", result.command_blocked_reasons)
+        self.assertIn("command_dry_run_no_send", result.command_blocked_reasons)
+        self.assertEqual(runner.stats.command_publications_attempted, 0)
+        self.assertEqual(runner.stats.command_publications_sent, 0)
+
     def test_command_dry_run_does_not_call_autonomy_without_usable_state(self):
         autonomy = FakeAutonomy()
         runner = CompetitionRunner(

@@ -628,10 +628,17 @@ Required fixture tests:
 - State fixture: known MAVLink/NED telemetry converts to internal z-up `VehicleState` exactly.
 - State rejection fixture: missing or stale local position/odometry blocks command eligibility.
 - Command fixture: one known command tuple maps to exact MAVLink command fields.
-- Command serialization fixture: `SET_ATTITUDE_TARGET` quaternion/body-rate/type-mask fields match `PyAIPilotExample` behavior or a known-good packet capture.
+- Command serialization fixture: `SET_ATTITUDE_TARGET` quaternion/body-rate/type-mask fields match the documented Phase 5A dry-run decision; `PyAIPilotExample` body-rate behavior remains non-equivalent reference evidence unless a later known-good packet capture proves otherwise.
 - Command rate fixture: command adapter never publishes at or above `100 Hz`.
 - Gazebo guard fixture: competition mode rejects Gazebo truth defaults and non-`None` `gazebo_pose`.
 - Runner fixture: dry-run mode processes fake heartbeat, telemetry, image, and command candidate without sending a UDP command.
+
+Phase 8 status:
+
+- Implemented for the deterministic, no-live-transport adapter boundary.
+- Coverage note: `docs/competition_adapter_phase8_deterministic_tests.md`.
+- Phase 8.25 geometry audit and Phase 8.5 PX4/Gazebo surrogate harness remain separate future phases.
+- No telemetry readiness, command readiness, race readiness, or Phase 4B completion is claimed.
 
 Acceptance criteria:
 
