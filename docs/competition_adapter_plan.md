@@ -446,12 +446,15 @@ Primary files to add:
 - `autonomy_core/command/competition_command_adapter.py`
 - Create `autonomy_core/command/__init__.py` if the package does not exist.
 - Tests such as `tests/test_competition_command_adapter.py`.
+- Phase 5A command semantics note: `docs/competition_adapter_phase5a_command_semantics.md`.
 
 Implementation tasks:
 
 - Accept either the raw tuple `(roll, pitch, yaw, thrust)` or `ControlCommand`.
 - Before implementing the MAVLink mapping, document whether existing `AutonomyAPI.attitude_control()` outputs roll/pitch/yaw attitude angles, body rates, yaw angle, yaw rate, normalized efforts, or another convention.
 - If tuple semantics are unclear, stop Phase 5 and add a command-semantics note before coding the MAVLink adapter.
+- Phase 5A documents the current tuple as roll/pitch/yaw attitude angles in radians plus normalized thrust; it is not a body-rate command.
+- Phase 5A may add only a dry-run `SET_ATTITUDE_TARGET` field builder with `send_ready = false`; live command publication remains blocked while Phase 4B lacks real competition telemetry evidence.
 - Validate finite values and expected units.
 - After comparing with the simulator example, record the confirmed units and ranges for roll, pitch, yaw, and thrust, including radians versus degrees and normalized thrust versus any simulator-specific thrust field.
 - Convert roll/pitch/yaw into the MAVLink `SET_ATTITUDE_TARGET` representation required by the simulator.
