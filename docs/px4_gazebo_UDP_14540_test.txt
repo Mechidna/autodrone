@@ -1,0 +1,2179 @@
+(.venv_ctrl) paolo@paolo-Legion-5-Pro-16IAH7:~/autonomy_core$ PYTHONDONTWRITEBYTECODE=1 python3 -B -m autonomy_core.tools.competition_mavlink_observe   --endpoint udpin:0.0.0.0:14540   --duration-s 10
+{
+  "attitude_available": true,
+  "duration_s": 10.0,
+  "endpoint": "udpin:0.0.0.0:14540",
+  "finished_wall_time": 1781307005.555545,
+  "local_position_ned_available": true,
+  "message_types": {
+    "ALTITUDE": {
+      "component_ids": [
+        1
+      ],
+      "count": 99,
+      "field_names": [
+        "altitude_amsl",
+        "altitude_local",
+        "altitude_monotonic",
+        "altitude_relative",
+        "altitude_terrain",
+        "bottom_clearance",
+        "time_usec"
+      ],
+      "first_seen_wall_time": 1781306995.574721,
+      "last_seen_wall_time": 1781307005.4859982,
+      "message_id": 141,
+      "message_type": "ALTITUDE",
+      "observed_rate_hz": 9.887726823582328,
+      "samples": [
+        {
+          "altitude_amsl": 0.2228357344865799,
+          "altitude_local": -0.0013554394245147705,
+          "altitude_monotonic": -0.13146032392978668,
+          "altitude_relative": -0.010713890194892883,
+          "altitude_terrain": "nan",
+          "bottom_clearance": "nan",
+          "time_usec": 46512000
+        },
+        {
+          "altitude_amsl": 0.22104576230049133,
+          "altitude_local": -0.0031454116106033325,
+          "altitude_monotonic": 0.046950116753578186,
+          "altitude_relative": -0.012503862380981445,
+          "altitude_terrain": "nan",
+          "bottom_clearance": "nan",
+          "time_usec": 46612000
+        },
+        {
+          "altitude_amsl": 0.21885931491851807,
+          "altitude_local": -0.005331858992576599,
+          "altitude_monotonic": -0.14085035026073456,
+          "altitude_relative": -0.014690309762954712,
+          "altitude_terrain": "nan",
+          "bottom_clearance": "nan",
+          "time_usec": 46712000
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_usec"
+      ]
+    },
+    "ATTITUDE": {
+      "component_ids": [
+        1
+      ],
+      "count": 987,
+      "field_names": [
+        "pitch",
+        "pitchspeed",
+        "roll",
+        "rollspeed",
+        "time_boot_ms",
+        "yaw",
+        "yawspeed"
+      ],
+      "first_seen_wall_time": 1781306995.574691,
+      "last_seen_wall_time": 1781307005.5476723,
+      "message_id": 30,
+      "message_type": "ATTITUDE",
+      "observed_rate_hz": 98.86712696942831,
+      "samples": [
+        {
+          "pitch": 9.744515409693122e-06,
+          "pitchspeed": 0.0006056532729417086,
+          "roll": 0.000235269995755516,
+          "rollspeed": -0.0003070828097406775,
+          "time_boot_ms": 46508,
+          "yaw": 1.675590991973877,
+          "yawspeed": 6.643347660428844e-06
+        },
+        {
+          "pitch": 4.540881491266191e-06,
+          "pitchspeed": -0.000329371978295967,
+          "roll": 0.0002253026468679309,
+          "rollspeed": -0.00030548052745871246,
+          "time_boot_ms": 46516,
+          "yaw": 1.6755831241607666,
+          "yawspeed": -0.0008622470777481794
+        },
+        {
+          "pitch": 2.6644556783139706e-07,
+          "pitchspeed": -7.890570850577205e-05,
+          "roll": 0.0002142965531675145,
+          "rollspeed": -0.00024345371639356017,
+          "time_boot_ms": 46528,
+          "yaw": 1.6755768060684204,
+          "yawspeed": -0.0006036176928319037
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_boot_ms"
+      ]
+    },
+    "ATTITUDE_QUATERNION": {
+      "component_ids": [
+        1
+      ],
+      "count": 493,
+      "field_names": [
+        "pitchspeed",
+        "q1",
+        "q2",
+        "q3",
+        "q4",
+        "repr_offset_q",
+        "rollspeed",
+        "time_boot_ms",
+        "yawspeed"
+      ],
+      "first_seen_wall_time": 1781306995.5750303,
+      "last_seen_wall_time": 1781307005.53547,
+      "message_id": 31,
+      "message_type": "ATTITUDE_QUATERNION",
+      "observed_rate_hz": 49.39540981195636,
+      "samples": [
+        {
+          "pitchspeed": -0.000329371978295967,
+          "q1": 0.6691056489944458,
+          "q2": 7.368832302745432e-05,
+          "q3": 8.523794531356543e-05,
+          "q4": 0.7431672811508179,
+          "repr_offset_q": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "rollspeed": -0.00030548052745871246,
+          "time_boot_ms": 46516,
+          "yawspeed": -0.0008622470777481794
+        },
+        {
+          "pitchspeed": 0.000293471704935655,
+          "q1": 0.6691074371337891,
+          "q2": 7.165835268096998e-05,
+          "q3": 7.971010927576572e-05,
+          "q4": 0.7431657314300537,
+          "repr_offset_q": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "rollspeed": 0.00026061877724714577,
+          "time_boot_ms": 46536,
+          "yawspeed": -0.0001447660179110244
+        },
+        {
+          "pitchspeed": -0.0003962655318900943,
+          "q1": 0.6691084504127502,
+          "q2": 7.319075666600838e-05,
+          "q3": 7.132669270504266e-05,
+          "q4": 0.7431648373603821,
+          "repr_offset_q": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "rollspeed": 0.00031184699037112296,
+          "time_boot_ms": 46556,
+          "yawspeed": -0.0006817143876105547
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_boot_ms"
+      ]
+    },
+    "ATTITUDE_TARGET": {
+      "component_ids": [
+        1
+      ],
+      "count": 99,
+      "field_names": [
+        "body_pitch_rate",
+        "body_roll_rate",
+        "body_yaw_rate",
+        "q",
+        "thrust",
+        "time_boot_ms",
+        "type_mask"
+      ],
+      "first_seen_wall_time": 1781306995.5748131,
+      "last_seen_wall_time": 1781307005.4862144,
+      "message_id": 83,
+      "message_type": "ATTITUDE_TARGET",
+      "observed_rate_hz": 9.887602904206085,
+      "samples": [
+        {
+          "body_pitch_rate": -3.8977828808128834e-05,
+          "body_roll_rate": -0.0009410799248144031,
+          "body_yaw_rate": 3.337860107421875e-06,
+          "q": [
+            0.6691023707389832,
+            0.0,
+            0.0,
+            0.7431703209877014
+          ],
+          "thrust": 0.0010000000474974513,
+          "time_boot_ms": 46504,
+          "type_mask": 0
+        },
+        {
+          "body_pitch_rate": 8.665249333716929e-05,
+          "body_roll_rate": -0.0007856000447645783,
+          "body_yaw_rate": 0.0,
+          "q": [
+            0.6691145300865173,
+            0.0,
+            0.0,
+            0.743159294128418
+          ],
+          "thrust": 0.0010000000474974513,
+          "time_boot_ms": 46608,
+          "type_mask": 0
+        },
+        {
+          "body_pitch_rate": 0.00014420277148019522,
+          "body_roll_rate": -0.0005283877835609019,
+          "body_yaw_rate": 1.0013580322265625e-05,
+          "q": [
+            0.669105589389801,
+            0.0,
+            0.0,
+            0.7431674003601074
+          ],
+          "thrust": 0.0010000000474974513,
+          "time_boot_ms": 46704,
+          "type_mask": 0
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_boot_ms"
+      ]
+    },
+    "BATTERY_STATUS": {
+      "component_ids": [
+        1
+      ],
+      "count": 5,
+      "field_names": [
+        "battery_function",
+        "battery_remaining",
+        "charge_state",
+        "current_battery",
+        "current_consumed",
+        "energy_consumed",
+        "fault_bitmask",
+        "id",
+        "mode",
+        "temperature",
+        "time_remaining",
+        "type",
+        "voltages",
+        "voltages_ext"
+      ],
+      "first_seen_wall_time": 1781306995.9645858,
+      "last_seen_wall_time": 1781307004.0696814,
+      "message_id": 147,
+      "message_type": "BATTERY_STATUS",
+      "observed_rate_hz": 0.49351669432495465,
+      "samples": [
+        {
+          "battery_function": 1,
+          "battery_remaining": 100,
+          "charge_state": 1,
+          "current_battery": -100,
+          "current_consumed": -11,
+          "energy_consumed": -1,
+          "fault_bitmask": 0,
+          "id": 0,
+          "mode": 0,
+          "temperature": 32767,
+          "time_remaining": 0,
+          "type": 1,
+          "voltages": [
+            16200,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535
+          ],
+          "voltages_ext": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "battery_function": 1,
+          "battery_remaining": 100,
+          "charge_state": 1,
+          "current_battery": -100,
+          "current_consumed": -12,
+          "energy_consumed": -1,
+          "fault_bitmask": 0,
+          "id": 0,
+          "mode": 0,
+          "temperature": 32767,
+          "time_remaining": 0,
+          "type": 1,
+          "voltages": [
+            16200,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535
+          ],
+          "voltages_ext": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "battery_function": 1,
+          "battery_remaining": 100,
+          "charge_state": 1,
+          "current_battery": -100,
+          "current_consumed": -12,
+          "energy_consumed": -1,
+          "fault_bitmask": 0,
+          "id": 0,
+          "mode": 0,
+          "temperature": 32767,
+          "time_remaining": 0,
+          "type": 1,
+          "voltages": [
+            16200,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535,
+            65535
+          ],
+          "voltages_ext": [
+            0,
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": []
+    },
+    "ESTIMATOR_STATUS": {
+      "component_ids": [
+        1
+      ],
+      "count": 10,
+      "field_names": [
+        "flags",
+        "hagl_ratio",
+        "mag_ratio",
+        "pos_horiz_accuracy",
+        "pos_horiz_ratio",
+        "pos_vert_accuracy",
+        "pos_vert_ratio",
+        "tas_ratio",
+        "time_usec",
+        "vel_ratio"
+      ],
+      "first_seen_wall_time": 1781306995.9647195,
+      "last_seen_wall_time": 1781307005.0818708,
+      "message_id": 230,
+      "message_type": "ESTIMATOR_STATUS",
+      "observed_rate_hz": 0.9871504533565076,
+      "samples": [
+        {
+          "flags": 959,
+          "hagl_ratio": "nan",
+          "mag_ratio": 0.0010151751339435577,
+          "pos_horiz_accuracy": 0.150677889585495,
+          "pos_horiz_ratio": 0.0048941634595394135,
+          "pos_vert_accuracy": 0.16730187833309174,
+          "pos_vert_ratio": 0.0029184746090322733,
+          "tas_ratio": "nan",
+          "time_usec": 46904000,
+          "vel_ratio": 0.007046972401440144
+        },
+        {
+          "flags": 959,
+          "hagl_ratio": "nan",
+          "mag_ratio": 0.0006489006336778402,
+          "pos_horiz_accuracy": 0.1511896401643753,
+          "pos_horiz_ratio": 0.005374101921916008,
+          "pos_vert_accuracy": 0.16749340295791626,
+          "pos_vert_ratio": 0.0033494923263788223,
+          "tas_ratio": "nan",
+          "time_usec": 47904000,
+          "vel_ratio": 0.011073651723563671
+        },
+        {
+          "flags": 959,
+          "hagl_ratio": "nan",
+          "mag_ratio": 0.0004687467298936099,
+          "pos_horiz_accuracy": 0.1517118364572525,
+          "pos_horiz_ratio": 0.0023902379907667637,
+          "pos_vert_accuracy": 0.1678791642189026,
+          "pos_vert_ratio": 0.0023446916602551937,
+          "tas_ratio": "nan",
+          "time_usec": 48904000,
+          "vel_ratio": 0.009150959551334381
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_usec"
+      ]
+    },
+    "EXTENDED_SYS_STATE": {
+      "component_ids": [
+        1
+      ],
+      "count": 50,
+      "field_names": [
+        "landed_state",
+        "vtol_state"
+      ],
+      "first_seen_wall_time": 1781306995.5748398,
+      "last_seen_wall_time": 1781307005.4862757,
+      "message_id": 245,
+      "message_type": "EXTENDED_SYS_STATE",
+      "observed_rate_hz": 4.943784208320229,
+      "samples": [
+        {
+          "landed_state": 1,
+          "vtol_state": 0
+        },
+        {
+          "landed_state": 1,
+          "vtol_state": 0
+        },
+        {
+          "landed_state": 1,
+          "vtol_state": 0
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": []
+    },
+    "GLOBAL_POSITION_INT": {
+      "component_ids": [
+        1
+      ],
+      "count": 493,
+      "field_names": [
+        "alt",
+        "hdg",
+        "lat",
+        "lon",
+        "relative_alt",
+        "time_boot_ms",
+        "vx",
+        "vy",
+        "vz"
+      ],
+      "first_seen_wall_time": 1781306995.5750575,
+      "last_seen_wall_time": 1781307005.5356464,
+      "message_id": 33,
+      "message_type": "GLOBAL_POSITION_INT",
+      "observed_rate_hz": 49.3946696683291,
+      "samples": [
+        {
+          "alt": 222,
+          "hdg": 9600,
+          "lat": 473979707,
+          "lon": 85461636,
+          "relative_alt": -10,
+          "time_boot_ms": 46512,
+          "vx": -1,
+          "vy": 0,
+          "vz": 0
+        },
+        {
+          "alt": 222,
+          "hdg": 9600,
+          "lat": 473979707,
+          "lon": 85461636,
+          "relative_alt": -11,
+          "time_boot_ms": 46536,
+          "vx": -1,
+          "vy": 0,
+          "vz": 0
+        },
+        {
+          "alt": 222,
+          "hdg": 9600,
+          "lat": 473979707,
+          "lon": 85461636,
+          "relative_alt": -11,
+          "time_boot_ms": 46552,
+          "vx": -1,
+          "vy": 0,
+          "vz": 0
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_boot_ms"
+      ]
+    },
+    "GPS_RAW_INT": {
+      "component_ids": [
+        1
+      ],
+      "count": 299,
+      "field_names": [
+        "alt",
+        "alt_ellipsoid",
+        "cog",
+        "eph",
+        "epv",
+        "fix_type",
+        "h_acc",
+        "hdg_acc",
+        "lat",
+        "lon",
+        "satellites_visible",
+        "time_usec",
+        "v_acc",
+        "vel",
+        "vel_acc",
+        "yaw"
+      ],
+      "first_seen_wall_time": 1781306995.5838983,
+      "last_seen_wall_time": 1781307005.5426981,
+      "message_id": 24,
+      "message_type": "GPS_RAW_INT",
+      "observed_rate_hz": 29.92328441348928,
+      "samples": [
+        {
+          "alt": 184,
+          "alt_ellipsoid": 184,
+          "cog": 31353,
+          "eph": 70,
+          "epv": 110,
+          "fix_type": 3,
+          "h_acc": 900,
+          "hdg_acc": 0,
+          "lat": 473979710,
+          "lon": 85461640,
+          "satellites_visible": 10,
+          "time_usec": 0,
+          "v_acc": 1780,
+          "vel": 0,
+          "vel_acc": 400,
+          "yaw": 0
+        },
+        {
+          "alt": 174,
+          "alt_ellipsoid": 174,
+          "cog": 29585,
+          "eph": 70,
+          "epv": 110,
+          "fix_type": 3,
+          "h_acc": 900,
+          "hdg_acc": 0,
+          "lat": 473979710,
+          "lon": 85461640,
+          "satellites_visible": 10,
+          "time_usec": 0,
+          "v_acc": 1780,
+          "vel": 1,
+          "vel_acc": 400,
+          "yaw": 0
+        },
+        {
+          "alt": 178,
+          "alt_ellipsoid": 178,
+          "cog": 25173,
+          "eph": 70,
+          "epv": 110,
+          "fix_type": 3,
+          "h_acc": 900,
+          "hdg_acc": 0,
+          "lat": 473979710,
+          "lon": 85461638,
+          "satellites_visible": 10,
+          "time_usec": 0,
+          "v_acc": 1780,
+          "vel": 1,
+          "vel_acc": 400,
+          "yaw": 0
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_usec"
+      ]
+    },
+    "HEARTBEAT": {
+      "component_ids": [
+        1
+      ],
+      "count": 10,
+      "field_names": [
+        "autopilot",
+        "base_mode",
+        "custom_mode",
+        "mavlink_version",
+        "system_status",
+        "type"
+      ],
+      "first_seen_wall_time": 1781306995.9641922,
+      "last_seen_wall_time": 1781307005.080788,
+      "message_id": 0,
+      "message_type": "HEARTBEAT",
+      "observed_rate_hz": 0.9872106048851066,
+      "samples": [
+        {
+          "autopilot": 12,
+          "base_mode": 29,
+          "custom_mode": 50593792,
+          "mavlink_version": 3,
+          "system_status": 0,
+          "type": 2
+        },
+        {
+          "autopilot": 12,
+          "base_mode": 29,
+          "custom_mode": 50593792,
+          "mavlink_version": 3,
+          "system_status": 0,
+          "type": 2
+        },
+        {
+          "autopilot": 12,
+          "base_mode": 29,
+          "custom_mode": 50593792,
+          "mavlink_version": 3,
+          "system_status": 0,
+          "type": 2
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": []
+    },
+    "HIGHRES_IMU": {
+      "component_ids": [
+        1
+      ],
+      "count": 494,
+      "field_names": [
+        "abs_pressure",
+        "diff_pressure",
+        "fields_updated",
+        "id",
+        "pressure_alt",
+        "temperature",
+        "time_usec",
+        "xacc",
+        "xgyro",
+        "xmag",
+        "yacc",
+        "ygyro",
+        "ymag",
+        "zacc",
+        "zgyro",
+        "zmag"
+      ],
+      "first_seen_wall_time": 1781306995.5745826,
+      "last_seen_wall_time": 1781307005.5475004,
+      "message_id": 105,
+      "message_type": "HIGHRES_IMU",
+      "observed_rate_hz": 49.43387784046594,
+      "samples": [
+        {
+          "abs_pressure": 1013.2656860351562,
+          "diff_pressure": 0.0,
+          "fields_updated": 6719,
+          "id": 0,
+          "pressure_alt": -0.13146032392978668,
+          "temperature": 15.0,
+          "time_usec": 46508000,
+          "xacc": -0.001577876741066575,
+          "xgyro": 6.169826519908383e-05,
+          "xmag": -0.009736206382513046,
+          "yacc": -0.0003443881869316101,
+          "ygyro": 0.0001048046033247374,
+          "ymag": -0.21681946516036987,
+          "zacc": -9.8064546585083,
+          "zgyro": -0.00033306831028312445,
+          "zmag": 0.4297802150249481
+        },
+        {
+          "abs_pressure": 1013.2656860351562,
+          "diff_pressure": 0.0,
+          "fields_updated": 63,
+          "id": 0,
+          "pressure_alt": -0.13146032392978668,
+          "temperature": 15.0,
+          "time_usec": 46528000,
+          "xacc": -0.00806978065520525,
+          "xgyro": -0.0009353752830065787,
+          "xmag": -0.009736206382513046,
+          "yacc": 0.005680619273334742,
+          "ygyro": 0.0001983093097805977,
+          "ymag": -0.21681946516036987,
+          "zacc": -9.814794540405273,
+          "zgyro": -0.000773073174059391,
+          "zmag": 0.4297802150249481
+        },
+        {
+          "abs_pressure": 1013.2656860351562,
+          "diff_pressure": 0.0,
+          "fields_updated": 63,
+          "id": 0,
+          "pressure_alt": -0.13146032392978668,
+          "temperature": 15.0,
+          "time_usec": 46548000,
+          "xacc": -0.006823150906711817,
+          "xgyro": 0.00011620463919825852,
+          "xmag": -0.009736206382513046,
+          "yacc": 0.011026374995708466,
+          "ygyro": -0.0008142662700265646,
+          "ymag": -0.21681946516036987,
+          "zacc": -9.807953834533691,
+          "zgyro": 0.00020303043129388243,
+          "zmag": 0.4297802150249481
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_usec"
+      ]
+    },
+    "HOME_POSITION": {
+      "component_ids": [
+        1
+      ],
+      "count": 5,
+      "field_names": [
+        "altitude",
+        "approach_x",
+        "approach_y",
+        "approach_z",
+        "latitude",
+        "longitude",
+        "q",
+        "time_usec",
+        "x",
+        "y",
+        "z"
+      ],
+      "first_seen_wall_time": 1781306995.9648077,
+      "last_seen_wall_time": 1781307004.0698624,
+      "message_id": 242,
+      "message_type": "HOME_POSITION",
+      "observed_rate_hz": 0.4935191913013957,
+      "samples": [
+        {
+          "altitude": 233,
+          "approach_x": 0.0,
+          "approach_y": 0.0,
+          "approach_z": 0.0,
+          "latitude": 473979708,
+          "longitude": 85461638,
+          "q": [
+            0.6695339679718018,
+            0.00034920137841254473,
+            0.0005900752148590982,
+            0.7427811026573181
+          ],
+          "time_usec": 7372000,
+          "x": -0.02442341297864914,
+          "y": 0.004381986800581217,
+          "z": -0.009358450770378113
+        },
+        {
+          "altitude": 233,
+          "approach_x": 0.0,
+          "approach_y": 0.0,
+          "approach_z": 0.0,
+          "latitude": 473979708,
+          "longitude": 85461638,
+          "q": [
+            0.6695339679718018,
+            0.00034920137841254473,
+            0.0005900752148590982,
+            0.7427811026573181
+          ],
+          "time_usec": 7372000,
+          "x": -0.02442341297864914,
+          "y": 0.004381986800581217,
+          "z": -0.009358450770378113
+        },
+        {
+          "altitude": 233,
+          "approach_x": 0.0,
+          "approach_y": 0.0,
+          "approach_z": 0.0,
+          "latitude": 473979708,
+          "longitude": 85461638,
+          "q": [
+            0.6695339679718018,
+            0.00034920137841254473,
+            0.0005900752148590982,
+            0.7427811026573181
+          ],
+          "time_usec": 7372000,
+          "x": -0.02442341297864914,
+          "y": 0.004381986800581217,
+          "z": -0.009358450770378113
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_usec"
+      ]
+    },
+    "LOCAL_POSITION_NED": {
+      "component_ids": [
+        1
+      ],
+      "count": 296,
+      "field_names": [
+        "time_boot_ms",
+        "vx",
+        "vy",
+        "vz",
+        "x",
+        "y",
+        "z"
+      ],
+      "first_seen_wall_time": 1781306995.5746508,
+      "last_seen_wall_time": 1781307005.5229816,
+      "message_id": 32,
+      "message_type": "LOCAL_POSITION_NED",
+      "observed_rate_hz": 29.65321555764174,
+      "samples": [
+        {
+          "time_boot_ms": 46504,
+          "vx": -0.016258643940091133,
+          "vy": -0.008230750449001789,
+          "vz": 0.004425675142556429,
+          "x": -0.03365767002105713,
+          "y": -0.010299205780029297,
+          "z": 0.0013554394245147705
+        },
+        {
+          "time_boot_ms": 46544,
+          "vx": -0.015667229890823364,
+          "vy": -0.007840092293918133,
+          "vz": 0.004538463428616524,
+          "x": -0.033050552010536194,
+          "y": -0.009569365531206131,
+          "z": 0.001943632960319519
+        },
+        {
+          "time_boot_ms": 46576,
+          "vx": -0.015135434456169605,
+          "vy": -0.007418852765113115,
+          "vz": 0.0047005354426801205,
+          "x": -0.03252885490655899,
+          "y": -0.008998970501124859,
+          "z": 0.002501875162124634
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_boot_ms"
+      ]
+    },
+    "MISSION_CURRENT": {
+      "component_ids": [
+        1
+      ],
+      "count": 9,
+      "field_names": [
+        "mission_mode",
+        "mission_state",
+        "seq",
+        "total"
+      ],
+      "first_seen_wall_time": 1781306996.435682,
+      "last_seen_wall_time": 1781307004.6198137,
+      "message_id": 42,
+      "message_type": "MISSION_CURRENT",
+      "observed_rate_hz": 0.9775013855089514,
+      "samples": [
+        {
+          "mission_mode": 2,
+          "mission_state": 1,
+          "seq": 0,
+          "total": 65535
+        },
+        {
+          "mission_mode": 2,
+          "mission_state": 1,
+          "seq": 0,
+          "total": 65535
+        },
+        {
+          "mission_mode": 2,
+          "mission_state": 1,
+          "seq": 0,
+          "total": 65535
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": []
+    },
+    "ODOMETRY": {
+      "component_ids": [
+        1
+      ],
+      "count": 296,
+      "field_names": [
+        "child_frame_id",
+        "estimator_type",
+        "frame_id",
+        "pitchspeed",
+        "pose_covariance",
+        "q",
+        "quality",
+        "reset_counter",
+        "rollspeed",
+        "time_usec",
+        "velocity_covariance",
+        "vx",
+        "vy",
+        "vz",
+        "x",
+        "y",
+        "yawspeed",
+        "z"
+      ],
+      "first_seen_wall_time": 1781306995.574768,
+      "last_seen_wall_time": 1781307005.5231907,
+      "message_id": 331,
+      "message_type": "ODOMETRY",
+      "observed_rate_hz": 29.652941956194052,
+      "samples": [
+        {
+          "child_frame_id": 1,
+          "estimator_type": 8,
+          "frame_id": 1,
+          "pitchspeed": 0.0005927660968154669,
+          "pose_covariance": [
+            0.011318987235426903,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.011325550265610218,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.027978001162409782,
+            0.0,
+            0.0,
+            0.0,
+            3.610245403251611e-05,
+            0.0,
+            0.0,
+            3.613171065808274e-05,
+            0.0,
+            0.03397549316287041
+          ],
+          "q": [
+            0.6691024303436279,
+            7.564477709820494e-05,
+            9.190570563077927e-05,
+            0.7431702613830566
+          ],
+          "quality": 0,
+          "reset_counter": 12,
+          "rollspeed": -0.0005314266891218722,
+          "time_usec": 46504000,
+          "velocity_covariance": [
+            0.0037077523302286863,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.003706430783495307,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.003035118104889989,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "vx": -0.016258643940091133,
+          "vy": -0.008230750449001789,
+          "vz": 0.004425675142556429,
+          "x": -0.03365767002105713,
+          "y": -0.010299205780029297,
+          "yawspeed": 6.998093886068091e-05,
+          "z": 0.0013554394245147705
+        },
+        {
+          "child_frame_id": 1,
+          "estimator_type": 8,
+          "frame_id": 1,
+          "pitchspeed": -0.0003946014621760696,
+          "pose_covariance": [
+            0.011372587643563747,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.011379118077456951,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.028027353808283806,
+            0.0,
+            0.0,
+            0.0,
+            3.611979991546832e-05,
+            0.0,
+            0.0,
+            3.615110836108215e-05,
+            0.0,
+            0.03397590294480324
+          ],
+          "q": [
+            0.6691064834594727,
+            7.156614447012544e-05,
+            7.564441330032423e-05,
+            0.7431665658950806
+          ],
+          "quality": 0,
+          "reset_counter": 12,
+          "rollspeed": -0.0001261903962586075,
+          "time_usec": 46544000,
+          "velocity_covariance": [
+            0.0037303860299289227,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0037287911400198936,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.003041619900614023,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "vx": -0.015667229890823364,
+          "vy": -0.007840092293918133,
+          "vz": 0.004538463428616524,
+          "x": -0.033050552010536194,
+          "y": -0.009569365531206131,
+          "yawspeed": 0.00021874759113416076,
+          "z": 0.001943632960319519
+        },
+        {
+          "child_frame_id": 1,
+          "estimator_type": 8,
+          "frame_id": 1,
+          "pitchspeed": 0.0002754550951067358,
+          "pose_covariance": [
+            0.011364281177520752,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.01137090940028429,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.027986638247966766,
+            0.0,
+            0.0,
+            0.0,
+            3.6115892726229504e-05,
+            0.0,
+            0.0,
+            3.61488237103913e-05,
+            0.0,
+            0.03397441655397415
+          ],
+          "q": [
+            0.6691106557846069,
+            6.96106071700342e-05,
+            6.774206849513575e-05,
+            0.7431628704071045
+          ],
+          "quality": 0,
+          "reset_counter": 12,
+          "rollspeed": 0.0004129988083150238,
+          "time_usec": 46576000,
+          "velocity_covariance": [
+            0.0037262148689478636,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.003724880749359727,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.003039086703211069,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "vx": -0.015135434456169605,
+          "vy": -0.007418852765113115,
+          "vz": 0.0047005354426801205,
+          "x": -0.03252885490655899,
+          "y": -0.008998970501124859,
+          "yawspeed": -0.0010507464176043868,
+          "z": 0.002501875162124634
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_usec"
+      ]
+    },
+    "OPEN_DRONE_ID_LOCATION": {
+      "component_ids": [
+        1
+      ],
+      "count": 10,
+      "field_names": [
+        "altitude_barometric",
+        "altitude_geodetic",
+        "barometer_accuracy",
+        "direction",
+        "height",
+        "height_reference",
+        "horizontal_accuracy",
+        "id_or_mac",
+        "latitude",
+        "longitude",
+        "speed_accuracy",
+        "speed_horizontal",
+        "speed_vertical",
+        "status",
+        "target_component",
+        "target_system",
+        "timestamp",
+        "timestamp_accuracy",
+        "vertical_accuracy"
+      ],
+      "first_seen_wall_time": 1781306995.9648635,
+      "last_seen_wall_time": 1781307005.0820327,
+      "message_id": 12901,
+      "message_type": "OPEN_DRONE_ID_LOCATION",
+      "observed_rate_hz": 0.9871485172702774,
+      "samples": [
+        {
+          "altitude_barometric": 0.051645129919052124,
+          "altitude_geodetic": 0.0,
+          "barometer_accuracy": 0,
+          "direction": 17500,
+          "height": -0.018836989998817444,
+          "height_reference": 0,
+          "horizontal_accuracy": 12,
+          "id_or_mac": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "latitude": 473979708,
+          "longitude": 85461637,
+          "speed_accuracy": 3,
+          "speed_horizontal": 0,
+          "speed_vertical": 1,
+          "status": 1,
+          "target_component": 0,
+          "target_system": 0,
+          "timestamp": 65535.0,
+          "timestamp_accuracy": 0,
+          "vertical_accuracy": 5
+        },
+        {
+          "altitude_barometric": -0.1831054538488388,
+          "altitude_geodetic": 0.0,
+          "barometer_accuracy": 0,
+          "direction": 2100,
+          "height": -0.03257365524768829,
+          "height_reference": 0,
+          "horizontal_accuracy": 12,
+          "id_or_mac": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "latitude": 473979712,
+          "longitude": 85461638,
+          "speed_accuracy": 3,
+          "speed_horizontal": 2,
+          "speed_vertical": 4,
+          "status": 1,
+          "target_component": 0,
+          "target_system": 0,
+          "timestamp": 65535.0,
+          "timestamp_accuracy": 0,
+          "vertical_accuracy": 5
+        },
+        {
+          "altitude_barometric": -0.004695011768490076,
+          "altitude_geodetic": 0.0,
+          "barometer_accuracy": 0,
+          "direction": 11100,
+          "height": -0.018175870180130005,
+          "height_reference": 0,
+          "horizontal_accuracy": 12,
+          "id_or_mac": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "latitude": 473979710,
+          "longitude": 85461640,
+          "speed_accuracy": 3,
+          "speed_horizontal": 3,
+          "speed_vertical": 2,
+          "status": 1,
+          "target_component": 0,
+          "target_system": 0,
+          "timestamp": 65535.0,
+          "timestamp_accuracy": 0,
+          "vertical_accuracy": 5
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "timestamp"
+      ]
+    },
+    "OPEN_DRONE_ID_SYSTEM": {
+      "component_ids": [
+        1
+      ],
+      "count": 10,
+      "field_names": [
+        "area_ceiling",
+        "area_count",
+        "area_floor",
+        "area_radius",
+        "category_eu",
+        "class_eu",
+        "classification_type",
+        "id_or_mac",
+        "operator_altitude_geo",
+        "operator_latitude",
+        "operator_location_type",
+        "operator_longitude",
+        "target_component",
+        "target_system",
+        "timestamp"
+      ],
+      "first_seen_wall_time": 1781306995.9649162,
+      "last_seen_wall_time": 1781307005.0820863,
+      "message_id": 12904,
+      "message_type": "OPEN_DRONE_ID_SYSTEM",
+      "observed_rate_hz": 0.9871484140125585,
+      "samples": [
+        {
+          "area_ceiling": -1000.0,
+          "area_count": 1,
+          "area_floor": -1000.0,
+          "area_radius": 0,
+          "category_eu": 0,
+          "class_eu": 0,
+          "classification_type": 0,
+          "id_or_mac": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "operator_altitude_geo": 0.23354962468147278,
+          "operator_latitude": 473979708,
+          "operator_location_type": 0,
+          "operator_longitude": 85461638,
+          "target_component": 0,
+          "target_system": 0,
+          "timestamp": 2748666496
+        },
+        {
+          "area_ceiling": -1000.0,
+          "area_count": 1,
+          "area_floor": -1000.0,
+          "area_radius": 0,
+          "category_eu": 0,
+          "class_eu": 0,
+          "classification_type": 0,
+          "id_or_mac": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "operator_altitude_geo": 0.23354962468147278,
+          "operator_latitude": 473979708,
+          "operator_location_type": 0,
+          "operator_longitude": 85461638,
+          "target_component": 0,
+          "target_system": 0,
+          "timestamp": 2748666496
+        },
+        {
+          "area_ceiling": -1000.0,
+          "area_count": 1,
+          "area_floor": -1000.0,
+          "area_radius": 0,
+          "category_eu": 0,
+          "class_eu": 0,
+          "classification_type": 0,
+          "id_or_mac": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "operator_altitude_geo": 0.23354962468147278,
+          "operator_latitude": 473979708,
+          "operator_location_type": 0,
+          "operator_longitude": 85461638,
+          "target_component": 0,
+          "target_system": 0,
+          "timestamp": 2748666496
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "timestamp"
+      ]
+    },
+    "PING": {
+      "component_ids": [
+        1
+      ],
+      "count": 10,
+      "field_names": [
+        "seq",
+        "target_component",
+        "target_system",
+        "time_usec"
+      ],
+      "first_seen_wall_time": 1781306995.9649575,
+      "last_seen_wall_time": 1781307005.0821264,
+      "message_id": 4,
+      "message_type": "PING",
+      "observed_rate_hz": 0.9871485430847106,
+      "samples": [
+        {
+          "seq": 41,
+          "target_component": 0,
+          "target_system": 0,
+          "time_usec": 46912000
+        },
+        {
+          "seq": 42,
+          "target_component": 0,
+          "target_system": 0,
+          "time_usec": 47912000
+        },
+        {
+          "seq": 43,
+          "target_component": 0,
+          "target_system": 0,
+          "time_usec": 48912000
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_usec"
+      ]
+    },
+    "POSITION_TARGET_LOCAL_NED": {
+      "component_ids": [
+        1
+      ],
+      "count": 99,
+      "field_names": [
+        "afx",
+        "afy",
+        "afz",
+        "coordinate_frame",
+        "time_boot_ms",
+        "type_mask",
+        "vx",
+        "vy",
+        "vz",
+        "x",
+        "y",
+        "yaw",
+        "yaw_rate",
+        "z"
+      ],
+      "first_seen_wall_time": 1781306995.5748641,
+      "last_seen_wall_time": 1781307005.4863548,
+      "message_id": 85,
+      "message_type": "POSITION_TARGET_LOCAL_NED",
+      "observed_rate_hz": 9.887513712719475,
+      "samples": [
+        {
+          "afx": 0.0,
+          "afy": 0.0,
+          "afz": 100.0,
+          "coordinate_frame": 1,
+          "time_boot_ms": 46504,
+          "type_mask": 63,
+          "vx": "nan",
+          "vy": "nan",
+          "vz": "nan",
+          "x": "nan",
+          "y": "nan",
+          "yaw": 1.675592064857483,
+          "yaw_rate": 0.0,
+          "z": "nan"
+        },
+        {
+          "afx": 0.0,
+          "afy": 0.0,
+          "afz": 100.0,
+          "coordinate_frame": 1,
+          "time_boot_ms": 46608,
+          "type_mask": 63,
+          "vx": "nan",
+          "vy": "nan",
+          "vz": "nan",
+          "x": "nan",
+          "y": "nan",
+          "yaw": 1.6755592823028564,
+          "yaw_rate": 0.0,
+          "z": "nan"
+        },
+        {
+          "afx": 0.0,
+          "afy": 0.0,
+          "afz": 100.0,
+          "coordinate_frame": 1,
+          "time_boot_ms": 46704,
+          "type_mask": 63,
+          "vx": "nan",
+          "vy": "nan",
+          "vz": "nan",
+          "x": "nan",
+          "y": "nan",
+          "yaw": 1.6755833625793457,
+          "yaw_rate": 0.0,
+          "z": "nan"
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_boot_ms"
+      ]
+    },
+    "SCALED_PRESSURE": {
+      "component_ids": [
+        1
+      ],
+      "count": 10,
+      "field_names": [
+        "press_abs",
+        "press_diff",
+        "temperature",
+        "temperature_press_diff",
+        "time_boot_ms"
+      ],
+      "first_seen_wall_time": 1781306995.9650223,
+      "last_seen_wall_time": 1781307005.0821965,
+      "message_id": 29,
+      "message_type": "SCALED_PRESSURE",
+      "observed_rate_hz": 0.9871479751674939,
+      "samples": [
+        {
+          "press_abs": 1013.2133178710938,
+          "press_diff": 0.0,
+          "temperature": 28815,
+          "temperature_press_diff": 0,
+          "time_boot_ms": 46840
+        },
+        {
+          "press_abs": 1013.2360229492188,
+          "press_diff": 0.0,
+          "temperature": 28815,
+          "temperature_press_diff": 0,
+          "time_boot_ms": 47840
+        },
+        {
+          "press_abs": 1013.260986328125,
+          "press_diff": 0.0,
+          "temperature": 28815,
+          "temperature_press_diff": 0,
+          "time_boot_ms": 48840
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_boot_ms"
+      ]
+    },
+    "SERVO_OUTPUT_RAW": {
+      "component_ids": [
+        1
+      ],
+      "count": 99,
+      "field_names": [
+        "port",
+        "servo10_raw",
+        "servo11_raw",
+        "servo12_raw",
+        "servo13_raw",
+        "servo14_raw",
+        "servo15_raw",
+        "servo16_raw",
+        "servo1_raw",
+        "servo2_raw",
+        "servo3_raw",
+        "servo4_raw",
+        "servo5_raw",
+        "servo6_raw",
+        "servo7_raw",
+        "servo8_raw",
+        "servo9_raw",
+        "time_usec"
+      ],
+      "first_seen_wall_time": 1781306995.57491,
+      "last_seen_wall_time": 1781307005.486469,
+      "message_id": 36,
+      "message_type": "SERVO_OUTPUT_RAW",
+      "observed_rate_hz": 9.887445452588722,
+      "samples": [
+        {
+          "port": 0,
+          "servo10_raw": 0,
+          "servo11_raw": 0,
+          "servo12_raw": 0,
+          "servo13_raw": 0,
+          "servo14_raw": 0,
+          "servo15_raw": 0,
+          "servo16_raw": 0,
+          "servo1_raw": 0,
+          "servo2_raw": 0,
+          "servo3_raw": 0,
+          "servo4_raw": 0,
+          "servo5_raw": 0,
+          "servo6_raw": 0,
+          "servo7_raw": 0,
+          "servo8_raw": 0,
+          "servo9_raw": 0,
+          "time_usec": 46508000
+        },
+        {
+          "port": 0,
+          "servo10_raw": 0,
+          "servo11_raw": 0,
+          "servo12_raw": 0,
+          "servo13_raw": 0,
+          "servo14_raw": 0,
+          "servo15_raw": 0,
+          "servo16_raw": 0,
+          "servo1_raw": 0,
+          "servo2_raw": 0,
+          "servo3_raw": 0,
+          "servo4_raw": 0,
+          "servo5_raw": 0,
+          "servo6_raw": 0,
+          "servo7_raw": 0,
+          "servo8_raw": 0,
+          "servo9_raw": 0,
+          "time_usec": 46608000
+        },
+        {
+          "port": 0,
+          "servo10_raw": 0,
+          "servo11_raw": 0,
+          "servo12_raw": 0,
+          "servo13_raw": 0,
+          "servo14_raw": 0,
+          "servo15_raw": 0,
+          "servo16_raw": 0,
+          "servo1_raw": 0,
+          "servo2_raw": 0,
+          "servo3_raw": 0,
+          "servo4_raw": 0,
+          "servo5_raw": 0,
+          "servo6_raw": 0,
+          "servo7_raw": 0,
+          "servo8_raw": 0,
+          "servo9_raw": 0,
+          "time_usec": 46708000
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_usec"
+      ]
+    },
+    "SYSTEM_TIME": {
+      "component_ids": [
+        1
+      ],
+      "count": 10,
+      "field_names": [
+        "time_boot_ms",
+        "time_unix_usec"
+      ],
+      "first_seen_wall_time": 1781306995.965143,
+      "last_seen_wall_time": 1781307005.0823555,
+      "message_id": 2,
+      "message_type": "SYSTEM_TIME",
+      "observed_rate_hz": 0.9871438190659341,
+      "samples": [
+        {
+          "time_boot_ms": 46912,
+          "time_unix_usec": 1781306995963833
+        },
+        {
+          "time_boot_ms": 47912,
+          "time_unix_usec": 1781306996977728
+        },
+        {
+          "time_boot_ms": 48912,
+          "time_unix_usec": 1781306997991063
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_boot_ms"
+      ]
+    },
+    "SYS_STATUS": {
+      "component_ids": [
+        1
+      ],
+      "count": 50,
+      "field_names": [
+        "battery_remaining",
+        "current_battery",
+        "drop_rate_comm",
+        "errors_comm",
+        "errors_count1",
+        "errors_count2",
+        "errors_count3",
+        "errors_count4",
+        "load",
+        "onboard_control_sensors_enabled",
+        "onboard_control_sensors_health",
+        "onboard_control_sensors_present",
+        "voltage_battery"
+      ],
+      "first_seen_wall_time": 1781306995.5749476,
+      "last_seen_wall_time": 1781307005.4865658,
+      "message_id": 1,
+      "message_type": "SYS_STATUS",
+      "observed_rate_hz": 4.943693234491972,
+      "samples": [
+        {
+          "battery_remaining": 100,
+          "current_battery": -100,
+          "drop_rate_comm": 0,
+          "errors_comm": 0,
+          "errors_count1": 0,
+          "errors_count2": 0,
+          "errors_count3": 0,
+          "errors_count4": 0,
+          "load": 274,
+          "onboard_control_sensors_enabled": 50446383,
+          "onboard_control_sensors_health": 52480063,
+          "onboard_control_sensors_present": 50380847,
+          "voltage_battery": 16200
+        },
+        {
+          "battery_remaining": 100,
+          "current_battery": -100,
+          "drop_rate_comm": 0,
+          "errors_comm": 0,
+          "errors_count1": 0,
+          "errors_count2": 0,
+          "errors_count3": 0,
+          "errors_count4": 0,
+          "load": 274,
+          "onboard_control_sensors_enabled": 50446383,
+          "onboard_control_sensors_health": 52480063,
+          "onboard_control_sensors_present": 50380847,
+          "voltage_battery": 16200
+        },
+        {
+          "battery_remaining": 100,
+          "current_battery": -100,
+          "drop_rate_comm": 0,
+          "errors_comm": 0,
+          "errors_count1": 0,
+          "errors_count2": 0,
+          "errors_count3": 0,
+          "errors_count4": 0,
+          "load": 215,
+          "onboard_control_sensors_enabled": 50446383,
+          "onboard_control_sensors_health": 52480063,
+          "onboard_control_sensors_present": 50380847,
+          "voltage_battery": 16200
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": []
+    },
+    "TIMESYNC": {
+      "component_ids": [
+        1
+      ],
+      "count": 99,
+      "field_names": [
+        "tc1",
+        "ts1"
+      ],
+      "first_seen_wall_time": 1781306995.574465,
+      "last_seen_wall_time": 1781307005.4855857,
+      "message_id": 111,
+      "message_type": "TIMESYNC",
+      "observed_rate_hz": 9.887882857003541,
+      "samples": [
+        {
+          "tc1": 0,
+          "ts1": 46512000000
+        },
+        {
+          "tc1": 0,
+          "ts1": 46612000000
+        },
+        {
+          "tc1": 0,
+          "ts1": 46712000000
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "tc1",
+        "ts1"
+      ]
+    },
+    "UNKNOWN_380": {
+      "component_ids": [
+        0
+      ],
+      "count": 5,
+      "field_names": [
+        "data"
+      ],
+      "first_seen_wall_time": 1781306996.041417,
+      "last_seen_wall_time": 1781307004.2119577,
+      "message_id": -2,
+      "message_type": "UNKNOWN_380",
+      "observed_rate_hz": 0.48956367677459517,
+      "samples": [
+        {
+          "data": "bytearray(b'\\xfd\\x14\\x00\\x00\\x03\\x01\\x01|\\x01\\x00\\x00\\x00\\x00\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff/\\x80')"
+        },
+        {
+          "data": "bytearray(b'\\xfd\\x14\\x00\\x00U\\x01\\x01|\\x01\\x00\\x00\\x00\\x00\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\x0fZ')"
+        },
+        {
+          "data": "bytearray(b'\\xfd\\x14\\x00\\x00\\xaf\\x01\\x01|\\x01\\x00\\x00\\x00\\x00\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff~<')"
+        }
+      ],
+      "system_ids": [
+        0
+      ],
+      "timestamp_fields": []
+    },
+    "UNKNOWN_411": {
+      "component_ids": [
+        0
+      ],
+      "count": 4,
+      "field_names": [
+        "data"
+      ],
+      "first_seen_wall_time": 1781306996.1788096,
+      "last_seen_wall_time": 1781307005.308508,
+      "message_id": -2,
+      "message_type": "UNKNOWN_411",
+      "observed_rate_hz": 0.3285979349082711,
+      "samples": [
+        {
+          "data": "bytearray(b'\\xfd\\x01\\x00\\x00A\\x01\\x01\\x9b\\x01\\x00\\x0e\\x04\\xe9')"
+        },
+        {
+          "data": "bytearray(b'\\xfd\\x01\\x00\\x001\\x01\\x01\\x9b\\x01\\x00\\x0e}a')"
+        },
+        {
+          "data": "bytearray(b'\\xfd\\x01\\x00\\x00(\\x01\\x01\\x9b\\x01\\x00\\x0e\\x06\\x96')"
+        }
+      ],
+      "system_ids": [
+        0
+      ],
+      "timestamp_fields": []
+    },
+    "UNKNOWN_436": {
+      "component_ids": [
+        0
+      ],
+      "count": 5,
+      "field_names": [
+        "data"
+      ],
+      "first_seen_wall_time": 1781306995.964659,
+      "last_seen_wall_time": 1781307004.0697267,
+      "message_id": -2,
+      "message_type": "UNKNOWN_436",
+      "observed_rate_hz": 0.49351839284687876,
+      "samples": [
+        {
+          "data": "bytearray(b'\\xfd\\x08\\x00\\x00\\xdc\\x01\\x01\\xb4\\x01\\x00\\x00\\x00\\x04\\x03\\x00\\x00\\x04\\x03\\x8a\\x13')"
+        },
+        {
+          "data": "bytearray(b'\\xfd\\x08\\x00\\x00(\\x01\\x01\\xb4\\x01\\x00\\x00\\x00\\x04\\x03\\x00\\x00\\x04\\x03\\xc9p')"
+        },
+        {
+          "data": "bytearray(b'\\xfd\\x08\\x00\\x00u\\x01\\x01\\xb4\\x01\\x00\\x00\\x00\\x04\\x03\\x00\\x00\\x04\\x03~x')"
+        }
+      ],
+      "system_ids": [
+        0
+      ],
+      "timestamp_fields": []
+    },
+    "UNKNOWN_8": {
+      "component_ids": [
+        0
+      ],
+      "count": 10,
+      "field_names": [
+        "data"
+      ],
+      "first_seen_wall_time": 1781306995.9652243,
+      "last_seen_wall_time": 1781307005.0824192,
+      "message_id": -2,
+      "message_type": "UNKNOWN_8",
+      "observed_rate_hz": 0.9871457293194479,
+      "samples": [
+        {
+          "data": "bytearray(b'\\xfd\\x12\\x00\\x00\\xea\\x01\\x01\\x08\\x00\\x00\\x00\\xd2\\xcb\\x02\\x00\\x00\\x00\\x00\\xe4b\\x00\\x00\\x00\\x00\\x00\\x00\\xeaD\\x0b{')"
+        },
+        {
+          "data": "bytearray(b'\\xfd\\x12\\x00\\x00\\x8f\\x01\\x01\\x08\\x00\\x00@\\x14\\xdb\\x02\\x00\\x00\\x00\\x00\\xe2a\\x00\\x00\\x00\\x00\\x00\\x00\\x8fF\\xd7\\xc5')"
+        },
+        {
+          "data": "bytearray(b'\\xfd\\x12\\x00\\x007\\x01\\x01\\x08\\x00\\x00\\x80V\\xea\\x02\\x00\\x00\\x00\\x00]a\\x00\\x00\\x00\\x00\\x00\\x007H\\xc7\\xfa')"
+        }
+      ],
+      "system_ids": [
+        0
+      ],
+      "timestamp_fields": []
+    },
+    "VFR_HUD": {
+      "component_ids": [
+        1
+      ],
+      "count": 99,
+      "field_names": [
+        "airspeed",
+        "alt",
+        "climb",
+        "groundspeed",
+        "heading",
+        "throttle"
+      ],
+      "first_seen_wall_time": 1781306995.5749793,
+      "last_seen_wall_time": 1781307005.486691,
+      "message_id": 74,
+      "message_type": "VFR_HUD",
+      "observed_rate_hz": 9.88729323826974,
+      "samples": [
+        {
+          "airspeed": "nan",
+          "alt": 0.2228357344865799,
+          "climb": -0.004425675142556429,
+          "groundspeed": 0.01822330243885517,
+          "heading": 96,
+          "throttle": 0
+        },
+        {
+          "airspeed": "nan",
+          "alt": 0.22104576230049133,
+          "climb": -0.004845770075917244,
+          "groundspeed": 0.016187090426683426,
+          "heading": 96,
+          "throttle": 0
+        },
+        {
+          "airspeed": "nan",
+          "alt": 0.21885931491851807,
+          "climb": -0.005316024646162987,
+          "groundspeed": 0.014576949179172516,
+          "heading": 96,
+          "throttle": 0
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": []
+    },
+    "VIBRATION": {
+      "component_ids": [
+        1
+      ],
+      "count": 5,
+      "field_names": [
+        "clipping_0",
+        "clipping_1",
+        "clipping_2",
+        "time_usec",
+        "vibration_x",
+        "vibration_y",
+        "vibration_z"
+      ],
+      "first_seen_wall_time": 1781306995.9651985,
+      "last_seen_wall_time": 1781307004.0703588,
+      "message_id": 241,
+      "message_type": "VIBRATION",
+      "observed_rate_hz": 0.49351276018659646,
+      "samples": [
+        {
+          "clipping_0": 0,
+          "clipping_1": 0,
+          "clipping_2": 0,
+          "time_usec": 46912000,
+          "vibration_x": 1.319210582786945e-12,
+          "vibration_y": 0.0010424841893836856,
+          "vibration_z": 0.007641216274350882
+        },
+        {
+          "clipping_0": 0,
+          "clipping_1": 0,
+          "clipping_2": 0,
+          "time_usec": 48912000,
+          "vibration_x": 8.384887294037024e-13,
+          "vibration_y": 0.0009659005445428193,
+          "vibration_z": 0.007517281454056501
+        },
+        {
+          "clipping_0": 0,
+          "clipping_1": 0,
+          "clipping_2": 0,
+          "time_usec": 50912000,
+          "vibration_x": 8.084240200011139e-13,
+          "vibration_y": 0.0009742110269144177,
+          "vibration_z": 0.007212505210191011
+        }
+      ],
+      "system_ids": [
+        1
+      ],
+      "timestamp_fields": [
+        "time_usec"
+      ]
+    }
+  },
+  "odometry_available": true,
+  "receive_only": true,
+  "started_wall_time": 1781306995.5552351
+}
+(.venv_ctrl) paolo@paolo-Legion-5-Pro-16IAH7:~/autonomy_core$
