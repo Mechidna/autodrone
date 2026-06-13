@@ -732,6 +732,107 @@ Phase 8.5A status:
 - Documentation is available in `docs/competition_adapter_phase8_5_px4_gazebo_surrogate_harness.md`.
 - This is scaffold/deterministic-test coverage only; no real PX4/Gazebo surrogate run was performed, Phase 8.5 is not fully complete, Phase 4B remains blocked, and Phase 9 was not started.
 
+Phase 8.5B status:
+
+- Deterministic surrogate scenario fixtures are implemented in `tests/test_px4_gazebo_surrogate_scenarios.py`.
+- The surrogate harness now supports multi-step scenario definitions with fake PX4 estimated telemetry samples, fake encoded JPEG byte frames, explicit runner modes, and deterministic timestamp validation.
+- Scenario execution still uses the existing `CompetitionRunner.step(...)` path with injected fake batches only; no new runner modes, live transports, sockets, or command publication were added.
+- Documentation is available in `docs/competition_adapter_phase8_5b_surrogate_scenarios.md`.
+- This remains surrogate-only regression coverage; no real PX4/Gazebo run was performed, Phase 8.5 is not fully complete, Phase 4B remains blocked, and Phase 9 was not started.
+
+### Phase 8.5C - Local UDP Vision Loopback For Image Adapter Only
+
+Priority: P1 surrogate/protocol confidence only; does not unblock Phase 4B or Phase 9.
+
+Purpose:
+
+- Make the competition vision packet path easy to understand and manually test before adding any full runner or live simulator transport.
+- Prove that `competition_image_adapter.py` can do the equivalent receiver-side work intended by `third_party/PyAIPilotExample/vision_rx.py`: receive UDP datagrams on `0.0.0.0:5600`, parse the exact `<IHHIIQ` header, reassemble JPEG chunks by `frame_id`, decode a completed JPEG image, attach official camera metadata, and emit a `CompetitionCameraFrame`.
+- Provide a local mock sender that generates an actual in-memory `640x360` test image, JPEG-encodes it, packetizes it with the VADR header, and sends the packets to `127.0.0.1:5600`.
+
+Scope:
+
+- Add a standalone, explicit smoke tool, for example `autonomy_core/tools/competition_vision_udp_loopback.py`.
+- The tool may open a UDP receiver socket only when explicitly executed, never on import.
+- The receiver side binds to `0.0.0.0:5600` by default to mirror `PyAIPilotExample/vision_rx.py`.
+- The sender side sends mock VADR packets to `127.0.0.1:5600` by default.
+- The smoke tool should support a single-process loopback mode so one command can start the receiver, generate the mock image, send packets, process them through `CompetitionImageAdapter.process_packet(...)`, and print a compact summary.
+- Any `cv2` import for JPEG encode/decode must be lazy and limited to explicit CLI execution or helper calls; importing competition runtime modules must remain safe.
+- Use official `RuntimeCompetitionConfig` values for resolution, camera matrix, distortion, vision header format, and default port.
+
+Non-goals:
+
+- Do not start PX4, Gazebo, MAVSDK, ROS, the competition simulator, or any simulator process.
+- Do not call `CompetitionRunner`, `AutonomyAPI`, perception, YOLO, PnP, planner, controller, state adapter, command adapter, or command publication paths.
+- Do not add live competition MAVLink transport.
+- Do not add the full live competition UDP vision transport to `CompetitionRunner`.
+- Do not ingest Gazebo camera frames in this phase; that remains a later surrogate bridge phase.
+- Do not send heartbeats, setpoints, actuator commands, attitude targets, position targets, or any MAVLink command.
+- Do not claim Phase 4B, Phase 9, telemetry readiness, command readiness, race readiness, or competition readiness.
+- Do not modify `third_party/PyAIPilotExample/**`.
+
+Implementation tasks:
+
+- Add a small loopback smoke module with import-safe functions for:
+  - building a deterministic `640x360` mock image with a visible nonuniform pattern;
+  - JPEG-encoding that image when `cv2` is available;
+  - packetizing the JPEG bytes with `pack_vision_packet(...)` or equivalent VADR `<IHHIIQ` fields;
+  - sending packets over UDP to a configurable host/port, default `127.0.0.1:5600`;
+  - receiving datagrams from a configurable bind host/port, default `0.0.0.0:5600`;
+  - passing received datagrams directly to `CompetitionImageAdapter.process_packet(...)`;
+  - stopping after an expected number of completed frames or a timeout.
+- Print or return a summary containing:
+  - `bind_host`, `port`, `packets_sent`, `packets_received`, `frames_completed`, `decode_failures`, `packets_rejected`, `image_shape`, `image_stamp_sec`, `image_stamp_nanosec`, `camera_matrix`, `dist_coeffs`, `gazebo_pose`, and `image_pose_snapshot`.
+- Add deterministic unit tests for packet-building and adapter processing without opening sockets.
+- Add an opt-in/manual UDP loopback smoke command in docs. Unit tests should not bind `5600` by default because the port may be in use.
+- If `cv2` is unavailable, fail the manual smoke command with a clear message and do not install dependencies.
+
+Suggested manual command:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 -B -m autonomy_core.tools.competition_vision_udp_loopback \
+  --bind-host 0.0.0.0 \
+  --send-host 127.0.0.1 \
+  --port 5600 \
+  --frames 1 \
+  --timeout-s 5 \
+  --save-mock-image /tmp/competition_vision_loopback_mock.jpg \
+  --save-decoded-image /tmp/competition_vision_loopback_decoded.jpg
+```
+
+Expected manual smoke output:
+
+```text
+packets_sent > 0
+packets_received == packets_sent
+frames_completed == 1
+image_shape == [360, 640, 3]
+gazebo_pose == None
+image_pose_snapshot == None
+camera_matrix == [[320, 0, 320], [0, 320, 180], [0, 0, 1]]
+dist_coeffs == [0, 0, 0, 0, 0]
+mock_image_path == /tmp/competition_vision_loopback_mock.jpg
+decoded_image_path == /tmp/competition_vision_loopback_decoded.jpg
+```
+
+Acceptance criteria:
+
+- Importing the loopback module does not open sockets and does not import `cv2`.
+- The explicit loopback command binds `0.0.0.0:5600`, sends mock VADR UDP packets to `127.0.0.1:5600`, and completes one decoded frame through `CompetitionImageAdapter`.
+- The adapter statistics and summary prove that real UDP datagrams, not direct in-memory injection, reached `process_packet(...)`.
+- The completed frame uses official competition camera metadata and has `gazebo_pose=None` and `image_pose_snapshot=None`.
+- Corrupt or incomplete UDP packet sequences are rejected or time out deterministically.
+- Protected vendor files remain unchanged.
+
+Phase 8.5C status:
+
+- Implemented for generated mock-image UDP loopback in `autonomy_core/tools/competition_vision_udp_loopback.py`.
+- The tool builds a deterministic `640x360` mock image, lazily JPEG-encodes it, packetizes it with the VADR `<IHHIIQ` header, sends packets to `127.0.0.1:5600`, receives on `0.0.0.0:5600`, and passes datagrams directly to `CompetitionImageAdapter.process_packet(...)`.
+- Optional `--save-mock-image` and `--save-decoded-image` outputs let the exact source and decoded images be inspected manually.
+- Deterministic no-socket tests are available in `tests/test_competition_vision_udp_loopback.py`; the actual UDP bind/send path remains an explicit smoke command.
+- Documentation is available in `docs/competition_adapter_phase8_5c_udp_vision_loopback.md`.
+- This does not call `CompetitionRunner`, `AutonomyAPI`, perception, telemetry, command, simulator, or Gazebo paths; Phase 4B and Phase 9 remain blocked/not started.
+
 ## Phase 9 - Offline Replay And Dry-Run Bring-Up
 
 Priority: P1.
@@ -893,11 +994,12 @@ Use this order for Codex implementation tasks:
 11. Run deterministic adapter tests.
 12. Run the Phase 8.25 early gate/drone geometry audit before interpreting perception or surrogate output.
 13. Build the Phase 8.5 PX4/Gazebo surrogate harness if the real competition simulator remains unavailable; keep results labeled surrogate-only.
-14. Run offline replay validation against saved frames and telemetry.
-15. Run real competition simulator observe/vision/command dry-run stages when available; PX4/Gazebo surrogate output does not satisfy Phase 4B or Phase 9 simulator stages.
-16. Enable live command output below `100 Hz` only after heartbeat, telemetry freshness, image timing, Gazebo guard, and command units are verified against the real competition simulator or an official equivalent.
-17. Add bounded race logging, no-human-interaction safeguards, and the `8 min` submitted-run timer.
-18. Complete the final Phase 11 gate-geometry audit before submitted runs.
+14. Add Phase 8.5C local UDP vision loopback smoke tooling for `CompetitionImageAdapter` only; bind `0.0.0.0:5600`, send mock VADR JPEG packets to `127.0.0.1:5600`, and do not call the runner, autonomy, perception, telemetry, or command paths.
+15. Run offline replay validation against saved frames and telemetry.
+16. Run real competition simulator observe/vision/command dry-run stages when available; PX4/Gazebo surrogate output and local UDP loopback output do not satisfy Phase 4B or Phase 9 simulator stages.
+17. Enable live command output below `100 Hz` only after heartbeat, telemetry freshness, image timing, Gazebo guard, and command units are verified against the real competition simulator or an official equivalent.
+18. Add bounded race logging, no-human-interaction safeguards, and the `8 min` submitted-run timer.
+19. Complete the final Phase 11 gate-geometry audit before submitted runs.
 
 ## Definition Of Done For The Adapter Branch
 

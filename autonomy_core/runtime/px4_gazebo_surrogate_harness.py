@@ -129,6 +129,65 @@ class Px4GazeboSurrogateSummary:
         }
 
 
+@dataclass(frozen=True)
+class SurrogateDecodedFrame:
+    """Minimal decoded frame stand-in for deterministic tests without cv2."""
+
+    height: int
+    width: int
+    channels: int = 3
+    dtype: str = "uint8"
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (self.height, self.width, self.channels)
+
+
+@dataclass(frozen=True)
+class Px4GazeboSurrogateScenarioStep:
+    """One deterministic scenario step for injected runner execution."""
+
+    wall_time_s: float
+    telemetry_samples: tuple[Px4EstimatedTelemetrySample, ...] = ()
+    jpeg_frames: tuple[bytes, ...] = ()
+    sim_time_ns: Optional[int] = None
+    frame_period_ns: int = 33_333_333
+    telemetry_include_heartbeat: bool = True
+    vision_metadata: Any = None
+
+
+@dataclass(frozen=True)
+class Px4GazeboSurrogateScenario:
+    """Surrogate-only scenario definition; not competition evidence."""
+
+    name: str
+    mode: CompetitionRunnerMode | str
+    steps: tuple[Px4GazeboSurrogateScenarioStep, ...]
+    command_tuple: tuple[float, ...] = (0.0, 0.0, 0.0, 0.5)
+
+
+@dataclass(frozen=True)
+class Px4GazeboSurrogateScenarioResult:
+    """Deterministic scenario result summary."""
+
+    scenario_name: str
+    mode: CompetitionRunnerMode
+    step_results: tuple[CompetitionRunnerStepResult, ...]
+    telemetry_message_count: int
+    vision_packet_count: int
+    frame_count: int
+    command_candidate_count: int
+    summary: Mapping[str, Any]
+
+    @property
+    def phase4b_satisfied(self) -> bool:
+        return bool(self.summary.get("phase4b_satisfied", False))
+
+    @property
+    def competition_readiness_claimed(self) -> bool:
+        return bool(self.summary.get("competition_readiness_claimed", False))
+
+
 class InjectedTelemetryTransport:
     """One-shot fake telemetry transport for CompetitionRunner injection."""
 
@@ -171,6 +230,17 @@ class _SurrogateCommandAutonomy:
 
     def update_gate_memory_from_frame(self, **kwargs: Any) -> None:
         self.perception_updates.append(dict(kwargs))
+
+
+class _ScenarioClock:
+    def __init__(self, start: float = 0.0):
+        self.now = float(start)
+
+    def __call__(self) -> float:
+        return self.now
+
+    def set(self, value: float) -> None:
+        self.now = _finite_float(value, name="wall_time_s")
 
 
 def make_surrogate_heartbeat(
@@ -343,6 +413,20 @@ def packetize_vadr_frame_array(
     )
 
 
+def deterministic_surrogate_jpeg_decoder(
+    _jpeg_bytes: bytes,
+    *,
+    config: RuntimeCompetitionConfig = VADR_TS_002,
+) -> SurrogateDecodedFrame:
+    """Decode stand-in for deterministic tests; does not inspect JPEG bytes."""
+
+    return SurrogateDecodedFrame(
+        height=config.camera_height_px,
+        width=config.camera_width_px,
+        channels=3,
+    )
+
+
 @dataclass
 class Px4GazeboSurrogateHarness:
     """Surrogate-only runner scaffold using injected fake transports."""
@@ -492,6 +576,107 @@ class Px4GazeboSurrogateHarness:
         )
         return self._step_and_record(runner)
 
+    def run_scenario(
+        self,
+        scenario: Px4GazeboSurrogateScenario,
+        *,
+        autonomy: Any = None,
+        image_adapter: Optional[CompetitionImageAdapter] = None,
+        jpeg_decoder: Optional[Callable[[bytes], Any]] = None,
+    ) -> Px4GazeboSurrogateScenarioResult:
+        """Run a deterministic surrogate scenario through injected batches only."""
+
+        steps = tuple(scenario.steps)
+        self._validate_scenario_steps(steps)
+        runner_mode = (
+            scenario.mode
+            if isinstance(scenario.mode, CompetitionRunnerMode)
+            else CompetitionRunnerMode(str(scenario.mode))
+        )
+        scenario_clock = _ScenarioClock(steps[0].wall_time_s if steps else 0.0)
+        active_autonomy = autonomy
+        if runner_mode == CompetitionRunnerMode.COMMAND_DRY_RUN and active_autonomy is None:
+            active_autonomy = _SurrogateCommandAutonomy(scenario.command_tuple)
+        active_image_adapter = image_adapter
+        if active_image_adapter is None and runner_mode in (
+            CompetitionRunnerMode.VISION_DRY_RUN,
+            CompetitionRunnerMode.COMMAND_DRY_RUN,
+        ):
+            decoder = jpeg_decoder
+            if decoder is None:
+                decoder = lambda jpeg: deterministic_surrogate_jpeg_decoder(
+                    jpeg,
+                    config=self.config,
+                )
+            active_image_adapter = CompetitionImageAdapter(
+                clock=scenario_clock,
+                jpeg_decoder=decoder,
+            )
+
+        runner = CompetitionRunner(
+            config=CompetitionRunnerConfig(
+                mode=runner_mode,
+                safety=CompetitionRunnerSafetyConfig(
+                    phase4b_telemetry_evidence_available=False,
+                    command_publication_enabled=False,
+                    allow_live_command_modes=False,
+                ),
+            ),
+            competition_config=self.config,
+            guard=self.guard,
+            clock=scenario_clock,
+            image_adapter=active_image_adapter,
+            autonomy=active_autonomy,
+        )
+
+        next_frame_id = 1
+        telemetry_message_count = 0
+        vision_packet_count = 0
+        step_results: list[CompetitionRunnerStepResult] = []
+        for step_index, step in enumerate(steps):
+            scenario_clock.set(step.wall_time_s)
+            messages = self.telemetry_messages(
+                step.telemetry_samples,
+                include_heartbeat=step.telemetry_include_heartbeat,
+            )
+            telemetry_message_count += len(messages)
+
+            packets: tuple[bytes, ...] = ()
+            if step.jpeg_frames:
+                sim_time_ns = (
+                    step.sim_time_ns
+                    if step.sim_time_ns is not None
+                    else int(step.wall_time_s * 1_000_000_000)
+                )
+                packets = self.packetize_jpeg_frames(
+                    step.jpeg_frames,
+                    starting_frame_id=next_frame_id,
+                    starting_sim_time_ns=sim_time_ns,
+                    frame_period_ns=step.frame_period_ns,
+                    metadata=step.vision_metadata,
+                )
+                next_frame_id += len(step.jpeg_frames)
+                vision_packet_count += len(packets)
+
+            result = runner.step(
+                telemetry_messages=messages,
+                vision_packets=packets,
+            )
+            self.summary.record_step(result)
+            step_results.append(result)
+
+        summary = self.summary_dict()
+        return Px4GazeboSurrogateScenarioResult(
+            scenario_name=scenario.name,
+            mode=runner_mode,
+            step_results=tuple(step_results),
+            telemetry_message_count=telemetry_message_count,
+            vision_packet_count=vision_packet_count,
+            frame_count=self.summary.frame_count,
+            command_candidate_count=self.summary.command_candidate_count,
+            summary=summary,
+        )
+
     def _step_and_record(self, runner: CompetitionRunner) -> CompetitionRunnerStepResult:
         result = runner.step()
         self.summary.record_step(result)
@@ -499,6 +684,42 @@ class Px4GazeboSurrogateHarness:
 
     def summary_dict(self) -> dict[str, Any]:
         return self.summary.to_dict()
+
+    def _validate_scenario_steps(
+        self,
+        steps: Sequence[Px4GazeboSurrogateScenarioStep],
+    ) -> None:
+        previous_wall_time: Optional[float] = None
+        previous_time_boot_ms: Optional[int] = None
+        previous_sim_time_ns: Optional[int] = None
+        for step in steps:
+            wall_time = _finite_float(step.wall_time_s, name="wall_time_s")
+            if previous_wall_time is not None and wall_time <= previous_wall_time:
+                raise Px4GazeboSurrogateHarnessError(
+                    "scenario wall_time_s values must be strictly increasing"
+                )
+            previous_wall_time = wall_time
+
+            if step.frame_period_ns <= 0:
+                raise Px4GazeboSurrogateHarnessError("frame_period_ns must be positive")
+            if step.sim_time_ns is not None:
+                sim_time_ns = _uint64(step.sim_time_ns, name="sim_time_ns")
+                if previous_sim_time_ns is not None and sim_time_ns < previous_sim_time_ns:
+                    raise Px4GazeboSurrogateHarnessError(
+                        "scenario sim_time_ns values must be monotonic"
+                    )
+                previous_sim_time_ns = sim_time_ns
+
+            for sample in step.telemetry_samples:
+                time_boot_ms = _uint32(sample.time_boot_ms, name="time_boot_ms")
+                if (
+                    previous_time_boot_ms is not None
+                    and time_boot_ms < previous_time_boot_ms
+                ):
+                    raise Px4GazeboSurrogateHarnessError(
+                        "scenario telemetry time_boot_ms values must be monotonic"
+                    )
+                previous_time_boot_ms = time_boot_ms
 
 
 def command_result_was_no_send(result: Optional[DryRunCommandResult]) -> bool:
@@ -544,9 +765,14 @@ __all__ = [
     "Px4EstimatedTelemetrySample",
     "Px4GazeboSurrogateHarness",
     "Px4GazeboSurrogateHarnessError",
+    "Px4GazeboSurrogateScenario",
+    "Px4GazeboSurrogateScenarioResult",
+    "Px4GazeboSurrogateScenarioStep",
     "Px4GazeboSurrogateSummary",
+    "SurrogateDecodedFrame",
     "SurrogateMavlinkMessage",
     "command_result_was_no_send",
+    "deterministic_surrogate_jpeg_decoder",
     "make_surrogate_heartbeat",
     "packetize_vadr_frame_array",
     "packetize_vadr_jpeg_bytes",
