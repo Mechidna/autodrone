@@ -1590,6 +1590,38 @@ Acceptance criteria:
 - PX4/Gazebo surrogate evidence can provide confidence but does not satisfy
   real competition simulator evidence requirements.
 
+Status:
+
+- Implemented explicit Phase 9B dry-run controls in
+  `autonomy_core/runtime/competition_main.py`.
+- `competition_main.py vision_dry_run` now supports `--real-perception` with
+  the Phase 9A competition-safe `AutonomyAPI` profile.
+- `--real-perception` requires `--use-real-autonomy` and `vision_dry_run`; live
+  operator runs require `--live-transports`.
+- The current live real-perception path requires
+  `--allow-legacy-yolo-default` as an explicit temporary acknowledgment because
+  `AutonomyAPI` still has a hardcoded legacy YOLO weights path.
+- Summary output includes `phase: "9B"`,
+  `phase9b_perception_dry_run_satisfied`, and
+  `phase9b_success_criteria`.
+- Command publication remains disabled; `command_live` and `race` remain
+  fail-closed.
+- Deterministic tests use fake components/factories and do not instantiate real
+  `AutonomyAPI`, run YOLO, open sockets, or send commands.
+- Manual PX4/Gazebo surrogate instructions and success criteria are documented
+  in `docs/competition_adapter_phase9b_real_perception_dry_run.md`.
+- Phase 9B.2 adds the opt-in `competition_official_ned` transform mode for
+  real-perception competition dry-runs. Legacy `AutonomyAPI` and `px4_runner`
+  defaults remain `physical_direct_rad_x_mirror`.
+- The competition-safe `AutonomyAPI` profile now selects
+  `competition_official_ned`, and `competition_main.py --real-perception`
+  fails closed if a non-official transform is requested.
+- Phase 9B.2 transform validation instructions and success criteria are
+  documented in
+  `docs/competition_adapter_phase9b_2_transform_validation.md`.
+- Phase 9C, Phase 9D, Phase 4B, command readiness, race readiness, and
+  competition readiness are still not claimed.
+
 ### Phase 9C - Command Candidate Dry-Run, No Send
 
 Priority: P1 after Phase 9B.
@@ -1605,6 +1637,9 @@ Acceptance criteria:
 - Phase 9A competition-safe `AutonomyAPI` profile is active.
 - Phase 9B perception dry-run has passed or an offline replay fixture provides
   valid perception/state inputs.
+- Phase 9B.2 official transform validation has passed, including no
+  `z_below_safe_min` rejection for the near gate caused by the selected
+  transform and no mirrored `det(R)=-1` active competition transform.
 - `command_candidate_count > 0` when state/image freshness gates pass.
 - Stale telemetry, stale image, invalid state, invalid command tuple, NaN, or
   infinity rejects command candidates deterministically.
@@ -1614,6 +1649,30 @@ Acceptance criteria:
   thrust units, and command-rate checks are logged and test-covered.
 - PX4/Gazebo no-send command candidates do not prove competition command
   acceptance.
+
+Status:
+
+- Implemented Phase 9C no-send command-candidate dry-run in
+  `autonomy_core/runtime/competition_main.py` and
+  `autonomy_core/runtime/competition_runner.py`.
+- `competition_main.py command_dry_run --real-perception --use-real-autonomy`
+  is labeled as `phase: "9C"` and remains no-send.
+- The runner syncs usable `CompetitionStateAdapter` output into the
+  competition-profiled `AutonomyAPI.telemetry` object before command dry-run
+  planning/control.
+- The runner attempts `path_plan(replan_reason="phase9c_command_dry_run")`
+  when available, then calls `attitude_control()` and converts the tuple through
+  `CompetitionDryRunCommandAdapter`.
+- Summary output includes planning attempt/success/failure counts, accepted and
+  rejected command candidate counts, `phase9c_success_criteria`,
+  `phase9c_command_dry_run_satisfied`, and the final no-send
+  `SET_ATTITUDE_TARGET` fields.
+- Deterministic tests use fake transports/autonomy only and do not instantiate
+  real `AutonomyAPI`, open sockets, run YOLO, run PX4/Gazebo, or send commands.
+- Documentation is available in
+  `docs/competition_adapter_phase9c_command_dry_run.md`.
+- Phase 4B, Phase 9D, command readiness, race readiness, and competition
+  readiness are still not claimed.
 
 ### Phase 9D - Real Competition Simulator Dry-Run Stages
 
@@ -1759,11 +1818,12 @@ Use this order for Codex implementation tasks:
 20. Run Phase 6E full receive dry-run with live transports: PX4/Gazebo MAVLink directly into `competition_mavlink_transport.py`, surrogate bridge UDP `5600` into `competition_vision_transport.py`, and `competition_main.py vision_dry_run`; no commands.
 21. Add Phase 9A competition-safe `AutonomyAPI` profile/factory before any real perception dry-run; do not use legacy defaults directly.
 22. Run Phase 9B real perception dry-run with the safe profile, `gazebo_pose=None`, `image_pose_snapshot=None`, and no commands.
-23. Run Phase 9C command candidate dry-run with the safe profile; build no-send command candidates only.
-24. Run Phase 9D real competition simulator observe/vision/command dry-run stages when available; PX4/Gazebo surrogate output and local UDP loopback output do not satisfy Phase 4B or Phase 9D simulator stages.
-25. Enable live command output below `100 Hz` only after heartbeat, telemetry freshness, image timing, Gazebo guard, and command units are verified against the real competition simulator or an official equivalent.
-26. Add bounded race logging, no-human-interaction safeguards, and the `8 min` submitted-run timer.
-27. Complete the final Phase 11 gate-geometry audit before submitted runs.
+23. Run Phase 9B.2 official transform validation with `competition_official_ned`; do not proceed if the selected transform still causes near-gate `z_below_safe_min` rejection or mirrored `det(R)=-1` competition output.
+24. Run Phase 9C command candidate dry-run with the safe profile; build no-send command candidates only.
+25. Run Phase 9D real competition simulator observe/vision/command dry-run stages when available; PX4/Gazebo surrogate output and local UDP loopback output do not satisfy Phase 4B or Phase 9D simulator stages.
+26. Enable live command output below `100 Hz` only after heartbeat, telemetry freshness, image timing, Gazebo guard, and command units are verified against the real competition simulator or an official equivalent.
+27. Add bounded race logging, no-human-interaction safeguards, and the `8 min` submitted-run timer.
+28. Complete the final Phase 11 gate-geometry audit before submitted runs.
 
 ## Definition Of Done For The Adapter Branch
 

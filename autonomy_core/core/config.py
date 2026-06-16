@@ -121,6 +121,7 @@ class PerceptionConfig:
         "direct_rad",
         "physical_direct_rad",
         "physical_direct_rad_x_mirror",
+        "competition_official_ned",
         "yaw_minus_pi_over_2",
         "pi_over_2_minus_yaw",
         "neg_yaw",

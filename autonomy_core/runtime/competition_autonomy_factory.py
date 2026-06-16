@@ -19,6 +19,7 @@ from autonomy_core.runtime.competition_guard import (
 
 COMPETITION_SAFE_POSE_SOURCE = "mavsdk"
 COMPETITION_AUTONOMY_PROFILE_NAME = "competition_safe_autonomy_profile"
+COMPETITION_OFFICIAL_TRANSFORM_MODE = "competition_official_ned"
 
 _CONTROLLED_AUTONOMY_KWARGS = frozenset(
     {
@@ -37,6 +38,7 @@ _FORBIDDEN_EXTRA_KWARG_PARTS = (
     "image_pose_snapshot",
     "use_diagnostic_far_depth_correction",
     "perception_world_pose_source",
+    "perception_transform_mode",
 )
 
 
@@ -54,6 +56,7 @@ class CompetitionAutonomyProfile:
     save_perception_debug_frames: bool = False
     use_lookahead_gate_filter: bool = True
     perception_world_pose_source: str = COMPETITION_SAFE_POSE_SOURCE
+    perception_transform_mode: str = COMPETITION_OFFICIAL_TRANSFORM_MODE
     use_diagnostic_far_depth_correction: bool = False
     allow_legacy_yolo_default: bool = False
     profile_name: str = COMPETITION_AUTONOMY_PROFILE_NAME
@@ -120,6 +123,7 @@ def apply_competition_autonomy_profile(
 
     setattr(autonomy, "perception_world_pose_source", profile.perception_world_pose_source)
     setattr(autonomy, "perception_world_pose_source_used", profile.perception_world_pose_source)
+    setattr(autonomy, "perception_transform_mode", profile.perception_transform_mode)
     setattr(autonomy, "save_perception_debug_frames", False)
     setattr(autonomy, "use_diagnostic_far_depth_correction", False)
     setattr(autonomy, "image_gazebo_pose_snapshot", None)
@@ -132,6 +136,7 @@ def apply_competition_autonomy_profile(
             "Gazebo truth is disabled for competition mode.",
             "Perception updates must pass gazebo_pose=None.",
             "Perception updates must pass image_pose_snapshot=None.",
+            f"Perception transform mode is {profile.perception_transform_mode}.",
             "Command publication is controlled outside AutonomyAPI.",
         ),
     )
@@ -144,6 +149,9 @@ def apply_competition_autonomy_profile(
             else "not_loaded_in_profile"
         ),
     )
+    print_startup = getattr(autonomy, "print_perception_transform_startup", None)
+    if profile.use_perception and callable(print_startup):
+        print_startup()
     return autonomy
 
 
@@ -187,6 +195,12 @@ def validate_competition_autonomy_api(
         raise CompetitionAutonomyProfileError(
             "competition AutonomyAPI profile must clear image_gazebo_pose_snapshot"
         )
+    transform_mode = getattr(autonomy, "perception_transform_mode", None)
+    if str(transform_mode) != profile.perception_transform_mode:
+        raise CompetitionAutonomyProfileError(
+            "competition AutonomyAPI profile must use "
+            f"perception_transform_mode={profile.perception_transform_mode!r}"
+        )
 
 
 def _profile_with_extra_kwargs(
@@ -203,6 +217,7 @@ def _profile_with_extra_kwargs(
         save_perception_debug_frames=profile.save_perception_debug_frames,
         use_lookahead_gate_filter=profile.use_lookahead_gate_filter,
         perception_world_pose_source=profile.perception_world_pose_source,
+        perception_transform_mode=profile.perception_transform_mode,
         use_diagnostic_far_depth_correction=profile.use_diagnostic_far_depth_correction,
         allow_legacy_yolo_default=profile.allow_legacy_yolo_default,
         profile_name=profile.profile_name,
@@ -228,6 +243,11 @@ def _validate_profile(profile: CompetitionAutonomyProfile) -> None:
         raise CompetitionAutonomyProfileError(
             "competition AutonomyAPI profile requires "
             "use_diagnostic_far_depth_correction=False"
+        )
+    if str(profile.perception_transform_mode) != COMPETITION_OFFICIAL_TRANSFORM_MODE:
+        raise CompetitionAutonomyProfileError(
+            "competition AutonomyAPI profile requires "
+            f"perception_transform_mode={COMPETITION_OFFICIAL_TRANSFORM_MODE!r}"
         )
     if bool(profile.use_perception) and not bool(profile.allow_legacy_yolo_default):
         raise CompetitionAutonomyProfileError(
@@ -261,6 +281,7 @@ def _load_autonomy_api(**kwargs: Any) -> Any:
 
 __all__ = [
     "COMPETITION_AUTONOMY_PROFILE_NAME",
+    "COMPETITION_OFFICIAL_TRANSFORM_MODE",
     "COMPETITION_SAFE_POSE_SOURCE",
     "CompetitionAutonomyProfile",
     "CompetitionAutonomyProfileError",

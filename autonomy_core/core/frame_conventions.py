@@ -107,6 +107,34 @@ def official_camera_to_body_frd_rotmat(
     return opencv_camera_to_mavlink_body_frd_rotmat(config.camera_tilt_up_rad)
 
 
+def body_frd_to_internal_body_flu_rotmat() -> np.ndarray:
+    """MAVLink body FRD to the existing internal body FLU convention."""
+
+    return np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, -1.0],
+        ],
+        dtype=float,
+    )
+
+
+def official_camera_to_internal_body_flu_rotmat(
+    config: RuntimeCompetitionConfig = VADR_TS_002,
+) -> np.ndarray:
+    """Official OpenCV camera optical frame to internal body FLU.
+
+    The competition protocol defines MAVLink body NED/FRD. The existing
+    perception runtime consumes body vectors in its z-up FLU convention, so the
+    official camera matrix is converted at this explicit boundary.
+    """
+
+    return body_frd_to_internal_body_flu_rotmat() @ official_camera_to_body_frd_rotmat(
+        config
+    )
+
+
 def official_body_frd_to_camera_rotmat(
     config: RuntimeCompetitionConfig = VADR_TS_002,
 ) -> np.ndarray:
@@ -145,12 +173,14 @@ __all__ = [
     "MAVLINK_BODY_FRD",
     "MAVLINK_LOCAL_NED",
     "OPENCV_CAMERA_OPTICAL",
+    "body_frd_to_internal_body_flu_rotmat",
     "body_frd_point_to_camera_optical",
     "camera_translation_body_frd",
     "mavlink_body_frd_to_opencv_camera_rotmat",
     "official_body_frd_to_camera_rotmat",
     "official_camera_matrix",
     "official_camera_to_body_frd_rotmat",
+    "official_camera_to_internal_body_flu_rotmat",
     "official_dist_coeffs",
     "opencv_camera_to_mavlink_body_frd_rotmat",
     "project_body_frd_point_to_pixel",

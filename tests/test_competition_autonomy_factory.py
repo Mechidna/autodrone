@@ -4,6 +4,7 @@ import unittest
 
 from autonomy_core.runtime.competition_autonomy_factory import (
     COMPETITION_AUTONOMY_PROFILE_NAME,
+    COMPETITION_OFFICIAL_TRANSFORM_MODE,
     COMPETITION_SAFE_POSE_SOURCE,
     CompetitionAutonomyProfile,
     CompetitionAutonomyProfileError,
@@ -19,9 +20,14 @@ class FakeAutonomy:
         self.constructor_kwargs = dict(kwargs)
         self.perception_world_pose_source = GAZEBO_TRUTH_POSE_SOURCE
         self.perception_world_pose_source_used = GAZEBO_TRUTH_POSE_SOURCE
+        self.perception_transform_mode = "physical_direct_rad_x_mirror"
         self.save_perception_debug_frames = True
         self.use_diagnostic_far_depth_correction = True
         self.image_gazebo_pose_snapshot = {"pose": "truth"}
+        self.print_perception_transform_startup_calls = 0
+
+    def print_perception_transform_startup(self):
+        self.print_perception_transform_startup_calls += 1
 
 
 class CompetitionAutonomyFactoryTests(unittest.TestCase):
@@ -72,6 +78,10 @@ class CompetitionAutonomyFactoryTests(unittest.TestCase):
             autonomy.perception_world_pose_source_used,
             COMPETITION_SAFE_POSE_SOURCE,
         )
+        self.assertEqual(
+            autonomy.perception_transform_mode,
+            COMPETITION_OFFICIAL_TRANSFORM_MODE,
+        )
         self.assertFalse(autonomy.save_perception_debug_frames)
         self.assertFalse(autonomy.use_diagnostic_far_depth_correction)
         self.assertIsNone(autonomy.image_gazebo_pose_snapshot)
@@ -81,6 +91,7 @@ class CompetitionAutonomyFactoryTests(unittest.TestCase):
             COMPETITION_AUTONOMY_PROFILE_NAME,
         )
         self.assertEqual(autonomy.competition_yolo_config_source, "not_loaded_in_profile")
+        self.assertEqual(autonomy.print_perception_transform_startup_calls, 0)
 
     def test_rejects_gazebo_truth_pose_source(self):
         profile = CompetitionAutonomyProfile(
@@ -134,9 +145,25 @@ class CompetitionAutonomyFactoryTests(unittest.TestCase):
 
         self.assertTrue(autonomy.constructor_kwargs["use_perception"])
         self.assertEqual(
+            autonomy.perception_transform_mode,
+            COMPETITION_OFFICIAL_TRANSFORM_MODE,
+        )
+        self.assertEqual(autonomy.print_perception_transform_startup_calls, 1)
+        self.assertEqual(
             autonomy.competition_yolo_config_source,
             "legacy_autonomyapi_default_explicitly_acknowledged",
         )
+
+    def test_rejects_non_official_competition_transform_mode(self):
+        profile = CompetitionAutonomyProfile(
+            perception_transform_mode="physical_direct_rad_x_mirror",
+        )
+
+        with self.assertRaisesRegex(CompetitionAutonomyProfileError, "perception_transform_mode"):
+            create_competition_autonomy_api(
+                profile=profile,
+                autonomy_factory=lambda **kwargs: FakeAutonomy(**kwargs),
+            )
 
     def test_rejects_extra_kwargs_that_override_profile_owned_fields(self):
         profile = CompetitionAutonomyProfile(
@@ -160,6 +187,14 @@ class CompetitionAutonomyFactoryTests(unittest.TestCase):
         autonomy.perception_world_pose_source = GAZEBO_TRUTH_POSE_SOURCE
 
         with self.assertRaisesRegex(CompetitionAutonomyProfileError, "gazebo_truth"):
+            validate_competition_autonomy_api(autonomy)
+
+    def test_validate_detects_transform_mode_drift_after_application(self):
+        autonomy = FakeAutonomy()
+        apply_competition_autonomy_profile(autonomy)
+        autonomy.perception_transform_mode = "physical_direct_rad_x_mirror"
+
+        with self.assertRaisesRegex(CompetitionAutonomyProfileError, "perception_transform_mode"):
             validate_competition_autonomy_api(autonomy)
 
 

@@ -111,6 +111,14 @@ class CompetitionConfigTests(unittest.TestCase):
             PerceptionConfig().gate_size,
             RuntimeCompetitionConfig().gate_inner_square_m,
         )
+        self.assertEqual(
+            PerceptionConfig().perception_transform_mode,
+            "physical_direct_rad_x_mirror",
+        )
+        self.assertIn(
+            "competition_official_ned",
+            PerceptionConfig().perception_transform_modes,
+        )
 
     def test_active_yolo_source_uses_official_inner_gate_helpers_without_importing_yolo(self):
         root = Path(__file__).resolve().parents[1]

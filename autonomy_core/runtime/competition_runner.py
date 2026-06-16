@@ -93,6 +93,10 @@ class CompetitionRunnerStats:
     vision_packets_processed: int = 0
     vision_frames_completed: int = 0
     perception_update_calls: int = 0
+    autonomy_telemetry_syncs: int = 0
+    planning_attempts: int = 0
+    planning_successes: int = 0
+    planning_failures: int = 0
     command_candidate_attempts: int = 0
     command_candidates_accepted: int = 0
     command_rejections: int = 0
@@ -111,6 +115,10 @@ class CompetitionRunnerStepResult:
     vision_packets_processed: int
     vision_frames_completed: int
     perception_update_calls: int
+    autonomy_telemetry_synced: bool
+    planning_attempted: bool
+    planning_succeeded: Optional[bool]
+    planning_error: str
     command_candidate_attempted: bool
     command_result: Optional[DryRunCommandResult]
     command_publication_allowed: bool
@@ -211,6 +219,14 @@ class CompetitionRunner:
             max_age_s=self.config.safety.max_state_age_s,
         )
 
+        autonomy_telemetry_synced = False
+        if self.mode in COMMAND_CANDIDATE_MODES:
+            autonomy_telemetry_synced = self._sync_autonomy_telemetry_from_state(
+                state_result,
+                now,
+                events,
+            )
+
         vision_batch = []
         if self.mode in VISION_MODES:
             vision_batch = list(
@@ -231,10 +247,19 @@ class CompetitionRunner:
 
         command_result: Optional[DryRunCommandResult] = None
         command_candidate_attempted = False
+        planning_attempted = False
+        planning_succeeded: Optional[bool] = None
+        planning_error = ""
         command_blocked_reasons = self._command_blocked_reasons(state_result)
 
         if self.mode in COMMAND_CANDIDATE_MODES:
-            command_candidate_attempted, command_result = self._build_command_candidate(
+            (
+                command_candidate_attempted,
+                command_result,
+                planning_attempted,
+                planning_succeeded,
+                planning_error,
+            ) = self._build_command_candidate(
                 state_result,
                 now,
                 events,
@@ -254,6 +279,10 @@ class CompetitionRunner:
             vision_packets_processed=len(vision_batch),
             vision_frames_completed=vision_completed,
             perception_update_calls=perception_updates,
+            autonomy_telemetry_synced=autonomy_telemetry_synced,
+            planning_attempted=planning_attempted,
+            planning_succeeded=planning_succeeded,
+            planning_error=planning_error,
             command_candidate_attempted=command_candidate_attempted,
             command_result=command_result,
             command_publication_allowed=False,
@@ -372,30 +401,79 @@ class CompetitionRunner:
         self.stats.perception_update_calls += 1
         return 1
 
+    def _sync_autonomy_telemetry_from_state(
+        self,
+        state_result: CompetitionStateResult,
+        now: float,
+        events: list[str],
+    ) -> bool:
+        if self.autonomy is None:
+            return False
+        if not state_result.is_usable or state_result.vehicle_state is None:
+            return False
+
+        telemetry = getattr(self.autonomy, "telemetry", None)
+        if telemetry is None:
+            events.append("autonomy_missing_telemetry_for_state_sync")
+            return False
+
+        state = state_result.vehicle_state
+        telemetry.pos = {
+            "x": float(state.pos[0]),
+            "y": float(state.pos[1]),
+            "z": float(state.pos[2]),
+        }
+        telemetry.vel = {
+            "vx": float(state.vel[0]),
+            "vy": float(state.vel[1]),
+            "vz": float(state.vel[2]),
+        }
+        existing_rpy = getattr(telemetry, "rpy", {}) or {}
+        telemetry.rpy = {
+            "roll": float(existing_rpy.get("roll", 0.0)),
+            "pitch": float(existing_rpy.get("pitch", 0.0)),
+            "yaw": float(state.yaw),
+        }
+        telemetry.position_sample_time = now
+        telemetry.velocity_sample_time = now
+        telemetry.attitude_sample_time = now
+        if hasattr(telemetry, "yaw_rad_raw"):
+            telemetry.yaw_rad_raw = float(state.yaw)
+        if hasattr(telemetry, "yaw_rad_perception"):
+            telemetry.yaw_rad_perception = float(state.yaw)
+
+        self.stats.autonomy_telemetry_syncs += 1
+        events.append("autonomy_telemetry_synced_from_competition_state")
+        return True
+
     def _build_command_candidate(
         self,
         state_result: CompetitionStateResult,
         now: float,
         events: list[str],
-    ) -> tuple[bool, Optional[DryRunCommandResult]]:
+    ) -> tuple[bool, Optional[DryRunCommandResult], bool, Optional[bool], str]:
         if (
             self.config.safety.require_fresh_state_for_command_candidate
             and not state_result.is_usable
         ):
             self.stats.command_rejections += 1
             events.append("command_candidate_blocked_invalid_state")
-            return False, None
+            return False, None, False, None, ""
 
         if self.autonomy is None:
             self.stats.command_rejections += 1
             events.append("command_candidate_blocked_missing_autonomy")
-            return False, None
+            return False, None, False, None, ""
+
+        planning_attempted, planning_succeeded, planning_error = (
+            self._attempt_path_plan_if_available(events)
+        )
 
         attitude_control = getattr(self.autonomy, "attitude_control", None)
         if not callable(attitude_control):
             self.stats.command_rejections += 1
             events.append("command_candidate_blocked_missing_attitude_control")
-            return False, None
+            return False, None, planning_attempted, planning_succeeded, planning_error
 
         self.stats.command_candidate_attempts += 1
         command_tuple = attitude_control()
@@ -411,7 +489,33 @@ class CompetitionRunner:
             self.stats.command_candidates_accepted += 1
         else:
             self.stats.command_rejections += 1
-        return True, result
+        return True, result, planning_attempted, planning_succeeded, planning_error
+
+    def _attempt_path_plan_if_available(
+        self,
+        events: list[str],
+    ) -> tuple[bool, Optional[bool], str]:
+        path_plan = getattr(self.autonomy, "path_plan", None)
+        if not callable(path_plan):
+            events.append("command_candidate_planning_not_available")
+            return False, None, ""
+
+        self.stats.planning_attempts += 1
+        try:
+            succeeded = bool(path_plan(replan_reason="phase9c_command_dry_run"))
+        except (ValueError, RuntimeError, ArithmeticError) as exc:
+            self.stats.planning_failures += 1
+            error = str(exc)
+            events.append(f"command_candidate_planning_error:{error}")
+            return True, False, error
+
+        if succeeded:
+            self.stats.planning_successes += 1
+            events.append("command_candidate_planning_succeeded")
+        else:
+            self.stats.planning_failures += 1
+            events.append("command_candidate_planning_failed")
+        return True, succeeded, ""
 
     def _command_blocked_reasons(
         self,

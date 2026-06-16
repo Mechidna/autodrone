@@ -9,12 +9,14 @@ from autonomy_core.core.frame_conventions import (
     MAVLINK_BODY_FRD,
     MAVLINK_LOCAL_NED,
     OPENCV_CAMERA_OPTICAL,
+    body_frd_to_internal_body_flu_rotmat,
     body_frd_point_to_camera_optical,
     camera_translation_body_frd,
     mavlink_body_frd_to_opencv_camera_rotmat,
     official_body_frd_to_camera_rotmat,
     official_camera_matrix,
     official_camera_to_body_frd_rotmat,
+    official_camera_to_internal_body_flu_rotmat,
     official_dist_coeffs,
     opencv_camera_to_mavlink_body_frd_rotmat,
     project_body_frd_point_to_pixel,
@@ -80,6 +82,20 @@ class CompetitionCameraModelTests(unittest.TestCase):
         np.testing.assert_allclose(rot_body_camera @ rot_camera_body, np.eye(3), atol=1e-12)
         np.testing.assert_allclose(rot_body_camera.T, rot_camera_body, atol=1e-12)
         np.testing.assert_allclose(rot_body_camera @ rot_body_camera.T, np.eye(3), atol=1e-12)
+        self.assertAlmostEqual(float(np.linalg.det(rot_body_camera)), 1.0, places=12)
+
+    def test_official_camera_to_internal_body_flu_is_proper_rotation(self):
+        config = RuntimeCompetitionConfig()
+        rot_body_camera = official_camera_to_internal_body_flu_rotmat(config)
+
+        np.testing.assert_allclose(
+            rot_body_camera,
+            body_frd_to_internal_body_flu_rotmat()
+            @ official_camera_to_body_frd_rotmat(config),
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(rot_body_camera @ rot_body_camera.T, np.eye(3), atol=1e-12)
+        self.assertAlmostEqual(float(np.linalg.det(rot_body_camera)), 1.0, places=12)
 
     def test_official_camera_optical_axis_points_up_relative_to_body_forward(self):
         config = RuntimeCompetitionConfig()
@@ -126,6 +142,23 @@ class CompetitionCameraModelTests(unittest.TestCase):
             + config.camera_cy_px
         )
         self.assertLess(inverted_v, config.camera_cy_px)
+
+    def test_tilted_phase9b_sample_maps_to_positive_internal_z(self):
+        config = RuntimeCompetitionConfig()
+        tilted_camera_tvec = np.array(
+            [0.08145763507435748, 1.640968327338819, 7.513559788178706],
+            dtype=float,
+        )
+
+        body_flu = official_camera_to_internal_body_flu_rotmat(config) @ tilted_camera_tvec
+
+        self.assertGreater(body_flu[0], 0.0)
+        self.assertGreater(body_flu[2], 0.0)
+        np.testing.assert_allclose(
+            body_flu,
+            np.array([7.621680911294569, -0.08145763507435748, 1.027782967495179]),
+            atol=1e-12,
+        )
 
     def test_body_point_conversion_uses_official_tilt_without_translation(self):
         config = RuntimeCompetitionConfig()

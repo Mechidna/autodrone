@@ -22,6 +22,10 @@ from autonomy_core.runtime.competition_runner import (
     CompetitionRunnerMode,
     CompetitionRunnerSafetyConfig,
 )
+from autonomy_core.runtime.competition_autonomy_factory import (
+    COMPETITION_OFFICIAL_TRANSFORM_MODE,
+    CompetitionAutonomyProfile,
+)
 from autonomy_core.runtime.competition_setup import (
     CompetitionRuntimeComponents,
     CompetitionSetupConfig,
@@ -36,6 +40,8 @@ from autonomy_core.runtime.competition_vision_transport import (
 
 PHASE_6D = "6D"
 PHASE_6E = "6E"
+PHASE_9B = "9B"
+PHASE_9C = "9C"
 PHASE4B_NOT_SATISFIED = "Phase 4B remains blocked pending real competition telemetry evidence."
 COMPETITION_READINESS_NOT_CLAIMED = "Dry-run output is not competition readiness evidence."
 PHASE6E_SURROGATE_LIMITATION = (
@@ -56,6 +62,9 @@ class CompetitionMainConfig:
     step_sleep_s: float = 0.0
     live_transports: bool = False
     use_real_autonomy: bool = False
+    real_perception: bool = False
+    allow_legacy_yolo_default: bool = False
+    perception_transform_mode: str = COMPETITION_OFFICIAL_TRANSFORM_MODE
     target_system: int = 1
     target_component: int = 1
     mavlink_endpoint: str = DEFAULT_MAVLINK_ENDPOINT
@@ -76,6 +85,9 @@ class CompetitionMainSummary:
     evidence_label: str = "unspecified"
     live_transports_requested: bool = False
     use_real_autonomy: bool = False
+    real_perception_requested: bool = False
+    allow_legacy_yolo_default: bool = False
+    perception_transform_mode: str = COMPETITION_OFFICIAL_TRANSFORM_MODE
     steps_requested: int = 0
     steps_completed: int = 0
     duration_s: float = 0.0
@@ -89,7 +101,14 @@ class CompetitionMainSummary:
     vision_packets_processed: int = 0
     vision_frames_completed: int = 0
     perception_update_calls: int = 0
+    autonomy_telemetry_sync_count: int = 0
+    planning_attempt_count: int = 0
+    planning_success_count: int = 0
+    planning_failure_count: int = 0
     command_candidate_count: int = 0
+    command_candidate_accepted_count: int = 0
+    command_candidate_rejection_count: int = 0
+    last_command_result: Optional[dict[str, Any]] = None
     command_publication_allowed: bool = False
     command_sent_count: int = 0
     command_blocked_reasons: tuple[str, ...] = ()
@@ -101,6 +120,10 @@ class CompetitionMainSummary:
     phase6e_perception_boundary_satisfied: bool = False
     phase6e_satisfied: bool = False
     phase6e_success_criteria: dict[str, bool] = field(default_factory=dict)
+    phase9b_perception_dry_run_satisfied: bool = False
+    phase9b_success_criteria: dict[str, bool] = field(default_factory=dict)
+    phase9c_command_dry_run_satisfied: bool = False
+    phase9c_success_criteria: dict[str, bool] = field(default_factory=dict)
     competition_readiness_claimed: bool = False
     notes: tuple[str, ...] = (
         PHASE4B_NOT_SATISFIED,
@@ -117,6 +140,9 @@ class CompetitionMainSummary:
             "evidence_label": self.evidence_label,
             "live_transports_requested": self.live_transports_requested,
             "use_real_autonomy": self.use_real_autonomy,
+            "real_perception_requested": self.real_perception_requested,
+            "allow_legacy_yolo_default": self.allow_legacy_yolo_default,
+            "perception_transform_mode": self.perception_transform_mode,
             "steps_requested": self.steps_requested,
             "steps_completed": self.steps_completed,
             "duration_s": self.duration_s,
@@ -130,7 +156,14 @@ class CompetitionMainSummary:
             "vision_packets_processed": self.vision_packets_processed,
             "vision_frames_completed": self.vision_frames_completed,
             "perception_update_calls": self.perception_update_calls,
+            "autonomy_telemetry_sync_count": self.autonomy_telemetry_sync_count,
+            "planning_attempt_count": self.planning_attempt_count,
+            "planning_success_count": self.planning_success_count,
+            "planning_failure_count": self.planning_failure_count,
             "command_candidate_count": self.command_candidate_count,
+            "command_candidate_accepted_count": self.command_candidate_accepted_count,
+            "command_candidate_rejection_count": self.command_candidate_rejection_count,
+            "last_command_result": self.last_command_result,
             "command_publication_allowed": self.command_publication_allowed,
             "command_sent_count": self.command_sent_count,
             "command_blocked_reasons": list(self.command_blocked_reasons),
@@ -144,6 +177,14 @@ class CompetitionMainSummary:
             ),
             "phase6e_satisfied": self.phase6e_satisfied,
             "phase6e_success_criteria": dict(sorted(self.phase6e_success_criteria.items())),
+            "phase9b_perception_dry_run_satisfied": (
+                self.phase9b_perception_dry_run_satisfied
+            ),
+            "phase9b_success_criteria": dict(sorted(self.phase9b_success_criteria.items())),
+            "phase9c_command_dry_run_satisfied": (
+                self.phase9c_command_dry_run_satisfied
+            ),
+            "phase9c_success_criteria": dict(sorted(self.phase9c_success_criteria.items())),
             "competition_readiness_claimed": self.competition_readiness_claimed,
             "notes": list(self.notes),
         }
@@ -192,6 +233,22 @@ def run_competition_main(
     phase6e_perception_boundary_satisfied = bool(
         phase6e_criteria.get("perception_update_calls_gt_0", False)
     )
+    phase9b_criteria = _phase9b_success_criteria(
+        config=config,
+        mode=mode,
+        aggregate=aggregate,
+        phase6e_receive_satisfied=phase6e_receive_satisfied,
+        phase6e_perception_boundary_satisfied=phase6e_perception_boundary_satisfied,
+    )
+    phase9b_satisfied = _phase9b_satisfied(phase9b_criteria)
+    phase9c_criteria = _phase9c_success_criteria(
+        config=config,
+        mode=mode,
+        aggregate=aggregate,
+        phase6e_receive_satisfied=phase6e_receive_satisfied,
+        phase6e_perception_boundary_satisfied=phase6e_perception_boundary_satisfied,
+    )
+    phase9c_satisfied = _phase9c_satisfied(phase9c_criteria)
 
     return CompetitionMainSummary(
         phase=_phase_for_config(config),
@@ -200,6 +257,9 @@ def run_competition_main(
         evidence_label=str(config.evidence_label),
         live_transports_requested=bool(config.live_transports),
         use_real_autonomy=bool(config.use_real_autonomy),
+        real_perception_requested=bool(config.real_perception),
+        allow_legacy_yolo_default=bool(config.allow_legacy_yolo_default),
+        perception_transform_mode=str(config.perception_transform_mode),
         steps_requested=int(config.steps),
         steps_completed=steps_completed,
         duration_s=max(0.0, finished - started),
@@ -213,7 +273,14 @@ def run_competition_main(
         vision_packets_processed=aggregate.vision_packets_processed,
         vision_frames_completed=aggregate.vision_frames_completed,
         perception_update_calls=aggregate.perception_update_calls,
+        autonomy_telemetry_sync_count=aggregate.autonomy_telemetry_sync_count,
+        planning_attempt_count=aggregate.planning_attempt_count,
+        planning_success_count=aggregate.planning_success_count,
+        planning_failure_count=aggregate.planning_failure_count,
         command_candidate_count=aggregate.command_candidate_count,
+        command_candidate_accepted_count=aggregate.command_candidate_accepted_count,
+        command_candidate_rejection_count=aggregate.command_candidate_rejection_count,
+        last_command_result=aggregate.last_command_result,
         command_publication_allowed=False,
         command_sent_count=0,
         command_blocked_reasons=aggregate.command_blocked_reasons,
@@ -224,6 +291,10 @@ def run_competition_main(
         phase6e_perception_boundary_satisfied=phase6e_perception_boundary_satisfied,
         phase6e_satisfied=phase6e_receive_satisfied,
         phase6e_success_criteria=phase6e_criteria,
+        phase9b_perception_dry_run_satisfied=phase9b_satisfied,
+        phase9b_success_criteria=phase9b_criteria,
+        phase9c_command_dry_run_satisfied=phase9c_satisfied,
+        phase9c_success_criteria=phase9c_criteria,
         notes=_notes_for_config(config),
     )
 
@@ -234,10 +305,17 @@ def fail_closed_summary(
     error: str,
     live_transports_requested: bool = False,
     use_real_autonomy: bool = False,
+    real_perception_requested: bool = False,
+    allow_legacy_yolo_default: bool = False,
+    perception_transform_mode: str = COMPETITION_OFFICIAL_TRANSFORM_MODE,
 ) -> CompetitionMainSummary:
     normalized = _mode_value(mode)
     return CompetitionMainSummary(
-        phase=PHASE_6E if live_transports_requested else PHASE_6D,
+        phase=_phase_for_flags(
+            mode=normalized,
+            live_transports=live_transports_requested,
+            real_perception=real_perception_requested,
+        ),
         mode=normalized,
         status="fail_closed",
         fail_closed=True,
@@ -245,6 +323,9 @@ def fail_closed_summary(
         evidence_label="fail_closed",
         live_transports_requested=bool(live_transports_requested),
         use_real_autonomy=bool(use_real_autonomy),
+        real_perception_requested=bool(real_perception_requested),
+        allow_legacy_yolo_default=bool(allow_legacy_yolo_default),
+        perception_transform_mode=str(perception_transform_mode),
         command_publication_allowed=False,
         command_sent_count=0,
         command_blocked_reasons=("phase6d_fail_closed",),
@@ -276,6 +357,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="explicitly construct real AutonomyAPI through competition_setup.py",
     )
+    parser.add_argument(
+        "--real-perception",
+        action="store_true",
+        help=(
+            "Phase 9B: enable the competition-safe AutonomyAPI profile with "
+            "use_perception=True. In command_dry_run this becomes Phase 9C; "
+            "commands are still never sent"
+        ),
+    )
+    parser.add_argument(
+        "--allow-legacy-yolo-default",
+        action="store_true",
+        help=(
+            "temporary Phase 9B acknowledgment that AutonomyAPI still uses its "
+            "legacy hardcoded YOLO weights path"
+        ),
+    )
+    parser.add_argument(
+        "--perception-transform-mode",
+        default=COMPETITION_OFFICIAL_TRANSFORM_MODE,
+        help=(
+            "Phase 9B.2 perception transform mode. Real-perception competition "
+            f"dry-runs require {COMPETITION_OFFICIAL_TRANSFORM_MODE!r}."
+        ),
+    )
     parser.add_argument("--target-system", type=int, default=1)
     parser.add_argument("--target-component", type=int, default=1)
     parser.add_argument("--mavlink-endpoint", default=DEFAULT_MAVLINK_ENDPOINT)
@@ -303,6 +409,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         step_sleep_s=float(args.step_sleep_s),
         live_transports=bool(args.live_transports),
         use_real_autonomy=bool(args.use_real_autonomy),
+        real_perception=bool(args.real_perception),
+        allow_legacy_yolo_default=bool(args.allow_legacy_yolo_default),
+        perception_transform_mode=str(args.perception_transform_mode),
         target_system=int(args.target_system),
         target_component=int(args.target_component),
         mavlink_endpoint=str(args.mavlink_endpoint),
@@ -321,6 +430,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             error=str(exc),
             live_transports_requested=bool(args.live_transports),
             use_real_autonomy=bool(args.use_real_autonomy),
+            real_perception_requested=bool(args.real_perception),
+            allow_legacy_yolo_default=bool(args.allow_legacy_yolo_default),
+            perception_transform_mode=str(args.perception_transform_mode),
         )
         exit_code = 2
 
@@ -340,7 +452,14 @@ class _Aggregate:
     vision_packets_processed: int = 0
     vision_frames_completed: int = 0
     perception_update_calls: int = 0
+    autonomy_telemetry_sync_count: int = 0
+    planning_attempt_count: int = 0
+    planning_success_count: int = 0
+    planning_failure_count: int = 0
     command_candidate_count: int = 0
+    command_candidate_accepted_count: int = 0
+    command_candidate_rejection_count: int = 0
+    last_command_result: Optional[dict[str, Any]] = None
     command_blocked_reasons: tuple[str, ...] = ()
     runner_events: tuple[str, ...] = ()
 
@@ -355,8 +474,22 @@ class _Aggregate:
         self.vision_packets_processed += int(result.vision_packets_processed)
         self.vision_frames_completed += int(result.vision_frames_completed)
         self.perception_update_calls += int(result.perception_update_calls)
+        if getattr(result, "autonomy_telemetry_synced", False):
+            self.autonomy_telemetry_sync_count += 1
+        if getattr(result, "planning_attempted", False):
+            self.planning_attempt_count += 1
+            if result.planning_succeeded:
+                self.planning_success_count += 1
+            else:
+                self.planning_failure_count += 1
         if result.command_candidate_attempted:
             self.command_candidate_count += 1
+            if result.command_result is not None and result.command_result.accepted:
+                self.command_candidate_accepted_count += 1
+            else:
+                self.command_candidate_rejection_count += 1
+        if result.command_result is not None:
+            self.last_command_result = _command_result_to_dict(result.command_result)
         self.command_blocked_reasons = tuple(result.command_blocked_reasons)
         self.runner_events = tuple([*self.runner_events, *result.events])
 
@@ -384,6 +517,11 @@ def _setup_config_from_main(
             port=config.vision_port,
             max_packets_per_poll=config.vision_max_packets_per_poll,
         ),
+        autonomy_profile=CompetitionAutonomyProfile(
+            use_perception=bool(config.real_perception),
+            allow_legacy_yolo_default=bool(config.allow_legacy_yolo_default),
+            perception_transform_mode=str(config.perception_transform_mode),
+        ),
     )
 
 
@@ -403,6 +541,35 @@ def _assert_main_config_safe(
         raise CompetitionMainSafetyError(
             f"{mode.value} is fail-closed in Phase 6D"
         )
+    if config.real_perception and mode not in {
+        CompetitionRunnerMode.VISION_DRY_RUN,
+        CompetitionRunnerMode.COMMAND_DRY_RUN,
+    }:
+        raise CompetitionMainSafetyError(
+            "real perception is only enabled for Phase 9B vision_dry_run or "
+            "Phase 9C command_dry_run"
+        )
+    if config.real_perception and not config.use_real_autonomy:
+        raise CompetitionMainSafetyError(
+            "Phase 9B/9C requires --use-real-autonomy with --real-perception"
+        )
+    if config.real_perception and not config.live_transports and components is None:
+        raise CompetitionMainSafetyError(
+            "Phase 9B/9C requires --live-transports or injected test components"
+        )
+    if config.real_perception and not config.allow_legacy_yolo_default and components is None:
+        raise CompetitionMainSafetyError(
+            "Phase 9B/9C currently requires --allow-legacy-yolo-default because "
+            "AutonomyAPI still has a hardcoded YOLO weights path"
+        )
+    if (
+        config.real_perception
+        and str(config.perception_transform_mode) != COMPETITION_OFFICIAL_TRANSFORM_MODE
+    ):
+        raise CompetitionMainSafetyError(
+            "Phase 9B.2/9C real perception requires "
+            f"--perception-transform-mode {COMPETITION_OFFICIAL_TRANSFORM_MODE}"
+        )
     if components is None and not config.live_transports:
         raise CompetitionMainSafetyError(
             "Phase 6D requires injected components or explicit --live-transports"
@@ -410,7 +577,24 @@ def _assert_main_config_safe(
 
 
 def _phase_for_config(config: CompetitionMainConfig) -> str:
+    if config.real_perception:
+        if _mode_value(config.mode) == CompetitionRunnerMode.COMMAND_DRY_RUN.value:
+            return PHASE_9C
+        return PHASE_9B
     return PHASE_6E if config.live_transports else PHASE_6D
+
+
+def _phase_for_flags(
+    *,
+    mode: str,
+    live_transports: bool,
+    real_perception: bool,
+) -> str:
+    if real_perception:
+        if str(mode) == CompetitionRunnerMode.COMMAND_DRY_RUN.value:
+            return PHASE_9C
+        return PHASE_9B
+    return PHASE_6E if live_transports else PHASE_6D
 
 
 def _notes_for_config(config: CompetitionMainConfig) -> tuple[str, ...]:
@@ -424,6 +608,26 @@ def _notes_for_config(config: CompetitionMainConfig) -> tuple[str, ...]:
             "Phase 6E validates production receive transports only; command "
             "publication remains disabled."
         )
+    if config.real_perception:
+        notes.append(
+            "Phase 9B/9C runs real perception through the competition-safe "
+            "AutonomyAPI profile; command publication remains disabled."
+        )
+        notes.append(
+            "Phase 9B.2 selects the official competition camera/NED transform "
+            "for real-perception dry-runs."
+        )
+        if config.allow_legacy_yolo_default:
+            notes.append(
+                "Legacy YOLO default was explicitly acknowledged for this "
+                "temporary dry-run; replace with explicit YOLO config later."
+            )
+        if _mode_value(config.mode) == CompetitionRunnerMode.COMMAND_DRY_RUN.value:
+            notes.append(
+                "Phase 9C builds no-send command candidates only; PX4/Gazebo "
+                "surrogate command candidates do not prove competition command "
+                "acceptance."
+            )
     return tuple(notes)
 
 
@@ -488,6 +692,124 @@ def _phase6e_receive_satisfied(
     return all(bool(criteria.get(name, False)) for name in required)
 
 
+def _phase9b_success_criteria(
+    *,
+    config: CompetitionMainConfig,
+    mode: CompetitionRunnerMode,
+    aggregate: _Aggregate,
+    phase6e_receive_satisfied: bool,
+    phase6e_perception_boundary_satisfied: bool,
+) -> dict[str, bool]:
+    return {
+        "mode_is_vision_dry_run": mode == CompetitionRunnerMode.VISION_DRY_RUN,
+        "live_transports_requested": bool(config.live_transports),
+        "use_real_autonomy": bool(config.use_real_autonomy),
+        "real_perception_requested": bool(config.real_perception),
+        "legacy_yolo_default_acknowledged": bool(config.allow_legacy_yolo_default),
+        "official_competition_transform_selected": (
+            str(config.perception_transform_mode) == COMPETITION_OFFICIAL_TRANSFORM_MODE
+        ),
+        "phase6e_receive_satisfied": bool(phase6e_receive_satisfied),
+        "phase6e_perception_boundary_satisfied": bool(
+            phase6e_perception_boundary_satisfied
+        ),
+        "perception_update_calls_gt_0": aggregate.perception_update_calls > 0,
+        "command_publication_allowed_false": True,
+        "command_sent_count_zero": True,
+        "phase4b_not_satisfied": True,
+        "competition_readiness_not_claimed": True,
+    }
+
+
+def _phase9b_satisfied(criteria: dict[str, bool]) -> bool:
+    required = [
+        "mode_is_vision_dry_run",
+        "live_transports_requested",
+        "use_real_autonomy",
+        "real_perception_requested",
+        "official_competition_transform_selected",
+        "phase6e_receive_satisfied",
+        "phase6e_perception_boundary_satisfied",
+        "perception_update_calls_gt_0",
+        "command_publication_allowed_false",
+        "command_sent_count_zero",
+        "phase4b_not_satisfied",
+        "competition_readiness_not_claimed",
+    ]
+    return all(bool(criteria.get(name, False)) for name in required)
+
+
+def _phase9c_success_criteria(
+    *,
+    config: CompetitionMainConfig,
+    mode: CompetitionRunnerMode,
+    aggregate: _Aggregate,
+    phase6e_receive_satisfied: bool,
+    phase6e_perception_boundary_satisfied: bool,
+) -> dict[str, bool]:
+    command_result = aggregate.last_command_result or {}
+    fields = command_result.get("fields") or {}
+    return {
+        "mode_is_command_dry_run": mode == CompetitionRunnerMode.COMMAND_DRY_RUN,
+        "live_transports_requested": bool(config.live_transports),
+        "use_real_autonomy": bool(config.use_real_autonomy),
+        "real_perception_requested": bool(config.real_perception),
+        "legacy_yolo_default_acknowledged": bool(config.allow_legacy_yolo_default),
+        "official_competition_transform_selected": (
+            str(config.perception_transform_mode) == COMPETITION_OFFICIAL_TRANSFORM_MODE
+        ),
+        "phase6e_receive_satisfied": bool(phase6e_receive_satisfied),
+        "phase6e_perception_boundary_satisfied": bool(
+            phase6e_perception_boundary_satisfied
+        ),
+        "perception_update_calls_gt_0": aggregate.perception_update_calls > 0,
+        "autonomy_telemetry_sync_count_gt_0": (
+            aggregate.autonomy_telemetry_sync_count > 0
+        ),
+        "planning_attempt_count_gt_0": aggregate.planning_attempt_count > 0,
+        "planning_success_count_gt_0": aggregate.planning_success_count > 0,
+        "command_candidate_count_gt_0": aggregate.command_candidate_count > 0,
+        "command_candidate_accepted_count_gt_0": (
+            aggregate.command_candidate_accepted_count > 0
+        ),
+        "last_command_result_accepted": bool(command_result.get("accepted", False)),
+        "last_command_result_no_send": fields.get("send_ready") is False,
+        "last_command_message_is_set_attitude_target": (
+            fields.get("message_name") == "SET_ATTITUDE_TARGET"
+        ),
+        "command_publication_allowed_false": True,
+        "command_sent_count_zero": True,
+        "phase4b_not_satisfied": True,
+        "competition_readiness_not_claimed": True,
+    }
+
+
+def _phase9c_satisfied(criteria: dict[str, bool]) -> bool:
+    required = [
+        "mode_is_command_dry_run",
+        "live_transports_requested",
+        "use_real_autonomy",
+        "real_perception_requested",
+        "official_competition_transform_selected",
+        "phase6e_receive_satisfied",
+        "phase6e_perception_boundary_satisfied",
+        "perception_update_calls_gt_0",
+        "autonomy_telemetry_sync_count_gt_0",
+        "planning_attempt_count_gt_0",
+        "planning_success_count_gt_0",
+        "command_candidate_count_gt_0",
+        "command_candidate_accepted_count_gt_0",
+        "last_command_result_accepted",
+        "last_command_result_no_send",
+        "last_command_message_is_set_attitude_target",
+        "command_publication_allowed_false",
+        "command_sent_count_zero",
+        "phase4b_not_satisfied",
+        "competition_readiness_not_claimed",
+    ]
+    return all(bool(criteria.get(name, False)) for name in required)
+
+
 def _normalize_mode(mode: CompetitionRunnerMode | str) -> CompetitionRunnerMode:
     if isinstance(mode, CompetitionRunnerMode):
         return mode
@@ -508,6 +830,35 @@ def _transport_summary(transport: Any) -> Optional[dict[str, Any]]:
     return None
 
 
+def _command_result_to_dict(result: Any) -> dict[str, Any]:
+    fields = getattr(result, "fields", None)
+    fields_dict = None
+    if fields is not None:
+        fields_dict = {
+            "message_name": fields.message_name,
+            "time_boot_ms": fields.time_boot_ms,
+            "target_system": fields.target_system,
+            "target_component": fields.target_component,
+            "type_mask": fields.type_mask,
+            "q": list(fields.q),
+            "body_roll_rate": fields.body_roll_rate,
+            "body_pitch_rate": fields.body_pitch_rate,
+            "body_yaw_rate": fields.body_yaw_rate,
+            "thrust": fields.thrust,
+            "source_tuple_semantics": fields.source_tuple_semantics,
+            "send_ready": fields.send_ready,
+            "send_blocked_reason": fields.send_blocked_reason,
+            "sequence": fields.sequence,
+            "pymavlink_args": list(fields.as_pymavlink_args()),
+        }
+
+    return {
+        "accepted": bool(getattr(result, "accepted", False)),
+        "rejection_reason": str(getattr(result, "rejection_reason", "")),
+        "fields": fields_dict,
+    }
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
 
@@ -517,6 +868,8 @@ __all__ = [
     "PHASE4B_NOT_SATISFIED",
     "PHASE_6D",
     "PHASE_6E",
+    "PHASE_9B",
+    "PHASE_9C",
     "PHASE6E_SURROGATE_LIMITATION",
     "CompetitionMainConfig",
     "CompetitionMainSafetyError",

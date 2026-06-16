@@ -7,6 +7,9 @@ import json
 import itertools
 from autonomy_core.control.attitude_control import compute_tracker_control_debug_fields
 from autonomy_core.core.competition_config import VADR_TS_002
+from autonomy_core.core.frame_conventions import (
+    official_camera_to_internal_body_flu_rotmat,
+)
 from autonomy_core.debug.gazebo_diagnostics import (
     _gazebo_model_pose_to_planner as gazebo_model_pose_to_planner_impl,
     capture_gazebo_pose_debug as capture_gazebo_pose_debug_impl,
@@ -369,6 +372,7 @@ class AutonomyAPI:
             "direct_rad",
             "physical_direct_rad",
             "physical_direct_rad_x_mirror",
+            "competition_official_ned",
             "yaw_minus_pi_over_2",
             "pi_over_2_minus_yaw",
             "neg_yaw",
@@ -1206,6 +1210,11 @@ class AutonomyAPI:
             return np.array([roll, pitch, yaw], dtype=float) * np.pi / 180.0
         if mode in ("direct_rad", "physical_direct_rad", "physical_direct_rad_x_mirror"):
             return np.array([roll, pitch, yaw], dtype=float)
+        if mode == "competition_official_ned":
+            return np.array(
+                [roll, pitch, self.wrap_pi((np.pi / 2.0) - yaw)],
+                dtype=float,
+            )
         if mode == "yaw_minus_pi_over_2":
             return np.array([roll, pitch, yaw - (np.pi / 2.0)], dtype=float)
         if mode == "pi_over_2_minus_yaw":
@@ -1314,6 +1323,8 @@ class AutonomyAPI:
             return self.physical_body_camera_matrix()
         if mode == "physical_direct_rad_x_mirror":
             return self.physical_x_mirror_body_camera_matrix()
+        if mode == "competition_official_ned":
+            return self.competition_official_body_camera_matrix()
         if default_matrix is not None:
             return np.asarray(default_matrix, dtype=float).reshape(3, 3)
         return np.asarray(self.perception_node.R_body_camera, dtype=float).reshape(3, 3)
@@ -1333,6 +1344,10 @@ class AutonomyAPI:
             [1.0, 0.0, 0.0],
             [0.0, -1.0, 0.0],
         ], dtype=float)
+
+    @staticmethod
+    def competition_official_body_camera_matrix():
+        return official_camera_to_internal_body_flu_rotmat(VADR_TS_002)
 
     def print_perception_transform_startup(self):
         if self.perception_node is None:
@@ -1359,6 +1374,12 @@ class AutonomyAPI:
                 "physical_direct_rad_x_mirror uses a horizontal mirror convention; "
                 "this indicates the live camera image or optical x-axis is mirrored "
                 "relative to OpenCV assumptions."
+            )
+        if self.perception_transform_mode == "competition_official_ned":
+            print(
+                "[PERCEPTION TRANSFORM STARTUP] "
+                "competition_official_ned uses VADR camera tilt, OpenCV optical "
+                "tvecs, MAVLink body FRD, and internal body FLU with det(R)=+1."
             )
 
     def transform_gate_camera_to_world(self, gate_camera, drone_pos, telemetry_rpy_raw_rad, mode, r_body_camera):
@@ -2754,6 +2775,7 @@ class AutonomyAPI:
         if self.perception_transform_mode in (
             "physical_direct_rad",
             "physical_direct_rad_x_mirror",
+            "competition_official_ned",
             "physical_mavsdk_yaw_aligned",
             "legacy_scaled_yaw",
         ):
@@ -2815,6 +2837,7 @@ class AutonomyAPI:
         if self.perception_transform_mode in (
             "physical_direct_rad",
             "physical_direct_rad_x_mirror",
+            "competition_official_ned",
             "physical_mavsdk_yaw_aligned",
             "legacy_scaled_yaw",
         ):
@@ -3882,6 +3905,10 @@ class AutonomyAPI:
                     [1.0, 0.0, 0.0],
                     [0.0, 1.0, 0.0],
                 ], dtype=float),
+            ),
+            (
+                "competition_official_ned",
+                self.competition_official_body_camera_matrix(),
             ),
             (
                 "old_live_default",
