@@ -91,6 +91,12 @@ class CompetitionMavlinkTransport:
     def is_started(self) -> bool:
         return self._connection is not None
 
+    @property
+    def active_connection(self) -> Any:
+        """Return the already-open connection without opening a socket."""
+
+        return self._connection
+
     def start(self) -> "CompetitionMavlinkTransport":
         """Open the configured MAVLink endpoint if not already injected."""
 

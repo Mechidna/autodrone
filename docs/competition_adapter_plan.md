@@ -1674,41 +1674,673 @@ Status:
 - Phase 4B, Phase 9D, command readiness, race readiness, and competition
   readiness are still not claimed.
 
-### Phase 9D - Real Competition Simulator Dry-Run Stages
+### Phase 9D - PX4/Gazebo Surrogate Command-Send Safety Gate
 
-Priority: P1 when the real competition simulator or official equivalent is
-available.
+Priority: P1 after Phase 9C when the real competition simulator remains
+unavailable.
 
 Purpose:
 
-- Repeat observe, vision dry-run, and command dry-run against the real
-  competition simulator before any command-enabled mode.
-- Use real competition evidence to resolve Phase 4B and command semantics.
+- Wire the PX4/Gazebo surrogate stack end-to-end through the competition stack:
+  PX4/Gazebo telemetry, Gazebo camera pixels packetized as VADR UDP vision,
+  competition-safe perception, planning/control, competition command adapter,
+  and a gated PX4/Gazebo-only MAVLink command sender.
+- Prove the competition stack can close a local SITL control loop using
+  surrogate inputs without importing legacy runner behavior into the competition
+  runner.
+- Keep all outputs labeled as PX4/Gazebo surrogate evidence only.
 
-Stages:
+Hard boundary:
 
-- Observe mode: receive heartbeat and telemetry only; record exact MAVLink
-  messages, IDs, rates, fields, timestamps, and system-status flags.
-- Telemetry decision: verify whether usable local position/odometry exists; if
-  absent, stop and scope a P0 state-estimation/VIO/EKF unblocker.
-- Vision dry-run: receive UDP `5600` VADR JPEG packets, decode frames, and call
-  the competition-safe perception boundary with `gazebo_pose=None`.
-- Command dry-run: build no-send command candidates only after telemetry and
-  image freshness gates pass.
-- Live command output under external safety controls is a later explicit phase,
-  not automatic Phase 9D work.
+- Phase 9D does not satisfy Phase 4B.
+- Phase 9D does not satisfy real competition simulator telemetry evidence.
+- Phase 9D does not claim competition command readiness, race readiness,
+  submitted-run readiness, or competition readiness.
+- The real competition simulator dry-run stages remain deferred until the real
+  simulator or an official equivalent is available.
+- The competition runner must not depend on `surrogate_runner.py`.
+- Gazebo truth must not be used for state, gate position, target selection,
+  command readiness, or command feedback.
+
+Expected data path:
+
+- PX4/Gazebo publishes MAVLink telemetry to
+  `competition_mavlink_transport.py`.
+- Gazebo camera publishes `640x360` frames with official VADR-like intrinsics.
+- `surrogate_vision_bridge.py` packetizes those frames into VADR-style UDP
+  `<IHHIIQ` JPEG packets and sends them to `127.0.0.1:5600`.
+- `competition_vision_transport.py` receives UDP `5600` packets.
+- `CompetitionImageAdapter` reassembles and decodes frames.
+- The competition-safe `AutonomyAPI` profile receives frames with
+  `gazebo_pose=None` and `image_pose_snapshot=None`.
+- `CompetitionRunner` syncs usable competition telemetry into the
+  competition-safe autonomy object, runs planning/control, and builds command
+  candidates through `CompetitionDryRunCommandAdapter`.
+- A new PX4/Gazebo-only command-send path may publish those already-built
+  command fields to PX4/Gazebo only after all Phase 9D safety gates pass.
+
+Implementation tasks:
+
+- Add an explicit PX4/Gazebo-only command sender or command transport wrapper
+  that can publish the already-serialized `SET_ATTITUDE_TARGET` fields from
+  the competition command adapter.
+- Keep command sending disabled by default.
+- Require an explicit CLI flag for command send, for example
+  `--px4-gazebo-command-send`, plus a second acknowledgement flag that states
+  the run is PX4/Gazebo surrogate-only evidence.
+- Keep `command_live` and `race` fail-closed for competition use.
+- Add bounded runtime controls: maximum duration, maximum command count,
+  command rate below `100 Hz`, stale telemetry rejection, stale image rejection,
+  heartbeat freshness rejection, state usability rejection, and command adapter
+  rejection.
+- Add conservative command safety clamps for the surrogate sender, including
+  finite-value checks, thrust bounds, attitude bounds, and explicit no-send on
+  invalid quaternion/body-rate/type-mask fields.
+- Record every sent command summary, but do not change the main flight logger
+  schema unless a separate logging migration is approved.
+- Keep the Phase 7 Gazebo-truth guard active: commands may use PX4 estimated
+  telemetry, but never Gazebo model pose, Gazebo camera pose, Gazebo TF, link
+  state, world pose, or pose snapshots.
+- Add deterministic fake-transport tests before any manual PX4/Gazebo send
+  run.
+
+Manual run stages:
+
+- Stage 1: run Phase 9C no-send command dry-run and confirm
+  `phase9c_command_dry_run_satisfied=true`, `command_candidate_count > 0`,
+  and `command_sent_count=0`.
+- Stage 2: run a one-command or very short bounded PX4/Gazebo command-send
+  smoke test with props/SITL safety assumptions documented.
+- Stage 3: run a short bounded control-loop test and inspect telemetry,
+  perception, planning, command candidate, sent-command, and safety-rejection
+  counts.
+- Stage 4: only if Stage 3 is stable, run a longer bounded PX4/Gazebo surrogate
+  end-to-end test.
 
 Acceptance criteria:
 
-- Each stage has logs sufficient to diagnose the next failure without changing
-  behavior mid-stage.
-- Command-enabled mode is never the first real simulator run.
-- Phase 4B is marked complete only from real competition simulator or official
-  equivalent receive-only telemetry evidence.
-- If usable local position/odometry is missing, stop after observe mode and
-  scope the state-estimation unblocker.
-- PX4/Gazebo surrogate output and local UDP loopback output do not satisfy
-  Phase 9D.
+- The command sender cannot run unless live PX4/Gazebo surrogate mode is
+  explicitly requested.
+- `phase4b_satisfied=false` and `competition_readiness_claimed=false` remain
+  in summaries.
+- The summary labels the run as PX4/Gazebo surrogate command-send evidence.
+- `state_usable=true`, heartbeat is fresh, image input is fresh, and perception
+  has updated before any command is sent.
+- `command_candidate_count > 0`.
+- `command_sent_count > 0` only in the explicit PX4/Gazebo command-send mode.
+- Command rate remains below `100 Hz`.
+- Every sent command is derived from the competition command adapter fields.
+- No command is sent when telemetry, image, perception, guard, or command
+  validation fails.
+- No Gazebo truth path reaches state, perception, planning, or command
+  readiness.
+- Deterministic tests prove fail-closed behavior, no-send default behavior,
+  explicit-send gating, safety rejection, and summary labels.
+
+Status:
+
+- Implemented PX4/Gazebo-only Phase 9D command-send safety gate in
+  `autonomy_core/runtime/competition_main.py`.
+- Added import-safe `autonomy_core/runtime/px4_gazebo_command_sender.py` for
+  explicit PX4/Gazebo `SET_ATTITUDE_TARGET` publication using already-built
+  competition command-adapter fields.
+- `CompetitionRunner` remains no-send; Phase 9D sending happens only in the
+  lifecycle/CLI layer after the runner produces an accepted command candidate.
+- `competition_mavlink_transport.py` remains receive-first and only exposes the
+  already-open connection for the explicit Phase 9D sender.
+- Phase 9D requires `--px4-gazebo-command-send` and
+  `--ack-px4-gazebo-surrogate-command-send`.
+- Summary output includes `phase: "9D"`,
+  `phase9d_surrogate_command_send_satisfied`, send attempt/sent/rejection
+  counts, the last command-send result, and sender safety summary.
+- Documentation is available in
+  `docs/competition_adapter_phase9d_px4_gazebo_command_send.md`.
+- Phase 4B, real competition simulator telemetry evidence, competition command
+  readiness, race readiness, submitted-run readiness, and competition readiness
+  are still not claimed.
+
+### Phase 9E - PX4/Gazebo Surrogate Arm/Offboard Bring-Up
+
+Priority: P1 after Phase 9D when the PX4/Gazebo surrogate receives
+`SET_ATTITUDE_TARGET` commands but does not fly.
+
+Purpose:
+
+- Add the minimum PX4/Gazebo-only arm/offboard bring-up needed for the local
+  surrogate simulator to actually accept and act on competition-stack command
+  output.
+- Keep the competition stack path intact: telemetry enters through
+  `competition_mavlink_transport.py`, vision enters through VADR-style UDP
+  packets, perception/planning/control run through the competition-safe
+  `AutonomyAPI` profile, and command fields come from the competition command
+  adapter.
+- Treat arming/offboard setup as surrogate infrastructure only, not as
+  competition protocol readiness.
+
+Reference evidence:
+
+- `third_party/PyAIPilotExample/main.py` calls `controller.arm()` before
+  entering its control loop.
+- `third_party/PyAIPilotExample/controller.py` implements `arm()` with
+  `MAV_CMD_COMPONENT_ARM_DISARM` and `param1=1`.
+- `PyAIPilotExample` also streams commands continuously in `controller.update()`.
+- Those files remain read-only vendor/reference code; do not edit, format,
+  stage, or commit them.
+
+Hard boundary:
+
+- Phase 9E is PX4/Gazebo surrogate-only.
+- Phase 9E does not satisfy Phase 4B.
+- Phase 9E does not satisfy real competition simulator telemetry evidence.
+- Phase 9E does not claim competition command readiness, race readiness,
+  submitted-run readiness, or competition readiness.
+- Phase 9E must not enable `command_live` or `race`.
+- Phase 9E must not use Gazebo truth for state, gate position, target
+  selection, command readiness, command feedback, or pass/fail criteria.
+- Phase 9E must not make `CompetitionRunner` depend on `surrogate_runner.py`.
+- Real competition simulator arm/offboard or submitted-run behavior remains a
+  later, separate, explicit phase after official simulator evidence exists.
+
+Expected data path:
+
+- PX4/Gazebo publishes MAVLink telemetry to
+  `competition_mavlink_transport.py`.
+- Gazebo camera publishes official-size `640x360` frames.
+- `surrogate_vision_bridge.py` packetizes frames into VADR-style UDP `5600`
+  JPEG packets.
+- `competition_vision_transport.py` receives VADR-style packets.
+- `CompetitionImageAdapter` decodes frames and passes official camera metadata.
+- The competition-safe `AutonomyAPI` profile updates perception with
+  `gazebo_pose=None` and `image_pose_snapshot=None`.
+- `CompetitionRunner` runs in `command_dry_run`, syncs competition telemetry,
+  calls planning/control, and builds command candidates.
+- Phase 9E PX4/Gazebo-only lifecycle code performs optional arm/offboard
+  bring-up and then lets the Phase 9D sender publish bounded
+  `SET_ATTITUDE_TARGET` commands.
+
+Implementation tasks:
+
+- Add an explicit PX4/Gazebo-only arm/offboard lifecycle helper or sender
+  extension; keep it import-safe and dependency-light.
+- Keep arming disabled by default.
+- Require explicit flags, for example:
+  `--px4-gazebo-arm`, `--ack-px4-gazebo-surrogate-arm`,
+  `--px4-gazebo-offboard`, and `--ack-px4-gazebo-surrogate-offboard`.
+- Send `MAV_CMD_COMPONENT_ARM_DISARM` only when the explicit arm flags are
+  present.
+- If PX4 requires mode setup, add an explicit PX4/Gazebo-only mode/offboard
+  command path, but keep it separate from competition readiness.
+- Stream neutral or bounded setpoints before and during mode/arm bring-up if
+  required by PX4 offboard behavior.
+- Require bounded runtime controls: maximum duration, maximum arm attempts,
+  maximum mode attempts, maximum command count, command rate below `100 Hz`,
+  heartbeat freshness, usable state, fresh image/perception, and accepted
+  command-adapter output.
+- Verify arming/mode state from receive telemetry when available, such as
+  `HEARTBEAT.base_mode`, `HEARTBEAT.custom_mode`, `EXTENDED_SYS_STATE`, or any
+  available PX4 mode/status fields.
+- Record arm attempts, arm acknowledgements if available, mode/offboard
+  attempts, mode evidence, setpoint pre-stream count, command send count,
+  command rejection count, and failsafe/timeout reasons in the JSON summary.
+- Keep `command_live` and `race` fail-closed.
+- Do not change planner, controller, YOLO, PnP, perception scoring, race
+  progression, logger schema, or legacy `px4_runner` behavior.
+- Do not retune thrust, yaw, gains, hover behavior, no-target behavior, or gate
+  progression during this phase.
+
+Suggested manual stages:
+
+- Stage 1: run Phase 9D one-command send again and confirm the send path still
+  works but the vehicle remains unarmed/not flying.
+- Stage 2: run arm-only PX4/Gazebo surrogate smoke test with no motion command
+  beyond neutral/pre-stream setpoints if required.
+- Stage 3: verify telemetry reports armed state or clearly document if PX4 does
+  not report enough status through the current MAVLink stream.
+- Stage 4: run offboard/mode-only bring-up with neutral/pre-stream setpoints and
+  verify mode evidence from telemetry.
+- Stage 5: run a short bounded armed/offboard command-send test with a small
+  command count and conservative safety limits.
+- Stage 6: only if Stage 5 is stable, run a longer bounded PX4/Gazebo surrogate
+  control-loop test.
+
+Acceptance criteria:
+
+- Arm/offboard behavior cannot run unless PX4/Gazebo surrogate arm/offboard
+  flags and acknowledgement flags are explicitly present.
+- `phase4b_satisfied=false` and `competition_readiness_claimed=false` remain in
+  all summaries.
+- The summary labels the run as PX4/Gazebo surrogate arm/offboard evidence.
+- `command_live` and `race` still fail closed.
+- The Phase 9D command-send path still requires `command_dry_run`.
+- No command is sent unless heartbeat is fresh, state is usable, image/perception
+  is fresh, planning succeeds, and command-adapter output is accepted.
+- Arm attempts are bounded and recorded.
+- Mode/offboard attempts are bounded and recorded.
+- Setpoint pre-stream count is recorded if required.
+- Telemetry evidence for armed/mode status is recorded when available.
+- If telemetry cannot prove armed/offboard status, the run must be labeled
+  inconclusive and must not proceed to longer command-loop testing.
+- Command rate remains below `100 Hz`.
+- No Gazebo truth path reaches state, perception, planning, command readiness,
+  arm readiness, mode readiness, or pass/fail criteria.
+- Deterministic tests prove import safety, fail-closed defaults, required
+  acknowledgements, bounded arm/mode attempts, no-send on failed gates, and
+  surrogate-only summary labels.
+
+Manual success criteria for first armed/offboard command smoke test:
+
+- `phase` is `"9E"` or equivalent Phase 9E label.
+- `px4_gazebo_surrogate_label` identifies PX4/Gazebo arm/offboard evidence.
+- `phase4b_satisfied=false`.
+- `competition_readiness_claimed=false`.
+- `arm_requested=true` only when explicit arm flags are supplied.
+- `arm_attempt_count > 0` only in explicit arm mode.
+- `armed_state_observed=true` or the summary clearly reports
+  `armed_state_observed=false` with an inconclusive status.
+- If offboard/mode setup is requested, `offboard_requested=true` and mode
+  evidence is recorded or the run is inconclusive.
+- `state_usable=true`.
+- `vision_frames_completed > 0`.
+- `perception_update_calls > 0`.
+- `command_candidate_count > 0`.
+- `command_sent_count > 0` only in explicit PX4/Gazebo command-send mode.
+- `command_sender_summary.stats.rejection_count=0` for commands that actually
+  reach the sender.
+
+Stop conditions:
+
+- No heartbeat.
+- Stale heartbeat.
+- Missing or stale local position/odometry.
+- No fresh vision/perception update.
+- Planning does not succeed.
+- Command adapter rejects the command.
+- Arm command is rejected or armed state cannot be confirmed when confirmation
+  is required.
+- Offboard/mode command is rejected or mode state cannot be confirmed when
+  confirmation is required.
+- Any failsafe, disarm, lost-link, or unexpected PX4 mode/status appears in
+  telemetry.
+- Any Gazebo truth metadata reaches guarded competition paths.
+- Any command safety clamp rejects thrust, attitude, body-rate, quaternion,
+  target IDs, or rate.
+
+Validation:
+
+- Add deterministic tests for arm command field construction using fake
+  connections only.
+- Add deterministic tests for mode/offboard command construction if that path is
+  implemented.
+- Add `competition_main.py` tests proving Phase 9E fails closed without explicit
+  arm/offboard acknowledgement flags.
+- Add tests proving Phase 9E summaries keep `phase4b_satisfied=false` and
+  `competition_readiness_claimed=false`.
+- Add import-safety checks proving `pymavlink`, `cv2`, `mavsdk`, and `rclpy` are
+  not loaded on import.
+- Run the full deterministic suite before any manual PX4/Gazebo armed test.
+
+Deliverables:
+
+- A short Phase 9E documentation note, for example
+  `docs/competition_adapter_phase9e_px4_gazebo_arm_offboard.md`.
+- Import-safe PX4/Gazebo-only arm/offboard helper or sender extension.
+- Explicit Phase 9E CLI flags and JSON summary fields.
+- Deterministic fake-connection tests.
+- Manual command examples and pass/fail criteria for arm-only,
+  offboard/mode-only, and short armed command-loop tests.
+
+Status:
+
+- Implemented PX4/Gazebo-only Phase 9E arm/offboard lifecycle gate in
+  `autonomy_core/runtime/competition_main.py` and
+  `autonomy_core/runtime/px4_gazebo_command_sender.py`.
+- Added explicit flags:
+  `--px4-gazebo-arm`, `--ack-px4-gazebo-surrogate-arm`,
+  `--px4-gazebo-offboard`, and
+  `--ack-px4-gazebo-surrogate-offboard`.
+- Added bounded arm/offboard attempt counters, last lifecycle command results,
+  armed/offboard telemetry evidence fields, and
+  `phase9e_surrogate_arm_offboard_satisfied`.
+- Added optional `--px4-gazebo-offboard-prestream-count` so PX4 Offboard mode
+  can be delayed until a bounded number of attitude targets have already been
+  sent.
+- Added `MAV_CMD_COMPONENT_ARM_DISARM` and PX4 Offboard
+  `MAV_CMD_DO_SET_MODE` support behind explicit surrogate-only flags.
+- Documentation is available in
+  `docs/competition_adapter_phase9e_px4_gazebo_arm_offboard.md`.
+- Phase 4B, real competition simulator telemetry evidence, competition command
+  readiness, race readiness, submitted-run readiness, and competition readiness
+  are still not claimed.
+
+### Phase 9E.1 - PX4/Gazebo Continuous Offboard Setpoint Stream
+
+Priority: P1 after Phase 9E when PX4/Gazebo arms or accepts mode commands but
+does not remain active because command publication is tied to fresh perception
+frames.
+
+Purpose:
+
+- Keep the competition stack path intact while making the PX4/Gazebo surrogate
+  behave like an Offboard client that streams setpoints continuously.
+- Reuse the latest accepted competition command candidate after image/perception
+  updates become intermittent, but only while the cached command remains fresh.
+- Preserve all Phase 9D/9E safety boundaries and keep this explicitly
+  PX4/Gazebo surrogate-only.
+
+Hard boundary:
+
+- Phase 9E.1 does not satisfy Phase 4B.
+- Phase 9E.1 does not satisfy real competition simulator telemetry evidence.
+- Phase 9E.1 does not claim competition command readiness, race readiness,
+  submitted-run readiness, or competition readiness.
+- Phase 9E.1 must not enable `command_live` or `race`.
+- Phase 9E.1 must not use Gazebo truth for state, gate position, target
+  selection, command readiness, command feedback, or pass/fail criteria.
+- Phase 9E.1 must not change planner, controller, YOLO, PnP, perception
+  scoring, race progression, logger schema, or legacy `px4_runner` behavior.
+
+Implementation:
+
+- Added explicit flag `--px4-gazebo-continuous-setpoint-stream`.
+- Added cached command age limit `--px4-gazebo-command-max-age-s`.
+- The cache updates only from an accepted competition command candidate on a
+  step with fresh image/perception gates.
+- Later sends may reuse the cached command only if heartbeat and state are
+  fresh and the cached command age is within the configured limit.
+- `CompetitionRunner` remains no-send; the stream is implemented in the
+  `competition_main.py` PX4/Gazebo surrogate lifecycle layer.
+- Summary output includes cache update count, reused setpoint count, stale cache
+  rejection count, last cached command age, and
+  `phase9e1_continuous_setpoint_stream_satisfied`.
+
+Acceptance criteria:
+
+- `phase` is `"9E.1"`.
+- Explicit Phase 9D command-send acknowledgement is present.
+- Explicit Phase 9E.1 continuous stream flag is present.
+- Phase 9E arm/offboard criteria pass when arm/offboard is requested.
+- `setpoint_stream_cache_update_count > 0`.
+- `setpoint_stream_reused_count > 0`.
+- `setpoint_stream_stale_rejection_count = 0`.
+- `command_sent_count > 1` and remains within the configured max count.
+- `phase4b_satisfied=false`.
+- `competition_readiness_claimed=false`.
+
+Status:
+
+- Implemented in `autonomy_core/runtime/competition_main.py`.
+- Added deterministic coverage in `tests/test_competition_main.py` proving a
+  fake run can cache one fresh command and keep streaming it after image input
+  goes stale.
+- Documentation is available in
+  `docs/competition_adapter_phase9e_1_continuous_offboard_stream.md`.
+- Phase 4B, real competition simulator telemetry evidence, competition command
+  readiness, race readiness, submitted-run readiness, and competition readiness
+  are still not claimed.
+
+### Phase 9E.2 - PX4/Gazebo Surrogate Command Safety Clamp And Stream Diagnostics
+
+Priority: P1 after Phase 9E.1 when PX4/Gazebo receives continuous setpoints
+but the local SITL response is too aggressive for safe bring-up.
+
+Purpose:
+
+- Keep the competition stack path intact while adding PX4/Gazebo surrogate-only
+  command safety diagnostics at the final sender boundary.
+- Preserve the raw competition command candidate from
+  `AutonomyAPI.attitude_control()` and `CompetitionDryRunCommandAdapter`.
+- Optionally clamp normalized thrust only in the explicit PX4/Gazebo sender so
+  local SITL can be smoke-tested near hover without retuning competition
+  controller behavior.
+- Record raw-vs-sent thrust, clamp count, command stream source, yaw range, and
+  send gaps in the JSON summary.
+
+Hard boundary:
+
+- Phase 9E.2 does not satisfy Phase 4B.
+- Phase 9E.2 does not satisfy real competition simulator telemetry evidence.
+- Phase 9E.2 does not claim competition command readiness, race readiness,
+  submitted-run readiness, or competition readiness.
+- Phase 9E.2 must not enable `command_live` or `race`.
+- Phase 9E.2 must not use Gazebo truth for state, gate position, target
+  selection, command readiness, command feedback, or pass/fail criteria.
+- Phase 9E.2 must not change planner, controller, YOLO, PnP, perception
+  scoring, race progression, logger schema, legacy runner behavior, or
+  `AutonomyAPI.attitude_control()` tuning.
+
+Implementation:
+
+- Added explicit flag `--px4-gazebo-surrogate-thrust-clamp`.
+- Added optional bounds `--px4-gazebo-surrogate-thrust-clamp-min` and
+  `--px4-gazebo-surrogate-thrust-clamp-max`; at least one bound is required
+  when the clamp flag is present.
+- The clamp requires the existing Phase 9D command-send flag and acknowledgement.
+- The clamp is applied in `px4_gazebo_command_sender.py` after the competition
+  command adapter has built `SET_ATTITUDE_TARGET` fields and before the MAVLink
+  send call.
+- Summary output includes raw thrust, sent thrust, `thrust_clamped`, stream
+  source (`current` or `cached`), send gap, sender thrust ranges, yaw range,
+  stream-source counts, and `phase9e2_surrogate_command_safety_satisfied`.
+
+Acceptance criteria:
+
+- `phase` is `"9E.2"`.
+- Explicit Phase 9D command-send acknowledgement is present.
+- Explicit Phase 9E.2 clamp flag is present.
+- At least one clamp bound is configured.
+- `command_sent_count > 0`.
+- `last_command_result.fields.thrust` records the raw competition command
+  candidate.
+- `last_command_send_result.raw_thrust` records the same pre-clamp thrust.
+- `last_command_send_result.thrust` records the actual PX4/Gazebo surrogate
+  thrust sent over MAVLink.
+- `last_command_send_result.thrust_clamped=true` for at least one sent command.
+- `command_sender_summary.stats.thrust_clamp_count > 0`.
+- `phase4b_satisfied=false`.
+- `competition_readiness_claimed=false`.
+
+Status:
+
+- Implemented in `autonomy_core/runtime/competition_main.py` and
+  `autonomy_core/runtime/px4_gazebo_command_sender.py`.
+- Added deterministic coverage in `tests/test_competition_main.py` proving the
+  raw command candidate can remain `0.85` while the PX4/Gazebo surrogate send
+  field is clamped to an explicit lower value.
+- Added deterministic coverage in `tests/test_px4_gazebo_command_sender.py`
+  proving sender-boundary clamp behavior, stream-source accounting, send-gap
+  diagnostics, and clamp config validation.
+- Documentation is available in
+  `docs/competition_adapter_phase9e_2_command_safety_diagnostics.md`.
+- Phase 4B, real competition simulator telemetry evidence, competition command
+  readiness, race readiness, submitted-run readiness, and competition readiness
+  are still not claimed.
+
+### Phase 9E.3 - PX4/Gazebo Body-Rate SET_ATTITUDE_TARGET Interface Smoke
+
+Priority: P1 after Phase 9E.2, before converting autonomy output into a
+body-rate command backend.
+
+Purpose:
+
+- Isolate the MAVLink command interface from perception, planning, and
+  controller behavior.
+- Prove PX4/Gazebo can receive and act on continuous `SET_ATTITUDE_TARGET`
+  body-rate commands shaped like the PyAIPilotExample attitude-control example.
+- Test fixed body rates and fixed thrust first, before mapping
+  `AutonomyAPI.attitude_control()` output into body-rate commands.
+
+Hard boundary:
+
+- Phase 9E.3 is PX4/Gazebo surrogate-only.
+- Phase 9E.3 does not satisfy Phase 4B.
+- Phase 9E.3 does not satisfy real competition simulator telemetry evidence.
+- Phase 9E.3 does not claim competition command readiness, race readiness,
+  submitted-run readiness, or competition readiness.
+- Phase 9E.3 must not enable `command_live` or `race`.
+- Phase 9E.3 must not use Gazebo truth for state, target selection, command
+  readiness, command feedback, or pass/fail criteria.
+- Phase 9E.3 must not call perception, planning, or
+  `AutonomyAPI.attitude_control()` to generate the fixed body-rate smoke
+  command.
+- Phase 9E.3 must not convert autonomy RPY output into body rates; that remains
+  a later explicit phase.
+- Phase 9E.3 must not retune planner, controller, yaw, thrust, hover, no-target
+  behavior, or race progression.
+
+Command under test:
+
+- Send `SET_ATTITUDE_TARGET`.
+- Use `ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE`.
+- Send `q = [1, 0, 0, 0]` as a dummy ignored quaternion.
+- Send explicit fixed `body_roll_rate`, `body_pitch_rate`, and
+  `body_yaw_rate` values.
+- Send explicit fixed normalized thrust, initially near the local PX4/Gazebo
+  hover thrust if the operator chooses, for example `0.74`.
+
+Expected implementation:
+
+- Add explicit PX4/Gazebo-only body-rate smoke flags such as
+  `--px4-gazebo-body-rate-smoke` and
+  `--ack-px4-gazebo-surrogate-body-rate-smoke`.
+- Add explicit fixed-command fields such as
+  `--px4-gazebo-body-roll-rate`, `--px4-gazebo-body-pitch-rate`,
+  `--px4-gazebo-body-yaw-rate`, and
+  `--px4-gazebo-body-rate-thrust`.
+- Reuse the already-open MAVLink connection from
+  `competition_mavlink_transport.py`.
+- Reuse the existing explicit PX4/Gazebo arm/offboard flags if PX4 requires
+  lifecycle setup.
+- Keep the body-rate smoke independent from the Phase 9E.2 quaternion-attitude
+  thrust clamp path and independent from the competition command adapter's
+  angle-to-quaternion mode.
+
+Acceptance criteria:
+
+- `phase` is `"9E.3"`.
+- Explicit body-rate smoke flag and acknowledgement are present.
+- `type_mask` equals `ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE`.
+- `q` equals `[1, 0, 0, 0]`.
+- Body rates equal the requested fixed values.
+- Thrust equals the requested fixed value.
+- Body-rate command send count is greater than zero.
+- Body-rate command rejection count is zero.
+- Heartbeat is seen and fresh.
+- State is usable.
+- Armed state is observed if arming was requested.
+- Offboard state is observed if offboard was requested and required for the run.
+- PX4 does not immediately enter repeated failsafe/RTL during the bounded smoke.
+- `phase4b_satisfied=false`.
+- `competition_readiness_claimed=false`.
+
+Status:
+
+- Implemented for PX4/Gazebo surrogate smoke testing.
+- `competition_main.py` exposes explicit Phase 9E.3 flags and JSON summary
+  criteria for fixed body-rate smoke commands.
+- `px4_gazebo_command_sender.py` exposes a fixed body-rate
+  `SET_ATTITUDE_TARGET` send path using
+  `ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE` and dummy quaternion
+  `[1, 0, 0, 0]`.
+- Deterministic tests cover body-rate packet fields, safety rejection,
+  rate limiting, Phase 9E.3 no-real-autonomy/no-real-perception gating, and
+  Offboard prestream satisfaction from fixed body-rate setpoints.
+- Documentation is available in
+  `docs/competition_adapter_phase9e_3_body_rate_interface_smoke.md`.
+- Phase 4B, real competition simulator telemetry evidence, competition command
+  readiness, race readiness, submitted-run readiness, and competition readiness
+  are still not claimed.
+
+### Phase 9E.4 - PX4/Gazebo Attitude-Angle Hover Interface Smoke
+
+Priority: P1 after Phase 9E.3, before changing competition controller behavior.
+
+Purpose:
+
+- Reproduce the legacy `px4_runner` MAVSDK hover interface using raw MAVLink
+  through the competition transport/sender path.
+- Test fixed absolute attitude hover setpoints before deciding whether command
+  issues are caused by the raw MAVLink interface or by the body-rate control
+  semantics tested in Phase 9E.3.
+- Keep this independent from perception, planning, `AutonomyAPI.attitude_control()`,
+  and competition command readiness.
+
+Hard boundary:
+
+- Phase 9E.4 is PX4/Gazebo surrogate-only.
+- Phase 9E.4 does not satisfy Phase 4B.
+- Phase 9E.4 does not satisfy real competition simulator telemetry evidence.
+- Phase 9E.4 does not claim competition command readiness, race readiness,
+  submitted-run readiness, or competition readiness.
+- Phase 9E.4 must not enable `command_live` or `race`.
+- Phase 9E.4 must not use Gazebo truth for state, target selection, command
+  readiness, command feedback, or pass/fail criteria.
+- Phase 9E.4 must not call perception, planning, or
+  `AutonomyAPI.attitude_control()` to generate the fixed hover command.
+- Phase 9E.4 must not retune planner, controller, yaw, thrust, hover,
+  no-target behavior, or race progression.
+
+Command under test:
+
+- Send `SET_ATTITUDE_TARGET`.
+- Use `type_mask = 7`, meaning body roll/pitch/yaw rates are ignored.
+- Send a real attitude quaternion from roll `0`, pitch `0`, and latest estimated
+  telemetry yaw by default.
+- Optionally allow an explicit diagnostic yaw override.
+- Send zero body rates.
+- Send explicit fixed normalized thrust, initially near local PX4/Gazebo hover
+  thrust if the operator chooses, for example `0.74`.
+
+Expected implementation:
+
+- Add explicit PX4/Gazebo-only attitude-hover smoke flags such as
+  `--px4-gazebo-attitude-hover-smoke` and
+  `--ack-px4-gazebo-surrogate-attitude-hover-smoke`.
+- Add explicit fixed-command fields such as
+  `--px4-gazebo-attitude-hover-roll-rad`,
+  `--px4-gazebo-attitude-hover-pitch-rad`,
+  optional `--px4-gazebo-attitude-hover-yaw-rad`, and
+  `--px4-gazebo-attitude-hover-thrust`.
+- Reuse the already-open MAVLink connection from
+  `competition_mavlink_transport.py`.
+- Reuse the existing explicit PX4/Gazebo arm/offboard flags if PX4 requires
+  lifecycle setup.
+- Keep the attitude-hover smoke independent from Phase 9D autonomy command
+  sends and Phase 9E.3 body-rate smoke.
+
+Acceptance criteria:
+
+- `phase` is `"9E.4"`.
+- Explicit attitude-hover smoke flag and acknowledgement are present.
+- `type_mask` equals `7`.
+- Body rates are all zero.
+- Roll and pitch equal the requested fixed attitude angles.
+- Yaw comes from latest estimated telemetry unless explicitly overridden.
+- Thrust equals the requested fixed value.
+- Attitude-hover command send count is greater than zero.
+- Attitude-hover command rejection count is zero.
+- Heartbeat is seen and fresh.
+- State is usable.
+- Armed state is observed if arming was requested.
+- Offboard state is observed if offboard was requested and required for the run.
+- `phase4b_satisfied=false`.
+- `competition_readiness_claimed=false`.
+
+Status:
+
+- Implemented for PX4/Gazebo surrogate smoke testing.
+- `competition_main.py` exposes explicit Phase 9E.4 flags and JSON summary
+  criteria for fixed attitude-angle hover commands.
+- `px4_gazebo_command_sender.py` exposes a fixed attitude-hover
+  `SET_ATTITUDE_TARGET` send path using body-rate-ignore type mask `7`.
+- Deterministic tests cover attitude-hover packet fields, safety rejection,
+  current-yaw and explicit-yaw modes, required acknowledgement/thrust gates,
+  body-rate conflict rejection, and Offboard prestream satisfaction from fixed
+  attitude-hover setpoints.
+- Documentation is available in
+  `docs/competition_adapter_phase9e_4_attitude_angle_hover_smoke.md`.
+- Phase 4B, real competition simulator telemetry evidence, competition command
+  readiness, race readiness, submitted-run readiness, and competition readiness
+  are still not claimed.
 
 ## Phase 10 - Race Logging, Compliance, And Bounded I/O
 
@@ -1820,10 +2452,15 @@ Use this order for Codex implementation tasks:
 22. Run Phase 9B real perception dry-run with the safe profile, `gazebo_pose=None`, `image_pose_snapshot=None`, and no commands.
 23. Run Phase 9B.2 official transform validation with `competition_official_ned`; do not proceed if the selected transform still causes near-gate `z_below_safe_min` rejection or mirrored `det(R)=-1` competition output.
 24. Run Phase 9C command candidate dry-run with the safe profile; build no-send command candidates only.
-25. Run Phase 9D real competition simulator observe/vision/command dry-run stages when available; PX4/Gazebo surrogate output and local UDP loopback output do not satisfy Phase 4B or Phase 9D simulator stages.
-26. Enable live command output below `100 Hz` only after heartbeat, telemetry freshness, image timing, Gazebo guard, and command units are verified against the real competition simulator or an official equivalent.
-27. Add bounded race logging, no-human-interaction safeguards, and the `8 min` submitted-run timer.
-28. Complete the final Phase 11 gate-geometry audit before submitted runs.
+25. Run Phase 9D PX4/Gazebo surrogate command-send safety gate: close the local SITL loop through the competition stack, VADR-style surrogate vision bridge, PX4 estimated telemetry, and explicit PX4/Gazebo-only command sender.
+26. Run Phase 9E PX4/Gazebo surrogate arm/offboard bring-up only after Phase 9D proves command transmission but PX4/Gazebo does not act on commands; keep it explicit, bounded, and surrogate-only.
+27. Run Phase 9E.1 PX4/Gazebo continuous Offboard setpoint stream if PX4 arms or accepts mode commands but does not remain active because command publication is tied to fresh perception frames.
+28. Run Phase 9E.2 PX4/Gazebo surrogate command safety clamp and stream diagnostics if Phase 9E.1 sends continuous setpoints but local SITL response is too aggressive; keep the clamp explicit, sender-boundary-only, and surrogate-only.
+29. Run Phase 9E.3 PX4/Gazebo body-rate `SET_ATTITUDE_TARGET` interface smoke with fixed body rates and fixed thrust, excluding perception/planning/controller output, before adding any autonomy angle-to-body-rate adapter.
+30. Keep real competition simulator observe/vision/command validation deferred until the real simulator or an official equivalent is available; PX4/Gazebo surrogate output and local UDP loopback output still do not satisfy Phase 4B or competition readiness.
+31. Enable real competition live command output below `100 Hz` only after heartbeat, telemetry freshness, image timing, Gazebo guard, and command units are verified against the real competition simulator or an official equivalent.
+32. Add bounded race logging, no-human-interaction safeguards, and the `8 min` submitted-run timer.
+33. Complete the final Phase 11 gate-geometry audit before submitted runs.
 
 ## Definition Of Done For The Adapter Branch
 
