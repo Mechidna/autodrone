@@ -17,6 +17,10 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
+from autonomy_core.command.competition_command_adapter import (
+    build_dry_run_set_attitude_target_fields,
+    quaternion_wxyz_from_euler_zyx,
+)
 from autonomy_core.runtime.competition_mavlink_transport import (
     CompetitionMavlinkTransportConfig,
     DEFAULT_MAVLINK_ENDPOINT,
@@ -51,6 +55,10 @@ from autonomy_core.runtime.px4_gazebo_command_sender import (
     Px4GazeboCommandSenderConfig,
     Px4GazeboSetAttitudeTargetSender,
 )
+from autonomy_core.runtime.competition_setpoint_streamer import (
+    CompetitionSetpointStreamConfig,
+    CompetitionSetpointStreamer,
+)
 
 
 PHASE_6D = "6D"
@@ -63,6 +71,11 @@ PHASE_9E_1 = "9E.1"
 PHASE_9E_2 = "9E.2"
 PHASE_9E_3 = "9E.3"
 PHASE_9E_4 = "9E.4"
+PHASE_9F = "9F"
+PHASE_9F_1 = "9F.1"
+PHASE_9F_2 = "9F.2"
+PHASE_9F_3B = "9F.3B"
+PHASE_9F_3C = "9F.3C"
 PHASE4B_NOT_SATISFIED = "Phase 4B remains blocked pending real competition telemetry evidence."
 COMPETITION_READINESS_NOT_CLAIMED = "Dry-run output is not competition readiness evidence."
 PHASE6E_SURROGATE_LIMITATION = (
@@ -100,6 +113,55 @@ PHASE9E4_SURROGATE_LIMITATION = (
     "it does not satisfy Phase 4B, real competition simulator evidence, or "
     "competition readiness."
 )
+PHASE9F_SURROGATE_LIMITATION = (
+    "Phase 9F closes the PX4/Gazebo surrogate autonomy loop through real "
+    "competition-stack perception, planning, dry-run command adaptation, and "
+    "PX4/Gazebo-only MAVLink command sending; it does not satisfy Phase 4B, "
+    "real competition simulator evidence, or competition readiness."
+)
+PHASE9F1_SURROGATE_LIMITATION = (
+    "Phase 9F.1 applies a PX4/Gazebo surrogate-only debug yaw override at the "
+    "MAVLink sender boundary and tightens full-loop health criteria; it does "
+    "not change AutonomyAPI, planner, controller, perception, or competition "
+    "command semantics."
+)
+PHASE9F2_SURROGATE_LIMITATION = (
+    "Phase 9F.2 adds a PX4/Gazebo surrogate-only fixed-rate cached setpoint "
+    "stream before Offboard mode request; it does not change AutonomyAPI, "
+    "planner, controller, perception, or competition command semantics."
+)
+PHASE9F3B_SURROGATE_LIMITATION = (
+    "Phase 9F.3B routes the PX4/Gazebo surrogate fixed-rate sender through "
+    "the generic competition setpoint streamer policy; it does not change "
+    "AutonomyAPI, planner, controller, perception, or competition command "
+    "semantics."
+)
+PHASE9F3C_SURROGATE_LIMITATION = (
+    "Phase 9F.3C adds an explicit PX4/Gazebo surrogate-only fallback/hold "
+    "setpoint for the generic streamer when autonomy commands are missing or "
+    "stale; it does not change planner, controller, perception, or competition "
+    "command semantics."
+)
+PX4_GAZEBO_FULL_AUTONOMY_LOOP_LABEL = (
+    "PX4/Gazebo surrogate full autonomy loop only"
+)
+PX4_GAZEBO_DEBUG_YAW_OVERRIDE_LABEL = (
+    "PX4/Gazebo surrogate debug yaw override only"
+)
+PX4_GAZEBO_FIXED_RATE_SETPOINT_STREAM_LABEL = (
+    "PX4/Gazebo surrogate fixed-rate setpoint stream only"
+)
+PX4_GAZEBO_GENERIC_SETPOINT_STREAMER_LABEL = (
+    "PX4/Gazebo surrogate generic setpoint streamer integration only"
+)
+PX4_GAZEBO_GENERIC_SETPOINT_FALLBACK_LABEL = (
+    "PX4/Gazebo surrogate generic setpoint fallback only"
+)
+PHASE9F_MIN_COMMAND_SEND_RATE_HZ = 10.0
+PHASE9F_MIN_VISION_FRAME_RATE_HZ = 5.0
+PHASE9F_MAX_SEND_GAP_S = 0.5
+PHASE9F2_DEFAULT_SETPOINT_STREAM_HZ = 20.0
+PHASE9F2_MAX_SETPOINT_STREAM_HZ = 99.0
 
 
 class CompetitionMainSafetyError(RuntimeError):
@@ -158,6 +220,22 @@ class CompetitionMainConfig:
     px4_gazebo_attitude_hover_pitch_rad: float = 0.0
     px4_gazebo_attitude_hover_yaw_rad: Optional[float] = None
     px4_gazebo_attitude_hover_thrust: Optional[float] = None
+    px4_gazebo_full_autonomy_loop: bool = False
+    ack_px4_gazebo_surrogate_full_autonomy_loop: bool = False
+    px4_gazebo_debug_yaw_override_rad: Optional[float] = None
+    ack_px4_gazebo_surrogate_debug_yaw_override: bool = False
+    px4_gazebo_fixed_rate_setpoint_stream: bool = False
+    ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream: bool = False
+    px4_gazebo_setpoint_stream_hz: float = PHASE9F2_DEFAULT_SETPOINT_STREAM_HZ
+    px4_gazebo_setpoint_stream_burst_limit: int = 2
+    px4_gazebo_generic_setpoint_streamer: bool = False
+    ack_px4_gazebo_surrogate_generic_setpoint_streamer: bool = False
+    px4_gazebo_generic_setpoint_fallback: bool = False
+    ack_px4_gazebo_surrogate_generic_setpoint_fallback: bool = False
+    px4_gazebo_generic_fallback_roll_rad: float = 0.0
+    px4_gazebo_generic_fallback_pitch_rad: float = 0.0
+    px4_gazebo_generic_fallback_yaw_rad: Optional[float] = None
+    px4_gazebo_generic_fallback_thrust: Optional[float] = None
 
 
 @dataclass
@@ -232,6 +310,49 @@ class CompetitionMainSummary:
     attitude_hover_command_sent_count: int = 0
     attitude_hover_command_rejection_count: int = 0
     last_attitude_hover_command_send_result: Optional[dict[str, Any]] = None
+    px4_gazebo_full_autonomy_loop_requested: bool = False
+    px4_gazebo_full_autonomy_loop_acknowledged: bool = False
+    px4_gazebo_full_autonomy_loop_label: str = PX4_GAZEBO_FULL_AUTONOMY_LOOP_LABEL
+    phase9f_command_backend: str = ""
+    phase9f_command_type_mask: Optional[int] = None
+    px4_gazebo_debug_yaw_override_requested: bool = False
+    px4_gazebo_debug_yaw_override_acknowledged: bool = False
+    px4_gazebo_debug_yaw_override_rad: Optional[float] = None
+    px4_gazebo_debug_yaw_override_applied_count: int = 0
+    px4_gazebo_debug_yaw_override_label: str = PX4_GAZEBO_DEBUG_YAW_OVERRIDE_LABEL
+    px4_gazebo_fixed_rate_setpoint_stream_requested: bool = False
+    px4_gazebo_fixed_rate_setpoint_stream_acknowledged: bool = False
+    px4_gazebo_setpoint_stream_hz: float = PHASE9F2_DEFAULT_SETPOINT_STREAM_HZ
+    px4_gazebo_setpoint_stream_burst_limit: int = 2
+    px4_gazebo_fixed_rate_setpoint_stream_label: str = (
+        PX4_GAZEBO_FIXED_RATE_SETPOINT_STREAM_LABEL
+    )
+    fixed_rate_setpoint_stream_iteration_count: int = 0
+    fixed_rate_setpoint_stream_attempt_count: int = 0
+    fixed_rate_setpoint_stream_sent_count: int = 0
+    fixed_rate_setpoint_stream_rejection_count: int = 0
+    px4_gazebo_generic_setpoint_streamer_requested: bool = False
+    px4_gazebo_generic_setpoint_streamer_acknowledged: bool = False
+    px4_gazebo_generic_setpoint_streamer_label: str = (
+        PX4_GAZEBO_GENERIC_SETPOINT_STREAMER_LABEL
+    )
+    generic_setpoint_streamer_summary: Optional[dict[str, Any]] = None
+    px4_gazebo_generic_setpoint_fallback_requested: bool = False
+    px4_gazebo_generic_setpoint_fallback_acknowledged: bool = False
+    px4_gazebo_generic_setpoint_fallback_label: str = (
+        PX4_GAZEBO_GENERIC_SETPOINT_FALLBACK_LABEL
+    )
+    generic_setpoint_fallback_roll_rad: Optional[float] = None
+    generic_setpoint_fallback_pitch_rad: Optional[float] = None
+    generic_setpoint_fallback_yaw_rad: Optional[float] = None
+    generic_setpoint_fallback_yaw_source: str = ""
+    generic_setpoint_fallback_thrust: Optional[float] = None
+    generic_setpoint_fallback_update_count: int = 0
+    generic_setpoint_fallback_rejection_count: int = 0
+    generic_setpoint_fallback_last_rejection: str = ""
+    phase9f_command_send_rate_hz: Optional[float] = None
+    phase9f_vision_frame_rate_hz: Optional[float] = None
+    phase9f_max_send_gap_s: Optional[float] = None
     arm_attempt_count: int = 0
     arm_sent_count: int = 0
     arm_rejection_count: int = 0
@@ -278,6 +399,14 @@ class CompetitionMainSummary:
     phase9e3_success_criteria: dict[str, bool] = field(default_factory=dict)
     phase9e4_attitude_hover_interface_satisfied: bool = False
     phase9e4_success_criteria: dict[str, bool] = field(default_factory=dict)
+    phase9f_full_autonomy_loop_satisfied: bool = False
+    phase9f_success_criteria: dict[str, bool] = field(default_factory=dict)
+    phase9f2_fixed_rate_setpoint_stream_satisfied: bool = False
+    phase9f2_success_criteria: dict[str, bool] = field(default_factory=dict)
+    phase9f3b_generic_setpoint_streamer_satisfied: bool = False
+    phase9f3b_success_criteria: dict[str, bool] = field(default_factory=dict)
+    phase9f3c_fallback_setpoint_satisfied: bool = False
+    phase9f3c_success_criteria: dict[str, bool] = field(default_factory=dict)
     competition_readiness_claimed: bool = False
     notes: tuple[str, ...] = (
         PHASE4B_NOT_SATISFIED,
@@ -392,6 +521,105 @@ class CompetitionMainSummary:
             "last_attitude_hover_command_send_result": (
                 self.last_attitude_hover_command_send_result
             ),
+            "px4_gazebo_full_autonomy_loop_requested": (
+                self.px4_gazebo_full_autonomy_loop_requested
+            ),
+            "px4_gazebo_full_autonomy_loop_acknowledged": (
+                self.px4_gazebo_full_autonomy_loop_acknowledged
+            ),
+            "px4_gazebo_full_autonomy_loop_label": (
+                self.px4_gazebo_full_autonomy_loop_label
+            ),
+            "phase9f_command_backend": self.phase9f_command_backend,
+            "phase9f_command_type_mask": self.phase9f_command_type_mask,
+            "px4_gazebo_debug_yaw_override_requested": (
+                self.px4_gazebo_debug_yaw_override_requested
+            ),
+            "px4_gazebo_debug_yaw_override_acknowledged": (
+                self.px4_gazebo_debug_yaw_override_acknowledged
+            ),
+            "px4_gazebo_debug_yaw_override_rad": (
+                self.px4_gazebo_debug_yaw_override_rad
+            ),
+            "px4_gazebo_debug_yaw_override_applied_count": (
+                self.px4_gazebo_debug_yaw_override_applied_count
+            ),
+            "px4_gazebo_debug_yaw_override_label": (
+                self.px4_gazebo_debug_yaw_override_label
+            ),
+            "px4_gazebo_fixed_rate_setpoint_stream_requested": (
+                self.px4_gazebo_fixed_rate_setpoint_stream_requested
+            ),
+            "px4_gazebo_fixed_rate_setpoint_stream_acknowledged": (
+                self.px4_gazebo_fixed_rate_setpoint_stream_acknowledged
+            ),
+            "px4_gazebo_setpoint_stream_hz": self.px4_gazebo_setpoint_stream_hz,
+            "px4_gazebo_setpoint_stream_burst_limit": (
+                self.px4_gazebo_setpoint_stream_burst_limit
+            ),
+            "px4_gazebo_fixed_rate_setpoint_stream_label": (
+                self.px4_gazebo_fixed_rate_setpoint_stream_label
+            ),
+            "fixed_rate_setpoint_stream_iteration_count": (
+                self.fixed_rate_setpoint_stream_iteration_count
+            ),
+            "fixed_rate_setpoint_stream_attempt_count": (
+                self.fixed_rate_setpoint_stream_attempt_count
+            ),
+            "fixed_rate_setpoint_stream_sent_count": (
+                self.fixed_rate_setpoint_stream_sent_count
+            ),
+            "fixed_rate_setpoint_stream_rejection_count": (
+                self.fixed_rate_setpoint_stream_rejection_count
+            ),
+            "px4_gazebo_generic_setpoint_streamer_requested": (
+                self.px4_gazebo_generic_setpoint_streamer_requested
+            ),
+            "px4_gazebo_generic_setpoint_streamer_acknowledged": (
+                self.px4_gazebo_generic_setpoint_streamer_acknowledged
+            ),
+            "px4_gazebo_generic_setpoint_streamer_label": (
+                self.px4_gazebo_generic_setpoint_streamer_label
+            ),
+            "generic_setpoint_streamer_summary": (
+                None
+                if self.generic_setpoint_streamer_summary is None
+                else dict(self.generic_setpoint_streamer_summary)
+            ),
+            "px4_gazebo_generic_setpoint_fallback_requested": (
+                self.px4_gazebo_generic_setpoint_fallback_requested
+            ),
+            "px4_gazebo_generic_setpoint_fallback_acknowledged": (
+                self.px4_gazebo_generic_setpoint_fallback_acknowledged
+            ),
+            "px4_gazebo_generic_setpoint_fallback_label": (
+                self.px4_gazebo_generic_setpoint_fallback_label
+            ),
+            "generic_setpoint_fallback_roll_rad": (
+                self.generic_setpoint_fallback_roll_rad
+            ),
+            "generic_setpoint_fallback_pitch_rad": (
+                self.generic_setpoint_fallback_pitch_rad
+            ),
+            "generic_setpoint_fallback_yaw_rad": (
+                self.generic_setpoint_fallback_yaw_rad
+            ),
+            "generic_setpoint_fallback_yaw_source": (
+                self.generic_setpoint_fallback_yaw_source
+            ),
+            "generic_setpoint_fallback_thrust": self.generic_setpoint_fallback_thrust,
+            "generic_setpoint_fallback_update_count": (
+                self.generic_setpoint_fallback_update_count
+            ),
+            "generic_setpoint_fallback_rejection_count": (
+                self.generic_setpoint_fallback_rejection_count
+            ),
+            "generic_setpoint_fallback_last_rejection": (
+                self.generic_setpoint_fallback_last_rejection
+            ),
+            "phase9f_command_send_rate_hz": self.phase9f_command_send_rate_hz,
+            "phase9f_vision_frame_rate_hz": self.phase9f_vision_frame_rate_hz,
+            "phase9f_max_send_gap_s": self.phase9f_max_send_gap_s,
             "arm_attempt_count": self.arm_attempt_count,
             "arm_sent_count": self.arm_sent_count,
             "arm_rejection_count": self.arm_rejection_count,
@@ -470,6 +698,30 @@ class CompetitionMainSummary:
             "phase9e4_success_criteria": dict(
                 sorted(self.phase9e4_success_criteria.items())
             ),
+            "phase9f_full_autonomy_loop_satisfied": (
+                self.phase9f_full_autonomy_loop_satisfied
+            ),
+            "phase9f_success_criteria": dict(
+                sorted(self.phase9f_success_criteria.items())
+            ),
+            "phase9f2_fixed_rate_setpoint_stream_satisfied": (
+                self.phase9f2_fixed_rate_setpoint_stream_satisfied
+            ),
+            "phase9f2_success_criteria": dict(
+                sorted(self.phase9f2_success_criteria.items())
+            ),
+            "phase9f3b_generic_setpoint_streamer_satisfied": (
+                self.phase9f3b_generic_setpoint_streamer_satisfied
+            ),
+            "phase9f3b_success_criteria": dict(
+                sorted(self.phase9f3b_success_criteria.items())
+            ),
+            "phase9f3c_fallback_setpoint_satisfied": (
+                self.phase9f3c_fallback_setpoint_satisfied
+            ),
+            "phase9f3c_success_criteria": dict(
+                sorted(self.phase9f3c_success_criteria.items())
+            ),
             "competition_readiness_claimed": self.competition_readiness_claimed,
             "notes": list(self.notes),
         }
@@ -497,6 +749,7 @@ def run_competition_main(
         command_sender=command_sender,
         clock=clock,
     )
+    setpoint_streamer = _setpoint_streamer_for_config(config)
     steps_completed = 0
     aggregate = _Aggregate()
     deadline = None if config.duration_s <= 0.0 else started + float(config.duration_s)
@@ -507,6 +760,29 @@ def run_competition_main(
                 break
             result = active_components.runner.step()
             aggregate.record(result)
+            _maybe_update_phase9f3b_setpoint_streamer(
+                config=config,
+                result=result,
+                setpoint_streamer=setpoint_streamer,
+            )
+            _maybe_update_phase9f3c_fallback_setpoint(
+                config=config,
+                result=result,
+                aggregate=aggregate,
+                setpoint_streamer=setpoint_streamer,
+            )
+            fixed_rate_results = _maybe_send_phase9f2_fixed_rate_setpoints(
+                config=config,
+                result=result,
+                aggregate=aggregate,
+                command_sender=active_command_sender,
+                setpoint_streamer=setpoint_streamer,
+                clock=clock,
+                sleep=sleep,
+            )
+            for fixed_rate_result in fixed_rate_results:
+                aggregate.record_command_send(fixed_rate_result)
+                aggregate.record_fixed_rate_setpoint_stream(fixed_rate_result)
             lifecycle_results = _maybe_send_phase9e_lifecycle(
                 config=config,
                 result=result,
@@ -531,14 +807,15 @@ def run_competition_main(
             )
             if attitude_hover_result is not None:
                 aggregate.record_attitude_hover_command_send(attitude_hover_result)
-            send_result = _maybe_send_phase9d_command(
-                config=config,
-                result=result,
-                aggregate=aggregate,
-                command_sender=active_command_sender,
-            )
-            if send_result is not None:
-                aggregate.record_command_send(send_result)
+            if not config.px4_gazebo_fixed_rate_setpoint_stream:
+                send_result = _maybe_send_phase9d_command(
+                    config=config,
+                    result=result,
+                    aggregate=aggregate,
+                    command_sender=active_command_sender,
+                )
+                if send_result is not None:
+                    aggregate.record_command_send(send_result)
             steps_completed += 1
             if config.step_sleep_s > 0.0:
                 sleep(float(config.step_sleep_s))
@@ -548,6 +825,9 @@ def run_competition_main(
             close()
 
     finished = float(clock())
+    if setpoint_streamer is not None:
+        aggregate.generic_setpoint_streamer_summary = setpoint_streamer.summary()
+    elapsed_s = max(0.0, finished - started)
     phase6e_criteria = _phase6e_success_criteria(
         config=config,
         mode=mode,
@@ -626,6 +906,39 @@ def run_competition_main(
         offboard_state_observed=offboard_state_observed,
     )
     phase9e4_satisfied = _phase9e4_satisfied(phase9e4_criteria, config)
+    phase9f_criteria = _phase9f_success_criteria(
+        config=config,
+        mode=mode,
+        aggregate=aggregate,
+        duration_s=elapsed_s,
+        command_sender_summary=command_sender_summary,
+        phase6e_receive_satisfied=phase6e_receive_satisfied,
+        phase6e_perception_boundary_satisfied=phase6e_perception_boundary_satisfied,
+        phase9c_satisfied=phase9c_satisfied,
+        phase9d_satisfied=phase9d_satisfied,
+        phase9e_satisfied=phase9e_satisfied,
+    )
+    phase9f_satisfied = _phase9f_satisfied(phase9f_criteria, config)
+    phase9f2_criteria = _phase9f2_success_criteria(
+        config=config,
+        mode=mode,
+        aggregate=aggregate,
+        phase9f_satisfied=phase9f_satisfied,
+    )
+    phase9f2_satisfied = _phase9f2_satisfied(phase9f2_criteria, config)
+    phase9f3b_criteria = _phase9f3b_success_criteria(
+        config=config,
+        mode=mode,
+        aggregate=aggregate,
+        phase9f2_satisfied=phase9f2_satisfied,
+    )
+    phase9f3b_satisfied = _phase9f3b_satisfied(phase9f3b_criteria, config)
+    phase9f3c_criteria = _phase9f3c_success_criteria(
+        config=config,
+        mode=mode,
+        aggregate=aggregate,
+    )
+    phase9f3c_satisfied = _phase9f3c_satisfied(phase9f3c_criteria, config)
 
     return CompetitionMainSummary(
         phase=_phase_for_config(config),
@@ -639,7 +952,7 @@ def run_competition_main(
         perception_transform_mode=str(config.perception_transform_mode),
         steps_requested=int(config.steps),
         steps_completed=steps_completed,
-        duration_s=max(0.0, finished - started),
+        duration_s=elapsed_s,
         telemetry_messages_processed=aggregate.telemetry_messages_processed,
         heartbeat_seen=aggregate.heartbeat_seen,
         heartbeat_age_s=aggregate.heartbeat_age_s,
@@ -772,6 +1085,110 @@ def run_competition_main(
         last_attitude_hover_command_send_result=(
             aggregate.last_attitude_hover_command_send_result
         ),
+        px4_gazebo_full_autonomy_loop_requested=bool(
+            config.px4_gazebo_full_autonomy_loop
+        ),
+        px4_gazebo_full_autonomy_loop_acknowledged=bool(
+            config.ack_px4_gazebo_surrogate_full_autonomy_loop
+        ),
+        phase9f_command_backend=(
+            "attitude_angle_quaternion_set_attitude_target"
+            if config.px4_gazebo_full_autonomy_loop
+            else ""
+        ),
+        phase9f_command_type_mask=(
+            ATTITUDE_HOVER_BODY_RATES_IGNORE_TYPE_MASK
+            if config.px4_gazebo_full_autonomy_loop
+            else None
+        ),
+        px4_gazebo_debug_yaw_override_requested=(
+            config.px4_gazebo_debug_yaw_override_rad is not None
+        ),
+        px4_gazebo_debug_yaw_override_acknowledged=bool(
+            config.ack_px4_gazebo_surrogate_debug_yaw_override
+        ),
+        px4_gazebo_debug_yaw_override_rad=(
+            float(config.px4_gazebo_debug_yaw_override_rad)
+            if config.px4_gazebo_debug_yaw_override_rad is not None
+            else None
+        ),
+        px4_gazebo_debug_yaw_override_applied_count=(
+            aggregate.debug_yaw_override_applied_count
+        ),
+        px4_gazebo_fixed_rate_setpoint_stream_requested=bool(
+            config.px4_gazebo_fixed_rate_setpoint_stream
+        ),
+        px4_gazebo_fixed_rate_setpoint_stream_acknowledged=bool(
+            config.ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream
+        ),
+        px4_gazebo_setpoint_stream_hz=float(config.px4_gazebo_setpoint_stream_hz),
+        px4_gazebo_setpoint_stream_burst_limit=int(
+            config.px4_gazebo_setpoint_stream_burst_limit
+        ),
+        fixed_rate_setpoint_stream_iteration_count=(
+            aggregate.fixed_rate_setpoint_stream_iteration_count
+        ),
+        fixed_rate_setpoint_stream_attempt_count=(
+            aggregate.fixed_rate_setpoint_stream_attempt_count
+        ),
+        fixed_rate_setpoint_stream_sent_count=(
+            aggregate.fixed_rate_setpoint_stream_sent_count
+        ),
+        fixed_rate_setpoint_stream_rejection_count=(
+            aggregate.fixed_rate_setpoint_stream_rejection_count
+        ),
+        px4_gazebo_generic_setpoint_streamer_requested=bool(
+            config.px4_gazebo_generic_setpoint_streamer
+        ),
+        px4_gazebo_generic_setpoint_streamer_acknowledged=bool(
+            config.ack_px4_gazebo_surrogate_generic_setpoint_streamer
+        ),
+        generic_setpoint_streamer_summary=aggregate.generic_setpoint_streamer_summary,
+        px4_gazebo_generic_setpoint_fallback_requested=bool(
+            config.px4_gazebo_generic_setpoint_fallback
+        ),
+        px4_gazebo_generic_setpoint_fallback_acknowledged=bool(
+            config.ack_px4_gazebo_surrogate_generic_setpoint_fallback
+        ),
+        generic_setpoint_fallback_roll_rad=(
+            float(config.px4_gazebo_generic_fallback_roll_rad)
+            if config.px4_gazebo_generic_setpoint_fallback
+            else None
+        ),
+        generic_setpoint_fallback_pitch_rad=(
+            float(config.px4_gazebo_generic_fallback_pitch_rad)
+            if config.px4_gazebo_generic_setpoint_fallback
+            else None
+        ),
+        generic_setpoint_fallback_yaw_rad=(
+            aggregate.last_generic_setpoint_fallback_yaw_rad
+        ),
+        generic_setpoint_fallback_yaw_source=(
+            aggregate.last_generic_setpoint_fallback_yaw_source
+        ),
+        generic_setpoint_fallback_thrust=(
+            float(config.px4_gazebo_generic_fallback_thrust)
+            if config.px4_gazebo_generic_fallback_thrust is not None
+            else None
+        ),
+        generic_setpoint_fallback_update_count=(
+            aggregate.generic_setpoint_fallback_update_count
+        ),
+        generic_setpoint_fallback_rejection_count=(
+            aggregate.generic_setpoint_fallback_rejection_count
+        ),
+        generic_setpoint_fallback_last_rejection=(
+            aggregate.generic_setpoint_fallback_last_rejection
+        ),
+        phase9f_command_send_rate_hz=_rate_or_none(
+            aggregate.command_sent_count,
+            elapsed_s,
+        ),
+        phase9f_vision_frame_rate_hz=_rate_or_none(
+            aggregate.vision_frames_completed,
+            elapsed_s,
+        ),
+        phase9f_max_send_gap_s=_phase9f_max_send_gap_s(command_sender_summary),
         arm_attempt_count=aggregate.arm_attempt_count,
         arm_sent_count=aggregate.arm_sent_count,
         arm_rejection_count=aggregate.arm_rejection_count,
@@ -821,6 +1238,14 @@ def run_competition_main(
         phase9e3_success_criteria=phase9e3_criteria,
         phase9e4_attitude_hover_interface_satisfied=phase9e4_satisfied,
         phase9e4_success_criteria=phase9e4_criteria,
+        phase9f_full_autonomy_loop_satisfied=phase9f_satisfied,
+        phase9f_success_criteria=phase9f_criteria,
+        phase9f2_fixed_rate_setpoint_stream_satisfied=phase9f2_satisfied,
+        phase9f2_success_criteria=phase9f2_criteria,
+        phase9f3b_generic_setpoint_streamer_satisfied=phase9f3b_satisfied,
+        phase9f3b_success_criteria=phase9f3b_criteria,
+        phase9f3c_fallback_setpoint_satisfied=phase9f3c_satisfied,
+        phase9f3c_success_criteria=phase9f3c_criteria,
         notes=_notes_for_config(config),
     )
 
@@ -856,6 +1281,18 @@ def fail_closed_summary(
     attitude_hover_pitch_rad: Optional[float] = None,
     attitude_hover_yaw_rad: Optional[float] = None,
     attitude_hover_thrust: Optional[float] = None,
+    px4_gazebo_full_autonomy_loop_requested: bool = False,
+    px4_gazebo_full_autonomy_loop_acknowledged: bool = False,
+    px4_gazebo_debug_yaw_override_requested: bool = False,
+    px4_gazebo_debug_yaw_override_acknowledged: bool = False,
+    px4_gazebo_debug_yaw_override_rad: Optional[float] = None,
+    px4_gazebo_fixed_rate_setpoint_stream_requested: bool = False,
+    px4_gazebo_fixed_rate_setpoint_stream_acknowledged: bool = False,
+    px4_gazebo_generic_setpoint_streamer_requested: bool = False,
+    px4_gazebo_generic_setpoint_streamer_acknowledged: bool = False,
+    px4_gazebo_generic_setpoint_fallback_requested: bool = False,
+    px4_gazebo_generic_setpoint_fallback_acknowledged: bool = False,
+    generic_setpoint_fallback_thrust: Optional[float] = None,
 ) -> CompetitionMainSummary:
     normalized = _mode_value(mode)
     return CompetitionMainSummary(
@@ -875,6 +1312,21 @@ def fail_closed_summary(
             px4_gazebo_body_rate_smoke=px4_gazebo_body_rate_smoke_requested,
             px4_gazebo_attitude_hover_smoke=(
                 px4_gazebo_attitude_hover_smoke_requested
+            ),
+            px4_gazebo_full_autonomy_loop=(
+                px4_gazebo_full_autonomy_loop_requested
+            ),
+            px4_gazebo_debug_yaw_override=(
+                px4_gazebo_debug_yaw_override_requested
+            ),
+            px4_gazebo_fixed_rate_setpoint_stream=(
+                px4_gazebo_fixed_rate_setpoint_stream_requested
+            ),
+            px4_gazebo_generic_setpoint_streamer=(
+                px4_gazebo_generic_setpoint_streamer_requested
+            ),
+            px4_gazebo_generic_setpoint_fallback=(
+                px4_gazebo_generic_setpoint_fallback_requested
             ),
         ),
         mode=normalized,
@@ -951,6 +1403,48 @@ def fail_closed_summary(
             "explicit" if attitude_hover_yaw_rad is not None else "current_state"
         ),
         attitude_hover_thrust=attitude_hover_thrust,
+        px4_gazebo_full_autonomy_loop_requested=bool(
+            px4_gazebo_full_autonomy_loop_requested
+        ),
+        px4_gazebo_full_autonomy_loop_acknowledged=bool(
+            px4_gazebo_full_autonomy_loop_acknowledged
+        ),
+        phase9f_command_backend=(
+            "attitude_angle_quaternion_set_attitude_target"
+            if px4_gazebo_full_autonomy_loop_requested
+            else ""
+        ),
+        phase9f_command_type_mask=(
+            ATTITUDE_HOVER_BODY_RATES_IGNORE_TYPE_MASK
+            if px4_gazebo_full_autonomy_loop_requested
+            else None
+        ),
+        px4_gazebo_debug_yaw_override_requested=bool(
+            px4_gazebo_debug_yaw_override_requested
+        ),
+        px4_gazebo_debug_yaw_override_acknowledged=bool(
+            px4_gazebo_debug_yaw_override_acknowledged
+        ),
+        px4_gazebo_debug_yaw_override_rad=px4_gazebo_debug_yaw_override_rad,
+        px4_gazebo_fixed_rate_setpoint_stream_requested=bool(
+            px4_gazebo_fixed_rate_setpoint_stream_requested
+        ),
+        px4_gazebo_fixed_rate_setpoint_stream_acknowledged=bool(
+            px4_gazebo_fixed_rate_setpoint_stream_acknowledged
+        ),
+        px4_gazebo_generic_setpoint_streamer_requested=bool(
+            px4_gazebo_generic_setpoint_streamer_requested
+        ),
+        px4_gazebo_generic_setpoint_streamer_acknowledged=bool(
+            px4_gazebo_generic_setpoint_streamer_acknowledged
+        ),
+        px4_gazebo_generic_setpoint_fallback_requested=bool(
+            px4_gazebo_generic_setpoint_fallback_requested
+        ),
+        px4_gazebo_generic_setpoint_fallback_acknowledged=bool(
+            px4_gazebo_generic_setpoint_fallback_acknowledged
+        ),
+        generic_setpoint_fallback_thrust=generic_setpoint_fallback_thrust,
         command_sent_count=0,
         command_blocked_reasons=("phase6d_fail_closed",),
     )
@@ -1162,6 +1656,121 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="explicit normalized thrust for Phase 9E.4 attitude-hover smoke",
     )
+    parser.add_argument(
+        "--px4-gazebo-full-autonomy-loop",
+        action="store_true",
+        help=(
+            "Phase 9F only: label and gate a full PX4/Gazebo surrogate "
+            "autonomy loop through real perception, planning, command dry-run "
+            "adaptation, and PX4/Gazebo-only command send"
+        ),
+    )
+    parser.add_argument(
+        "--ack-px4-gazebo-surrogate-full-autonomy-loop",
+        action="store_true",
+        help=(
+            "required acknowledgement that Phase 9F is PX4/Gazebo "
+            "surrogate-only evidence, not competition readiness"
+        ),
+    )
+    parser.add_argument(
+        "--px4-gazebo-debug-yaw-override-rad",
+        type=float,
+        default=None,
+        help=(
+            "Phase 9F.1 only: override only the outgoing PX4/Gazebo "
+            "surrogate MAVLink yaw at the sender boundary for debugging"
+        ),
+    )
+    parser.add_argument(
+        "--ack-px4-gazebo-surrogate-debug-yaw-override",
+        action="store_true",
+        help=(
+            "required acknowledgement that Phase 9F.1 yaw override is "
+            "PX4/Gazebo surrogate-only and does not change controller output"
+        ),
+    )
+    parser.add_argument(
+        "--px4-gazebo-fixed-rate-setpoint-stream",
+        action="store_true",
+        help=(
+            "Phase 9F.2 only: send cached accepted competition command fields "
+            "through the PX4/Gazebo surrogate MAVLink sender at a fixed stream "
+            "cadence before Offboard request"
+        ),
+    )
+    parser.add_argument(
+        "--ack-px4-gazebo-surrogate-fixed-rate-setpoint-stream",
+        action="store_true",
+        help=(
+            "required acknowledgement that Phase 9F.2 fixed-rate setpoint "
+            "streaming is PX4/Gazebo surrogate-only evidence"
+        ),
+    )
+    parser.add_argument(
+        "--px4-gazebo-setpoint-stream-hz",
+        type=float,
+        default=PHASE9F2_DEFAULT_SETPOINT_STREAM_HZ,
+        help="Phase 9F.2 PX4/Gazebo surrogate setpoint stream target rate",
+    )
+    parser.add_argument(
+        "--px4-gazebo-setpoint-stream-burst-limit",
+        type=int,
+        default=2,
+        help=(
+            "maximum Phase 9F.2 cached setpoints to send after each runner step"
+        ),
+    )
+    parser.add_argument(
+        "--px4-gazebo-generic-setpoint-streamer",
+        action="store_true",
+        help=(
+            "Phase 9F.3B only: route PX4/Gazebo surrogate fixed-rate sends "
+            "through CompetitionSetpointStreamer policy"
+        ),
+    )
+    parser.add_argument(
+        "--ack-px4-gazebo-surrogate-generic-setpoint-streamer",
+        action="store_true",
+        help=(
+            "required acknowledgement that Phase 9F.3B generic setpoint "
+            "streamer integration is PX4/Gazebo surrogate-only evidence"
+        ),
+    )
+    parser.add_argument(
+        "--px4-gazebo-generic-setpoint-fallback",
+        action="store_true",
+        help=(
+            "Phase 9F.3C only: enable explicit PX4/Gazebo surrogate fallback/"
+            "hold setpoints in CompetitionSetpointStreamer when autonomy "
+            "commands are missing or stale"
+        ),
+    )
+    parser.add_argument(
+        "--ack-px4-gazebo-surrogate-generic-setpoint-fallback",
+        action="store_true",
+        help=(
+            "required acknowledgement that Phase 9F.3C fallback setpoints are "
+            "PX4/Gazebo surrogate-only and not competition readiness"
+        ),
+    )
+    parser.add_argument("--px4-gazebo-generic-fallback-roll-rad", type=float, default=0.0)
+    parser.add_argument("--px4-gazebo-generic-fallback-pitch-rad", type=float, default=0.0)
+    parser.add_argument(
+        "--px4-gazebo-generic-fallback-yaw-rad",
+        type=float,
+        default=None,
+        help=(
+            "optional Phase 9F.3C fallback yaw. If omitted, current state yaw "
+            "is used for the fallback/hold setpoint"
+        ),
+    )
+    parser.add_argument(
+        "--px4-gazebo-generic-fallback-thrust",
+        type=float,
+        default=None,
+        help="required explicit normalized thrust for Phase 9F.3C fallback setpoints",
+    )
     return parser
 
 
@@ -1246,6 +1855,48 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
         px4_gazebo_attitude_hover_yaw_rad=args.px4_gazebo_attitude_hover_yaw_rad,
         px4_gazebo_attitude_hover_thrust=args.px4_gazebo_attitude_hover_thrust,
+        px4_gazebo_full_autonomy_loop=bool(args.px4_gazebo_full_autonomy_loop),
+        ack_px4_gazebo_surrogate_full_autonomy_loop=bool(
+            args.ack_px4_gazebo_surrogate_full_autonomy_loop
+        ),
+        px4_gazebo_debug_yaw_override_rad=(
+            args.px4_gazebo_debug_yaw_override_rad
+        ),
+        ack_px4_gazebo_surrogate_debug_yaw_override=bool(
+            args.ack_px4_gazebo_surrogate_debug_yaw_override
+        ),
+        px4_gazebo_fixed_rate_setpoint_stream=bool(
+            args.px4_gazebo_fixed_rate_setpoint_stream
+        ),
+        ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream=bool(
+            args.ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream
+        ),
+        px4_gazebo_setpoint_stream_hz=float(args.px4_gazebo_setpoint_stream_hz),
+        px4_gazebo_setpoint_stream_burst_limit=int(
+            args.px4_gazebo_setpoint_stream_burst_limit
+        ),
+        px4_gazebo_generic_setpoint_streamer=bool(
+            args.px4_gazebo_generic_setpoint_streamer
+        ),
+        ack_px4_gazebo_surrogate_generic_setpoint_streamer=bool(
+            args.ack_px4_gazebo_surrogate_generic_setpoint_streamer
+        ),
+        px4_gazebo_generic_setpoint_fallback=bool(
+            args.px4_gazebo_generic_setpoint_fallback
+        ),
+        ack_px4_gazebo_surrogate_generic_setpoint_fallback=bool(
+            args.ack_px4_gazebo_surrogate_generic_setpoint_fallback
+        ),
+        px4_gazebo_generic_fallback_roll_rad=float(
+            args.px4_gazebo_generic_fallback_roll_rad
+        ),
+        px4_gazebo_generic_fallback_pitch_rad=float(
+            args.px4_gazebo_generic_fallback_pitch_rad
+        ),
+        px4_gazebo_generic_fallback_yaw_rad=(
+            args.px4_gazebo_generic_fallback_yaw_rad
+        ),
+        px4_gazebo_generic_fallback_thrust=args.px4_gazebo_generic_fallback_thrust,
     )
     try:
         summary = run_competition_main(config)
@@ -1301,6 +1952,40 @@ def main(argv: Optional[list[str]] = None) -> int:
             attitude_hover_pitch_rad=float(args.px4_gazebo_attitude_hover_pitch_rad),
             attitude_hover_yaw_rad=args.px4_gazebo_attitude_hover_yaw_rad,
             attitude_hover_thrust=args.px4_gazebo_attitude_hover_thrust,
+            px4_gazebo_full_autonomy_loop_requested=bool(
+                args.px4_gazebo_full_autonomy_loop
+            ),
+            px4_gazebo_full_autonomy_loop_acknowledged=bool(
+                args.ack_px4_gazebo_surrogate_full_autonomy_loop
+            ),
+            px4_gazebo_debug_yaw_override_requested=(
+                args.px4_gazebo_debug_yaw_override_rad is not None
+            ),
+            px4_gazebo_debug_yaw_override_acknowledged=bool(
+                args.ack_px4_gazebo_surrogate_debug_yaw_override
+            ),
+            px4_gazebo_debug_yaw_override_rad=(
+                args.px4_gazebo_debug_yaw_override_rad
+            ),
+            px4_gazebo_fixed_rate_setpoint_stream_requested=bool(
+                args.px4_gazebo_fixed_rate_setpoint_stream
+            ),
+            px4_gazebo_fixed_rate_setpoint_stream_acknowledged=bool(
+                args.ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream
+            ),
+            px4_gazebo_generic_setpoint_streamer_requested=bool(
+                args.px4_gazebo_generic_setpoint_streamer
+            ),
+            px4_gazebo_generic_setpoint_streamer_acknowledged=bool(
+                args.ack_px4_gazebo_surrogate_generic_setpoint_streamer
+            ),
+            px4_gazebo_generic_setpoint_fallback_requested=bool(
+                args.px4_gazebo_generic_setpoint_fallback
+            ),
+            px4_gazebo_generic_setpoint_fallback_acknowledged=bool(
+                args.ack_px4_gazebo_surrogate_generic_setpoint_fallback
+            ),
+            generic_setpoint_fallback_thrust=args.px4_gazebo_generic_fallback_thrust,
         )
         exit_code = 2
 
@@ -1354,6 +2039,17 @@ class _Aggregate:
     command_sent_count: int = 0
     command_send_rejection_count: int = 0
     last_command_send_result: Optional[dict[str, Any]] = None
+    debug_yaw_override_applied_count: int = 0
+    fixed_rate_setpoint_stream_iteration_count: int = 0
+    fixed_rate_setpoint_stream_attempt_count: int = 0
+    fixed_rate_setpoint_stream_sent_count: int = 0
+    fixed_rate_setpoint_stream_rejection_count: int = 0
+    generic_setpoint_streamer_summary: Optional[dict[str, Any]] = None
+    generic_setpoint_fallback_update_count: int = 0
+    generic_setpoint_fallback_rejection_count: int = 0
+    generic_setpoint_fallback_last_rejection: str = ""
+    last_generic_setpoint_fallback_yaw_rad: Optional[float] = None
+    last_generic_setpoint_fallback_yaw_source: str = ""
     command_blocked_reasons: tuple[str, ...] = ()
     runner_events: tuple[str, ...] = ()
 
@@ -1404,6 +2100,17 @@ class _Aggregate:
         else:
             self.command_send_rejection_count += 1
         self.last_command_send_result = dict(send_result)
+
+    def record_fixed_rate_setpoint_stream(
+        self,
+        send_result: dict[str, Any],
+    ) -> None:
+        if bool(send_result.get("attempted", False)):
+            self.fixed_rate_setpoint_stream_attempt_count += 1
+        if bool(send_result.get("sent", False)):
+            self.fixed_rate_setpoint_stream_sent_count += 1
+        else:
+            self.fixed_rate_setpoint_stream_rejection_count += 1
 
     def record_body_rate_command_send(self, send_result: dict[str, Any]) -> None:
         if bool(send_result.get("sent", False)):
@@ -1491,6 +2198,115 @@ def _command_sender_for_config(
         ),
         clock=clock,
     )
+
+
+def _setpoint_streamer_for_config(
+    config: CompetitionMainConfig,
+) -> Optional[CompetitionSetpointStreamer]:
+    if not config.px4_gazebo_generic_setpoint_streamer:
+        return None
+    return CompetitionSetpointStreamer(
+        config=CompetitionSetpointStreamConfig(
+            stream_rate_hz=float(config.px4_gazebo_setpoint_stream_hz),
+            autonomy_command_fresh_s=float(config.px4_gazebo_command_max_age_s),
+            require_fallback=bool(config.px4_gazebo_generic_setpoint_fallback),
+        )
+    )
+
+
+def _maybe_update_phase9f3b_setpoint_streamer(
+    *,
+    config: CompetitionMainConfig,
+    result: Any,
+    setpoint_streamer: Optional[CompetitionSetpointStreamer],
+) -> None:
+    if setpoint_streamer is None:
+        return
+    if not config.px4_gazebo_generic_setpoint_streamer:
+        return
+    if (
+        result.command_result is None
+        or not result.command_result.accepted
+        or result.command_result.fields is None
+    ):
+        return
+    if _phase9d_current_command_rejection_reason(result):
+        return
+    setpoint_streamer.update_autonomy_fields(
+        result.command_result.fields,
+        now_s=float(result.now_s),
+    )
+
+
+def _maybe_update_phase9f3c_fallback_setpoint(
+    *,
+    config: CompetitionMainConfig,
+    result: Any,
+    aggregate: _Aggregate,
+    setpoint_streamer: Optional[CompetitionSetpointStreamer],
+) -> None:
+    if not config.px4_gazebo_generic_setpoint_fallback:
+        return
+    if setpoint_streamer is None:
+        aggregate.generic_setpoint_fallback_rejection_count += 1
+        aggregate.generic_setpoint_fallback_last_rejection = (
+            "generic_setpoint_streamer_unavailable"
+        )
+        return
+
+    yaw_rad, yaw_source, yaw_rejection = _phase9f3c_fallback_yaw(config, result)
+    if yaw_rejection:
+        aggregate.generic_setpoint_fallback_rejection_count += 1
+        aggregate.generic_setpoint_fallback_last_rejection = yaw_rejection
+        return
+    if config.px4_gazebo_generic_fallback_thrust is None:
+        aggregate.generic_setpoint_fallback_rejection_count += 1
+        aggregate.generic_setpoint_fallback_last_rejection = (
+            "generic_fallback_thrust_missing"
+        )
+        return
+
+    try:
+        fields = build_dry_run_set_attitude_target_fields(
+            (
+                float(config.px4_gazebo_generic_fallback_roll_rad),
+                float(config.px4_gazebo_generic_fallback_pitch_rad),
+                float(yaw_rad),
+                float(config.px4_gazebo_generic_fallback_thrust),
+            ),
+            time_boot_ms=_time_boot_ms_from_wall_time(result.now_s),
+            target_system=int(config.target_system),
+            target_component=int(config.target_component),
+        )
+        setpoint_streamer.update_fallback_fields(fields)
+    except Exception as exc:
+        aggregate.generic_setpoint_fallback_rejection_count += 1
+        aggregate.generic_setpoint_fallback_last_rejection = str(exc)
+        return
+
+    aggregate.generic_setpoint_fallback_update_count += 1
+    aggregate.last_generic_setpoint_fallback_yaw_rad = float(yaw_rad)
+    aggregate.last_generic_setpoint_fallback_yaw_source = str(yaw_source)
+
+
+def _phase9f3c_fallback_yaw(
+    config: CompetitionMainConfig,
+    result: Any,
+) -> tuple[Optional[float], str, str]:
+    if config.px4_gazebo_generic_fallback_yaw_rad is not None:
+        yaw = float(config.px4_gazebo_generic_fallback_yaw_rad)
+        if not math.isfinite(yaw):
+            return None, "explicit", "generic_fallback_yaw_must_be_finite"
+        return yaw, "explicit", ""
+
+    state = getattr(result.state_result, "vehicle_state", None)
+    yaw = getattr(state, "yaw", None)
+    if yaw is None:
+        return None, "current_state", "generic_fallback_current_yaw_unavailable"
+    yaw_float = float(yaw)
+    if not math.isfinite(yaw_float):
+        return None, "current_state", "generic_fallback_current_yaw_must_be_finite"
+    return yaw_float, "current_state", ""
 
 
 def _maybe_send_phase9e_lifecycle(
@@ -1811,14 +2627,241 @@ def _maybe_send_phase9d_command(
         aggregate.setpoint_stream_reused_count += 1
     else:
         fields = result.command_result.fields
+    fields, override_metadata = _phase9f_apply_debug_yaw_override(
+        config=config,
+        fields=fields,
+        aggregate=aggregate,
+    )
     send_method = getattr(command_sender, "send_set_attitude_target", None)
     if not callable(send_method):
         return _phase9d_rejected_send_result("command_sender_missing_send_method")
     send_result = send_method(fields, now_s=result.now_s, stream_source=stream_source)
     to_dict = getattr(send_result, "to_dict", None)
     if callable(to_dict):
-        return to_dict()
-    return dict(send_result)
+        result_dict = to_dict()
+    else:
+        result_dict = dict(send_result)
+    result_dict.update(override_metadata)
+    return result_dict
+
+
+def _maybe_send_phase9f2_fixed_rate_setpoints(
+    *,
+    config: CompetitionMainConfig,
+    result: Any,
+    aggregate: _Aggregate,
+    command_sender: Optional[Any],
+    setpoint_streamer: Optional[CompetitionSetpointStreamer],
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> tuple[dict[str, Any], ...]:
+    if not config.px4_gazebo_fixed_rate_setpoint_stream:
+        return ()
+    aggregate.fixed_rate_setpoint_stream_iteration_count += 1
+    if not config.px4_gazebo_command_send:
+        return ()
+    if command_sender is None:
+        return (_phase9d_rejected_send_result("command_sender_unavailable"),)
+    if aggregate.command_sent_count >= int(config.px4_gazebo_command_max_count):
+        return ()
+
+    base_rejection = _phase9d_base_pre_send_rejection_reason(config, result)
+    if base_rejection:
+        return ()
+    if aggregate.cached_command_fields is None and not (
+        config.px4_gazebo_generic_setpoint_streamer
+        and config.px4_gazebo_generic_setpoint_fallback
+    ):
+        return ()
+
+    send_method = getattr(command_sender, "send_set_attitude_target", None)
+    if not callable(send_method):
+        return (_phase9d_rejected_send_result("command_sender_missing_send_method"),)
+
+    results: list[dict[str, Any]] = []
+    stream_period_s = 1.0 / float(config.px4_gazebo_setpoint_stream_hz)
+    remaining = int(config.px4_gazebo_command_max_count) - aggregate.command_sent_count
+    burst_count = max(
+        0,
+        min(int(config.px4_gazebo_setpoint_stream_burst_limit), remaining),
+    )
+    for burst_index in range(burst_count):
+        if burst_index > 0:
+            sleep(stream_period_s)
+        send_time_s = _phase9f2_next_send_time_s(
+            command_sender=command_sender,
+            clock=clock,
+            sleep=sleep,
+            min_period_s=float(config.px4_gazebo_command_min_period_s),
+        )
+        fields_or_rejection, stream_source, streamer_metadata, send_time_s = (
+            _phase9f_fixed_rate_fields_for_time(
+                config=config,
+                now_s=send_time_s,
+                aggregate=aggregate,
+                setpoint_streamer=setpoint_streamer,
+                sleep=sleep,
+            )
+        )
+        if isinstance(fields_or_rejection, str):
+            if fields_or_rejection in {
+                "cached_command_stale",
+                "generic_setpoint_streamer:autonomy_command_stale",
+            }:
+                aggregate.setpoint_stream_stale_rejection_count += 1
+            results.append(_phase9d_rejected_send_result(fields_or_rejection))
+            break
+
+        fields = fields_or_rejection
+        aggregate.setpoint_stream_reused_count += 1
+        fields, override_metadata = _phase9f_apply_debug_yaw_override(
+            config=config,
+            fields=fields,
+            aggregate=aggregate,
+        )
+        send_result = send_method(
+            fields,
+            now_s=send_time_s,
+            stream_source=stream_source,
+        )
+        result_dict = _result_to_dict(send_result)
+        result_dict.update(override_metadata)
+        result_dict.update(streamer_metadata)
+        result_dict["fixed_rate_setpoint_stream"] = True
+        result_dict["fixed_rate_setpoint_stream_hz"] = float(
+            config.px4_gazebo_setpoint_stream_hz
+        )
+        result_dict["fixed_rate_setpoint_stream_label"] = (
+            PX4_GAZEBO_FIXED_RATE_SETPOINT_STREAM_LABEL
+        )
+        results.append(result_dict)
+
+        if not bool(result_dict.get("sent", False)):
+            break
+    return tuple(results)
+
+
+def _phase9f_fixed_rate_fields_for_time(
+    *,
+    config: CompetitionMainConfig,
+    now_s: float,
+    aggregate: _Aggregate,
+    setpoint_streamer: Optional[CompetitionSetpointStreamer],
+    sleep: Callable[[float], None],
+) -> tuple[Any, str, dict[str, Any], float]:
+    if not config.px4_gazebo_generic_setpoint_streamer:
+        fields_or_rejection = _cached_command_fields_for_time(
+            config=config,
+            now_s=now_s,
+            aggregate=aggregate,
+        )
+        return fields_or_rejection, "fixed_rate_cached", {}, float(now_s)
+
+    if setpoint_streamer is None:
+        return (
+            "generic_setpoint_streamer_unavailable",
+            "generic_setpoint_streamer",
+            {},
+            float(now_s),
+        )
+
+    effective_now_s = float(now_s)
+    decision = setpoint_streamer.step(now_s=now_s)
+    if (
+        not decision.should_emit
+        and decision.reason == "stream_rate_wait"
+        and decision.next_due_s is not None
+    ):
+        wait_s = max(0.0, float(decision.next_due_s) - float(now_s))
+        if wait_s > 0.0:
+            sleep(wait_s)
+        effective_now_s = float(decision.next_due_s)
+        decision = setpoint_streamer.step(now_s=effective_now_s)
+
+    metadata = {
+        "generic_setpoint_streamer": True,
+        "generic_setpoint_streamer_label": PX4_GAZEBO_GENERIC_SETPOINT_STREAMER_LABEL,
+        "generic_setpoint_streamer_source": decision.source,
+        "generic_setpoint_streamer_reason": decision.reason,
+        "generic_setpoint_streamer_sequence": decision.sequence,
+        "generic_setpoint_streamer_command_age_s": decision.command_age_s,
+        "generic_setpoint_streamer_phase4b_satisfied": decision.phase4b_satisfied,
+        "generic_setpoint_streamer_competition_readiness_claimed": (
+            decision.competition_readiness_claimed
+        ),
+    }
+    if decision.source == "fallback":
+        metadata["generic_setpoint_fallback"] = True
+        metadata["generic_setpoint_fallback_label"] = (
+            PX4_GAZEBO_GENERIC_SETPOINT_FALLBACK_LABEL
+        )
+    if decision.command_age_s is not None:
+        aggregate.last_cached_command_age_s = float(decision.command_age_s)
+    if not decision.should_emit or decision.fields is None:
+        return (
+            f"generic_setpoint_streamer:{decision.reason}",
+            "generic_setpoint_streamer",
+            metadata,
+            effective_now_s,
+        )
+    return decision.fields, f"generic_{decision.source}", metadata, effective_now_s
+
+
+def _phase9f2_next_send_time_s(
+    *,
+    command_sender: Any,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    min_period_s: float,
+) -> float:
+    now_s = float(clock())
+    last_sent_s = _command_sender_last_send_wall_time(command_sender)
+    if last_sent_s is None:
+        return now_s
+
+    remaining_s = float(min_period_s) - (now_s - float(last_sent_s))
+    if remaining_s > 0.0:
+        sleep(remaining_s)
+        now_s = float(clock())
+    return now_s
+
+
+def _command_sender_last_send_wall_time(command_sender: Any) -> Optional[float]:
+    stats = getattr(command_sender, "stats", None)
+    last_sent_s = getattr(stats, "last_send_wall_time", None)
+    if last_sent_s is None:
+        return None
+    return float(last_sent_s)
+
+
+def _phase9f_apply_debug_yaw_override(
+    *,
+    config: CompetitionMainConfig,
+    fields: Any,
+    aggregate: _Aggregate,
+) -> tuple[Any, dict[str, Any]]:
+    if config.px4_gazebo_debug_yaw_override_rad is None:
+        return fields, {}
+
+    yaw_override = float(config.px4_gazebo_debug_yaw_override_rad)
+    roll_rad, pitch_rad, original_yaw_rad = _euler_zyx_from_quaternion_wxyz(
+        tuple(float(component) for component in fields.q)
+    )
+    override_q = quaternion_wxyz_from_euler_zyx(
+        roll_rad=roll_rad,
+        pitch_rad=pitch_rad,
+        yaw_rad=yaw_override,
+    )
+    aggregate.debug_yaw_override_applied_count += 1
+    return (
+        replace(fields, q=override_q),
+        {
+            "debug_yaw_override_applied": True,
+            "debug_yaw_override_label": PX4_GAZEBO_DEBUG_YAW_OVERRIDE_LABEL,
+            "debug_yaw_original_rad": original_yaw_rad,
+            "debug_yaw_override_rad": yaw_override,
+        },
+    )
 
 
 def _phase9d_base_pre_send_rejection_reason(
@@ -1862,12 +2905,25 @@ def _phase9e1_cached_command_fields(
     result: Any,
     aggregate: _Aggregate,
 ) -> Any:
+    return _cached_command_fields_for_time(
+        config=config,
+        now_s=float(result.now_s),
+        aggregate=aggregate,
+    )
+
+
+def _cached_command_fields_for_time(
+    *,
+    config: CompetitionMainConfig,
+    now_s: float,
+    aggregate: _Aggregate,
+) -> Any:
     if aggregate.cached_command_fields is None:
         return "cached_command_missing"
     if aggregate.cached_command_wall_time_s is None:
         return "cached_command_time_missing"
 
-    age_s = float(result.now_s) - float(aggregate.cached_command_wall_time_s)
+    age_s = float(now_s) - float(aggregate.cached_command_wall_time_s)
     aggregate.last_cached_command_age_s = age_s
     if age_s < 0.0:
         return "cached_command_time_in_future"
@@ -1876,7 +2932,7 @@ def _phase9e1_cached_command_fields(
 
     return replace(
         aggregate.cached_command_fields,
-        time_boot_ms=_time_boot_ms_from_wall_time(result.now_s),
+        time_boot_ms=_time_boot_ms_from_wall_time(now_s),
     )
 
 
@@ -1952,6 +3008,203 @@ def _assert_main_config_safe(
     if mode in {CompetitionRunnerMode.COMMAND_LIVE, CompetitionRunnerMode.RACE}:
         raise CompetitionMainSafetyError(
             f"{mode.value} is fail-closed in Phase 6D"
+        )
+    if config.px4_gazebo_full_autonomy_loop:
+        if mode != CompetitionRunnerMode.COMMAND_DRY_RUN:
+            raise CompetitionMainSafetyError(
+                "Phase 9F full autonomy loop requires command_dry_run"
+            )
+        if not config.ack_px4_gazebo_surrogate_full_autonomy_loop:
+            raise CompetitionMainSafetyError(
+                "Phase 9F requires "
+                "--ack-px4-gazebo-surrogate-full-autonomy-loop"
+            )
+        if not config.live_transports and components is None:
+            raise CompetitionMainSafetyError(
+                "Phase 9F requires --live-transports or injected test components"
+            )
+        if not config.use_real_autonomy or not config.real_perception:
+            raise CompetitionMainSafetyError(
+                "Phase 9F requires --use-real-autonomy and --real-perception"
+            )
+        if (
+            str(config.perception_transform_mode)
+            != COMPETITION_OFFICIAL_TRANSFORM_MODE
+        ):
+            raise CompetitionMainSafetyError(
+                "Phase 9F requires "
+                f"--perception-transform-mode {COMPETITION_OFFICIAL_TRANSFORM_MODE}"
+            )
+        if not config.px4_gazebo_command_send:
+            raise CompetitionMainSafetyError(
+                "Phase 9F requires --px4-gazebo-command-send"
+            )
+        if not config.ack_px4_gazebo_surrogate_command_send:
+            raise CompetitionMainSafetyError(
+                "Phase 9F requires --ack-px4-gazebo-surrogate-command-send"
+            )
+        if not config.px4_gazebo_continuous_setpoint_stream:
+            raise CompetitionMainSafetyError(
+                "Phase 9F requires --px4-gazebo-continuous-setpoint-stream"
+            )
+        if not config.px4_gazebo_arm or not config.ack_px4_gazebo_surrogate_arm:
+            raise CompetitionMainSafetyError(
+                "Phase 9F requires --px4-gazebo-arm and "
+                "--ack-px4-gazebo-surrogate-arm"
+            )
+        if (
+            not config.px4_gazebo_offboard
+            or not config.ack_px4_gazebo_surrogate_offboard
+        ):
+            raise CompetitionMainSafetyError(
+                "Phase 9F requires --px4-gazebo-offboard and "
+                "--ack-px4-gazebo-surrogate-offboard"
+            )
+        if config.px4_gazebo_body_rate_smoke or config.px4_gazebo_attitude_hover_smoke:
+            raise CompetitionMainSafetyError(
+                "Phase 9F cannot be combined with fixed smoke command modes"
+            )
+    if config.px4_gazebo_debug_yaw_override_rad is not None:
+        if not config.px4_gazebo_full_autonomy_loop:
+            raise CompetitionMainSafetyError(
+                "Phase 9F.1 debug yaw override requires "
+                "--px4-gazebo-full-autonomy-loop"
+            )
+        if not config.ack_px4_gazebo_surrogate_debug_yaw_override:
+            raise CompetitionMainSafetyError(
+                "Phase 9F.1 debug yaw override requires "
+                "--ack-px4-gazebo-surrogate-debug-yaw-override"
+            )
+        yaw_override = float(config.px4_gazebo_debug_yaw_override_rad)
+        if not math.isfinite(yaw_override):
+            raise CompetitionMainSafetyError(
+                "px4_gazebo_debug_yaw_override_rad must be finite"
+            )
+    if (
+        config.ack_px4_gazebo_surrogate_debug_yaw_override
+        and config.px4_gazebo_debug_yaw_override_rad is None
+    ):
+        raise CompetitionMainSafetyError(
+            "--ack-px4-gazebo-surrogate-debug-yaw-override requires "
+            "--px4-gazebo-debug-yaw-override-rad"
+        )
+    if config.px4_gazebo_fixed_rate_setpoint_stream:
+        if not config.px4_gazebo_full_autonomy_loop:
+            raise CompetitionMainSafetyError(
+                "Phase 9F.2 fixed-rate setpoint stream requires "
+                "--px4-gazebo-full-autonomy-loop"
+            )
+        if not config.ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream:
+            raise CompetitionMainSafetyError(
+                "Phase 9F.2 fixed-rate setpoint stream requires "
+                "--ack-px4-gazebo-surrogate-fixed-rate-setpoint-stream"
+            )
+        stream_hz = float(config.px4_gazebo_setpoint_stream_hz)
+        if not math.isfinite(stream_hz) or stream_hz <= 0.0:
+            raise CompetitionMainSafetyError(
+                "px4_gazebo_setpoint_stream_hz must be finite and positive"
+            )
+        if stream_hz > PHASE9F2_MAX_SETPOINT_STREAM_HZ:
+            raise CompetitionMainSafetyError(
+                "px4_gazebo_setpoint_stream_hz must remain below 100 Hz"
+            )
+        if (1.0 / stream_hz) < float(config.px4_gazebo_command_min_period_s):
+            raise CompetitionMainSafetyError(
+                "px4_gazebo_setpoint_stream_hz conflicts with command min period"
+            )
+        if int(config.px4_gazebo_setpoint_stream_burst_limit) <= 0:
+            raise CompetitionMainSafetyError(
+                "px4_gazebo_setpoint_stream_burst_limit must be positive"
+            )
+        if (
+            config.px4_gazebo_offboard
+            and int(config.px4_gazebo_offboard_prestream_count) <= 0
+        ):
+            raise CompetitionMainSafetyError(
+                "Phase 9F.2 requires positive "
+                "--px4-gazebo-offboard-prestream-count before Offboard request"
+            )
+    if (
+        config.ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream
+        and not config.px4_gazebo_fixed_rate_setpoint_stream
+    ):
+        raise CompetitionMainSafetyError(
+            "--ack-px4-gazebo-surrogate-fixed-rate-setpoint-stream requires "
+            "--px4-gazebo-fixed-rate-setpoint-stream"
+        )
+    if config.px4_gazebo_generic_setpoint_streamer:
+        if not config.px4_gazebo_fixed_rate_setpoint_stream:
+            raise CompetitionMainSafetyError(
+                "Phase 9F.3B generic setpoint streamer requires "
+                "--px4-gazebo-fixed-rate-setpoint-stream"
+            )
+        if not config.ack_px4_gazebo_surrogate_generic_setpoint_streamer:
+            raise CompetitionMainSafetyError(
+                "Phase 9F.3B generic setpoint streamer requires "
+                "--ack-px4-gazebo-surrogate-generic-setpoint-streamer"
+            )
+    if (
+        config.ack_px4_gazebo_surrogate_generic_setpoint_streamer
+        and not config.px4_gazebo_generic_setpoint_streamer
+    ):
+        raise CompetitionMainSafetyError(
+            "--ack-px4-gazebo-surrogate-generic-setpoint-streamer requires "
+            "--px4-gazebo-generic-setpoint-streamer"
+        )
+    if config.px4_gazebo_generic_setpoint_fallback:
+        if not config.px4_gazebo_generic_setpoint_streamer:
+            raise CompetitionMainSafetyError(
+                "Phase 9F.3C fallback setpoint requires "
+                "--px4-gazebo-generic-setpoint-streamer"
+            )
+        if not config.ack_px4_gazebo_surrogate_generic_setpoint_fallback:
+            raise CompetitionMainSafetyError(
+                "Phase 9F.3C fallback setpoint requires "
+                "--ack-px4-gazebo-surrogate-generic-setpoint-fallback"
+            )
+        if config.px4_gazebo_generic_fallback_thrust is None:
+            raise CompetitionMainSafetyError(
+                "Phase 9F.3C fallback setpoint requires "
+                "--px4-gazebo-generic-fallback-thrust"
+            )
+        fallback_values = (
+            float(config.px4_gazebo_generic_fallback_roll_rad),
+            float(config.px4_gazebo_generic_fallback_pitch_rad),
+            float(config.px4_gazebo_generic_fallback_thrust),
+        )
+        if config.px4_gazebo_generic_fallback_yaw_rad is not None:
+            fallback_values = (
+                *fallback_values,
+                float(config.px4_gazebo_generic_fallback_yaw_rad),
+            )
+        if not all(math.isfinite(value) for value in fallback_values):
+            raise CompetitionMainSafetyError(
+                "Phase 9F.3C fallback roll/pitch/yaw/thrust must be finite"
+            )
+        fallback_thrust = float(config.px4_gazebo_generic_fallback_thrust)
+        if not (
+            float(config.px4_gazebo_command_min_thrust)
+            <= fallback_thrust
+            <= float(config.px4_gazebo_command_max_thrust)
+        ):
+            raise CompetitionMainSafetyError(
+                "Phase 9F.3C fallback thrust must be within command thrust bounds"
+            )
+        max_abs_rp = float(config.px4_gazebo_command_max_abs_roll_pitch_rad)
+        if (
+            abs(float(config.px4_gazebo_generic_fallback_roll_rad)) > max_abs_rp
+            or abs(float(config.px4_gazebo_generic_fallback_pitch_rad)) > max_abs_rp
+        ):
+            raise CompetitionMainSafetyError(
+                "Phase 9F.3C fallback roll/pitch exceed command attitude bounds"
+            )
+    if (
+        config.ack_px4_gazebo_surrogate_generic_setpoint_fallback
+        and not config.px4_gazebo_generic_setpoint_fallback
+    ):
+        raise CompetitionMainSafetyError(
+            "--ack-px4-gazebo-surrogate-generic-setpoint-fallback requires "
+            "--px4-gazebo-generic-setpoint-fallback"
         )
     if config.px4_gazebo_command_send:
         if config.px4_gazebo_body_rate_smoke or config.px4_gazebo_attitude_hover_smoke:
@@ -2274,6 +3527,16 @@ def _assert_main_config_safe(
 
 
 def _phase_for_config(config: CompetitionMainConfig) -> str:
+    if config.px4_gazebo_generic_setpoint_fallback:
+        return PHASE_9F_3C
+    if config.px4_gazebo_generic_setpoint_streamer:
+        return PHASE_9F_3B
+    if config.px4_gazebo_fixed_rate_setpoint_stream:
+        return PHASE_9F_2
+    if config.px4_gazebo_debug_yaw_override_rad is not None:
+        return PHASE_9F_1
+    if config.px4_gazebo_full_autonomy_loop:
+        return PHASE_9F
     if config.px4_gazebo_attitude_hover_smoke:
         return PHASE_9E_4
     if config.px4_gazebo_body_rate_smoke:
@@ -2305,7 +3568,22 @@ def _phase_for_flags(
     px4_gazebo_offboard: bool = False,
     px4_gazebo_body_rate_smoke: bool = False,
     px4_gazebo_attitude_hover_smoke: bool = False,
+    px4_gazebo_full_autonomy_loop: bool = False,
+    px4_gazebo_debug_yaw_override: bool = False,
+    px4_gazebo_fixed_rate_setpoint_stream: bool = False,
+    px4_gazebo_generic_setpoint_streamer: bool = False,
+    px4_gazebo_generic_setpoint_fallback: bool = False,
 ) -> str:
+    if px4_gazebo_generic_setpoint_fallback:
+        return PHASE_9F_3C
+    if px4_gazebo_generic_setpoint_streamer:
+        return PHASE_9F_3B
+    if px4_gazebo_fixed_rate_setpoint_stream:
+        return PHASE_9F_2
+    if px4_gazebo_debug_yaw_override:
+        return PHASE_9F_1
+    if px4_gazebo_full_autonomy_loop:
+        return PHASE_9F
     if px4_gazebo_attitude_hover_smoke:
         return PHASE_9E_4
     if px4_gazebo_body_rate_smoke:
@@ -2393,6 +3671,42 @@ def _notes_for_config(config: CompetitionMainConfig) -> tuple[str, ...]:
             "Phase 9E.4 fixed attitude-angle hover smoke uses roll=0, pitch=0, "
             "current-or-explicit yaw, and explicit thrust to mirror legacy "
             "MAVSDK attitude hover semantics."
+        )
+    if config.px4_gazebo_full_autonomy_loop:
+        notes.append(PHASE9F_SURROGATE_LIMITATION)
+        notes.append(
+            "Phase 9F uses the existing competition command dry-run adapter "
+            "backend: attitude-angle quaternion SET_ATTITUDE_TARGET with type "
+            f"mask {ATTITUDE_HOVER_BODY_RATES_IGNORE_TYPE_MASK}; body-rate "
+            "competition protocol work remains a separate decision."
+        )
+    if config.px4_gazebo_debug_yaw_override_rad is not None:
+        notes.append(PHASE9F1_SURROGATE_LIMITATION)
+        notes.append(
+            "Phase 9F.1 preserves AutonomyAPI/controller yaw in the dry-run "
+            "command result and replaces only the outgoing PX4/Gazebo "
+            "surrogate MAVLink quaternion yaw before send."
+        )
+    if config.px4_gazebo_fixed_rate_setpoint_stream:
+        notes.append(PHASE9F2_SURROGATE_LIMITATION)
+        notes.append(
+            "Phase 9F.2 sends cached accepted competition command fields at "
+            "the configured PX4/Gazebo surrogate stream cadence before the "
+            "Offboard mode request gate; it is still PX4/Gazebo-only evidence."
+        )
+    if config.px4_gazebo_generic_setpoint_streamer:
+        notes.append(PHASE9F3B_SURROGATE_LIMITATION)
+        notes.append(
+            "Phase 9F.3B keeps command publication in the PX4/Gazebo surrogate "
+            "sender, but sources cadence and freshness decisions from "
+            "CompetitionSetpointStreamer."
+        )
+    if config.px4_gazebo_generic_setpoint_fallback:
+        notes.append(PHASE9F3C_SURROGATE_LIMITATION)
+        notes.append(
+            "Phase 9F.3C streams explicit fallback/hold fields when autonomy "
+            "commands are missing or stale; this is PX4/Gazebo-only evidence "
+            "and not competition readiness."
         )
     return tuple(notes)
 
@@ -3175,6 +4489,476 @@ def _phase9e4_satisfied(
     return all(bool(criteria.get(name, False)) for name in required)
 
 
+def _phase9f_success_criteria(
+    *,
+    config: CompetitionMainConfig,
+    mode: CompetitionRunnerMode,
+    aggregate: _Aggregate,
+    duration_s: float,
+    command_sender_summary: Optional[dict[str, Any]],
+    phase6e_receive_satisfied: bool,
+    phase6e_perception_boundary_satisfied: bool,
+    phase9c_satisfied: bool,
+    phase9d_satisfied: bool,
+    phase9e_satisfied: bool,
+) -> dict[str, bool]:
+    last_send = aggregate.last_command_send_result or {}
+    command_result = aggregate.last_command_result or {}
+    fields = command_result.get("fields") or {}
+    q = last_send.get("q") or ()
+    command_send_rate_hz = _rate_or_none(aggregate.command_sent_count, duration_s)
+    vision_frame_rate_hz = _rate_or_none(aggregate.vision_frames_completed, duration_s)
+    max_send_gap_s = _phase9f_max_send_gap_s(command_sender_summary)
+    debug_yaw_requested = config.px4_gazebo_debug_yaw_override_rad is not None
+    debug_yaw_override_rad = (
+        float(config.px4_gazebo_debug_yaw_override_rad)
+        if debug_yaw_requested
+        else None
+    )
+    return {
+        "mode_is_command_dry_run": mode == CompetitionRunnerMode.COMMAND_DRY_RUN,
+        "live_transports_requested": bool(config.live_transports),
+        "use_real_autonomy": bool(config.use_real_autonomy),
+        "real_perception_requested": bool(config.real_perception),
+        "legacy_yolo_default_acknowledged": bool(config.allow_legacy_yolo_default),
+        "official_competition_transform_selected": (
+            str(config.perception_transform_mode) == COMPETITION_OFFICIAL_TRANSFORM_MODE
+        ),
+        "px4_gazebo_full_autonomy_loop_requested": bool(
+            config.px4_gazebo_full_autonomy_loop
+        ),
+        "px4_gazebo_full_autonomy_loop_acknowledged": bool(
+            config.ack_px4_gazebo_surrogate_full_autonomy_loop
+        ),
+        "px4_gazebo_command_send_requested": bool(config.px4_gazebo_command_send),
+        "px4_gazebo_command_send_acknowledged": bool(
+            config.ack_px4_gazebo_surrogate_command_send
+        ),
+        "px4_gazebo_arm_requested": bool(config.px4_gazebo_arm),
+        "px4_gazebo_arm_acknowledged": bool(config.ack_px4_gazebo_surrogate_arm),
+        "px4_gazebo_offboard_requested": bool(config.px4_gazebo_offboard),
+        "px4_gazebo_offboard_acknowledged": bool(
+            config.ack_px4_gazebo_surrogate_offboard
+        ),
+        "px4_gazebo_continuous_setpoint_stream_requested": bool(
+            config.px4_gazebo_continuous_setpoint_stream
+        ),
+        "fixed_smoke_modes_disabled": (
+            not config.px4_gazebo_body_rate_smoke
+            and not config.px4_gazebo_attitude_hover_smoke
+        ),
+        "phase6e_receive_satisfied": bool(phase6e_receive_satisfied),
+        "phase6e_perception_boundary_satisfied": bool(
+            phase6e_perception_boundary_satisfied
+        ),
+        "phase9c_command_dry_run_satisfied": bool(phase9c_satisfied),
+        "phase9d_surrogate_command_send_satisfied": bool(phase9d_satisfied),
+        "phase9e_surrogate_arm_offboard_satisfied": bool(phase9e_satisfied),
+        "heartbeat_seen": bool(aggregate.heartbeat_seen),
+        "state_usable": bool(aggregate.state_usable),
+        "vision_frames_completed_gt_0": aggregate.vision_frames_completed > 0,
+        "perception_update_calls_gt_0": aggregate.perception_update_calls > 0,
+        "autonomy_telemetry_sync_count_gt_0": (
+            aggregate.autonomy_telemetry_sync_count > 0
+        ),
+        "planning_success_count_gt_0": aggregate.planning_success_count > 0,
+        "command_candidate_accepted_count_gt_0": (
+            aggregate.command_candidate_accepted_count > 0
+        ),
+        "command_sent_count_gt_0": aggregate.command_sent_count > 0,
+        "command_sent_count_lte_max": (
+            aggregate.command_sent_count <= int(config.px4_gazebo_command_max_count)
+        ),
+        "command_send_rejection_count_zero": (
+            aggregate.command_send_rejection_count == 0
+        ),
+        "setpoint_stream_stale_rejection_count_zero": (
+            aggregate.setpoint_stream_stale_rejection_count == 0
+        ),
+        "phase9f_command_send_rate_hz_gt_10": (
+            command_send_rate_hz is not None
+            and command_send_rate_hz > PHASE9F_MIN_COMMAND_SEND_RATE_HZ
+        ),
+        "phase9f_vision_frame_rate_hz_gt_5": (
+            vision_frame_rate_hz is not None
+            and vision_frame_rate_hz > PHASE9F_MIN_VISION_FRAME_RATE_HZ
+        ),
+        "phase9f_max_send_gap_s_lte_0_5": (
+            max_send_gap_s is not None
+            and max_send_gap_s <= PHASE9F_MAX_SEND_GAP_S
+        ),
+        "last_command_send_result_sent": bool(last_send.get("sent", False)),
+        "last_command_send_surrogate_labeled": (
+            last_send.get("surrogate_label") == PX4_GAZEBO_SURROGATE_LABEL
+        ),
+        "last_command_result_attitude_angle_type_mask": (
+            fields.get("type_mask") == ATTITUDE_HOVER_BODY_RATES_IGNORE_TYPE_MASK
+        ),
+        "last_command_send_attitude_angle_type_mask": (
+            last_send.get("type_mask") == ATTITUDE_HOVER_BODY_RATES_IGNORE_TYPE_MASK
+        ),
+        "last_command_send_has_quaternion": len(tuple(q)) == 4,
+        "last_command_send_body_rates_zero": (
+            _float_equal(last_send.get("body_roll_rate"), 0.0)
+            and _float_equal(last_send.get("body_pitch_rate"), 0.0)
+            and _float_equal(last_send.get("body_yaw_rate"), 0.0)
+        ),
+        "debug_yaw_override_not_requested_or_acknowledged": (
+            not debug_yaw_requested
+            or bool(config.ack_px4_gazebo_surrogate_debug_yaw_override)
+        ),
+        "debug_yaw_override_not_requested_or_applied": (
+            not debug_yaw_requested
+            or aggregate.debug_yaw_override_applied_count > 0
+        ),
+        "debug_yaw_override_not_requested_or_last_send_marked": (
+            not debug_yaw_requested
+            or bool(last_send.get("debug_yaw_override_applied", False))
+        ),
+        "debug_yaw_override_not_requested_or_last_send_matches": (
+            not debug_yaw_requested
+            or (
+                _float_equal(last_send.get("debug_yaw_override_rad"), debug_yaw_override_rad)
+                and _float_equal(last_send.get("yaw_rad"), debug_yaw_override_rad)
+            )
+        ),
+        "last_command_send_phase4b_false": last_send.get("phase4b_satisfied") is False,
+        "last_command_send_competition_readiness_false": (
+            last_send.get("competition_readiness_claimed") is False
+        ),
+        "phase4b_not_satisfied": True,
+        "competition_readiness_not_claimed": True,
+    }
+
+
+def _phase9f_satisfied(
+    criteria: dict[str, bool],
+    config: CompetitionMainConfig,
+) -> bool:
+    if not config.px4_gazebo_full_autonomy_loop:
+        return False
+    required = [
+        "mode_is_command_dry_run",
+        "live_transports_requested",
+        "use_real_autonomy",
+        "real_perception_requested",
+        "legacy_yolo_default_acknowledged",
+        "official_competition_transform_selected",
+        "px4_gazebo_full_autonomy_loop_requested",
+        "px4_gazebo_full_autonomy_loop_acknowledged",
+        "px4_gazebo_command_send_requested",
+        "px4_gazebo_command_send_acknowledged",
+        "px4_gazebo_arm_requested",
+        "px4_gazebo_arm_acknowledged",
+        "px4_gazebo_offboard_requested",
+        "px4_gazebo_offboard_acknowledged",
+        "px4_gazebo_continuous_setpoint_stream_requested",
+        "fixed_smoke_modes_disabled",
+        "phase6e_receive_satisfied",
+        "phase6e_perception_boundary_satisfied",
+        "phase9c_command_dry_run_satisfied",
+        "phase9d_surrogate_command_send_satisfied",
+        "phase9e_surrogate_arm_offboard_satisfied",
+        "heartbeat_seen",
+        "state_usable",
+        "vision_frames_completed_gt_0",
+        "perception_update_calls_gt_0",
+        "autonomy_telemetry_sync_count_gt_0",
+        "planning_success_count_gt_0",
+        "command_candidate_accepted_count_gt_0",
+        "command_sent_count_gt_0",
+        "command_sent_count_lte_max",
+        "command_send_rejection_count_zero",
+        "setpoint_stream_stale_rejection_count_zero",
+        "phase9f_command_send_rate_hz_gt_10",
+        "phase9f_vision_frame_rate_hz_gt_5",
+        "phase9f_max_send_gap_s_lte_0_5",
+        "last_command_send_result_sent",
+        "last_command_send_surrogate_labeled",
+        "last_command_result_attitude_angle_type_mask",
+        "last_command_send_attitude_angle_type_mask",
+        "last_command_send_has_quaternion",
+        "last_command_send_body_rates_zero",
+        "debug_yaw_override_not_requested_or_acknowledged",
+        "debug_yaw_override_not_requested_or_applied",
+        "debug_yaw_override_not_requested_or_last_send_marked",
+        "debug_yaw_override_not_requested_or_last_send_matches",
+        "last_command_send_phase4b_false",
+        "last_command_send_competition_readiness_false",
+        "phase4b_not_satisfied",
+        "competition_readiness_not_claimed",
+    ]
+    return all(bool(criteria.get(name, False)) for name in required)
+
+
+def _phase9f2_success_criteria(
+    *,
+    config: CompetitionMainConfig,
+    mode: CompetitionRunnerMode,
+    aggregate: _Aggregate,
+    phase9f_satisfied: bool,
+) -> dict[str, bool]:
+    stream_hz = float(config.px4_gazebo_setpoint_stream_hz)
+    last_send = aggregate.last_command_send_result or {}
+    return {
+        "mode_is_command_dry_run": mode == CompetitionRunnerMode.COMMAND_DRY_RUN,
+        "px4_gazebo_fixed_rate_setpoint_stream_requested": bool(
+            config.px4_gazebo_fixed_rate_setpoint_stream
+        ),
+        "px4_gazebo_fixed_rate_setpoint_stream_acknowledged": bool(
+            config.ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream
+        ),
+        "px4_gazebo_full_autonomy_loop_requested": bool(
+            config.px4_gazebo_full_autonomy_loop
+        ),
+        "px4_gazebo_continuous_setpoint_stream_requested": bool(
+            config.px4_gazebo_continuous_setpoint_stream
+        ),
+        "stream_hz_positive": stream_hz > 0.0,
+        "stream_hz_below_100": stream_hz <= PHASE9F2_MAX_SETPOINT_STREAM_HZ,
+        "burst_limit_positive": (
+            int(config.px4_gazebo_setpoint_stream_burst_limit) > 0
+        ),
+        "offboard_prestream_count_positive": (
+            not config.px4_gazebo_offboard
+            or int(config.px4_gazebo_offboard_prestream_count) > 0
+        ),
+        "offboard_prestream_count_satisfied": (
+            not config.px4_gazebo_offboard
+            or aggregate.command_sent_count
+            >= int(config.px4_gazebo_offboard_prestream_count)
+        ),
+        "fixed_rate_iteration_count_gt_0": (
+            aggregate.fixed_rate_setpoint_stream_iteration_count > 0
+        ),
+        "fixed_rate_attempt_count_gt_0": (
+            aggregate.fixed_rate_setpoint_stream_attempt_count > 0
+        ),
+        "fixed_rate_sent_count_gt_0": (
+            aggregate.fixed_rate_setpoint_stream_sent_count > 0
+        ),
+        "fixed_rate_rejection_count_zero": (
+            aggregate.fixed_rate_setpoint_stream_rejection_count == 0
+        ),
+        "fixed_rate_sent_count_equals_command_sent_count": (
+            aggregate.fixed_rate_setpoint_stream_sent_count
+            == aggregate.command_sent_count
+        ),
+        "last_command_send_fixed_rate_marked": bool(
+            last_send.get("fixed_rate_setpoint_stream", False)
+        ),
+        "last_command_send_surrogate_labeled": (
+            last_send.get("surrogate_label") == PX4_GAZEBO_SURROGATE_LABEL
+        ),
+        "phase9f_full_autonomy_loop_satisfied": bool(phase9f_satisfied),
+        "phase4b_not_satisfied": True,
+        "competition_readiness_not_claimed": True,
+    }
+
+
+def _phase9f2_satisfied(
+    criteria: dict[str, bool],
+    config: CompetitionMainConfig,
+) -> bool:
+    if not config.px4_gazebo_fixed_rate_setpoint_stream:
+        return False
+    required = [
+        "mode_is_command_dry_run",
+        "px4_gazebo_fixed_rate_setpoint_stream_requested",
+        "px4_gazebo_fixed_rate_setpoint_stream_acknowledged",
+        "px4_gazebo_full_autonomy_loop_requested",
+        "px4_gazebo_continuous_setpoint_stream_requested",
+        "stream_hz_positive",
+        "stream_hz_below_100",
+        "burst_limit_positive",
+        "offboard_prestream_count_positive",
+        "offboard_prestream_count_satisfied",
+        "fixed_rate_iteration_count_gt_0",
+        "fixed_rate_attempt_count_gt_0",
+        "fixed_rate_sent_count_gt_0",
+        "fixed_rate_rejection_count_zero",
+        "fixed_rate_sent_count_equals_command_sent_count",
+        "last_command_send_fixed_rate_marked",
+        "last_command_send_surrogate_labeled",
+        "phase9f_full_autonomy_loop_satisfied",
+        "phase4b_not_satisfied",
+        "competition_readiness_not_claimed",
+    ]
+    return all(bool(criteria.get(name, False)) for name in required)
+
+
+def _phase9f3b_success_criteria(
+    *,
+    config: CompetitionMainConfig,
+    mode: CompetitionRunnerMode,
+    aggregate: _Aggregate,
+    phase9f2_satisfied: bool,
+) -> dict[str, bool]:
+    last_send = aggregate.last_command_send_result or {}
+    streamer_summary = aggregate.generic_setpoint_streamer_summary or {}
+    streamer_stats = streamer_summary.get("stats", {})
+    if not isinstance(streamer_stats, dict):
+        streamer_stats = {}
+    return {
+        "mode_is_command_dry_run": mode == CompetitionRunnerMode.COMMAND_DRY_RUN,
+        "px4_gazebo_generic_setpoint_streamer_requested": bool(
+            config.px4_gazebo_generic_setpoint_streamer
+        ),
+        "px4_gazebo_generic_setpoint_streamer_acknowledged": bool(
+            config.ack_px4_gazebo_surrogate_generic_setpoint_streamer
+        ),
+        "px4_gazebo_fixed_rate_setpoint_stream_requested": bool(
+            config.px4_gazebo_fixed_rate_setpoint_stream
+        ),
+        "px4_gazebo_fixed_rate_setpoint_stream_acknowledged": bool(
+            config.ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream
+        ),
+        "phase9f2_fixed_rate_setpoint_stream_satisfied": bool(phase9f2_satisfied),
+        "generic_setpoint_streamer_summary_present": bool(streamer_summary),
+        "generic_setpoint_streamer_emit_count_gt_0": (
+            int(streamer_stats.get("emit_count", 0)) > 0
+        ),
+        "generic_setpoint_streamer_invalid_update_count_zero": (
+            int(streamer_stats.get("invalid_update_count", 0)) == 0
+        ),
+        "last_command_send_generic_streamer_marked": bool(
+            last_send.get("generic_setpoint_streamer", False)
+        ),
+        "last_command_send_generic_streamer_label": (
+            last_send.get("generic_setpoint_streamer_label")
+            == PX4_GAZEBO_GENERIC_SETPOINT_STREAMER_LABEL
+        ),
+        "last_command_send_generic_streamer_phase4b_false": (
+            last_send.get("generic_setpoint_streamer_phase4b_satisfied") is False
+        ),
+        "last_command_send_generic_streamer_readiness_false": (
+            last_send.get(
+                "generic_setpoint_streamer_competition_readiness_claimed"
+            )
+            is False
+        ),
+        "phase4b_not_satisfied": True,
+        "competition_readiness_not_claimed": True,
+    }
+
+
+def _phase9f3b_satisfied(
+    criteria: dict[str, bool],
+    config: CompetitionMainConfig,
+) -> bool:
+    if not config.px4_gazebo_generic_setpoint_streamer:
+        return False
+    required = [
+        "mode_is_command_dry_run",
+        "px4_gazebo_generic_setpoint_streamer_requested",
+        "px4_gazebo_generic_setpoint_streamer_acknowledged",
+        "px4_gazebo_fixed_rate_setpoint_stream_requested",
+        "px4_gazebo_fixed_rate_setpoint_stream_acknowledged",
+        "phase9f2_fixed_rate_setpoint_stream_satisfied",
+        "generic_setpoint_streamer_summary_present",
+        "generic_setpoint_streamer_emit_count_gt_0",
+        "generic_setpoint_streamer_invalid_update_count_zero",
+        "last_command_send_generic_streamer_marked",
+        "last_command_send_generic_streamer_label",
+        "last_command_send_generic_streamer_phase4b_false",
+        "last_command_send_generic_streamer_readiness_false",
+        "phase4b_not_satisfied",
+        "competition_readiness_not_claimed",
+    ]
+    return all(bool(criteria.get(name, False)) for name in required)
+
+
+def _phase9f3c_success_criteria(
+    *,
+    config: CompetitionMainConfig,
+    mode: CompetitionRunnerMode,
+    aggregate: _Aggregate,
+) -> dict[str, bool]:
+    last_send = aggregate.last_command_send_result or {}
+    streamer_summary = aggregate.generic_setpoint_streamer_summary or {}
+    streamer_stats = streamer_summary.get("stats", {})
+    if not isinstance(streamer_stats, dict):
+        streamer_stats = {}
+    return {
+        "mode_is_command_dry_run": mode == CompetitionRunnerMode.COMMAND_DRY_RUN,
+        "px4_gazebo_generic_setpoint_fallback_requested": bool(
+            config.px4_gazebo_generic_setpoint_fallback
+        ),
+        "px4_gazebo_generic_setpoint_fallback_acknowledged": bool(
+            config.ack_px4_gazebo_surrogate_generic_setpoint_fallback
+        ),
+        "px4_gazebo_generic_setpoint_streamer_requested": bool(
+            config.px4_gazebo_generic_setpoint_streamer
+        ),
+        "px4_gazebo_generic_setpoint_streamer_acknowledged": bool(
+            config.ack_px4_gazebo_surrogate_generic_setpoint_streamer
+        ),
+        "fallback_thrust_configured": (
+            config.px4_gazebo_generic_fallback_thrust is not None
+        ),
+        "fallback_update_count_gt_0": (
+            aggregate.generic_setpoint_fallback_update_count > 0
+        ),
+        "fallback_update_rejection_count_zero": (
+            aggregate.generic_setpoint_fallback_rejection_count == 0
+        ),
+        "generic_setpoint_streamer_summary_present": bool(streamer_summary),
+        "generic_setpoint_streamer_fallback_update_count_gt_0": (
+            int(streamer_stats.get("fallback_update_count", 0)) > 0
+        ),
+        "generic_setpoint_streamer_fallback_emit_count_gt_0": (
+            int(streamer_stats.get("fallback_emit_count", 0)) > 0
+        ),
+        "fixed_rate_sent_count_gt_0": (
+            aggregate.fixed_rate_setpoint_stream_sent_count > 0
+        ),
+        "fixed_rate_rejection_count_zero": (
+            aggregate.fixed_rate_setpoint_stream_rejection_count == 0
+        ),
+        "command_send_rejection_count_zero": (
+            aggregate.command_send_rejection_count == 0
+        ),
+        "last_command_send_generic_fallback_marked": bool(
+            last_send.get("generic_setpoint_fallback", False)
+        ),
+        "last_command_send_generic_fallback_label": (
+            last_send.get("generic_setpoint_fallback_label")
+            == PX4_GAZEBO_GENERIC_SETPOINT_FALLBACK_LABEL
+        ),
+        "phase4b_not_satisfied": True,
+        "competition_readiness_not_claimed": True,
+    }
+
+
+def _phase9f3c_satisfied(
+    criteria: dict[str, bool],
+    config: CompetitionMainConfig,
+) -> bool:
+    if not config.px4_gazebo_generic_setpoint_fallback:
+        return False
+    required = [
+        "mode_is_command_dry_run",
+        "px4_gazebo_generic_setpoint_fallback_requested",
+        "px4_gazebo_generic_setpoint_fallback_acknowledged",
+        "px4_gazebo_generic_setpoint_streamer_requested",
+        "px4_gazebo_generic_setpoint_streamer_acknowledged",
+        "fallback_thrust_configured",
+        "fallback_update_count_gt_0",
+        "fallback_update_rejection_count_zero",
+        "generic_setpoint_streamer_summary_present",
+        "generic_setpoint_streamer_fallback_update_count_gt_0",
+        "generic_setpoint_streamer_fallback_emit_count_gt_0",
+        "fixed_rate_sent_count_gt_0",
+        "fixed_rate_rejection_count_zero",
+        "command_send_rejection_count_zero",
+        "last_command_send_generic_fallback_marked",
+        "last_command_send_generic_fallback_label",
+        "phase4b_not_satisfied",
+        "competition_readiness_not_claimed",
+    ]
+    return all(bool(criteria.get(name, False)) for name in required)
+
+
 def _normalize_mode(mode: CompetitionRunnerMode | str) -> CompetitionRunnerMode:
     if isinstance(mode, CompetitionRunnerMode):
         return mode
@@ -3260,6 +5044,63 @@ def _float_equal(left: Any, right: Any, *, abs_tol: float = 1e-9) -> bool:
     )
 
 
+def _euler_zyx_from_quaternion_wxyz(
+    q: tuple[float, float, float, float],
+) -> tuple[float, float, float]:
+    if len(q) != 4:
+        raise ValueError("q must contain four wxyz components")
+    w, x, y, z = (float(component) for component in q)
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    if norm <= 0.0 or not math.isfinite(norm):
+        raise ValueError("q must have a finite non-zero norm")
+    w /= norm
+    x /= norm
+    y /= norm
+    z /= norm
+
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1.0:
+        pitch = math.copysign(math.pi / 2.0, sinp)
+    else:
+        pitch = math.asin(sinp)
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+    return roll, pitch, yaw
+
+
+def _rate_or_none(count: int, duration_s: float) -> Optional[float]:
+    duration = float(duration_s)
+    if duration <= 0.0 or not math.isfinite(duration):
+        return None
+    return float(count) / duration
+
+
+def _phase9f_max_send_gap_s(
+    command_sender_summary: Optional[dict[str, Any]],
+) -> Optional[float]:
+    if not isinstance(command_sender_summary, dict):
+        return None
+    stats = command_sender_summary.get("stats")
+    if not isinstance(stats, dict):
+        return None
+    value = stats.get("max_send_gap_s")
+    if value is None:
+        return None
+    try:
+        gap = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(gap):
+        return None
+    return gap
+
+
 def _command_result_to_dict(result: Any) -> dict[str, Any]:
     fields = getattr(result, "fields", None)
     fields_dict = None
@@ -3306,6 +5147,8 @@ __all__ = [
     "PHASE_9E_2",
     "PHASE_9E_3",
     "PHASE_9E_4",
+    "PHASE_9F",
+    "PHASE_9F_1",
     "PHASE6E_SURROGATE_LIMITATION",
     "PHASE9D_SURROGATE_LIMITATION",
     "PHASE9E_SURROGATE_LIMITATION",
@@ -3313,6 +5156,10 @@ __all__ = [
     "PHASE9E2_SURROGATE_LIMITATION",
     "PHASE9E3_SURROGATE_LIMITATION",
     "PHASE9E4_SURROGATE_LIMITATION",
+    "PHASE9F_SURROGATE_LIMITATION",
+    "PHASE9F1_SURROGATE_LIMITATION",
+    "PX4_GAZEBO_DEBUG_YAW_OVERRIDE_LABEL",
+    "PX4_GAZEBO_FULL_AUTONOMY_LOOP_LABEL",
     "CompetitionMainConfig",
     "CompetitionMainSafetyError",
     "CompetitionMainSummary",

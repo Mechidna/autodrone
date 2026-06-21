@@ -15,6 +15,15 @@ from autonomy_core.runtime.competition_main import (
     PHASE_9E_2,
     PHASE_9E_3,
     PHASE_9E_4,
+    PHASE_9F,
+    PHASE_9F_1,
+    PHASE_9F_2,
+    PHASE_9F_3B,
+    PHASE_9F_3C,
+    PX4_GAZEBO_DEBUG_YAW_OVERRIDE_LABEL,
+    PX4_GAZEBO_FIXED_RATE_SETPOINT_STREAM_LABEL,
+    PX4_GAZEBO_GENERIC_SETPOINT_FALLBACK_LABEL,
+    PX4_GAZEBO_GENERIC_SETPOINT_STREAMER_LABEL,
     run_competition_main,
 )
 from autonomy_core.runtime.competition_autonomy_factory import (
@@ -172,6 +181,13 @@ class HighThrustFakeAutonomy(FakeAutonomy):
     def attitude_control(self):
         self.attitude_control_calls += 1
         return (0.0, 0.0, 0.0, 0.85)
+
+
+class OneShotPlanningFakeAutonomy(FakeAutonomy):
+    def path_plan(self, replan_reason="scheduled"):
+        self.path_plan_calls += 1
+        self.path_plan_reasons.append(replan_reason)
+        return self.path_plan_calls == 1
 
 
 class FakeMav:
@@ -1353,6 +1369,728 @@ class CompetitionMainTests(unittest.TestCase):
         self.assertFalse(summary["armed_state_observed"])
         self.assertFalse(summary["phase9e_surrogate_arm_offboard_satisfied"])
         self.assertFalse(summary["competition_readiness_claimed"])
+
+    def test_phase9f_full_autonomy_loop_reports_success_with_fake_connection(self):
+        connection = FakeConnection()
+        sender = Px4GazeboSetAttitudeTargetSender(connection=connection)
+        autonomy = FakeAutonomy()
+        clock = IncrementingClock()
+        components = build_competition_runtime(
+            CompetitionSetupConfig(mode=CompetitionRunnerMode.COMMAND_DRY_RUN),
+            mavlink_transport=RepeatingFakeMavlinkTransport(
+                summary_data=px4_armed_offboard_summary()
+            ),
+            vision_transport=FakeVisionTransport([b"packet"] * 6),
+            image_adapter=FakeImageAdapter(),
+            autonomy=autonomy,
+            clock=clock,
+        )
+
+        summary = run_competition_main(
+            CompetitionMainConfig(
+                mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                steps=20,
+                live_transports=True,
+                use_real_autonomy=True,
+                real_perception=True,
+                allow_legacy_yolo_default=True,
+                px4_gazebo_full_autonomy_loop=True,
+                ack_px4_gazebo_surrogate_full_autonomy_loop=True,
+                px4_gazebo_command_send=True,
+                ack_px4_gazebo_surrogate_command_send=True,
+                px4_gazebo_continuous_setpoint_stream=True,
+                px4_gazebo_arm=True,
+                ack_px4_gazebo_surrogate_arm=True,
+                px4_gazebo_offboard=True,
+                ack_px4_gazebo_surrogate_offboard=True,
+                px4_gazebo_command_max_count=20,
+                px4_gazebo_command_max_age_s=10.0,
+                evidence_label="px4_gazebo_surrogate_phase9f",
+            ),
+            components=components,
+            command_sender=sender,
+            clock=clock,
+        ).to_dict()
+
+        self.assertEqual(summary["phase"], PHASE_9F)
+        self.assertEqual(summary["evidence_label"], "px4_gazebo_surrogate_phase9f")
+        self.assertTrue(summary["px4_gazebo_full_autonomy_loop_requested"])
+        self.assertTrue(summary["px4_gazebo_full_autonomy_loop_acknowledged"])
+        self.assertEqual(
+            summary["phase9f_command_backend"],
+            "attitude_angle_quaternion_set_attitude_target",
+        )
+        self.assertEqual(
+            summary["phase9f_command_type_mask"],
+            ATTITUDE_HOVER_BODY_RATES_IGNORE_TYPE_MASK,
+        )
+        self.assertTrue(summary["use_real_autonomy"])
+        self.assertTrue(summary["real_perception_requested"])
+        self.assertTrue(summary["px4_gazebo_command_send_requested"])
+        self.assertTrue(summary["px4_gazebo_arm_requested"])
+        self.assertTrue(summary["px4_gazebo_offboard_requested"])
+        self.assertTrue(summary["px4_gazebo_continuous_setpoint_stream_requested"])
+        self.assertTrue(summary["phase6e_receive_satisfied"])
+        self.assertTrue(summary["phase6e_perception_boundary_satisfied"])
+        self.assertTrue(summary["phase9c_command_dry_run_satisfied"])
+        self.assertTrue(summary["phase9d_surrogate_command_send_satisfied"])
+        self.assertTrue(summary["phase9e_surrogate_arm_offboard_satisfied"])
+        self.assertTrue(summary["phase9f_full_autonomy_loop_satisfied"])
+        self.assertEqual(summary["vision_frames_completed"], 6)
+        self.assertEqual(summary["perception_update_calls"], 6)
+        self.assertGreater(summary["planning_success_count"], 0)
+        self.assertGreater(summary["command_candidate_accepted_count"], 0)
+        self.assertEqual(summary["command_sent_count"], 20)
+        self.assertEqual(summary["command_send_rejection_count"], 0)
+        self.assertEqual(summary["setpoint_stream_stale_rejection_count"], 0)
+        self.assertGreater(summary["phase9f_command_send_rate_hz"], 10.0)
+        self.assertGreater(summary["phase9f_vision_frame_rate_hz"], 5.0)
+        self.assertLessEqual(summary["phase9f_max_send_gap_s"], 0.5)
+        self.assertEqual(len(connection.mav.command_long_calls), 2)
+        self.assertEqual(len(connection.mav.set_attitude_target_calls), 20)
+        self.assertEqual(
+            summary["last_command_send_result"]["type_mask"],
+            ATTITUDE_HOVER_BODY_RATES_IGNORE_TYPE_MASK,
+        )
+        self.assertFalse(summary["phase4b_satisfied"])
+        self.assertFalse(summary["competition_readiness_claimed"])
+
+    def test_phase9f_rejects_sparse_command_stream_as_incomplete(self):
+        connection = FakeConnection()
+        sender = Px4GazeboSetAttitudeTargetSender(connection=connection)
+        autonomy = FakeAutonomy()
+
+        summary = run_competition_main(
+            CompetitionMainConfig(
+                mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                live_transports=True,
+                use_real_autonomy=True,
+                real_perception=True,
+                allow_legacy_yolo_default=True,
+                px4_gazebo_full_autonomy_loop=True,
+                ack_px4_gazebo_surrogate_full_autonomy_loop=True,
+                px4_gazebo_command_send=True,
+                ack_px4_gazebo_surrogate_command_send=True,
+                px4_gazebo_continuous_setpoint_stream=True,
+                px4_gazebo_arm=True,
+                ack_px4_gazebo_surrogate_arm=True,
+                px4_gazebo_offboard=True,
+                ack_px4_gazebo_surrogate_offboard=True,
+                px4_gazebo_command_max_count=1,
+            ),
+            components=components_for_mode(
+                CompetitionRunnerMode.COMMAND_DRY_RUN,
+                with_vision=True,
+                autonomy=autonomy,
+                mavlink_summary=px4_armed_offboard_summary(),
+            ),
+            command_sender=sender,
+            clock=lambda: 100.0,
+        ).to_dict()
+
+        self.assertEqual(summary["phase"], PHASE_9F)
+        self.assertEqual(summary["command_sent_count"], 1)
+        self.assertIsNone(summary["phase9f_command_send_rate_hz"])
+        self.assertIsNone(summary["phase9f_max_send_gap_s"])
+        self.assertFalse(
+            summary["phase9f_success_criteria"][
+                "phase9f_command_send_rate_hz_gt_10"
+            ]
+        )
+        self.assertFalse(
+            summary["phase9f_success_criteria"]["phase9f_max_send_gap_s_lte_0_5"]
+        )
+        self.assertFalse(summary["phase9f_full_autonomy_loop_satisfied"])
+
+    def test_phase9f1_debug_yaw_override_replaces_only_outgoing_yaw(self):
+        connection = FakeConnection()
+        sender = Px4GazeboSetAttitudeTargetSender(connection=connection)
+        autonomy = FakeAutonomy()
+        clock = IncrementingClock()
+        yaw_override = 1.57079632679
+        components = build_competition_runtime(
+            CompetitionSetupConfig(mode=CompetitionRunnerMode.COMMAND_DRY_RUN),
+            mavlink_transport=RepeatingFakeMavlinkTransport(
+                summary_data=px4_armed_offboard_summary()
+            ),
+            vision_transport=FakeVisionTransport([b"packet"] * 6),
+            image_adapter=FakeImageAdapter(),
+            autonomy=autonomy,
+            clock=clock,
+        )
+
+        summary = run_competition_main(
+            CompetitionMainConfig(
+                mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                steps=20,
+                live_transports=True,
+                use_real_autonomy=True,
+                real_perception=True,
+                allow_legacy_yolo_default=True,
+                px4_gazebo_full_autonomy_loop=True,
+                ack_px4_gazebo_surrogate_full_autonomy_loop=True,
+                px4_gazebo_command_send=True,
+                ack_px4_gazebo_surrogate_command_send=True,
+                px4_gazebo_continuous_setpoint_stream=True,
+                px4_gazebo_arm=True,
+                ack_px4_gazebo_surrogate_arm=True,
+                px4_gazebo_offboard=True,
+                ack_px4_gazebo_surrogate_offboard=True,
+                px4_gazebo_command_max_count=20,
+                px4_gazebo_command_max_age_s=10.0,
+                px4_gazebo_debug_yaw_override_rad=yaw_override,
+                ack_px4_gazebo_surrogate_debug_yaw_override=True,
+                evidence_label="px4_gazebo_surrogate_phase9f1",
+            ),
+            components=components,
+            command_sender=sender,
+            clock=clock,
+        ).to_dict()
+
+        self.assertEqual(summary["phase"], PHASE_9F_1)
+        self.assertTrue(summary["phase9f_full_autonomy_loop_satisfied"])
+        self.assertTrue(summary["px4_gazebo_debug_yaw_override_requested"])
+        self.assertTrue(summary["px4_gazebo_debug_yaw_override_acknowledged"])
+        self.assertEqual(
+            summary["px4_gazebo_debug_yaw_override_label"],
+            PX4_GAZEBO_DEBUG_YAW_OVERRIDE_LABEL,
+        )
+        self.assertEqual(
+            summary["px4_gazebo_debug_yaw_override_applied_count"],
+            summary["command_sent_count"],
+        )
+        self.assertAlmostEqual(
+            summary["last_command_send_result"]["debug_yaw_original_rad"],
+            0.0,
+        )
+        self.assertAlmostEqual(
+            summary["last_command_send_result"]["debug_yaw_override_rad"],
+            yaw_override,
+        )
+        self.assertAlmostEqual(
+            summary["last_command_send_result"]["yaw_rad"],
+            yaw_override,
+        )
+        self.assertTrue(
+            summary["phase9f_success_criteria"][
+                "debug_yaw_override_not_requested_or_last_send_matches"
+            ]
+        )
+        original_q = summary["last_command_result"]["fields"]["q"]
+        self.assertEqual(original_q, [1.0, 0.0, 0.0, 0.0])
+        expected_q = quaternion_wxyz_from_euler_zyx(
+            roll_rad=0.0,
+            pitch_rad=0.0,
+            yaw_rad=yaw_override,
+        )
+        sent_q = connection.mav.set_attitude_target_calls[-1][4]
+        for actual, expected in zip(sent_q, expected_q):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_phase9f2_fixed_rate_stream_prestreams_before_offboard(self):
+        connection = FakeConnection()
+        sender = Px4GazeboSetAttitudeTargetSender(connection=connection)
+        autonomy = FakeAutonomy()
+        clock = IncrementingClock(step=0.03)
+        components = build_competition_runtime(
+            CompetitionSetupConfig(mode=CompetitionRunnerMode.COMMAND_DRY_RUN),
+            mavlink_transport=RepeatingFakeMavlinkTransport(
+                summary_data=px4_armed_offboard_summary()
+            ),
+            vision_transport=FakeVisionTransport([b"packet"] * 40),
+            image_adapter=FakeImageAdapter(),
+            autonomy=autonomy,
+            clock=clock,
+        )
+
+        summary = run_competition_main(
+            CompetitionMainConfig(
+                mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                steps=20,
+                live_transports=True,
+                use_real_autonomy=True,
+                real_perception=True,
+                allow_legacy_yolo_default=True,
+                px4_gazebo_full_autonomy_loop=True,
+                ack_px4_gazebo_surrogate_full_autonomy_loop=True,
+                px4_gazebo_command_send=True,
+                ack_px4_gazebo_surrogate_command_send=True,
+                px4_gazebo_continuous_setpoint_stream=True,
+                px4_gazebo_arm=True,
+                ack_px4_gazebo_surrogate_arm=True,
+                px4_gazebo_offboard=True,
+                ack_px4_gazebo_surrogate_offboard=True,
+                px4_gazebo_offboard_prestream_count=5,
+                px4_gazebo_command_max_count=30,
+                px4_gazebo_command_max_age_s=10.0,
+                px4_gazebo_fixed_rate_setpoint_stream=True,
+                ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream=True,
+                px4_gazebo_setpoint_stream_hz=20.0,
+                px4_gazebo_setpoint_stream_burst_limit=2,
+                evidence_label="px4_gazebo_surrogate_phase9f2",
+            ),
+            components=components,
+            command_sender=sender,
+            clock=clock,
+            sleep=lambda _seconds: None,
+        ).to_dict()
+
+        self.assertEqual(summary["phase"], PHASE_9F_2)
+        self.assertEqual(summary["evidence_label"], "px4_gazebo_surrogate_phase9f2")
+        self.assertTrue(summary["px4_gazebo_fixed_rate_setpoint_stream_requested"])
+        self.assertTrue(summary["px4_gazebo_fixed_rate_setpoint_stream_acknowledged"])
+        self.assertEqual(
+            summary["px4_gazebo_fixed_rate_setpoint_stream_label"],
+            PX4_GAZEBO_FIXED_RATE_SETPOINT_STREAM_LABEL,
+        )
+        self.assertEqual(summary["px4_gazebo_setpoint_stream_hz"], 20.0)
+        self.assertEqual(summary["px4_gazebo_setpoint_stream_burst_limit"], 2)
+        self.assertGreater(summary["fixed_rate_setpoint_stream_iteration_count"], 0)
+        self.assertGreater(summary["fixed_rate_setpoint_stream_attempt_count"], 0)
+        self.assertEqual(
+            summary["fixed_rate_setpoint_stream_sent_count"],
+            summary["command_sent_count"],
+        )
+        self.assertEqual(summary["fixed_rate_setpoint_stream_rejection_count"], 0)
+        self.assertGreaterEqual(summary["command_sent_count"], 5)
+        self.assertEqual(summary["command_send_rejection_count"], 0)
+        self.assertEqual(summary["setpoint_stream_stale_rejection_count"], 0)
+        self.assertEqual(summary["offboard_sent_count"], 1)
+        self.assertTrue(summary["phase9f_full_autonomy_loop_satisfied"])
+        self.assertTrue(summary["phase9f2_fixed_rate_setpoint_stream_satisfied"])
+        self.assertTrue(
+            summary["phase9f2_success_criteria"][
+                "offboard_prestream_count_satisfied"
+            ]
+        )
+        self.assertTrue(
+            summary["phase9f2_success_criteria"][
+                "last_command_send_fixed_rate_marked"
+            ]
+        )
+        self.assertEqual(len(connection.mav.command_long_calls), 2)
+        self.assertEqual(
+            len(connection.mav.set_attitude_target_calls),
+            summary["command_sent_count"],
+        )
+        self.assertFalse(summary["phase4b_satisfied"])
+        self.assertFalse(summary["competition_readiness_claimed"])
+
+    def test_phase9f3b_generic_setpoint_streamer_drives_fixed_rate_sender(self):
+        connection = FakeConnection()
+        sender = Px4GazeboSetAttitudeTargetSender(connection=connection)
+        autonomy = FakeAutonomy()
+        clock = IncrementingClock(step=0.03)
+        components = build_competition_runtime(
+            CompetitionSetupConfig(mode=CompetitionRunnerMode.COMMAND_DRY_RUN),
+            mavlink_transport=RepeatingFakeMavlinkTransport(
+                summary_data=px4_armed_offboard_summary()
+            ),
+            vision_transport=FakeVisionTransport([b"packet"] * 40),
+            image_adapter=FakeImageAdapter(),
+            autonomy=autonomy,
+            clock=clock,
+        )
+
+        summary = run_competition_main(
+            CompetitionMainConfig(
+                mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                steps=20,
+                live_transports=True,
+                use_real_autonomy=True,
+                real_perception=True,
+                allow_legacy_yolo_default=True,
+                px4_gazebo_full_autonomy_loop=True,
+                ack_px4_gazebo_surrogate_full_autonomy_loop=True,
+                px4_gazebo_command_send=True,
+                ack_px4_gazebo_surrogate_command_send=True,
+                px4_gazebo_continuous_setpoint_stream=True,
+                px4_gazebo_arm=True,
+                ack_px4_gazebo_surrogate_arm=True,
+                px4_gazebo_offboard=True,
+                ack_px4_gazebo_surrogate_offboard=True,
+                px4_gazebo_offboard_prestream_count=5,
+                px4_gazebo_command_max_count=30,
+                px4_gazebo_command_max_age_s=10.0,
+                px4_gazebo_fixed_rate_setpoint_stream=True,
+                ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream=True,
+                px4_gazebo_setpoint_stream_hz=20.0,
+                px4_gazebo_setpoint_stream_burst_limit=2,
+                px4_gazebo_generic_setpoint_streamer=True,
+                ack_px4_gazebo_surrogate_generic_setpoint_streamer=True,
+                evidence_label="px4_gazebo_surrogate_phase9f3b",
+            ),
+            components=components,
+            command_sender=sender,
+            clock=clock,
+            sleep=lambda _seconds: None,
+        ).to_dict()
+
+        self.assertEqual(summary["phase"], PHASE_9F_3B)
+        self.assertEqual(summary["evidence_label"], "px4_gazebo_surrogate_phase9f3b")
+        self.assertTrue(summary["px4_gazebo_generic_setpoint_streamer_requested"])
+        self.assertTrue(summary["px4_gazebo_generic_setpoint_streamer_acknowledged"])
+        self.assertEqual(
+            summary["px4_gazebo_generic_setpoint_streamer_label"],
+            PX4_GAZEBO_GENERIC_SETPOINT_STREAMER_LABEL,
+        )
+        self.assertTrue(summary["phase9f2_fixed_rate_setpoint_stream_satisfied"])
+        self.assertTrue(summary["phase9f3b_generic_setpoint_streamer_satisfied"])
+        streamer_summary = summary["generic_setpoint_streamer_summary"]
+        self.assertIsInstance(streamer_summary, dict)
+        self.assertEqual(streamer_summary["stream_rate_hz"], 20.0)
+        self.assertGreater(streamer_summary["stats"]["autonomy_update_count"], 0)
+        self.assertGreater(streamer_summary["stats"]["emit_count"], 0)
+        self.assertEqual(streamer_summary["stats"]["invalid_update_count"], 0)
+        self.assertEqual(summary["fixed_rate_setpoint_stream_rejection_count"], 0)
+        self.assertEqual(summary["command_send_rejection_count"], 0)
+        self.assertEqual(summary["setpoint_stream_stale_rejection_count"], 0)
+        last_send = summary["last_command_send_result"]
+        self.assertTrue(last_send["generic_setpoint_streamer"])
+        self.assertEqual(
+            last_send["generic_setpoint_streamer_label"],
+            PX4_GAZEBO_GENERIC_SETPOINT_STREAMER_LABEL,
+        )
+        self.assertFalse(last_send["generic_setpoint_streamer_phase4b_satisfied"])
+        self.assertFalse(
+            last_send["generic_setpoint_streamer_competition_readiness_claimed"]
+        )
+        self.assertEqual(
+            len(connection.mav.set_attitude_target_calls),
+            summary["command_sent_count"],
+        )
+        self.assertFalse(summary["phase4b_satisfied"])
+        self.assertFalse(summary["competition_readiness_claimed"])
+
+    def test_phase9f3c_fallback_setpoint_streams_when_autonomy_stale(self):
+        connection = FakeConnection()
+        sender = Px4GazeboSetAttitudeTargetSender(connection=connection)
+        autonomy = OneShotPlanningFakeAutonomy()
+        clock = IncrementingClock(step=0.03)
+        components = build_competition_runtime(
+            CompetitionSetupConfig(mode=CompetitionRunnerMode.COMMAND_DRY_RUN),
+            mavlink_transport=RepeatingFakeMavlinkTransport(
+                summary_data=px4_armed_offboard_summary()
+            ),
+            vision_transport=FakeVisionTransport([b"packet"] * 40),
+            image_adapter=FakeImageAdapter(),
+            autonomy=autonomy,
+            clock=clock,
+        )
+
+        summary = run_competition_main(
+            CompetitionMainConfig(
+                mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                steps=20,
+                live_transports=True,
+                use_real_autonomy=True,
+                real_perception=True,
+                allow_legacy_yolo_default=True,
+                px4_gazebo_full_autonomy_loop=True,
+                ack_px4_gazebo_surrogate_full_autonomy_loop=True,
+                px4_gazebo_command_send=True,
+                ack_px4_gazebo_surrogate_command_send=True,
+                px4_gazebo_continuous_setpoint_stream=True,
+                px4_gazebo_arm=True,
+                ack_px4_gazebo_surrogate_arm=True,
+                px4_gazebo_offboard=True,
+                ack_px4_gazebo_surrogate_offboard=True,
+                px4_gazebo_offboard_prestream_count=5,
+                px4_gazebo_command_max_count=30,
+                px4_gazebo_command_max_age_s=0.001,
+                px4_gazebo_fixed_rate_setpoint_stream=True,
+                ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream=True,
+                px4_gazebo_setpoint_stream_hz=20.0,
+                px4_gazebo_setpoint_stream_burst_limit=2,
+                px4_gazebo_generic_setpoint_streamer=True,
+                ack_px4_gazebo_surrogate_generic_setpoint_streamer=True,
+                px4_gazebo_generic_setpoint_fallback=True,
+                ack_px4_gazebo_surrogate_generic_setpoint_fallback=True,
+                px4_gazebo_generic_fallback_thrust=0.74,
+                evidence_label="px4_gazebo_surrogate_phase9f3c",
+            ),
+            components=components,
+            command_sender=sender,
+            clock=clock,
+            sleep=lambda _seconds: None,
+        ).to_dict()
+
+        self.assertEqual(summary["phase"], PHASE_9F_3C)
+        self.assertEqual(summary["evidence_label"], "px4_gazebo_surrogate_phase9f3c")
+        self.assertTrue(summary["px4_gazebo_generic_setpoint_fallback_requested"])
+        self.assertTrue(summary["px4_gazebo_generic_setpoint_fallback_acknowledged"])
+        self.assertEqual(
+            summary["px4_gazebo_generic_setpoint_fallback_label"],
+            PX4_GAZEBO_GENERIC_SETPOINT_FALLBACK_LABEL,
+        )
+        self.assertEqual(summary["generic_setpoint_fallback_roll_rad"], 0.0)
+        self.assertEqual(summary["generic_setpoint_fallback_pitch_rad"], 0.0)
+        self.assertAlmostEqual(summary["generic_setpoint_fallback_yaw_rad"], 0.25)
+        self.assertEqual(summary["generic_setpoint_fallback_yaw_source"], "current_state")
+        self.assertEqual(summary["generic_setpoint_fallback_thrust"], 0.74)
+        self.assertGreater(summary["generic_setpoint_fallback_update_count"], 0)
+        self.assertEqual(summary["generic_setpoint_fallback_rejection_count"], 0)
+        self.assertEqual(summary["generic_setpoint_fallback_last_rejection"], "")
+        streamer_summary = summary["generic_setpoint_streamer_summary"]
+        self.assertIsInstance(streamer_summary, dict)
+        self.assertTrue(streamer_summary["require_fallback"])
+        self.assertGreater(streamer_summary["stats"]["fallback_update_count"], 0)
+        self.assertGreater(streamer_summary["stats"]["fallback_emit_count"], 0)
+        self.assertEqual(streamer_summary["stats"]["invalid_update_count"], 0)
+        self.assertEqual(summary["fixed_rate_setpoint_stream_rejection_count"], 0)
+        self.assertEqual(summary["command_send_rejection_count"], 0)
+        self.assertEqual(summary["setpoint_stream_stale_rejection_count"], 0)
+        self.assertGreater(summary["command_sent_count"], 0)
+        last_send = summary["last_command_send_result"]
+        self.assertTrue(last_send["generic_setpoint_streamer"])
+        self.assertTrue(last_send["generic_setpoint_fallback"])
+        self.assertEqual(
+            last_send["generic_setpoint_fallback_label"],
+            PX4_GAZEBO_GENERIC_SETPOINT_FALLBACK_LABEL,
+        )
+        self.assertEqual(last_send["stream_source"], "generic_fallback")
+        self.assertEqual(last_send["thrust"], 0.74)
+        self.assertTrue(summary["phase9f3c_fallback_setpoint_satisfied"])
+        self.assertTrue(
+            summary["phase9f3c_success_criteria"][
+                "generic_setpoint_streamer_fallback_emit_count_gt_0"
+            ]
+        )
+        self.assertFalse(summary["phase4b_satisfied"])
+        self.assertFalse(summary["competition_readiness_claimed"])
+
+    def test_phase9f3c_fallback_requires_ack_and_thrust(self):
+        base_kwargs = dict(
+            mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+            live_transports=True,
+            use_real_autonomy=True,
+            real_perception=True,
+            allow_legacy_yolo_default=True,
+            px4_gazebo_full_autonomy_loop=True,
+            ack_px4_gazebo_surrogate_full_autonomy_loop=True,
+            px4_gazebo_command_send=True,
+            ack_px4_gazebo_surrogate_command_send=True,
+            px4_gazebo_continuous_setpoint_stream=True,
+            px4_gazebo_arm=True,
+            ack_px4_gazebo_surrogate_arm=True,
+            px4_gazebo_offboard=True,
+            ack_px4_gazebo_surrogate_offboard=True,
+            px4_gazebo_offboard_prestream_count=5,
+            px4_gazebo_fixed_rate_setpoint_stream=True,
+            ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream=True,
+            px4_gazebo_generic_setpoint_streamer=True,
+            ack_px4_gazebo_surrogate_generic_setpoint_streamer=True,
+            px4_gazebo_generic_setpoint_fallback=True,
+        )
+
+        with self.assertRaisesRegex(CompetitionMainSafetyError, "Phase 9F.3C"):
+            run_competition_main(
+                CompetitionMainConfig(**base_kwargs),
+                components=components_for_mode(
+                    CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    with_vision=True,
+                    autonomy=FakeAutonomy(),
+                ),
+            )
+
+        with self.assertRaisesRegex(CompetitionMainSafetyError, "fallback-thrust"):
+            run_competition_main(
+                CompetitionMainConfig(
+                    **{
+                        **base_kwargs,
+                        "ack_px4_gazebo_surrogate_generic_setpoint_fallback": True,
+                    }
+                ),
+                components=components_for_mode(
+                    CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    with_vision=True,
+                    autonomy=FakeAutonomy(),
+                ),
+            )
+
+    def test_phase9f3b_requires_explicit_generic_streamer_ack(self):
+        with self.assertRaisesRegex(CompetitionMainSafetyError, "Phase 9F.3B"):
+            run_competition_main(
+                CompetitionMainConfig(
+                    mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    live_transports=True,
+                    use_real_autonomy=True,
+                    real_perception=True,
+                    allow_legacy_yolo_default=True,
+                    px4_gazebo_full_autonomy_loop=True,
+                    ack_px4_gazebo_surrogate_full_autonomy_loop=True,
+                    px4_gazebo_command_send=True,
+                    ack_px4_gazebo_surrogate_command_send=True,
+                    px4_gazebo_continuous_setpoint_stream=True,
+                    px4_gazebo_arm=True,
+                    ack_px4_gazebo_surrogate_arm=True,
+                    px4_gazebo_offboard=True,
+                    ack_px4_gazebo_surrogate_offboard=True,
+                    px4_gazebo_offboard_prestream_count=5,
+                    px4_gazebo_fixed_rate_setpoint_stream=True,
+                    ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream=True,
+                    px4_gazebo_generic_setpoint_streamer=True,
+                ),
+                components=components_for_mode(
+                    CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    with_vision=True,
+                    autonomy=FakeAutonomy(),
+                ),
+            )
+
+    def test_phase9f2_requires_explicit_fixed_rate_ack(self):
+        with self.assertRaisesRegex(CompetitionMainSafetyError, "fixed-rate"):
+            run_competition_main(
+                CompetitionMainConfig(
+                    mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    live_transports=True,
+                    use_real_autonomy=True,
+                    real_perception=True,
+                    allow_legacy_yolo_default=True,
+                    px4_gazebo_full_autonomy_loop=True,
+                    ack_px4_gazebo_surrogate_full_autonomy_loop=True,
+                    px4_gazebo_command_send=True,
+                    ack_px4_gazebo_surrogate_command_send=True,
+                    px4_gazebo_continuous_setpoint_stream=True,
+                    px4_gazebo_arm=True,
+                    ack_px4_gazebo_surrogate_arm=True,
+                    px4_gazebo_offboard=True,
+                    ack_px4_gazebo_surrogate_offboard=True,
+                    px4_gazebo_offboard_prestream_count=5,
+                    px4_gazebo_fixed_rate_setpoint_stream=True,
+                ),
+                components=components_for_mode(
+                    CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    with_vision=True,
+                    autonomy=FakeAutonomy(),
+                ),
+            )
+
+    def test_phase9f2_requires_positive_offboard_prestream_count(self):
+        with self.assertRaisesRegex(CompetitionMainSafetyError, "prestream-count"):
+            run_competition_main(
+                CompetitionMainConfig(
+                    mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    live_transports=True,
+                    use_real_autonomy=True,
+                    real_perception=True,
+                    allow_legacy_yolo_default=True,
+                    px4_gazebo_full_autonomy_loop=True,
+                    ack_px4_gazebo_surrogate_full_autonomy_loop=True,
+                    px4_gazebo_command_send=True,
+                    ack_px4_gazebo_surrogate_command_send=True,
+                    px4_gazebo_continuous_setpoint_stream=True,
+                    px4_gazebo_arm=True,
+                    ack_px4_gazebo_surrogate_arm=True,
+                    px4_gazebo_offboard=True,
+                    ack_px4_gazebo_surrogate_offboard=True,
+                    px4_gazebo_fixed_rate_setpoint_stream=True,
+                    ack_px4_gazebo_surrogate_fixed_rate_setpoint_stream=True,
+                ),
+                components=components_for_mode(
+                    CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    with_vision=True,
+                    autonomy=FakeAutonomy(),
+                ),
+            )
+
+    def test_phase9f1_debug_yaw_override_requires_explicit_ack(self):
+        with self.assertRaisesRegex(CompetitionMainSafetyError, "debug yaw override"):
+            run_competition_main(
+                CompetitionMainConfig(
+                    mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    live_transports=True,
+                    use_real_autonomy=True,
+                    real_perception=True,
+                    allow_legacy_yolo_default=True,
+                    px4_gazebo_full_autonomy_loop=True,
+                    ack_px4_gazebo_surrogate_full_autonomy_loop=True,
+                    px4_gazebo_command_send=True,
+                    ack_px4_gazebo_surrogate_command_send=True,
+                    px4_gazebo_continuous_setpoint_stream=True,
+                    px4_gazebo_arm=True,
+                    ack_px4_gazebo_surrogate_arm=True,
+                    px4_gazebo_offboard=True,
+                    ack_px4_gazebo_surrogate_offboard=True,
+                    px4_gazebo_debug_yaw_override_rad=1.57,
+                ),
+                components=components_for_mode(
+                    CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    with_vision=True,
+                    autonomy=FakeAutonomy(),
+                ),
+            )
+
+    def test_phase9f1_debug_yaw_override_requires_full_loop(self):
+        with self.assertRaisesRegex(CompetitionMainSafetyError, "Phase 9F.1"):
+            run_competition_main(
+                CompetitionMainConfig(
+                    mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    live_transports=True,
+                    use_real_autonomy=True,
+                    real_perception=True,
+                    allow_legacy_yolo_default=True,
+                    px4_gazebo_command_send=True,
+                    ack_px4_gazebo_surrogate_command_send=True,
+                    px4_gazebo_debug_yaw_override_rad=1.57,
+                    ack_px4_gazebo_surrogate_debug_yaw_override=True,
+                ),
+                components=components_for_mode(
+                    CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    with_vision=True,
+                    autonomy=FakeAutonomy(),
+                ),
+            )
+
+    def test_phase9f_requires_explicit_full_loop_ack(self):
+        with self.assertRaisesRegex(CompetitionMainSafetyError, "full-autonomy-loop"):
+            run_competition_main(
+                CompetitionMainConfig(
+                    mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    live_transports=True,
+                    use_real_autonomy=True,
+                    real_perception=True,
+                    allow_legacy_yolo_default=True,
+                    px4_gazebo_full_autonomy_loop=True,
+                    px4_gazebo_command_send=True,
+                    ack_px4_gazebo_surrogate_command_send=True,
+                    px4_gazebo_continuous_setpoint_stream=True,
+                    px4_gazebo_arm=True,
+                    ack_px4_gazebo_surrogate_arm=True,
+                    px4_gazebo_offboard=True,
+                    ack_px4_gazebo_surrogate_offboard=True,
+                ),
+                components=components_for_mode(
+                    CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    with_vision=True,
+                    autonomy=FakeAutonomy(),
+                ),
+            )
+
+    def test_phase9f_requires_continuous_setpoint_stream(self):
+        with self.assertRaisesRegex(CompetitionMainSafetyError, "continuous"):
+            run_competition_main(
+                CompetitionMainConfig(
+                    mode=CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    live_transports=True,
+                    use_real_autonomy=True,
+                    real_perception=True,
+                    allow_legacy_yolo_default=True,
+                    px4_gazebo_full_autonomy_loop=True,
+                    ack_px4_gazebo_surrogate_full_autonomy_loop=True,
+                    px4_gazebo_command_send=True,
+                    ack_px4_gazebo_surrogate_command_send=True,
+                    px4_gazebo_arm=True,
+                    ack_px4_gazebo_surrogate_arm=True,
+                    px4_gazebo_offboard=True,
+                    ack_px4_gazebo_surrogate_offboard=True,
+                ),
+                components=components_for_mode(
+                    CompetitionRunnerMode.COMMAND_DRY_RUN,
+                    with_vision=True,
+                    autonomy=FakeAutonomy(),
+                ),
+            )
 
     def test_command_dry_run_builds_candidate_but_sends_nothing(self):
         components = components_for_mode(
