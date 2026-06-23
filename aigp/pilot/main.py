@@ -47,12 +47,63 @@ controller = components["controller"]
 ts_loop = components["ts_loop"]
 mavlink_rx = components["mavlink_rx"]
 vision_rx = components["vision_rx"]
+autonomy_adapter = components["autonomy_adapter"]
+perception_adapter = components["perception_adapter"]
+
+
+def update_autonomy_command():
+    lock = shared_data.get("lock")
+
+    with lock:
+        frame = shared_data.get("latest_frame")
+        attitude = shared_data.get("attitude")
+        imu = shared_data.get("highres_imu")
+        timesync = shared_data.get("timesync")
+        local_position_ned = shared_data.get("local_position_ned")
+        odometry = shared_data.get("odometry")
+        track_gates = shared_data.get("track_gates")
+        latest_perception = shared_data.get("latest_perception")
+
+    if frame is None or attitude is None or imu is None:
+        with lock:
+            shared_data["latest_autonomy_command"] = None
+            shared_data["latest_autonomy_command_wall_time"] = time.time()
+            shared_data["latest_autonomy_command_status"] = "missing_inputs"
+            shared_data["latest_autonomy_active_track_count"] = 0
+        return
+
+    active_track_count = 0
+    try:
+        cmd = autonomy_adapter.update(
+            frame=frame,
+            attitude=attitude,
+            imu=imu,
+            timesync=timesync,
+            local_position_ned=local_position_ned,
+            odometry=odometry,
+            track_gates=track_gates,
+            latest_perception=latest_perception,
+        )
+        active_track_count = int(
+            getattr(autonomy_adapter.autonomy, "active_track_count", 0)
+        )
+        status = "ok"
+    except Exception as exc:
+        cmd = None
+        status = f"error:{exc}"
+
+    with lock:
+        shared_data["latest_autonomy_command"] = cmd
+        shared_data["latest_autonomy_command_wall_time"] = time.time()
+        shared_data["latest_autonomy_command_status"] = status
+        shared_data["latest_autonomy_active_track_count"] = active_track_count
 
 
 if RUNNER_MODE == "px4":
     print("Priming PX4 Offboard stream...", flush=True)
 
     for _ in range(100):  # 2 seconds at 50 Hz
+        update_autonomy_command()
         controller.update()
 
     print("Switching to OFFBOARD...", flush=True)
@@ -63,7 +114,7 @@ if RUNNER_MODE == "px4":
 
 elif RUNNER_MODE == "competition":
     # Competition/fake-sim mode should not use PX4 OFFBOARD.
-    # The PyAIPilotExample includes arm(), so keep it here for compatibility.
+    # The pilot includes arm(), so keep it here for compatibility.
     # If the real competition sim ignores this, that is okay.
     print("Competition mode: arming and streaming commands without PX4 OFFBOARD.", flush=True)
     controller.arm()
@@ -75,6 +126,7 @@ try:
     next_print = time.time()
 
     while True:
+        update_autonomy_command()
         controller.update()
 
         if time.time() >= next_print:
@@ -84,6 +136,10 @@ try:
                 has_attitude = "attitude" in shared_data
                 has_imu = "highres_imu" in shared_data
                 has_frame = "latest_frame" in shared_data
+                has_perception = shared_data.get("latest_perception") is not None
+                has_command = shared_data.get("latest_autonomy_command") is not None
+                command_status = shared_data.get("latest_autonomy_command_status", "unknown")
+                perception_status = shared_data.get("latest_perception_status", "unknown")
                 counts = dict(shared_data.get("mavlink_message_counts", {}))
 
             print(
@@ -91,6 +147,10 @@ try:
                 has_attitude,
                 has_imu,
                 has_frame,
+                has_perception,
+                has_command,
+                command_status,
+                perception_status,
                 counts,
                 flush=True,
             )
@@ -114,6 +174,7 @@ finally:
         ("timesync", ts_loop),
         ("mavlink_rx", mavlink_rx),
         ("vision_rx", vision_rx),
+        ("perception_adapter", perception_adapter),
     ]:
         thread = component.get_thread_for_join()
         if thread is not None:

@@ -153,7 +153,7 @@ class RuntimeCompetitionConfig:
 
 @dataclass(frozen=True)
 class PyAIPilotExampleReferenceConfig:
-    """Read-only reference-code defaults from third_party/PyAIPilotExample."""
+    """Read-only reference-code defaults from third_party/pilot."""
 
     mavlink_default_ip: str = "127.0.0.1"
     mavlink_default_udp_port: int = 14550

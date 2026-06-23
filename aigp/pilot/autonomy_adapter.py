@@ -3,6 +3,8 @@ from typing import Any, Literal, Optional
 
 import numpy as np
 
+from autonomy_wrapper import PyAIPilotAutonomyAPI
+
 
 @dataclass
 class AttitudeCommand:
@@ -44,15 +46,22 @@ class AutonomyInputSnapshot:
     pos_neu: Optional[np.ndarray]
     vel_neu: Optional[np.ndarray]
 
+    # Optional race track data
+    track_gates: Optional[list[dict[str, Any]]]
+
+    # Optional perception landmarks
+    latest_perception: Optional[dict[str, Any]]
+
     # Optional timing
     timesync: Optional[dict[str, Any]]
 
 
 class AutonomyAdapter:
     def __init__(self):
-        # Later:
-        # from autonomy_core.launch.autonomy_api6 import AutonomyAPI
-        # self.autonomy = AutonomyAPI(use_perception=True, race_gate_count=...)
+        self.autonomy = PyAIPilotAutonomyAPI(
+            use_perception=True,
+            race_gate_count=3,
+        )
         self.last_snapshot: Optional[AutonomyInputSnapshot] = None
 
     @staticmethod
@@ -71,6 +80,9 @@ class AutonomyAdapter:
         imu,
         timesync=None,
         local_position_ned=None,
+        odometry=None,
+        track_gates=None,
+        latest_perception=None,
     ) -> AutonomyInputSnapshot:
         image_bgr = frame["image"]
 
@@ -100,8 +112,13 @@ class AutonomyAdapter:
         vel_ned = None
         pos_neu = None
         vel_neu = None
+        if odometry is not None:
+            pos_ned = self._vec3(odometry.get("pos_ned"))
+            vel_ned = self._vec3(odometry.get("vel_ned"))
+            pos_neu = self._vec3(odometry.get("pos_neu"))
+            vel_neu = self._vec3(odometry.get("vel_neu"))
 
-        if local_position_ned is not None:
+        elif local_position_ned is not None:
             pos_ned = self._vec3(local_position_ned.get("pos_ned"))
             vel_ned = self._vec3(local_position_ned.get("vel_ned"))
             pos_neu = self._vec3(local_position_ned.get("pos_neu"))
@@ -157,10 +174,22 @@ class AutonomyAdapter:
             pos_neu=pos_neu,
             vel_neu=vel_neu,
 
+            track_gates=track_gates,
+            latest_perception=latest_perception,
             timesync=timesync,
         )
 
-    def update(self, frame, attitude, imu, timesync=None, local_position_ned=None):
+    def update(
+        self,
+        frame,
+        attitude,
+        imu,
+        timesync=None,
+        local_position_ned=None,
+        odometry=None,
+        track_gates=None,
+        latest_perception=None,
+    ):
         """
         Platform-neutral autonomy update.
 
@@ -180,17 +209,21 @@ class AutonomyAdapter:
             imu=imu,
             timesync=timesync,
             local_position_ned=local_position_ned,
+            odometry=odometry,
+            track_gates=track_gates,
+            latest_perception=latest_perception,
         )
 
         self.last_snapshot = snapshot
 
-        # Temporary debug command.
-        # Later replace this section with:
-        #   snapshot -> telemetry object -> AutonomyAPI -> command
+        cmd = self.autonomy.update(snapshot)
+        if cmd is None:
+            return None
+
         return AttitudeCommand(
             kind="attitude",
-            roll_deg=0.0,
-            pitch_deg=0.0,
-            yaw_deg=np.degrees(snapshot.yaw_rad),
-            thrust=0.75,
+            roll_deg=float(np.degrees(cmd.roll_rad)),
+            pitch_deg=float(np.degrees(cmd.pitch_rad)),
+            yaw_deg=float(np.degrees(cmd.yaw_rad)),
+            thrust=float(cmd.thrust),
         )

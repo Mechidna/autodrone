@@ -4,6 +4,8 @@ from vision_rx import VisionRX
 from mavlink_rx import MAVLinkRX
 from controller import Controller
 from ros_camera_rx import RosCameraRX
+from autonomy_adapter import AutonomyAdapter
+from perception_adapter import PerceptionAdapter
 import os
 
 def setup_components(shared_data, system_boot_ms, server_ip, server_udp_port):
@@ -44,6 +46,8 @@ def setup_components(shared_data, system_boot_ms, server_ip, server_udp_port):
     # -------------------------------
     # Main control loop
     # -------------------------------
+    perception_adapter = PerceptionAdapter(shared_data)
+    autonomy_adapter = AutonomyAdapter()
     controller = Controller(sim_conn, shared_data, system_boot_ms)
 
     return {
@@ -51,5 +55,7 @@ def setup_components(shared_data, system_boot_ms, server_ip, server_udp_port):
         'mavlink_rx': mavlink_rx,
         'ts_loop': ts_loop,
         'sim_conn': sim_conn,
-        'controller': controller
+        'controller': controller,
+        'autonomy_adapter': autonomy_adapter,
+        'perception_adapter': perception_adapter,
     }

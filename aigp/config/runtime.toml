@@ -1,0 +1,71 @@
+# Runtime profile for aigp/pilot.
+# This file is intentionally not wired into main.py yet.
+
+profile = "py_aipilot_example"
+
+[runtime]
+runner_mode = "px4"              # px4 | competition
+use_perception = true
+race_gate_count = 3
+control_hz = 50
+
+[mavlink]
+ip = "127.0.0.1"
+port_px4 = 14540
+port_competition = 14550
+target_system = 1
+target_component = 1
+
+[telemetry]
+prefer_odometry = false
+require_local_position = true
+max_state_age_s = 0.5
+store_highres_imu = true
+store_timesync = true
+
+[vision]
+source = "udp"                   # udp | ros
+udp_bind_ip = "0.0.0.0"
+udp_port = 5600
+ros_camera_topic = "/camera"
+ros_camera_info_topic = "/camera_info"
+
+[camera.competition]
+width = 640
+height = 360
+fx = 320.0
+fy = 320.0
+cx = 320.0
+cy = 180.0
+dist_coeffs = [0.0, 0.0, 0.0, 0.0, 0.0]
+
+[perception]
+enabled = true
+gate_size_m = 1.5
+yolo_model_path = "/home/paolo/datasets/gazebo_gate_yolo_pose_ab_runs/partial/weights/best.pt"
+preprocess_mode = "raw"
+yolo_conf = 0.1
+yolo_imgsz = 640
+yolo_device = 0
+transform_mode = "physical_direct_rad_x_mirror"
+world_pose_source = "mavsdk"
+
+[planner]
+safe_min_target_z = 1.0
+safe_max_target_z = 3.0
+pass_radius_m = 1.25
+replan_min_interval_s = 0.3
+max_detection_range_m = 25.0
+
+[controller]
+kp = [2.5, 2.5, 3.5]
+kv = [2.0, 2.0, 2.6]
+thrust_hover = 0.74
+thrust_min = 0.60
+thrust_max = 0.85
+max_tilt_deg = 20.0
+max_yaw_rate_deg_s = 90.0
+
+[command]
+type = "set_attitude_target"
+stream_hz = 50

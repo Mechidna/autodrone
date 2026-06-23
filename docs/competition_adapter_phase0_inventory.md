@@ -39,9 +39,9 @@ Commands requested by the plan were run before file edits:
 ```bash
 git status --short
 git branch --show-current
-git status --short -- third_party/PyAIPilotExample || true
-git diff --name-only -- third_party/PyAIPilotExample || true
-git diff --cached --name-only -- third_party/PyAIPilotExample || true
+git status --short -- third_party/pilot || true
+git diff --name-only -- third_party/pilot || true
+git diff --cached --name-only -- third_party/pilot || true
 ```
 
 Observed output summary:

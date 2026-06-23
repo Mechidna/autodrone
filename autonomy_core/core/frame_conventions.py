@@ -120,6 +120,45 @@ def body_frd_to_internal_body_flu_rotmat() -> np.ndarray:
     )
 
 
+def body_frd_to_local_ned_rotmat(
+    roll_rad: float,
+    pitch_rad: float,
+    yaw_rad: float,
+) -> np.ndarray:
+    """MAVLink body-FRD to local-NED rotation from MAVLink attitude RPY."""
+
+    roll = float(roll_rad)
+    pitch = float(pitch_rad)
+    yaw = float(yaw_rad)
+
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+
+    return np.array(
+        [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ],
+        dtype=float,
+    )
+
+
+def local_ned_to_neu(point_ned: np.ndarray) -> np.ndarray:
+    """Convert a local NED 3-vector to the internal positive-up NEU frame."""
+
+    point = np.asarray(point_ned, dtype=float).reshape(3)
+    return np.array([point[0], point[1], -point[2]], dtype=float)
+
+
+def local_neu_to_ned(point_neu: np.ndarray) -> np.ndarray:
+    """Convert an internal positive-up NEU 3-vector to local NED."""
+
+    point = np.asarray(point_neu, dtype=float).reshape(3)
+    return np.array([point[0], point[1], -point[2]], dtype=float)
+
+
 def official_camera_to_internal_body_flu_rotmat(
     config: RuntimeCompetitionConfig = VADR_TS_002,
 ) -> np.ndarray:
@@ -174,8 +213,11 @@ __all__ = [
     "MAVLINK_LOCAL_NED",
     "OPENCV_CAMERA_OPTICAL",
     "body_frd_to_internal_body_flu_rotmat",
+    "body_frd_to_local_ned_rotmat",
     "body_frd_point_to_camera_optical",
     "camera_translation_body_frd",
+    "local_ned_to_neu",
+    "local_neu_to_ned",
     "mavlink_body_frd_to_opencv_camera_rotmat",
     "official_body_frd_to_camera_rotmat",
     "official_camera_matrix",
