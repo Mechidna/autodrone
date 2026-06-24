@@ -1,18 +1,25 @@
-import os
 import threading
 import time
 
 from perception_wrapper import PerceptionWrapper
+from runtime_config import load_runtime_config
 
 
 class PerceptionAdapter:
-    def __init__(self, data, hz=None):
+    def __init__(self, data, hz=None, config=None):
         self.data = data
-        self.hz = float(hz if hz is not None else os.getenv("PERCEPTION_HZ", "30"))
+        self.config = config if config is not None else load_runtime_config()
+        self.enabled = bool(self.config.perception.enabled)
+        self.hz = float(hz if hz is not None else self.config.perception.hz)
         self.period_s = 1.0 / max(1.0, self.hz)
-        self.adapter = PerceptionWrapper()
-        self.is_running = True
         self.last_processed_frame_id = None
+        self.thread = None
+        self.is_running = False
+        if not self.enabled:
+            self._write_status("disabled")
+            return
+        self.adapter = PerceptionWrapper(config=self.config)
+        self.is_running = True
         self.thread = threading.Thread(
             target=self._loop,
             daemon=False,

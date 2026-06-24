@@ -1,32 +1,21 @@
-import os
 import time
 import threading
 
 from setup import setup_components
+from runtime_config import load_runtime_config
 
 
-RUNNER_MODE = os.getenv("RUNNER_MODE", "px4").lower()
-
-if RUNNER_MODE not in ("px4", "competition"):
-    raise RuntimeError(
-        f"Invalid RUNNER_MODE={RUNNER_MODE}. "
-        "Use RUNNER_MODE=px4 or RUNNER_MODE=competition."
-    )
-
-SIM_SERVER_UDP_IP = os.getenv("MAVLINK_IP", "127.0.0.1")
-
-if RUNNER_MODE == "px4":
-    default_udp_port = 14540
-else:
-    default_udp_port = 14550
-
-SIM_SERVER_UDP_PORT = int(os.getenv("MAVLINK_PORT", str(default_udp_port)))
+CONFIG = load_runtime_config()
+RUNNER_MODE = CONFIG.runtime.runner_mode
+SIM_SERVER_UDP_IP = CONFIG.mavlink.ip
+SIM_SERVER_UDP_PORT = CONFIG.mavlink.port_for_mode(RUNNER_MODE)
 
 print(
     f"Starting main.py with "
     f"RUNNER_MODE={RUNNER_MODE}, "
-    f"VISION_SOURCE={os.getenv('VISION_SOURCE', 'udp')}, "
-    f"MAVLINK={SIM_SERVER_UDP_IP}:{SIM_SERVER_UDP_PORT}",
+    f"VISION_SOURCE={CONFIG.vision.source}, "
+    f"MAVLINK={SIM_SERVER_UDP_IP}:{SIM_SERVER_UDP_PORT}, "
+    f"CONFIG={CONFIG.path}",
     flush=True,
 )
 
@@ -39,8 +28,7 @@ shared_data = {
 components = setup_components(
     shared_data,
     system_boot_ms,
-    SIM_SERVER_UDP_IP,
-    SIM_SERVER_UDP_PORT,
+    CONFIG,
 )
 
 controller = components["controller"]
@@ -100,24 +88,26 @@ def update_autonomy_command():
 
 
 if RUNNER_MODE == "px4":
-    print("Priming PX4 Offboard stream...", flush=True)
+    if CONFIG.runtime.px4_offboard_enabled:
+        print("Priming PX4 Offboard stream...", flush=True)
 
-    for _ in range(100):  # 2 seconds at 50 Hz
-        update_autonomy_command()
-        controller.update()
+        for _ in range(CONFIG.runtime.px4_offboard_prime_count):
+            update_autonomy_command()
+            controller.update()
 
-    print("Switching to OFFBOARD...", flush=True)
-    controller.set_mode("OFFBOARD")
+        print(f"Switching to {CONFIG.runtime.px4_offboard_mode}...", flush=True)
+        controller.set_mode(CONFIG.runtime.px4_offboard_mode)
 
-    print("Arming drone...", flush=True)
-    controller.arm()
+    if CONFIG.runtime.px4_arm:
+        print("Arming drone...", flush=True)
+        controller.arm()
 
 elif RUNNER_MODE == "competition":
-    # Competition/fake-sim mode should not use PX4 OFFBOARD.
-    # The pilot includes arm(), so keep it here for compatibility.
-    # If the real competition sim ignores this, that is okay.
-    print("Competition mode: arming and streaming commands without PX4 OFFBOARD.", flush=True)
-    controller.arm()
+    if CONFIG.runtime.competition_arm:
+        print("Competition mode: arming and streaming commands without PX4 OFFBOARD.", flush=True)
+        controller.arm()
+    else:
+        print("Competition mode: streaming commands without PX4 OFFBOARD or arm.", flush=True)
 
 
 print("Starting control loop...", flush=True)
@@ -155,7 +145,7 @@ try:
                 flush=True,
             )
 
-            next_print = time.time() + 1.0
+            next_print = time.time() + CONFIG.runtime.flow_status_period_s
 
 except KeyboardInterrupt:
     print("Stopping...", flush=True)
@@ -165,7 +155,7 @@ except KeyboardInterrupt:
         if hasattr(controller, "land"):
             try:
                 controller.land()
-                time.sleep(2.0)
+                time.sleep(CONFIG.runtime.shutdown_land_wait_s)
             except Exception as exc:
                 print(f"Landing request failed: {exc}", flush=True)
 
@@ -178,6 +168,6 @@ finally:
     ]:
         thread = component.get_thread_for_join()
         if thread is not None:
-            thread.join(timeout=1.0)
+            thread.join(timeout=CONFIG.runtime.join_timeout_s)
 
     print("Client exited!", flush=True)

@@ -723,7 +723,7 @@ class CompetitionMainSummary:
                 sorted(self.phase9f3c_success_criteria.items())
             ),
             "competition_readiness_claimed": self.competition_readiness_claimed,
-            "notes": list(self.notes),
+            "notes.txt": list(self.notes),
         }
 
 

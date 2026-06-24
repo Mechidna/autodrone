@@ -1,13 +1,19 @@
 # Runtime profile for aigp/pilot.
-# This file is intentionally not wired into main.py yet.
 
 profile = "py_aipilot_example"
 
 [runtime]
 runner_mode = "px4"              # px4 | competition
 use_perception = true
-race_gate_count = 3
 control_hz = 50
+flow_status_period_s = 1.0
+join_timeout_s = 1.0
+shutdown_land_wait_s = 2.0
+px4_offboard_enabled = true
+px4_offboard_prime_count = 100
+px4_offboard_mode = "OFFBOARD"
+px4_arm = true
+competition_arm = true
 
 [mavlink]
 ip = "127.0.0.1"
@@ -23,10 +29,19 @@ max_state_age_s = 0.5
 store_highres_imu = true
 store_timesync = true
 
+[timesync]
+request_hz = 10
+
 [vision]
 source = "udp"                   # udp | ros
 udp_bind_ip = "0.0.0.0"
 udp_port = 5600
+udp_socket_timeout_s = 0.1
+udp_recv_bytes = 65536
+packet_header_format = "<IHHIIQ"
+max_pending_frames = 8
+stale_frame_timeout_s = 0.5
+max_jpeg_size_bytes = 4000000
 ros_camera_topic = "/camera"
 ros_camera_info_topic = "/camera_info"
 
@@ -41,6 +56,8 @@ dist_coeffs = [0.0, 0.0, 0.0, 0.0, 0.0]
 
 [perception]
 enabled = true
+backend = "yolo"                 # blue | orange | yolo
+hz = 30
 gate_size_m = 1.5
 yolo_model_path = "/home/paolo/datasets/gazebo_gate_yolo_pose_ab_runs/partial/weights/best.pt"
 preprocess_mode = "raw"
@@ -49,23 +66,74 @@ yolo_imgsz = 640
 yolo_device = 0
 transform_mode = "physical_direct_rad_x_mirror"
 world_pose_source = "mavsdk"
+max_reprojection_error_for_memory = 20.0
+reject_negative_depth = true
+
+[gate_memory]
+association_radius = 1.5
+commit_radius = 1.5
+new_track_block_radius = 4.5
+min_confidence_per_hit = 0.2
+commit_hits = 4
+commit_confidence_sum = 1.2
+commit_spread_radius = 1.0
+stale_time = 3.0
+alpha = 0.35
+use_lookahead_gate_filter = true
+history_size = 15
+min_hits_for_stable = 6
+max_center_std_for_stable = 0.45
+max_camera_std_for_stable = 0.45
+max_reprojection_error_for_stable = 5.0
+max_outlier_distance = 0.75
+max_committed_match_distance = 0.8
+min_observation_time = 0.25
+
+[race]
+gate_count = 3
+pass_radius_m = 1.25
+clear_radius_m = 1.75
+debounce_s = 0.75
+expected_gate_altitude_m = 1.5
+active_target_lost_grace_s = 2.0
 
 [planner]
+vmax = 2.5
+amax = 2.0
+t_min = 1.0
 safe_min_target_z = 1.0
 safe_max_target_z = 3.0
-pass_radius_m = 1.25
+target_z_mode = "observed_clamped" # observed_clamped | expected
+replan_target_shift_m = 1.0
+replan_after_trajectory_s = 0.25
 replan_min_interval_s = 0.3
 max_detection_range_m = 25.0
 
 [controller]
+mass = 1.0
+gravity = 9.81
 kp = [2.5, 2.5, 3.5]
 kv = [2.0, 2.0, 2.6]
+max_acc_xy = 2.0
+max_acc_z_up = 2.5
+max_acc_z_down = 2.0
 thrust_hover = 0.74
 thrust_min = 0.60
 thrust_max = 0.85
+fallback_thrust = 0.74
 max_tilt_deg = 20.0
 max_yaw_rate_deg_s = 90.0
+command_print_period_s = 1.0
 
 [command]
 type = "set_attitude_target"
 stream_hz = 50
+max_hz = 100
+
+[hover]
+stale_after_s = 1.0
+takeoff_alt_m = 1.5
+takeoff_window_s = 10.0
+stationary_speed_m_s = 0.05
+near_ground_abs_z_m = 0.25
+post_race_hold_mode = "position_hold"

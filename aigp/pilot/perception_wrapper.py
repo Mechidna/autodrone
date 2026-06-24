@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import math
-import os
 import time
-import tomllib
-from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
@@ -17,10 +14,7 @@ from autonomy_core.core.frame_conventions import (
     local_neu_to_ned,
     official_camera_to_body_frd_rotmat,
 )
-
-
-DEFAULT_CAMERA_MATRIX = np.array(VADR_TS_002.camera_matrix, dtype=float)
-DEFAULT_DIST_COEFFS = np.array(VADR_TS_002.dist_coeffs, dtype=float)
+from runtime_config import load_runtime_config
 
 
 class PerceptionWrapper:
@@ -36,33 +30,35 @@ class PerceptionWrapper:
         yolo_imgsz: Optional[int] = None,
         yolo_device: Optional[int | str] = None,
         preprocess_mode: Optional[str] = None,
+        config=None,
     ):
-        self.camera_matrix = self._matrix3(camera_matrix, DEFAULT_CAMERA_MATRIX)
-        self.dist_coeffs = self._dist_coeffs(dist_coeffs, DEFAULT_DIST_COEFFS)
-
-        config = self._load_runtime_config()
-        perception_config = config.get("perception", {})
+        self.config = config if config is not None else load_runtime_config()
+        perception_config = self.config.perception
+        self.transform_mode = str(perception_config.transform_mode)
+        self.world_pose_source = str(perception_config.world_pose_source)
+        self.camera_matrix = self._matrix3(camera_matrix, self.config.camera.matrix)
+        self.dist_coeffs = self._dist_coeffs(dist_coeffs, self.config.camera.dist_coeffs)
 
         if backend is None:
-            backend = os.getenv("PERCEPTION_BACKEND", "blue")
+            backend = perception_config.backend
         self.backend = str(backend).lower()
 
         if gate_perception is None:
             gate_perception = self._create_gate_perception(
                 yolo_model_path=yolo_model_path
-                or os.getenv("YOLO_MODEL_PATH")
-                or perception_config.get("yolo_model_path"),
+                or perception_config.yolo_model_path,
                 yolo_conf=yolo_conf
                 if yolo_conf is not None
-                else perception_config.get("yolo_conf", 0.1),
+                else perception_config.yolo_conf,
                 yolo_imgsz=yolo_imgsz
                 if yolo_imgsz is not None
-                else perception_config.get("yolo_imgsz", 640),
+                else perception_config.yolo_imgsz,
                 yolo_device=yolo_device
                 if yolo_device is not None
-                else perception_config.get("yolo_device"),
+                else perception_config.yolo_device,
                 preprocess_mode=preprocess_mode
-                or perception_config.get("preprocess_mode", "raw"),
+                or perception_config.preprocess_mode,
+                gate_size_m=perception_config.gate_size_m,
             )
 
         self.gate_perception = gate_perception
@@ -73,14 +69,6 @@ class PerceptionWrapper:
             getattr(self.gate_perception, "model_points", VADR_TS_002.gate_inner_object_points_m),
             dtype=float,
         ).reshape(4, 3)
-
-    @staticmethod
-    def _load_runtime_config() -> dict[str, Any]:
-        config_path = Path(__file__).resolve().parents[1] / "config" / "runtime.toml"
-        if not config_path.exists():
-            return {}
-        with config_path.open("rb") as f:
-            return tomllib.load(f)
 
     @staticmethod
     def _matrix3(value, default) -> np.ndarray:
@@ -102,12 +90,13 @@ class PerceptionWrapper:
         yolo_imgsz: int,
         yolo_device: Optional[int | str],
         preprocess_mode: str,
+        gate_size_m: float,
     ):
         if self.backend in ("yolo", "pose", "yolo_pose"):
             from autonomy_core.perception.gate_perception_yolo import GatePerception
 
             return GatePerception(
-                gate_size=VADR_TS_002.gate_inner_square_m,
+                gate_size=float(gate_size_m),
                 yolo_model_path=yolo_model_path,
                 yolo_conf=float(yolo_conf),
                 yolo_imgsz=int(yolo_imgsz),
@@ -121,7 +110,7 @@ class PerceptionWrapper:
             return GatePerception(gate_size=VADR_TS_002.gate_outer_square_m)
 
         if self.backend not in ("blue", "hsv", "hsv_blue"):
-            raise ValueError(f"Unsupported PERCEPTION_BACKEND={self.backend!r}")
+            raise ValueError(f"Unsupported perception.backend={self.backend!r}")
 
         from autonomy_core.perception.gate_perception import GatePerception
 
@@ -185,6 +174,8 @@ class PerceptionWrapper:
             "camera_translation_body": self.camera_translation_body.copy(),
             "world_frame": "mavlink_local_ned_projected_to_neu",
             "body_frame": "mavlink_body_frd",
+            "transform_mode": self.transform_mode,
+            "world_pose_source": self.world_pose_source,
             "detections": [],
         }
 
@@ -323,7 +314,9 @@ class PerceptionWrapper:
         out["drone_rpy_rad_mavlink"] = np.asarray(drone_rpy_rad, dtype=float).reshape(3).copy()
         out["camera_to_body_matrix_used"] = self.camera_to_body.copy()
         out["camera_translation_body_used"] = self.camera_translation_body.copy()
-        out["body_to_world_method_used"] = "mavlink_body_frd_to_local_ned_to_neu"
+        out["body_to_world_method_used"] = (
+            f"mavlink_body_frd_to_local_ned_to_neu:{self.transform_mode}"
+        )
 
         gate_normal_camera = self._vec3(out.get("gate_normal_camera"), default=None)
         if gate_normal_camera is not None:

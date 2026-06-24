@@ -3,6 +3,7 @@ import math
 
 from pymavlink import mavutil
 from hover_hold import HoverHold
+from runtime_config import load_runtime_config
 
 # --------------------------------------------------------------------------------------
 # RESET COMMAND
@@ -49,7 +50,7 @@ def euler_to_quaternion(roll, pitch, yaw):
 
     return [w, x, y, z]
 
-def get_latest_autonomy_command(data):
+def get_latest_autonomy_command(data, print_period_s=1.0):
     lock = data.get("lock") if isinstance(data, dict) else None
 
     if lock is not None:
@@ -65,7 +66,7 @@ def get_latest_autonomy_command(data):
     if not hasattr(get_latest_autonomy_command, "last_cmd_print_time"):
         get_latest_autonomy_command.last_cmd_print_time = 0.0
 
-    if now - get_latest_autonomy_command.last_cmd_print_time >= 1.0:
+    if now - get_latest_autonomy_command.last_cmd_print_time >= float(print_period_s):
         if cmd is None:
             print(
                 "controller command:",
@@ -85,11 +86,13 @@ def get_latest_autonomy_command(data):
 
     return cmd
 
-def get_latest_attitude_command(data):
-    cmd = get_latest_autonomy_command(data)
+def get_latest_attitude_command(data, fallback_thrust=None, print_period_s=1.0):
+    cmd = get_latest_autonomy_command(data, print_period_s=print_period_s)
 
     if cmd is None:
-        return 0.0, 0.0, 0.0, 0.74
+        if fallback_thrust is None:
+            fallback_thrust = load_runtime_config().controller.fallback_thrust
+        return 0.0, 0.0, 0.0, float(fallback_thrust)
 
     return cmd.roll_deg, cmd.pitch_deg, cmd.yaw_deg, cmd.thrust
 
@@ -121,8 +124,18 @@ def send_attitude_angle_flight_control(mavlink_conn, system_boot_ms, roll_deg, p
         max(0.0, min(1.0, thrust))
     )
 
-def update_attitude_angle_flight_control(mavlink_conn, system_boot_ms, data):
-    roll_deg, pitch_deg, yaw_deg, thrust = get_latest_attitude_command(data)
+def update_attitude_angle_flight_control(
+    mavlink_conn,
+    system_boot_ms,
+    data,
+    fallback_thrust=None,
+    print_period_s=1.0,
+):
+    roll_deg, pitch_deg, yaw_deg, thrust = get_latest_attitude_command(
+        data,
+        fallback_thrust=fallback_thrust,
+        print_period_s=print_period_s,
+    )
     send_attitude_angle_flight_control(
         mavlink_conn,
         system_boot_ms,
@@ -223,21 +236,33 @@ def update_position_flight_control(mavlink_conn, system_boot_ms):
         0.0             # ignored yaw rate
     )
 
-# --------------------------------------------------------------------------------------
-# Control Loop
-# --------------------------------------------------------------------------------------
-
-CONTROL_HZ = 50
-
 class Controller:
-    def __init__(self, sim_conn, data, system_boot_ms):
+    def __init__(self, sim_conn, data, system_boot_ms, config=None):
         self.sim_conn = sim_conn
         self.data = data
         self.system_boot_ms = system_boot_ms
-        self.hover_hold = HoverHold()
+        self.config = config if config is not None else load_runtime_config()
+        if self.config.command.type != "set_attitude_target":
+            raise RuntimeError(
+                f"Unsupported command.type={self.config.command.type!r}; "
+                "pilot controller currently supports 'set_attitude_target'."
+            )
+        self.control_hz = float(self.config.command.stream_hz)
+        self.fallback_thrust = float(self.config.controller.fallback_thrust)
+        self.command_print_period_s = float(self.config.controller.command_print_period_s)
+        self.hover_hold = HoverHold(
+            stale_after_s=self.config.hover.stale_after_s,
+            takeoff_alt_m=self.config.hover.takeoff_alt_m,
+            takeoff_window_s=self.config.hover.takeoff_window_s,
+            stationary_speed_m_s=self.config.hover.stationary_speed_m_s,
+            near_ground_abs_z_m=self.config.hover.near_ground_abs_z_m,
+        )
 
     def update(self):
-        cmd = get_latest_autonomy_command(self.data)
+        cmd = get_latest_autonomy_command(
+            self.data,
+            print_period_s=self.command_print_period_s,
+        )
 
         if cmd is None:
             if not self.hover_hold.update_and_send(self.sim_conn, self.system_boot_ms, self.data):
@@ -247,7 +272,7 @@ class Controller:
                     0.0,
                     0.0,
                     0.0,
-                    0.74,
+                    self.fallback_thrust,
                 )
         else:
             self.hover_hold.reset()
@@ -264,7 +289,7 @@ class Controller:
         # update_position_flight_control(self.sim_conn, self.system_boot_ms)
         # update_motor_control(self.sim_conn, self.system_boot_ms)
 
-        time.sleep(1.0 / CONTROL_HZ)
+        time.sleep(1.0 / max(1.0, self.control_hz))
 
     # -------------------------------
     # Arm the drone

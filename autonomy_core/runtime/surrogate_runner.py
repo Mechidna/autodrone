@@ -224,7 +224,7 @@ class SurrogateRunnerSummary:
             "runner_events": list(self.runner_events),
             "phase4b_satisfied": self.phase4b_satisfied,
             "competition_readiness_claimed": self.competition_readiness_claimed,
-            "notes": list(self.notes),
+            "notes.txt": list(self.notes),
         }
 
 

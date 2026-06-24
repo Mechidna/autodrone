@@ -8,14 +8,18 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image, CameraInfo
 from cv_bridge import CvBridge
 
-
-ROS_CAMERA_TOPIC = "/camera"
-ROS_CAMERA_INFO_TOPIC = "/camera_info"
+from runtime_config import load_runtime_config
 
 
 class RosCameraNode(Node):
-    def __init__(self, data, camera_topic=ROS_CAMERA_TOPIC, camera_info_topic=ROS_CAMERA_INFO_TOPIC):
+    def __init__(self, data, camera_topic=None, camera_info_topic=None):
         super().__init__("ros_camera_rx_node")
+
+        config = load_runtime_config()
+        if camera_topic is None:
+            camera_topic = config.vision.ros_camera_topic
+        if camera_info_topic is None:
+            camera_info_topic = config.vision.ros_camera_info_topic
 
         self.data = data
         self.bridge = CvBridge()
@@ -130,8 +134,8 @@ class RosCameraRX:
     def __init__(
         self,
         data,
-        camera_topic=ROS_CAMERA_TOPIC,
-        camera_info_topic=ROS_CAMERA_INFO_TOPIC,
+        camera_topic=None,
+        camera_info_topic=None,
         init_rclpy=True,
     ):
         self.data = data

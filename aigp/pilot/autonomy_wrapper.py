@@ -16,17 +16,7 @@ from autonomy_core.planning.minimum_snap_planner_multi_time_optimized import (
 )
 from autonomy_core.planning.trajectory_manager import allocate_segment_times
 from autonomy_core.perception.gate_memory import GateMemory
-
-
-DEFAULT_CAMERA_MATRIX = np.array(
-    [
-        [320.0, 0.0, 320.0],
-        [0.0, 320.0, 180.0],
-        [0.0, 0.0, 1.0],
-    ],
-    dtype=float,
-)
-DEFAULT_DIST_COEFFS = np.zeros(5, dtype=float)
+from runtime_config import load_runtime_config
 
 
 @dataclass(frozen=True)
@@ -51,60 +41,109 @@ class PyAIPilotAutonomyAPI:
 
     def __init__(
         self,
-        use_perception: bool = False,
-        race_gate_count: int = 3,
-        pass_radius_m: float = 1.25,
+        use_perception: bool | None = None,
+        race_gate_count: int | None = None,
+        pass_radius_m: float | None = None,
+        config=None,
     ):
-        self.use_perception = bool(use_perception)
-        self.pass_radius_m = float(pass_radius_m)
-        self.camera_matrix = DEFAULT_CAMERA_MATRIX.copy()
-        self.dist_coeffs = DEFAULT_DIST_COEFFS.copy()
+        self.config = config if config is not None else load_runtime_config()
+        self.use_perception = (
+            self.config.runtime.use_perception
+            if use_perception is None
+            else bool(use_perception)
+        )
+        self.pass_radius_m = (
+            float(self.config.race.pass_radius_m)
+            if pass_radius_m is None
+            else float(pass_radius_m)
+        )
+        self.camera_matrix = np.asarray(self.config.camera.matrix, dtype=float).reshape(3, 3)
+        self.dist_coeffs = np.asarray(self.config.camera.dist_coeffs, dtype=float).reshape(-1)
+        self.race_gate_count = (
+            self.config.race.gate_count
+            if race_gate_count is None
+            else int(race_gate_count)
+        )
+        if self.race_gate_count is not None:
+            self.race_gate_count = int(self.race_gate_count)
 
         self.gate_centers_neu = []
+        self.gate_track_ids = []
+        self._candidate_gate_track_ids = []
         self._last_gate_signature = None
         self.active_track_count = 0
 
         self.current_gate_idx = 0
         self.current_gate_pos = None
+        self.active_target_track_id = None
+        self.last_active_target_center = None
+        self.active_target_lost_time = None
+        self.active_target_lost_grace_s = float(self.config.race.active_target_lost_grace_s)
+        self.race_order_track_ids = []
+        self.completed_track_ids = set()
         self.active_waypoints = None
         self.active_times = None
         self.last_planned_gate_idx = -1
         self.trajectory_start_time = 0.0
         self.last_desired_yaw = 0.0
-        self.replan_target_shift_m = 1.0
-        self.replan_after_trajectory_s = 0.25
+        self.replan_target_shift_m = float(self.config.planner.replan_target_shift_m)
+        self.replan_after_trajectory_s = float(self.config.planner.replan_after_trajectory_s)
+        self.replan_min_interval_s = float(self.config.planner.replan_min_interval_s)
+        self.last_plan_wall_time = 0.0
+        self.planner_vmax = float(self.config.planner.vmax)
+        self.planner_amax = float(self.config.planner.amax)
+        self.planner_t_min = float(self.config.planner.t_min)
+        self.safe_min_target_z = float(self.config.planner.safe_min_target_z)
+        self.safe_max_target_z = float(self.config.planner.safe_max_target_z)
+        self.target_z_mode = str(self.config.planner.target_z_mode).lower()
+        self.expected_gate_altitude_m = float(self.config.race.expected_gate_altitude_m)
+        self.max_detection_range_m = float(self.config.planner.max_detection_range_m)
+        self.max_reprojection_error_for_memory = float(
+            self.config.perception.max_reprojection_error_for_memory
+        )
+        self.reject_negative_depth = bool(self.config.perception.reject_negative_depth)
+        gate_memory_config = self.config.gate_memory
         self.gate_memory = GateMemory(
-            association_radius=1.5,
-            commit_radius=1.5,
-            new_track_block_radius=4.5,
-            min_confidence_per_hit=0.2,
-            commit_hits=4,
-            commit_confidence_sum=1.2,
-            stale_time=3.0,
-            alpha=0.35,
-            min_hits_for_stable=6,
-            max_center_std_for_stable=0.45,
-            max_camera_std_for_stable=0.45,
-            max_reprojection_error_for_stable=5.0,
+            association_radius=gate_memory_config.association_radius,
+            commit_radius=gate_memory_config.commit_radius,
+            new_track_block_radius=gate_memory_config.new_track_block_radius,
+            min_confidence_per_hit=gate_memory_config.min_confidence_per_hit,
+            commit_hits=gate_memory_config.commit_hits,
+            commit_confidence_sum=gate_memory_config.commit_confidence_sum,
+            commit_spread_radius=gate_memory_config.commit_spread_radius,
+            stale_time=gate_memory_config.stale_time,
+            alpha=gate_memory_config.alpha,
+            use_lookahead_gate_filter=gate_memory_config.use_lookahead_gate_filter,
+            history_size=gate_memory_config.history_size,
+            min_hits_for_stable=gate_memory_config.min_hits_for_stable,
+            max_center_std_for_stable=gate_memory_config.max_center_std_for_stable,
+            max_camera_std_for_stable=gate_memory_config.max_camera_std_for_stable,
+            max_reprojection_error_for_stable=gate_memory_config.max_reprojection_error_for_stable,
+            max_outlier_distance=gate_memory_config.max_outlier_distance,
+            min_observation_time=gate_memory_config.min_observation_time,
+        )
+        self.gate_memory.max_committed_match_distance = (
+            gate_memory_config.max_committed_match_distance
         )
         self._last_gate_memory_frame_key = None
         self._last_stable_gate_print_signature = None
+        self._last_race_order_print_signature = None
         self._last_trace_print_time = 0.0
         self._trace_period_s = 0.5
 
         self.planner = MultiSegmentMinimumSnapPlanner()
         self.tracker = RPGHighLevelTracker(
-            mass=1.0,
-            gravity=9.81,
-            kp=(2.5, 2.5, 3.5),
-            kv=(2.0, 2.0, 2.6),
-            max_tilt_deg=20.0,
-            max_acc_xy=2.0,
-            max_acc_z_up=2.5,
-            max_acc_z_down=2.0,
-            thrust_hover=0.74,
-            thrust_min=0.60,
-            thrust_max=0.85,
+            mass=self.config.controller.mass,
+            gravity=self.config.controller.gravity,
+            kp=self.config.controller.kp,
+            kv=self.config.controller.kv,
+            max_tilt_deg=self.config.controller.max_tilt_deg,
+            max_acc_xy=self.config.controller.max_acc_xy,
+            max_acc_z_up=self.config.controller.max_acc_z_up,
+            max_acc_z_down=self.config.controller.max_acc_z_down,
+            thrust_hover=self.config.controller.thrust_hover,
+            thrust_min=self.config.controller.thrust_min,
+            thrust_max=self.config.controller.thrust_max,
         )
 
     def update(self, snapshot) -> AutonomyCommandRad | None:
@@ -206,6 +245,7 @@ class PyAIPilotAutonomyAPI:
         print(
             "autonomy_trace "
             f"gate_idx={self.current_gate_idx} "
+            f"active_track={self.active_target_track_id} "
             f"tracks={self.active_track_count} "
             f"tau={tau:.2f}/{float(self.planner.total_time):.2f} "
             f"dist={dist_txt} "
@@ -223,19 +263,28 @@ class PyAIPilotAutonomyAPI:
         if not self.gate_centers_neu:
             return False
 
-        target = self.gate_centers_neu[
-            min(self.current_gate_idx, len(self.gate_centers_neu) - 1)
-        ].copy()
-        if target[2] < 1.0:
-            target[2] = 1.0
+        target_idx = int(self.current_gate_idx)
+        if target_idx < 0 or target_idx >= len(self.gate_centers_neu):
+            return False
+
+        target = self._apply_target_z_policy(self.gate_centers_neu[target_idx])
+
+        self.active_target_track_id = (
+            self.gate_track_ids[target_idx]
+            if target_idx < len(self.gate_track_ids)
+            else None
+        )
+        if self.active_target_track_id is not None:
+            self.last_active_target_center = target.copy()
+            self.active_target_lost_time = None
 
         waypoints = np.vstack([pos, target])
         times = allocate_segment_times(
             waypoints,
             current_vel=vel,
-            vmax=2.5,
-            amax=2.0,
-            T_min=1.0,
+            vmax=self.planner_vmax,
+            amax=self.planner_amax,
+            T_min=self.planner_t_min,
         )
 
         self.planner = MultiSegmentMinimumSnapPlanner()
@@ -254,25 +303,49 @@ class PyAIPilotAutonomyAPI:
         self.active_waypoints = waypoints.copy()
         self.active_times = np.asarray(times, dtype=float).copy()
         self.trajectory_start_time = time.time()
+        self.last_plan_wall_time = self.trajectory_start_time
         self.last_planned_gate_idx = int(self.current_gate_idx)
         return True
 
+    def _apply_target_z_policy(self, target) -> np.ndarray:
+        out = np.asarray(target, dtype=float).reshape(3).copy()
+        if self.target_z_mode in ("expected", "expected_altitude", "fixed_expected"):
+            out[2] = self.expected_gate_altitude_m
+        else:
+            out[2] = float(
+                np.clip(
+                    out[2],
+                    self.safe_min_target_z,
+                    self.safe_max_target_z,
+                )
+            )
+        return out
+
     def _advance_gate_if_needed(self, pos: np.ndarray) -> bool:
-        if not self.gate_centers_neu:
+        if self.current_gate_pos is None and not self.gate_centers_neu:
             return False
-        if self.current_gate_idx >= len(self.gate_centers_neu) - 1:
+        if (
+            self.race_gate_count is not None
+            and self.current_gate_idx >= self.race_gate_count
+        ):
             return False
 
-        target = (
-            self.current_gate_pos
-            if self.current_gate_pos is not None
-            else self.gate_centers_neu[self.current_gate_idx]
-        )
+        if self.current_gate_pos is not None:
+            target = self.current_gate_pos
+        elif 0 <= self.current_gate_idx < len(self.gate_centers_neu):
+            target = self.gate_centers_neu[self.current_gate_idx]
+        else:
+            return False
         distance = float(np.linalg.norm(pos - target))
         if distance >= self.pass_radius_m:
             return False
 
+        if self.active_target_track_id is not None:
+            self.completed_track_ids.add(int(self.active_target_track_id))
         self.current_gate_idx += 1
+        self.active_target_track_id = None
+        self.last_active_target_center = None
+        self.active_target_lost_time = None
         self.active_waypoints = None
         self.active_times = None
         return True
@@ -282,9 +355,10 @@ class PyAIPilotAutonomyAPI:
             return True
         if self.active_waypoints is None or self.planner.total_time <= 0.0:
             return True
-        elapsed = time.time() - self.trajectory_start_time
+        now = time.time()
+        elapsed = now - self.trajectory_start_time
         if elapsed > float(self.planner.total_time) + self.replan_after_trajectory_s:
-            return True
+            return now - self.last_plan_wall_time >= self.replan_min_interval_s
         return self.last_planned_gate_idx != self.current_gate_idx
 
     def _desired_yaw(
@@ -322,23 +396,211 @@ class PyAIPilotAutonomyAPI:
         if isinstance(latest_perception, dict):
             self._update_gate_memory(latest_perception)
 
+        pos = np.asarray(snapshot.pos_neu, dtype=float).reshape(3)
+        committed_tracks = self.gate_memory.get_committed_tracks()
+        committed_by_id = {int(track.id): track for track in committed_tracks}
         stable_tracks = self.gate_memory.get_stable_tracks()
-        if not stable_tracks:
-            return []
+        self._refresh_perception_race_order(
+            stable_tracks=stable_tracks,
+            committed_by_id=committed_by_id,
+            current_pos=pos,
+        )
 
-        gates = [track.center.copy() for track in stable_tracks]
-        signature = tuple(
-            (track.id, *self._rounded_gate(track.center, decimals=2))
+        gates, track_ids = self._ordered_perception_gates(committed_by_id)
+        self._candidate_gate_track_ids = list(track_ids)
+
+        stable_signature = tuple(
+            (int(track.id), *self._rounded_gate(track.center, decimals=2))
             for track in stable_tracks
         )
-        if signature != self._last_stable_gate_print_signature:
+        if stable_signature != self._last_stable_gate_print_signature:
             coords = " ".join(
                 f"id={track.id}:({track.center[0]:.2f}, {track.center[1]:.2f}, {track.center[2]:.2f})"
                 for track in stable_tracks
             )
             print(f"autonomy_wrapper stable perception gates NEU: {coords}", flush=True)
-            self._last_stable_gate_print_signature = signature
+            self._last_stable_gate_print_signature = stable_signature
+
+        race_signature = tuple(
+            (track_id, *self._rounded_gate(gate, decimals=2))
+            for track_id, gate in zip(track_ids, gates)
+        )
+        if race_signature != self._last_race_order_print_signature:
+            coords = " ".join(
+                f"id={track_id}:({gate[0]:.2f}, {gate[1]:.2f}, {gate[2]:.2f})"
+                for track_id, gate in zip(track_ids, gates)
+            )
+            print(
+                f"autonomy_wrapper race order gates NEU: {coords}",
+                flush=True,
+            )
+            self._last_race_order_print_signature = race_signature
+
         return gates
+
+    def _refresh_perception_race_order(
+        self,
+        stable_tracks,
+        committed_by_id: dict[int, object],
+        current_pos: np.ndarray,
+    ) -> None:
+        current_pos = np.asarray(current_pos, dtype=float).reshape(3)
+
+        accepted_ids = []
+        for track_id in self.race_order_track_ids:
+            track_id = int(track_id)
+            if track_id in committed_by_id and track_id not in accepted_ids:
+                accepted_ids.append(track_id)
+
+        for track in stable_tracks:
+            track_id = int(track.id)
+            if track_id in self.completed_track_ids:
+                continue
+            if track_id in accepted_ids:
+                continue
+            if (
+                self.race_gate_count is not None
+                and len(accepted_ids) >= self.race_gate_count
+            ):
+                break
+            accepted_ids.append(track_id)
+
+        prefix_len = min(max(int(self.current_gate_idx), 0), len(accepted_ids))
+        completed_prefix = accepted_ids[:prefix_len]
+        candidate_ids = [
+            track_id
+            for track_id in accepted_ids[prefix_len:]
+            if track_id not in self.completed_track_ids
+        ]
+
+        active_id = self.active_target_track_id
+        if active_id is not None:
+            active_id = int(active_id)
+
+        if active_id is not None and active_id in committed_by_id:
+            if active_id not in candidate_ids and active_id not in completed_prefix:
+                candidate_ids.insert(0, active_id)
+        elif active_id is not None:
+            active_id = None
+
+        ordered_suffix = self._order_track_ids_by_progress(
+            candidate_ids=candidate_ids,
+            current_pos=current_pos,
+            committed_by_id=committed_by_id,
+            active_id=active_id,
+        )
+
+        order = completed_prefix + ordered_suffix
+        if self.race_gate_count is not None:
+            order = order[: self.race_gate_count]
+        self.race_order_track_ids = order
+
+        if (
+            self.active_target_track_id is None
+            and 0 <= self.current_gate_idx < len(self.race_order_track_ids)
+        ):
+            self.active_target_track_id = self.race_order_track_ids[self.current_gate_idx]
+
+    def _order_track_ids_by_progress(
+        self,
+        candidate_ids: list[int],
+        current_pos: np.ndarray,
+        committed_by_id: dict[int, object],
+        active_id,
+    ) -> list[int]:
+        unique_ids = []
+        for track_id in candidate_ids:
+            track_id = int(track_id)
+            if track_id in committed_by_id and track_id not in unique_ids:
+                unique_ids.append(track_id)
+        if not unique_ids:
+            return []
+
+        current_pos = np.asarray(current_pos, dtype=float).reshape(3)
+
+        def center_for(track_id: int) -> np.ndarray:
+            return np.asarray(committed_by_id[int(track_id)].center, dtype=float).reshape(3)
+
+        if active_id is not None and int(active_id) in unique_ids:
+            first_id = int(active_id)
+        else:
+            first_id = min(
+                unique_ids,
+                key=lambda track_id: (
+                    float(np.linalg.norm(center_for(track_id) - current_pos)),
+                    int(track_id),
+                ),
+            )
+
+        rest = [track_id for track_id in unique_ids if track_id != first_id]
+        if not rest:
+            return [first_id]
+
+        first_center = center_for(first_id)
+        farthest_id = max(
+            rest,
+            key=lambda track_id: float(np.linalg.norm(center_for(track_id) - current_pos)),
+        )
+        course = center_for(farthest_id) - first_center
+        norm = float(np.linalg.norm(course))
+        if norm < 1e-6:
+            course = first_center - current_pos
+            norm = float(np.linalg.norm(course))
+        if norm < 1e-6:
+            rest.sort(
+                key=lambda track_id: (
+                    float(np.linalg.norm(center_for(track_id) - current_pos)),
+                    int(track_id),
+                )
+            )
+            return [first_id] + rest
+        course = course / norm
+
+        if float(np.dot(first_center - current_pos, course)) < 0.0:
+            course = -course
+
+        rest.sort(
+            key=lambda track_id: (
+                float(np.dot(center_for(track_id) - current_pos, course)),
+                float(np.linalg.norm(center_for(track_id) - current_pos)),
+                int(track_id),
+            )
+        )
+        return [first_id] + rest
+
+    def _ordered_perception_gates(
+        self,
+        committed_by_id: dict[int, object],
+    ) -> tuple[list[np.ndarray], list[int]]:
+        gates = []
+        track_ids = []
+        now = time.time()
+
+        for track_id in self.race_order_track_ids:
+            track_id = int(track_id)
+            center = None
+            track = committed_by_id.get(track_id)
+            if track is not None:
+                center = np.asarray(track.center, dtype=float).reshape(3).copy()
+                if track_id == self.active_target_track_id:
+                    self.last_active_target_center = center.copy()
+                    self.active_target_lost_time = None
+            elif (
+                track_id == self.active_target_track_id
+                and self.last_active_target_center is not None
+            ):
+                if self.active_target_lost_time is None:
+                    self.active_target_lost_time = now
+                if now - self.active_target_lost_time <= self.active_target_lost_grace_s:
+                    center = self.last_active_target_center.copy()
+
+            if center is None or not np.all(np.isfinite(center)):
+                continue
+
+            gates.append(center)
+            track_ids.append(track_id)
+
+        return gates, track_ids
 
     def _update_gate_memory(self, latest_perception: dict) -> None:
         frame_key = self._perception_frame_key(latest_perception)
@@ -372,11 +634,25 @@ class PyAIPilotAutonomyAPI:
                 np.nan,
                 allow_nan=True,
             )
+            if (
+                math.isfinite(reprojection_error)
+                and reprojection_error > self.max_reprojection_error_for_memory
+            ):
+                continue
+
             center_camera = detection.get("gate_center_camera")
             if center_camera is not None:
                 center_camera = np.asarray(center_camera, dtype=float)
                 if center_camera.shape != (3,) or not np.all(np.isfinite(center_camera)):
                     center_camera = None
+            if center_camera is not None:
+                if self.reject_negative_depth and float(center_camera[2]) <= 0.0:
+                    continue
+                if (
+                    self.max_detection_range_m > 0.0
+                    and float(np.linalg.norm(center_camera)) > self.max_detection_range_m
+                ):
+                    continue
 
             self.gate_memory.add_detection(
                 center=arr.copy(),
@@ -411,9 +687,11 @@ class PyAIPilotAutonomyAPI:
     def _track_gates_from_snapshot(self, snapshot) -> list[np.ndarray]:
         track_gates = getattr(snapshot, "track_gates", None)
         if not track_gates:
+            self._candidate_gate_track_ids = []
             return []
 
         gates = []
+        track_ids = []
         for gate in sorted(track_gates, key=self._track_gate_sort_key):
             position = gate.get("position_neu")
             if position is None and gate.get("position_ned") is not None:
@@ -425,11 +703,20 @@ class PyAIPilotAutonomyAPI:
             arr = np.asarray(position, dtype=float)
             if arr.shape == (3,) and np.all(np.isfinite(arr)):
                 gates.append(arr.copy())
+                track_ids.append(self._int_or_default(gate.get("gate_id"), len(track_ids)))
 
+        self._candidate_gate_track_ids = track_ids
         return gates
 
     def _install_gate_centers(self, gates: list[np.ndarray]) -> None:
-        signature = self._gate_signature(gates)
+        track_ids = list(self._candidate_gate_track_ids)
+        if len(track_ids) != len(gates):
+            track_ids = [None] * len(gates)
+
+        signature = (
+            int(self.current_gate_idx),
+            self._gate_signature(gates, track_ids),
+        )
         if signature == self._last_gate_signature:
             return
 
@@ -447,20 +734,26 @@ class PyAIPilotAutonomyAPI:
             np.asarray(gate, dtype=float).reshape(3).copy()
             for gate in gates
         ]
-        self.active_track_count = len(self.gate_centers_neu)
-        self.current_gate_idx = min(
-            int(self.current_gate_idx),
-            max(0, len(self.gate_centers_neu) - 1),
+        self.gate_track_ids = list(track_ids)
+        self.current_gate_idx = max(0, int(self.current_gate_idx))
+        if self.race_gate_count is not None:
+            self.current_gate_idx = min(self.current_gate_idx, self.race_gate_count)
+        self.active_track_count = max(
+            0,
+            len(self.gate_centers_neu) - self.current_gate_idx,
         )
         next_target = (
             self.gate_centers_neu[self.current_gate_idx].copy()
-            if self.gate_centers_neu
+            if 0 <= self.current_gate_idx < len(self.gate_centers_neu)
             else None
         )
         self._last_gate_signature = signature
 
         if next_target is None:
             self.current_gate_pos = None
+            self.active_target_track_id = None
+            self.last_active_target_center = None
+            self.active_target_lost_time = None
             self.active_waypoints = None
             self.active_times = None
             self.last_planned_gate_idx = -1
@@ -479,13 +772,25 @@ class PyAIPilotAutonomyAPI:
 
         if should_replan:
             self.current_gate_pos = next_target.copy()
+            self.active_target_track_id = (
+                self.gate_track_ids[self.current_gate_idx]
+                if self.current_gate_idx < len(self.gate_track_ids)
+                else None
+            )
+            if self.active_target_track_id is not None:
+                self.last_active_target_center = next_target.copy()
             self.active_waypoints = None
             self.active_times = None
             self.last_planned_gate_idx = -1
 
     @classmethod
-    def _gate_signature(cls, gates: list[np.ndarray]) -> tuple:
-        return tuple(cls._rounded_gate(gate, decimals=1) for gate in gates)
+    def _gate_signature(cls, gates: list[np.ndarray], track_ids=None) -> tuple:
+        if track_ids is None or len(track_ids) != len(gates):
+            track_ids = [None] * len(gates)
+        return tuple(
+            (track_id, *cls._rounded_gate(gate, decimals=1))
+            for track_id, gate in zip(track_ids, gates)
+        )
 
     @staticmethod
     def _rounded_gate(gate, decimals: int) -> tuple[float, float, float]:

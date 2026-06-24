@@ -6,14 +6,60 @@ import time
 import cv2
 import numpy as np
 
-# Modify these properties if you want to run the server remotely for example
-SIM_SERVER_UDP_IP = "0.0.0.0"
-SIM_SERVER_UDP_PORT = 5600
+from runtime_config import load_runtime_config
 
 class VisionRX:
 
-    def __init__(self, data):
+    def __init__(
+        self,
+        data,
+        bind_ip=None,
+        port=None,
+        socket_timeout_s=None,
+        recv_bytes=None,
+        header_format=None,
+        max_pending_frames=None,
+        stale_frame_timeout_s=None,
+        max_jpeg_size_bytes=None,
+        expected_width=None,
+        expected_height=None,
+    ):
+        config = load_runtime_config()
         self.data = data
+        self.bind_ip = str(config.vision.udp_bind_ip if bind_ip is None else bind_ip)
+        self.port = int(config.vision.udp_port if port is None else port)
+        self.socket_timeout_s = float(
+            config.vision.udp_socket_timeout_s
+            if socket_timeout_s is None
+            else socket_timeout_s
+        )
+        self.recv_bytes = int(config.vision.udp_recv_bytes if recv_bytes is None else recv_bytes)
+        self.header_format = str(
+            config.vision.packet_header_format
+            if header_format is None
+            else header_format
+        )
+        self.max_pending_frames = int(
+            config.vision.max_pending_frames
+            if max_pending_frames is None
+            else max_pending_frames
+        )
+        self.stale_frame_timeout_s = float(
+            config.vision.stale_frame_timeout_s
+            if stale_frame_timeout_s is None
+            else stale_frame_timeout_s
+        )
+        self.max_jpeg_size_bytes = int(
+            config.vision.max_jpeg_size_bytes
+            if max_jpeg_size_bytes is None
+            else max_jpeg_size_bytes
+        )
+        self.expected_width = int(
+            config.camera.width if expected_width is None else expected_width
+        )
+        self.expected_height = int(
+            config.camera.height if expected_height is None else expected_height
+        )
         self.thread = threading.Thread(
             target=self._vision_loop,
             daemon=False
@@ -26,19 +72,20 @@ class VisionRX:
         return self.thread
 
     def _vision_loop(self):
-        header_format = "<IHHIIQ"
+        header_format = self.header_format
         header_sz = struct.calcsize(header_format)
         frames = {}  # frame_id -> received associated frame data
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.bind((SIM_SERVER_UDP_IP, SIM_SERVER_UDP_PORT))
-        print("Listening for camera frames...")
-        sock.settimeout(0.1)
+        sock.bind((self.bind_ip, self.port))
+        print(f"Listening for camera frames on {self.bind_ip}:{self.port}...")
+        sock.settimeout(self.socket_timeout_s)
 
         while self.is_running:
             try:
-                packet, addr = sock.recvfrom(65536)
+                packet, addr = sock.recvfrom(self.recv_bytes)
             except socket.timeout:
+                self._prune_stale_frames(frames)
                 continue
 
             if len(packet) < header_sz:
@@ -65,15 +112,23 @@ class VisionRX:
             if payload_size != len(payload):
                 continue
 
+            if self.max_jpeg_size_bytes > 0 and jpeg_size > self.max_jpeg_size_bytes:
+                continue
+
             if frame_id not in frames:
                 frames[frame_id] = {
                     "chunks": {},
                     "total": total_chunks,
                     "size": jpeg_size,
-                    "time": sim_time_ns
+                    "time": sim_time_ns,
+                    "first_seen_wall_time": time.time(),
                 }
 
             frames[frame_id]["chunks"][chunk_id] = payload
+            self._prune_stale_frames(frames)
+            self._limit_pending_frames(frames)
+            if frame_id not in frames:
+                continue
 
             # Check if frame is complete
             if len(frames[frame_id]["chunks"]) == total_chunks:
@@ -103,11 +158,54 @@ class VisionRX:
                 image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
                 if image is not None:
-                    self.process_frame(frame_id, image, sim_time_ns)
+                    if self._valid_image_shape(image):
+                        self.process_frame(frame_id, image, sim_time_ns)
                 else:
                     print(f"Failed to decode frame: {frame_id}")
 
                 del frames[frame_id]
+
+    def _prune_stale_frames(self, frames):
+        if self.stale_frame_timeout_s <= 0.0:
+            return
+        now = time.time()
+        stale_ids = [
+            frame_id
+            for frame_id, frame in frames.items()
+            if now - float(frame.get("first_seen_wall_time", now)) > self.stale_frame_timeout_s
+        ]
+        for frame_id in stale_ids:
+            frames.pop(frame_id, None)
+
+    def _limit_pending_frames(self, frames):
+        if self.max_pending_frames <= 0:
+            return
+        while len(frames) > self.max_pending_frames:
+            oldest_frame_id = min(
+                frames,
+                key=lambda frame_id: float(
+                    frames[frame_id].get("first_seen_wall_time", 0.0)
+                ),
+            )
+            frames.pop(oldest_frame_id, None)
+
+    def _valid_image_shape(self, image):
+        if self.expected_width is None and self.expected_height is None:
+            return True
+        height, width = image.shape[:2]
+        if self.expected_width is not None and width != self.expected_width:
+            print(
+                f"Unexpected camera width frame={width}, expected {self.expected_width}",
+                flush=True,
+            )
+            return False
+        if self.expected_height is not None and height != self.expected_height:
+            print(
+                f"Unexpected camera height frame={height}, expected {self.expected_height}",
+                flush=True,
+            )
+            return False
+        return True
 
     def process_frame(self, frame_id, img, sim_time_ns=None):
         """

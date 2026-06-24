@@ -125,7 +125,7 @@ class SurrogateVisionBridgeSummary:
             "phase4b_satisfied": self.phase4b_satisfied,
             "phase9_satisfied": self.phase9_satisfied,
             "competition_readiness_claimed": self.competition_readiness_claimed,
-            "notes": list(self.notes),
+            "notes.txt": list(self.notes),
             "errors": list(self.errors),
         }
 

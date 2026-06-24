@@ -4,6 +4,7 @@ from typing import Any, Literal, Optional
 import numpy as np
 
 from autonomy_wrapper import PyAIPilotAutonomyAPI
+from runtime_config import load_runtime_config
 
 
 @dataclass
@@ -57,10 +58,13 @@ class AutonomyInputSnapshot:
 
 
 class AutonomyAdapter:
-    def __init__(self):
+    def __init__(self, config=None):
+        self.config = config if config is not None else load_runtime_config()
         self.autonomy = PyAIPilotAutonomyAPI(
-            use_perception=True,
-            race_gate_count=3,
+            use_perception=self.config.runtime.use_perception,
+            race_gate_count=self.config.race.gate_count,
+            pass_radius_m=self.config.race.pass_radius_m,
+            config=self.config,
         )
         self.last_snapshot: Optional[AutonomyInputSnapshot] = None
 
@@ -112,34 +116,35 @@ class AutonomyAdapter:
         vel_ned = None
         pos_neu = None
         vel_neu = None
-        if odometry is not None:
-            pos_ned = self._vec3(odometry.get("pos_ned"))
-            vel_ned = self._vec3(odometry.get("vel_ned"))
-            pos_neu = self._vec3(odometry.get("pos_neu"))
-            vel_neu = self._vec3(odometry.get("vel_neu"))
-
-        elif local_position_ned is not None:
-            pos_ned = self._vec3(local_position_ned.get("pos_ned"))
-            vel_ned = self._vec3(local_position_ned.get("vel_ned"))
-            pos_neu = self._vec3(local_position_ned.get("pos_neu"))
-            vel_neu = self._vec3(local_position_ned.get("vel_neu"))
+        position_sources = (
+            (odometry, local_position_ned)
+            if self.config.telemetry.prefer_odometry
+            else (local_position_ned, odometry)
+        )
+        for source in position_sources:
+            if source is None:
+                continue
+            pos_ned = self._vec3(source.get("pos_ned"))
+            vel_ned = self._vec3(source.get("vel_ned"))
+            pos_neu = self._vec3(source.get("pos_neu"))
+            vel_neu = self._vec3(source.get("vel_neu"))
 
             # Fallback if aliases are missing
             if pos_ned is None:
                 pos_ned = np.array(
                     [
-                        local_position_ned.get("x", 0.0),
-                        local_position_ned.get("y", 0.0),
-                        local_position_ned.get("z", 0.0),
+                        source.get("x", 0.0),
+                        source.get("y", 0.0),
+                        source.get("z", 0.0),
                     ],
                     dtype=float,
                 )
             if vel_ned is None:
                 vel_ned = np.array(
                     [
-                        local_position_ned.get("vx", 0.0),
-                        local_position_ned.get("vy", 0.0),
-                        local_position_ned.get("vz", 0.0),
+                        source.get("vx", 0.0),
+                        source.get("vy", 0.0),
+                        source.get("vz", 0.0),
                     ],
                     dtype=float,
                 )
@@ -147,6 +152,8 @@ class AutonomyAdapter:
                 pos_neu = np.array([pos_ned[0], pos_ned[1], -pos_ned[2]], dtype=float)
             if vel_neu is None and vel_ned is not None:
                 vel_neu = np.array([vel_ned[0], vel_ned[1], -vel_ned[2]], dtype=float)
+            if pos_ned is not None or pos_neu is not None:
+                break
 
         return AutonomyInputSnapshot(
             image_bgr=image_bgr,

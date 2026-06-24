@@ -7,15 +7,16 @@ TIMESYNC_REQUEST_HZ = 10
 
 class TimeSync:
 
-    def __init__(self, mavlink_connection, data):
+    def __init__(self, mavlink_connection, data, hz=TIMESYNC_REQUEST_HZ):
         self.mavlink_conn = mavlink_connection
         self.data = data
+        self.hz = float(hz)
         self.thread = None
         self.is_running = False
 
     @classmethod
-    def create_timesync(cls, mavlink_connection, data):
-        ts = cls(mavlink_connection, data)
+    def create_timesync(cls, mavlink_connection, data, hz=TIMESYNC_REQUEST_HZ):
+        ts = cls(mavlink_connection, data, hz=hz)
         ts.thread = threading.Thread(
             target=ts.timesync_loop,
             daemon = False
@@ -35,4 +36,4 @@ class TimeSync:
                 now,  # tc1 = client time
                 0     # ts1 = 0 (request)
             )
-            time.sleep(1.0 / TIMESYNC_REQUEST_HZ)
+            time.sleep(1.0 / max(1.0, self.hz))
