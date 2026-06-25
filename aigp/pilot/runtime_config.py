@@ -56,11 +56,20 @@ class StateEstimationSection:
     use_imu_prediction: bool
     use_vision_correction: bool
     vision_correction_source: str
+    allow_known_gate_correction: bool
     max_imu_dt_s: float
     max_state_age_s: float
     vision_correction_alpha: float
+    vision_correction_alpha_xy: float
+    vision_correction_alpha_z: float
+    vision_correction_max_delta_m: float
     vision_correction_max_residual_m: float
     vision_correction_min_confidence: float
+    estimator_landmark_min_hits: int
+    estimator_landmark_min_observation_time_s: float
+    estimator_landmark_max_center_std_m: float
+    estimator_landmark_max_camera_std_m: float
+    estimator_landmark_max_reprojection_error: float
     known_gate_positions_neu: tuple[tuple[float, float, float], ...]
     gravity_m_s2: float
     max_imu_accel_m_s2: float
@@ -120,6 +129,8 @@ class PerceptionSection:
     transform_mode: str
     world_pose_source: str
     max_reprojection_error_for_memory: float
+    min_depth_m_for_memory: float
+    max_depth_m_for_memory: float
     reject_negative_depth: bool
 
 
@@ -220,6 +231,8 @@ class HoverAcquisitionSection:
     accel_deadband_m_s2: float
     target_vz_m_s: float
     max_up_vz_m_s: float
+    max_relative_z_m: float
+    max_settle_vz_m_s: float
     min_duration_s: float
     max_duration_s: float
     stable_duration_s: float
@@ -229,6 +242,9 @@ class HoverAcquisitionSection:
     lift_confirm_vz_m_s: float
     relative_airborne_z_m: float
     min_confidence: float
+    overshoot_thrust_step_per_s: float
+    reset_hover_on_disarm: bool
+    release_on_timeout_while_unstable: bool
     print_period_s: float
 
 
@@ -353,8 +369,13 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             vision_correction_source=_str(
                 state_estimation_raw,
                 "vision_correction_source",
-                "known_gates",
+                "stable_tracks",
             ).lower(),
+            allow_known_gate_correction=_bool(
+                state_estimation_raw,
+                "allow_known_gate_correction",
+                False,
+            ),
             max_imu_dt_s=_float(state_estimation_raw, "max_imu_dt_s", 0.05),
             max_state_age_s=_float(
                 state_estimation_raw,
@@ -364,7 +385,22 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             vision_correction_alpha=_float(
                 state_estimation_raw,
                 "vision_correction_alpha",
-                0.25,
+                0.10,
+            ),
+            vision_correction_alpha_xy=_float(
+                state_estimation_raw,
+                "vision_correction_alpha_xy",
+                _float(state_estimation_raw, "vision_correction_alpha", 0.10),
+            ),
+            vision_correction_alpha_z=_float(
+                state_estimation_raw,
+                "vision_correction_alpha_z",
+                0.0,
+            ),
+            vision_correction_max_delta_m=_float(
+                state_estimation_raw,
+                "vision_correction_max_delta_m",
+                0.5,
             ),
             vision_correction_max_residual_m=_float(
                 state_estimation_raw,
@@ -375,6 +411,31 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 state_estimation_raw,
                 "vision_correction_min_confidence",
                 0.2,
+            ),
+            estimator_landmark_min_hits=_int(
+                state_estimation_raw,
+                "estimator_landmark_min_hits",
+                12,
+            ),
+            estimator_landmark_min_observation_time_s=_float(
+                state_estimation_raw,
+                "estimator_landmark_min_observation_time_s",
+                0.75,
+            ),
+            estimator_landmark_max_center_std_m=_float(
+                state_estimation_raw,
+                "estimator_landmark_max_center_std_m",
+                0.25,
+            ),
+            estimator_landmark_max_camera_std_m=_float(
+                state_estimation_raw,
+                "estimator_landmark_max_camera_std_m",
+                0.25,
+            ),
+            estimator_landmark_max_reprojection_error=_float(
+                state_estimation_raw,
+                "estimator_landmark_max_reprojection_error",
+                2.5,
             ),
             known_gate_positions_neu=tuple(
                 _vec3_tuple(item)
@@ -427,7 +488,17 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             max_reprojection_error_for_memory=_float(
                 perception_raw,
                 "max_reprojection_error_for_memory",
-                20.0,
+                5.0,
+            ),
+            min_depth_m_for_memory=_float(
+                perception_raw,
+                "min_depth_m_for_memory",
+                0.5,
+            ),
+            max_depth_m_for_memory=_float(
+                perception_raw,
+                "max_depth_m_for_memory",
+                _float(planner_raw, "max_detection_range_m", 25.0),
             ),
             reject_negative_depth=_bool(perception_raw, "reject_negative_depth", True),
         ),
@@ -436,28 +507,28 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             commit_radius=_float(gate_memory_raw, "commit_radius", 1.5),
             new_track_block_radius=_float(gate_memory_raw, "new_track_block_radius", 4.5),
             min_confidence_per_hit=_float(gate_memory_raw, "min_confidence_per_hit", 0.2),
-            commit_hits=_int(gate_memory_raw, "commit_hits", 4),
-            commit_confidence_sum=_float(gate_memory_raw, "commit_confidence_sum", 1.2),
-            commit_spread_radius=_float(gate_memory_raw, "commit_spread_radius", 1.0),
+            commit_hits=_int(gate_memory_raw, "commit_hits", 6),
+            commit_confidence_sum=_float(gate_memory_raw, "commit_confidence_sum", 1.8),
+            commit_spread_radius=_float(gate_memory_raw, "commit_spread_radius", 0.60),
             stale_time=_float(gate_memory_raw, "stale_time", 3.0),
             alpha=_float(gate_memory_raw, "alpha", 0.35),
             use_lookahead_gate_filter=_bool(gate_memory_raw, "use_lookahead_gate_filter", True),
             history_size=_int(gate_memory_raw, "history_size", 15),
-            min_hits_for_stable=_int(gate_memory_raw, "min_hits_for_stable", 6),
-            max_center_std_for_stable=_float(gate_memory_raw, "max_center_std_for_stable", 0.45),
-            max_camera_std_for_stable=_float(gate_memory_raw, "max_camera_std_for_stable", 0.45),
+            min_hits_for_stable=_int(gate_memory_raw, "min_hits_for_stable", 10),
+            max_center_std_for_stable=_float(gate_memory_raw, "max_center_std_for_stable", 0.30),
+            max_camera_std_for_stable=_float(gate_memory_raw, "max_camera_std_for_stable", 0.30),
             max_reprojection_error_for_stable=_float(
                 gate_memory_raw,
                 "max_reprojection_error_for_stable",
-                5.0,
+                3.0,
             ),
-            max_outlier_distance=_float(gate_memory_raw, "max_outlier_distance", 0.75),
+            max_outlier_distance=_float(gate_memory_raw, "max_outlier_distance", 0.60),
             max_committed_match_distance=_float(
                 gate_memory_raw,
                 "max_committed_match_distance",
-                0.8,
+                0.60,
             ),
-            min_observation_time=_float(gate_memory_raw, "min_observation_time", 0.25),
+            min_observation_time=_float(gate_memory_raw, "min_observation_time", 0.50),
         ),
         race=RaceSection(
             gate_count=_int_optional(
@@ -583,7 +654,7 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 _float(controller_raw, "thrust_hover_initial", 0.5),
             ),
             min_thrust=_float(hover_acquisition_raw, "min_thrust", 0.0),
-            max_probe_thrust=_float(hover_acquisition_raw, "max_probe_thrust", 1.0),
+            max_probe_thrust=_float(hover_acquisition_raw, "max_probe_thrust", 0.85),
             thrust_step_per_s=_float(
                 hover_acquisition_raw,
                 "thrust_step_per_s",
@@ -603,6 +674,8 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             ),
             target_vz_m_s=_float(hover_acquisition_raw, "target_vz_m_s", 0.10),
             max_up_vz_m_s=_float(hover_acquisition_raw, "max_up_vz_m_s", 0.80),
+            max_relative_z_m=_float(hover_acquisition_raw, "max_relative_z_m", 2.0),
+            max_settle_vz_m_s=_float(hover_acquisition_raw, "max_settle_vz_m_s", 0.60),
             min_duration_s=_float(hover_acquisition_raw, "min_duration_s", 0.75),
             max_duration_s=_float(hover_acquisition_raw, "max_duration_s", 4.0),
             stable_duration_s=_float(
@@ -632,6 +705,21 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 _float(hover_acquisition_raw, "airborne_z_m", 0.25),
             ),
             min_confidence=_float(hover_acquisition_raw, "min_confidence", 0.0),
+            overshoot_thrust_step_per_s=_float(
+                hover_acquisition_raw,
+                "overshoot_thrust_step_per_s",
+                0.60,
+            ),
+            reset_hover_on_disarm=_bool(
+                hover_acquisition_raw,
+                "reset_hover_on_disarm",
+                True,
+            ),
+            release_on_timeout_while_unstable=_bool(
+                hover_acquisition_raw,
+                "release_on_timeout_while_unstable",
+                False,
+            ),
             print_period_s=_float(hover_acquisition_raw, "print_period_s", 0.5),
         ),
         command=CommandSection(
@@ -682,6 +770,30 @@ def _validate(config: PilotConfig) -> None:
             "state_estimation.vision_correction_source must be 'none', "
             "'known_gates', 'stable_tracks', or 'known_gates_or_stable_tracks'."
         )
+    source_uses_known_gates = config.state_estimation.vision_correction_source in (
+        "known_gates",
+        "known_gates_or_stable_tracks",
+    )
+    known_gate_positions_configured = bool(
+        config.state_estimation.known_gate_positions_neu
+    )
+    known_gate_correction_active = (
+        config.state_estimation.mode == "estimator"
+        and config.state_estimation.use_vision_correction
+        and (source_uses_known_gates or known_gate_positions_configured)
+    )
+    if (
+        known_gate_correction_active
+        and not config.state_estimation.allow_known_gate_correction
+    ):
+        raise RuntimeError(
+            "Known gate correction is disabled for the estimator path because "
+            "gate coordinates/altitude are not provided by VADR-TS-002. Use "
+            "vision_correction_source='stable_tracks' with "
+            "known_gate_positions_neu=[] for competition-style validation, or "
+            "set state_estimation.allow_known_gate_correction=true only for "
+            "explicit sim-truth debugging."
+        )
     if config.command.stream_hz <= 0.0:
         raise RuntimeError("command.stream_hz must be positive.")
     if config.command.max_hz <= 0.0:
@@ -704,6 +816,48 @@ def _validate(config: PilotConfig) -> None:
         raise RuntimeError("controller thrust_hover_initial must stay within [0.0, 1.0].")
     if not 0.0 <= config.controller.fallback_thrust <= 1.0:
         raise RuntimeError("controller fallback_thrust must stay within [0.0, 1.0].")
+    for key, value in (
+        ("vision_correction_alpha", config.state_estimation.vision_correction_alpha),
+        ("vision_correction_alpha_xy", config.state_estimation.vision_correction_alpha_xy),
+        ("vision_correction_alpha_z", config.state_estimation.vision_correction_alpha_z),
+    ):
+        if not 0.0 <= float(value) <= 1.0:
+            raise RuntimeError(f"state_estimation.{key} must stay within [0.0, 1.0].")
+    if config.state_estimation.vision_correction_max_delta_m < 0.0:
+        raise RuntimeError("state_estimation.vision_correction_max_delta_m must be non-negative.")
+    if config.state_estimation.vision_correction_max_residual_m < 0.0:
+        raise RuntimeError("state_estimation.vision_correction_max_residual_m must be non-negative.")
+    if config.state_estimation.estimator_landmark_min_hits < 1:
+        raise RuntimeError("state_estimation.estimator_landmark_min_hits must be at least 1.")
+    for key, value in (
+        (
+            "estimator_landmark_min_observation_time_s",
+            config.state_estimation.estimator_landmark_min_observation_time_s,
+        ),
+        (
+            "estimator_landmark_max_center_std_m",
+            config.state_estimation.estimator_landmark_max_center_std_m,
+        ),
+        (
+            "estimator_landmark_max_camera_std_m",
+            config.state_estimation.estimator_landmark_max_camera_std_m,
+        ),
+        (
+            "estimator_landmark_max_reprojection_error",
+            config.state_estimation.estimator_landmark_max_reprojection_error,
+        ),
+        ("perception.min_depth_m_for_memory", config.perception.min_depth_m_for_memory),
+        ("perception.max_depth_m_for_memory", config.perception.max_depth_m_for_memory),
+    ):
+        if float(value) < 0.0:
+            raise RuntimeError(f"{key} must be non-negative.")
+    if (
+        config.perception.max_depth_m_for_memory > 0.0
+        and config.perception.min_depth_m_for_memory > config.perception.max_depth_m_for_memory
+    ):
+        raise RuntimeError(
+            "perception.min_depth_m_for_memory must be <= max_depth_m_for_memory."
+        )
     if not 0.0 <= config.controller.adaptive_hover_min <= config.controller.adaptive_hover_max <= 1.0:
         raise RuntimeError(
             "controller adaptive_hover_min/adaptive_hover_max must stay within [0.0, 1.0]."
@@ -716,6 +870,16 @@ def _validate(config: PilotConfig) -> None:
         raise RuntimeError("hover_acquisition initial_thrust must stay within [0.0, 1.0].")
     if config.hover_acquisition.max_duration_s <= 0.0:
         raise RuntimeError("hover_acquisition max_duration_s must be positive.")
+    for key, value in (
+        ("max_relative_z_m", config.hover_acquisition.max_relative_z_m),
+        ("max_settle_vz_m_s", config.hover_acquisition.max_settle_vz_m_s),
+        (
+            "overshoot_thrust_step_per_s",
+            config.hover_acquisition.overshoot_thrust_step_per_s,
+        ),
+    ):
+        if float(value) < 0.0:
+            raise RuntimeError(f"hover_acquisition.{key} must be non-negative.")
 
 
 def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:

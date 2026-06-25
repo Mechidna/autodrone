@@ -82,6 +82,8 @@ class HoverAcquisition:
         self.accel_deadband_m_s2 = max(0.0, float(section.accel_deadband_m_s2))
         self.target_vz_m_s = float(section.target_vz_m_s)
         self.max_up_vz_m_s = max(0.0, float(section.max_up_vz_m_s))
+        self.max_relative_z_m = max(0.0, float(section.max_relative_z_m))
+        self.max_settle_vz_m_s = max(0.0, float(section.max_settle_vz_m_s))
         self.min_duration_s = max(0.0, float(section.min_duration_s))
         self.max_duration_s = max(0.0, float(section.max_duration_s))
         self.stable_duration_s = max(0.0, float(section.stable_duration_s))
@@ -91,6 +93,14 @@ class HoverAcquisition:
         self.lift_confirm_vz_m_s = max(0.0, float(section.lift_confirm_vz_m_s))
         self.relative_airborne_z_m = max(0.0, float(section.relative_airborne_z_m))
         self.min_confidence = _clamp(section.min_confidence, 0.0, 1.0)
+        self.overshoot_thrust_step_per_s = max(
+            0.0,
+            float(section.overshoot_thrust_step_per_s),
+        )
+        self.reset_hover_on_disarm = bool(section.reset_hover_on_disarm)
+        self.release_on_timeout_while_unstable = bool(
+            section.release_on_timeout_while_unstable
+        )
 
         self.completed = False
         self.start_time: Optional[float] = None
@@ -148,7 +158,11 @@ class HoverAcquisition:
 
         if self.require_armed and armed is False:
             self._reset_runtime()
-            thrust = max(current_hover, self.initial_thrust)
+            thrust = (
+                self.initial_thrust
+                if self.reset_hover_on_disarm
+                else max(current_hover, self.initial_thrust)
+            )
             debug = self._debug(
                 status="waiting_armed",
                 active=True,
@@ -178,7 +192,11 @@ class HoverAcquisition:
             self.start_time = now
             self.last_update_time = now
             self.initial_z = state_z
-            self.hover_thrust = max(current_hover, self.initial_thrust)
+            self.hover_thrust = (
+                self.initial_thrust
+                if self.reset_hover_on_disarm
+                else max(current_hover, self.initial_thrust)
+            )
             self.lift_confirmed = state_z >= self.relative_airborne_z_m
             self.stable_since = None
             elapsed_s = 0.0
@@ -192,6 +210,10 @@ class HoverAcquisition:
 
         z_rel_m = state_z - float(self.initial_z if self.initial_z is not None else state_z)
         self._update_lift_confirmation(state_z=state_z, z_rel_m=z_rel_m, vz_m_s=state_vz)
+        overshoot = self._overshoot(z_rel_m=z_rel_m, vz_m_s=state_vz)
+        if overshoot:
+            self.lift_confirmed = True
+            self.stable_since = None
 
         if dt_s > 0.0:
             self.hover_thrust = self._next_thrust(
@@ -199,6 +221,7 @@ class HoverAcquisition:
                 vz_m_s=state_vz,
                 az_m_s2=az_m_s2,
                 dt_s=dt_s,
+                overshoot=overshoot,
             )
 
         stable_time_s = self._stable_time(
@@ -208,7 +231,12 @@ class HoverAcquisition:
             az_m_s2=az_m_s2,
         )
         timed_out = self.max_duration_s > 0.0 and elapsed_s >= self.max_duration_s
-        if stable_time_s >= self.stable_duration_s or timed_out:
+        release_blocked = (
+            timed_out
+            and not self.release_on_timeout_while_unstable
+            and self._release_unsafe(z_rel_m=z_rel_m, vz_m_s=state_vz, overshoot=overshoot)
+        )
+        if stable_time_s >= self.stable_duration_s or (timed_out and not release_blocked):
             self.completed = True
             status = "stable" if stable_time_s >= self.stable_duration_s else "timeout"
             if timed_out and not self.lift_confirmed:
@@ -233,7 +261,12 @@ class HoverAcquisition:
                 debug=debug,
             )
 
-        status = "seeking_lift" if not self.lift_confirmed else "settling"
+        if overshoot:
+            status = "overshoot_recover"
+        elif release_blocked:
+            status = "timeout_recovering"
+        else:
+            status = "seeking_lift" if not self.lift_confirmed else "settling"
         debug = self._debug(
             status=status,
             active=True,
@@ -266,6 +299,7 @@ class HoverAcquisition:
         vz_m_s: float,
         az_m_s2: float,
         dt_s: float,
+        overshoot: bool,
     ) -> float:
         accel_feedback = 0.0
         accel_valid = math.isfinite(az_m_s2)
@@ -276,7 +310,11 @@ class HoverAcquisition:
         rate = self.velocity_gain * (target_vz - vz_m_s) + accel_feedback
 
         up_limit = self.thrust_trim_step_per_s if self.lift_confirmed else self.thrust_step_per_s
-        down_limit = self.thrust_trim_step_per_s
+        down_limit = (
+            self.overshoot_thrust_step_per_s
+            if overshoot
+            else self.thrust_trim_step_per_s
+        )
         rate = _clamp(rate, -down_limit, up_limit)
 
         if not self.lift_confirmed:
@@ -284,7 +322,9 @@ class HoverAcquisition:
             if vz_m_s < self.lift_confirm_vz_m_s and weak_accel:
                 rate = max(rate, self.thrust_step_per_s)
 
-        if self.max_up_vz_m_s > 0.0 and vz_m_s > self.max_up_vz_m_s:
+        if overshoot:
+            rate = min(rate, -down_limit)
+        elif self.max_up_vz_m_s > 0.0 and vz_m_s > self.max_up_vz_m_s:
             rate = min(rate, -down_limit)
 
         return _clamp(
@@ -292,6 +332,23 @@ class HoverAcquisition:
             self.min_thrust,
             self.max_probe_thrust,
         )
+
+    def _overshoot(self, *, z_rel_m: float, vz_m_s: float) -> bool:
+        return (
+            (self.max_relative_z_m > 0.0 and z_rel_m >= self.max_relative_z_m)
+            or (self.max_up_vz_m_s > 0.0 and vz_m_s > self.max_up_vz_m_s)
+        )
+
+    def _release_unsafe(self, *, z_rel_m: float, vz_m_s: float, overshoot: bool) -> bool:
+        if not self.lift_confirmed:
+            return True
+        if overshoot:
+            return True
+        if self.max_settle_vz_m_s > 0.0 and abs(vz_m_s) > self.max_settle_vz_m_s:
+            return True
+        if self.max_relative_z_m > 0.0 and z_rel_m > self.max_relative_z_m:
+            return True
+        return False
 
     def _stable_time(
         self,

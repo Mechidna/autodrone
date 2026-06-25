@@ -17,8 +17,10 @@ from autonomy_core.planning.minimum_snap_planner_multi_time_optimized import (
 from autonomy_core.planning.trajectory_manager import allocate_segment_times
 from autonomy_core.perception.gate_memory import GateMemory
 from adaptive_hover_thrust import AdaptiveHoverThrust
+from estimator_landmark_map import EstimatorLandmarkMap
 from hover_acquisition import HoverAcquisition
 from runtime_config import load_runtime_config
+from target_manager import TargetManager
 from vehicle_state_estimator import VehicleStateEstimator
 
 
@@ -79,11 +81,17 @@ class PyAIPilotAutonomyAPI:
         self.current_gate_idx = 0
         self.current_gate_pos = None
         self.active_target_track_id = None
+        self.active_target_center_at_plan = None
+        self.active_target_latest_filtered_center = None
         self.last_active_target_center = None
         self.active_target_lost_time = None
         self.active_target_lost_grace_s = float(self.config.race.active_target_lost_grace_s)
         self.race_order_track_ids = []
         self.completed_track_ids = set()
+        self.target_manager = TargetManager(
+            race_gate_count=self.race_gate_count,
+            active_target_lost_grace_s=self.active_target_lost_grace_s,
+        )
         self.active_waypoints = None
         self.active_times = None
         self.last_planned_gate_idx = -1
@@ -104,6 +112,8 @@ class PyAIPilotAutonomyAPI:
         self.max_reprojection_error_for_memory = float(
             self.config.perception.max_reprojection_error_for_memory
         )
+        self.min_depth_m_for_memory = float(self.config.perception.min_depth_m_for_memory)
+        self.max_depth_m_for_memory = float(self.config.perception.max_depth_m_for_memory)
         self.reject_negative_depth = bool(self.config.perception.reject_negative_depth)
         gate_memory_config = self.config.gate_memory
         self.gate_memory = GateMemory(
@@ -127,6 +137,18 @@ class PyAIPilotAutonomyAPI:
         )
         self.gate_memory.max_committed_match_distance = (
             gate_memory_config.max_committed_match_distance
+        )
+        state_estimation_config = self.config.state_estimation
+        self.estimator_landmark_map = EstimatorLandmarkMap(
+            min_hits=state_estimation_config.estimator_landmark_min_hits,
+            min_observation_time_s=(
+                state_estimation_config.estimator_landmark_min_observation_time_s
+            ),
+            max_center_std_m=state_estimation_config.estimator_landmark_max_center_std_m,
+            max_camera_std_m=state_estimation_config.estimator_landmark_max_camera_std_m,
+            max_reprojection_error=(
+                state_estimation_config.estimator_landmark_max_reprojection_error
+            ),
         )
         self.state_estimator = VehicleStateEstimator(self.config)
         self.last_state_estimate = None
@@ -396,11 +418,29 @@ class PyAIPilotAutonomyAPI:
             hover_gain_txt = f"{float(hover_debug.gain):.3f}"
             hover_fast_txt = f"{float(hover_debug.fast_weight):.2f}"
 
+        target_diag = self.target_manager.diagnostics()
+        target_shift_txt = "nan"
+        target_shift_xy_txt = "nan"
+        target_shift_z_txt = "nan"
+        target_lock_age_txt = "nan"
+        if math.isfinite(float(target_diag.shift_m)):
+            target_shift_txt = f"{float(target_diag.shift_m):.2f}"
+            target_shift_xy_txt = f"{float(target_diag.shift_xy_m):.2f}"
+            target_shift_z_txt = f"{float(target_diag.shift_z_m):.2f}"
+        if math.isfinite(float(target_diag.lock_age_s)):
+            target_lock_age_txt = f"{float(target_diag.lock_age_s):.2f}"
+
         print(
             "autonomy_trace "
             f"gate_idx={self.current_gate_idx} "
             f"active_track={self.active_target_track_id} "
             f"tracks={self.active_track_count} "
+            f"target_lock={int(target_diag.locked)} "
+            f"target_event={target_diag.event} "
+            f"target_shift={target_shift_txt} "
+            f"target_shift_xy_z=({target_shift_xy_txt},{target_shift_z_txt}) "
+            f"target_lock_age={target_lock_age_txt} "
+            f"active_replan_held={int(target_diag.suppress_active_replan)} "
             f"state={state_source} "
             f"truth_err={truth_error_txt} "
             f"corr={correction_txt} "
@@ -422,6 +462,27 @@ class PyAIPilotAutonomyAPI:
             flush=True,
         )
 
+    def _sync_target_manager_state(self, clear_unlocked_current: bool = False) -> None:
+        diag = self.target_manager.diagnostics()
+        self.current_gate_idx = int(diag.gate_idx)
+        self.active_target_track_id = diag.active_track_id
+        self.completed_track_ids = set(self.target_manager.completed_track_ids)
+        self.active_target_center_at_plan = (
+            None if diag.center_at_plan is None else diag.center_at_plan.copy()
+        )
+        self.active_target_latest_filtered_center = (
+            None if diag.latest_center is None else diag.latest_center.copy()
+        )
+
+        if diag.center_at_plan is not None:
+            self.current_gate_pos = diag.center_at_plan.copy()
+            self.last_active_target_center = diag.center_at_plan.copy()
+            self.active_target_lost_time = None
+        elif clear_unlocked_current:
+            self.current_gate_pos = None
+            self.last_active_target_center = None
+            self.active_target_lost_time = None
+
     def _path_plan(self, pos: np.ndarray, vel: np.ndarray) -> bool:
         if not self.gate_centers_neu:
             return False
@@ -431,15 +492,18 @@ class PyAIPilotAutonomyAPI:
             return False
 
         target = self._apply_target_z_policy(self.gate_centers_neu[target_idx])
-
-        self.active_target_track_id = (
+        target_track_id = (
             self.gate_track_ids[target_idx]
             if target_idx < len(self.gate_track_ids)
             else None
         )
-        if self.active_target_track_id is not None:
-            self.last_active_target_center = target.copy()
-            self.active_target_lost_time = None
+        target = self.target_manager.lock_target(
+            gate_idx=target_idx,
+            track_id=target_track_id,
+            center_neu=target,
+            reason="path_plan",
+        )
+        self._sync_target_manager_state()
 
         waypoints = np.vstack([pos, target])
         times = allocate_segment_times(
@@ -503,12 +567,8 @@ class PyAIPilotAutonomyAPI:
         if distance >= self.pass_radius_m:
             return False
 
-        if self.active_target_track_id is not None:
-            self.completed_track_ids.add(int(self.active_target_track_id))
-        self.current_gate_idx += 1
-        self.active_target_track_id = None
-        self.last_active_target_center = None
-        self.active_target_lost_time = None
+        self.target_manager.mark_passed(pos_neu=pos, distance_m=distance)
+        self._sync_target_manager_state(clear_unlocked_current=True)
         self.active_waypoints = None
         self.active_times = None
         return True
@@ -554,11 +614,10 @@ class PyAIPilotAutonomyAPI:
 
         return self._track_gates_from_snapshot(snapshot)
 
-    def _stable_gate_landmarks_neu(self) -> list[np.ndarray]:
-        return [
-            np.asarray(track.center, dtype=float).reshape(3).copy()
-            for track in self.gate_memory.get_stable_tracks()
-        ]
+    def _stable_gate_landmarks_neu(self) -> list[dict[str, object]]:
+        return self.estimator_landmark_map.update_from_tracks(
+            self.gate_memory.get_stable_tracks()
+        )
 
     def _perception_gates_from_snapshot(self, snapshot) -> list[np.ndarray]:
         latest_perception = getattr(snapshot, "latest_perception", None)
@@ -815,7 +874,18 @@ class PyAIPilotAutonomyAPI:
                 if center_camera.shape != (3,) or not np.all(np.isfinite(center_camera)):
                     center_camera = None
             if center_camera is not None:
-                if self.reject_negative_depth and float(center_camera[2]) <= 0.0:
+                depth_m = float(center_camera[2])
+                if self.reject_negative_depth and depth_m <= 0.0:
+                    continue
+                if (
+                    self.min_depth_m_for_memory > 0.0
+                    and depth_m < self.min_depth_m_for_memory
+                ):
+                    continue
+                if (
+                    self.max_depth_m_for_memory > 0.0
+                    and depth_m > self.max_depth_m_for_memory
+                ):
                     continue
                 if (
                     self.max_detection_range_m > 0.0
@@ -889,6 +959,13 @@ class PyAIPilotAutonomyAPI:
         if signature == self._last_gate_signature:
             return
 
+        gates, track_ids = self.target_manager.update_live_targets(
+            gate_idx=self.current_gate_idx,
+            gates=gates,
+            track_ids=track_ids,
+        )
+        self._sync_target_manager_state()
+
         previous_target = (
             self.current_gate_pos.copy()
             if self.current_gate_pos is not None
@@ -933,10 +1010,18 @@ class PyAIPilotAutonomyAPI:
             if previous_target is not None
             else math.inf
         )
+        active_locked_same_gate = (
+            self.target_manager.locked
+            and had_active_plan
+            and self.last_planned_gate_idx == self.current_gate_idx
+        )
         should_replan = (
             not had_active_plan
             or self.last_planned_gate_idx != self.current_gate_idx
-            or target_shift > self.replan_target_shift_m
+            or (
+                not active_locked_same_gate
+                and target_shift > self.replan_target_shift_m
+            )
         )
 
         if should_replan:

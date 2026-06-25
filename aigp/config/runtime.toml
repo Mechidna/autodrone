@@ -35,17 +35,22 @@ mavlink_truth_logging = true
 init_position_source = "zero"    # zero | mavlink_once
 use_imu_prediction = true
 use_vision_correction = true
-vision_correction_source = "known_gates_or_stable_tracks" # none | known_gates | stable_tracks | known_gates_or_stable_tracks
+vision_correction_source = "stable_tracks" # none | stable_tracks | known_gates | known_gates_or_stable_tracks
+allow_known_gate_correction = false # debug/sim-truth only; not competition-valid
 max_imu_dt_s = 0.05
 max_state_age_s = 0.5
-vision_correction_alpha = 0.25
+vision_correction_alpha = 0.10
+vision_correction_alpha_xy = 0.12
+vision_correction_alpha_z = 0.0
+vision_correction_max_delta_m = 0.50
 vision_correction_max_residual_m = 3.0
 vision_correction_min_confidence = 0.2
-known_gate_positions_neu = [
-    [0.0, 8.0, 1.5],
-    [0.8, 16.0, 1.5],
-    [-0.8, 24.0, 1.5],
-]
+estimator_landmark_min_hits = 12
+estimator_landmark_min_observation_time_s = 0.75
+estimator_landmark_max_center_std_m = 0.25
+estimator_landmark_max_camera_std_m = 0.25
+estimator_landmark_max_reprojection_error = 2.5
+known_gate_positions_neu = []
 gravity_m_s2 = 9.81
 max_imu_accel_m_s2 = 20.0
 max_imu_velocity_m_s = 8.0
@@ -87,7 +92,9 @@ yolo_imgsz = 640
 yolo_device = 0
 transform_mode = "physical_direct_rad_x_mirror"
 world_pose_source = "mavsdk"
-max_reprojection_error_for_memory = 20.0
+max_reprojection_error_for_memory = 5.0
+min_depth_m_for_memory = 0.5
+max_depth_m_for_memory = 25.0
 reject_negative_depth = true
 
 [gate_memory]
@@ -95,20 +102,20 @@ association_radius = 1.5
 commit_radius = 1.5
 new_track_block_radius = 4.5
 min_confidence_per_hit = 0.2
-commit_hits = 4
-commit_confidence_sum = 1.2
-commit_spread_radius = 1.0
+commit_hits = 6
+commit_confidence_sum = 1.8
+commit_spread_radius = 0.60
 stale_time = 3.0
 alpha = 0.35
 use_lookahead_gate_filter = true
 history_size = 15
-min_hits_for_stable = 6
-max_center_std_for_stable = 0.45
-max_camera_std_for_stable = 0.45
-max_reprojection_error_for_stable = 5.0
-max_outlier_distance = 0.75
-max_committed_match_distance = 0.8
-min_observation_time = 0.25
+min_hits_for_stable = 10
+max_center_std_for_stable = 0.30
+max_camera_std_for_stable = 0.30
+max_reprojection_error_for_stable = 3.0
+max_outlier_distance = 0.60
+max_committed_match_distance = 0.60
+min_observation_time = 0.50
 
 [race]
 gate_count = 3
@@ -168,14 +175,17 @@ estimator_mode_only = true
 require_armed = true
 initial_thrust = 0.5
 min_thrust = 0.0
-max_probe_thrust = 1.0
+max_probe_thrust = 0.85
 thrust_step_per_s = 0.25
 thrust_trim_step_per_s = 0.12
+overshoot_thrust_step_per_s = 0.60
 velocity_gain = 0.35
 accel_gain = 0.05
 accel_deadband_m_s2 = 0.30
 target_vz_m_s = 0.10
 max_up_vz_m_s = 0.80
+max_relative_z_m = 2.0
+max_settle_vz_m_s = 0.60
 min_duration_s = 0.75
 max_duration_s = 4.0
 stable_duration_s = 0.50
@@ -185,6 +195,8 @@ lift_confirm_z_m = 0.15
 lift_confirm_vz_m_s = 0.15
 relative_airborne_z_m = 0.25   # relative to estimator start, not gate altitude
 min_confidence = 0.0
+reset_hover_on_disarm = true
+release_on_timeout_while_unstable = false
 print_period_s = 0.5
 
 [command]

@@ -265,11 +265,7 @@ class VehicleStateEstimator:
             if confidence < min_confidence:
                 continue
 
-            reprojection_error = self._finite_float(detection.get("reprojection_error"))
-            if (
-                reprojection_error is not None
-                and reprojection_error > float(self.config.perception.max_reprojection_error_for_memory)
-            ):
+            if not self._detection_geometry_ok(detection):
                 continue
 
             gate_body = self._vec3(
@@ -304,8 +300,45 @@ class VehicleStateEstimator:
             weights=np.asarray(weights, dtype=float),
         )
         alpha = float(np.clip(self.config.state_estimation.vision_correction_alpha, 0.0, 1.0))
+        alpha_xy = float(
+            np.clip(
+                getattr(
+                    self.config.state_estimation,
+                    "vision_correction_alpha_xy",
+                    alpha,
+                ),
+                0.0,
+                1.0,
+            )
+        )
+        alpha_z = float(
+            np.clip(
+                getattr(
+                    self.config.state_estimation,
+                    "vision_correction_alpha_z",
+                    0.0,
+                ),
+                0.0,
+                1.0,
+            )
+        )
         delta = measured_pos - self.pos_neu
-        self.pos_neu = self.pos_neu + alpha * delta
+        max_delta = float(
+            max(
+                0.0,
+                getattr(
+                    self.config.state_estimation,
+                    "vision_correction_max_delta_m",
+                    0.0,
+                ),
+            )
+        )
+        if max_delta > 0.0:
+            delta_norm = float(np.linalg.norm(delta))
+            if delta_norm > max_delta:
+                delta = delta * (max_delta / max(delta_norm, 1e-9))
+        self.pos_neu[:2] = self.pos_neu[:2] + alpha_xy * delta[:2]
+        self.pos_neu[2] = self.pos_neu[2] + alpha_z * delta[2]
 
         correction = {
             "source": "+".join(sorted(set(sources))),
@@ -318,8 +351,37 @@ class VehicleStateEstimator:
     def _vision_landmarks(self, snapshot, source_mode: str) -> list[tuple[np.ndarray, str]]:
         landmarks: list[tuple[np.ndarray, str]] = []
 
-        if source_mode in ("known_gates", "known_gates_or_stable_tracks"):
-            for idx, position in enumerate(self.config.state_estimation.known_gate_positions_neu):
+        if source_mode in ("stable_tracks", "known_gates_or_stable_tracks"):
+            stable_landmarks = (
+                getattr(snapshot, "stable_gate_landmarks_neu", None) or []
+            )
+            for idx, item in enumerate(stable_landmarks):
+                label = f"stable_track:{idx}"
+                position = item
+                if isinstance(item, dict):
+                    position = item.get("position_neu")
+                    landmark_id = item.get("track_id", item.get("landmark_id", idx))
+                    label = f"stable_track:{landmark_id}"
+                arr = self._vec3(position)
+                if arr is not None:
+                    landmarks.append((arr, label))
+
+        if source_mode == "known_gates_or_stable_tracks" and landmarks:
+            return landmarks
+
+        allow_known_gate_correction = bool(
+            getattr(
+                self.config.state_estimation,
+                "allow_known_gate_correction",
+                False,
+            )
+        )
+        if (
+            source_mode in ("known_gates", "known_gates_or_stable_tracks")
+            and allow_known_gate_correction
+        ):
+            known_positions = self.config.state_estimation.known_gate_positions_neu
+            for idx, position in enumerate(known_positions):
                 arr = self._vec3(position)
                 if arr is not None:
                     landmarks.append((arr, f"known_gate:{idx}"))
@@ -336,16 +398,36 @@ class VehicleStateEstimator:
                     gate_id = gate.get("gate_id", len(landmarks))
                     landmarks.append((arr, f"track_gate:{gate_id}"))
 
-        if source_mode == "known_gates_or_stable_tracks" and landmarks:
-            return landmarks
-
-        if source_mode in ("stable_tracks", "known_gates_or_stable_tracks"):
-            for idx, position in enumerate(getattr(snapshot, "stable_gate_landmarks_neu", None) or []):
-                arr = self._vec3(position)
-                if arr is not None:
-                    landmarks.append((arr, f"stable_track:{idx}"))
-
         return landmarks
+
+    def _detection_geometry_ok(self, detection: dict) -> bool:
+        reprojection_error = self._finite_float(detection.get("reprojection_error"))
+        if (
+            reprojection_error is not None
+            and reprojection_error
+            > float(self.config.perception.max_reprojection_error_for_memory)
+        ):
+            return False
+
+        center_camera = self._vec3(detection.get("gate_center_camera"))
+        if center_camera is None:
+            return True
+
+        depth_m = float(center_camera[2])
+        if bool(self.config.perception.reject_negative_depth) and depth_m <= 0.0:
+            return False
+
+        min_depth = float(
+            getattr(self.config.perception, "min_depth_m_for_memory", 0.0)
+        )
+        max_depth = float(
+            getattr(self.config.perception, "max_depth_m_for_memory", 0.0)
+        )
+        if min_depth > 0.0 and depth_m < min_depth:
+            return False
+        if max_depth > 0.0 and depth_m > max_depth:
+            return False
+        return True
 
     @staticmethod
     def _nearest_landmark(
