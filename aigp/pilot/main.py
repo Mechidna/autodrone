@@ -51,6 +51,8 @@ def update_autonomy_command():
         odometry = shared_data.get("odometry")
         track_gates = shared_data.get("track_gates")
         latest_perception = shared_data.get("latest_perception")
+        armed = shared_data.get("armed")
+        heartbeat = shared_data.get("heartbeat")
 
     if frame is None or attitude is None or imu is None:
         with lock:
@@ -72,6 +74,8 @@ def update_autonomy_command():
             odometry=odometry,
             track_gates=track_gates,
             latest_perception=latest_perception,
+            armed=armed,
+            heartbeat=heartbeat,
         )
         active_track_count = int(
             getattr(autonomy_adapter.autonomy, "active_track_count", 0)

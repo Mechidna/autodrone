@@ -17,6 +17,7 @@ from autonomy_core.planning.minimum_snap_planner_multi_time_optimized import (
 from autonomy_core.planning.trajectory_manager import allocate_segment_times
 from autonomy_core.perception.gate_memory import GateMemory
 from adaptive_hover_thrust import AdaptiveHoverThrust
+from hover_acquisition import HoverAcquisition
 from runtime_config import load_runtime_config
 from vehicle_state_estimator import VehicleStateEstimator
 
@@ -162,8 +163,20 @@ class PyAIPilotAutonomyAPI:
             max_z_error=self.config.controller.adaptive_hover_max_z_error,
             saturation_margin=self.config.controller.adaptive_hover_saturation_margin,
             min_confidence=self.config.controller.adaptive_hover_min_confidence,
+            fast_enabled=(
+                bool(self.config.controller.adaptive_hover_fast_enabled)
+                and str(self.config.state_estimation.mode).lower() == "estimator"
+            ),
+            fast_gain=self.config.controller.adaptive_hover_fast_gain,
+            fast_min_z_error=self.config.controller.adaptive_hover_fast_min_z_error,
+            fast_stable_signal=self.config.controller.adaptive_hover_fast_stable_signal,
+            fast_stable_z_error=self.config.controller.adaptive_hover_fast_stable_z_error,
+            fast_stable_samples=self.config.controller.adaptive_hover_fast_stable_samples,
+            fast_decay_s=self.config.controller.adaptive_hover_fast_decay_s,
         )
         self.hover_thrust = float(self.adaptive_hover.value)
+        self.hover_acquisition = HoverAcquisition(self.config)
+        self._last_hover_acquisition_trace_time = 0.0
 
     def update(self, snapshot) -> AutonomyCommandRad | None:
         snapshot.stable_gate_landmarks_neu = self._stable_gate_landmarks_neu()
@@ -198,6 +211,30 @@ class PyAIPilotAutonomyAPI:
         )
 
         self._install_gate_centers(self._gates_from_snapshot(snapshot))
+
+        if not self.hover_acquisition.completed:
+            acquisition_result = self.hover_acquisition.update(
+                snapshot=snapshot,
+                estimate=estimate,
+                hover_thrust=self.adaptive_hover.value,
+            )
+            if acquisition_result.debug.active or acquisition_result.debug.completed:
+                self.adaptive_hover.set_value(
+                    acquisition_result.hover_thrust,
+                    status=f"acquisition_{acquisition_result.debug.status}",
+                )
+                self.hover_thrust = float(self.adaptive_hover.value)
+                self.tracker.thrust_hover = self.hover_thrust
+                self._trace_hover_acquisition(pos, acquisition_result.debug)
+
+            if acquisition_result.command is not None:
+                command = acquisition_result.command
+                return AutonomyCommandRad(
+                    roll_rad=command.roll_rad,
+                    pitch_rad=command.pitch_rad,
+                    yaw_rad=command.yaw_rad,
+                    thrust=command.thrust,
+                )
 
         advanced = self._advance_gate_if_needed(pos)
         if self._should_plan(advanced):
@@ -256,6 +293,32 @@ class PyAIPilotAutonomyAPI:
             pitch_rad=pitch_rad,
             yaw_rad=yaw_cmd_rad,
             thrust=thrust,
+        )
+
+    def _trace_hover_acquisition(self, pos, debug) -> None:
+        now = time.time()
+        period_s = float(self.config.hover_acquisition.print_period_s)
+        if now - self._last_hover_acquisition_trace_time < period_s:
+            return
+        self._last_hover_acquisition_trace_time = now
+
+        arr = np.asarray(pos, dtype=float).reshape(3)
+        print(
+            "hover_acquisition "
+            f"status={debug.status} "
+            f"active={int(debug.active)} "
+            f"done={int(debug.completed)} "
+            f"armed={debug.armed} "
+            f"elapsed={debug.elapsed_s:.2f} "
+            f"z_rel={debug.z_rel_m:.2f} "
+            f"vz={debug.vz_m_s:.2f} "
+            f"az={debug.az_m_s2:.2f} "
+            f"thrust={debug.thrust:.3f} "
+            f"hover={debug.hover_thrust:.3f} "
+            f"lift={int(debug.lift_confirmed)} "
+            f"stable={debug.stable_time_s:.2f} "
+            f"pos_neu=({arr[0]:.2f},{arr[1]:.2f},{arr[2]:.2f})",
+            flush=True,
         )
 
     def _trace_autonomy(
@@ -321,6 +384,8 @@ class PyAIPilotAutonomyAPI:
         hover_status = "none"
         hover_signal_txt = "0.00"
         hover_err_txt = "(0.00,0.00)"
+        hover_gain_txt = "0.00"
+        hover_fast_txt = "0.00"
         if hover_debug is not None:
             hover_txt = f"{float(hover_debug.value):.3f}"
             hover_status = str(hover_debug.status)
@@ -328,6 +393,8 @@ class PyAIPilotAutonomyAPI:
             hover_err_txt = (
                 f"({float(hover_debug.z_error):.2f},{float(hover_debug.vz_error):.2f})"
             )
+            hover_gain_txt = f"{float(hover_debug.gain):.3f}"
+            hover_fast_txt = f"{float(hover_debug.fast_weight):.2f}"
 
         print(
             "autonomy_trace "
@@ -349,7 +416,9 @@ class PyAIPilotAutonomyAPI:
             f"hover={hover_txt} "
             f"hover_adapt={hover_status} "
             f"hover_sig={hover_signal_txt} "
-            f"hover_err_z_vz={hover_err_txt}",
+            f"hover_err_z_vz={hover_err_txt} "
+            f"hover_gain={hover_gain_txt} "
+            f"hover_fast={hover_fast_txt}",
             flush=True,
         )
 

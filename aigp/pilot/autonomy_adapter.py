@@ -58,6 +58,10 @@ class AutonomyInputSnapshot:
     # Optional timing
     timesync: Optional[dict[str, Any]]
 
+    # Optional vehicle/system state
+    armed: Optional[bool]
+    heartbeat: Optional[dict[str, Any]]
+
 
 class AutonomyAdapter:
     def __init__(self, config=None):
@@ -90,6 +94,8 @@ class AutonomyAdapter:
         odometry=None,
         track_gates=None,
         latest_perception=None,
+        armed=None,
+        heartbeat=None,
     ) -> AutonomyInputSnapshot:
         image_bgr = frame["image"]
 
@@ -194,6 +200,8 @@ class AutonomyAdapter:
             track_gates=track_gates,
             latest_perception=latest_perception,
             timesync=timesync,
+            armed=None if armed is None else bool(armed),
+            heartbeat=heartbeat if isinstance(heartbeat, dict) else None,
         )
 
     def update(
@@ -206,6 +214,8 @@ class AutonomyAdapter:
         odometry=None,
         track_gates=None,
         latest_perception=None,
+        armed=None,
+        heartbeat=None,
     ):
         """
         Platform-neutral autonomy update.
@@ -229,6 +239,8 @@ class AutonomyAdapter:
             odometry=odometry,
             track_gates=track_gates,
             latest_perception=latest_perception,
+            armed=armed,
+            heartbeat=heartbeat,
         )
 
         self.last_snapshot = snapshot

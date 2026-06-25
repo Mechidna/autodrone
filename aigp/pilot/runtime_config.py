@@ -194,8 +194,42 @@ class ControllerSection:
     adaptive_hover_max_z_error: float
     adaptive_hover_saturation_margin: float
     adaptive_hover_min_confidence: float
+    adaptive_hover_fast_enabled: bool
+    adaptive_hover_fast_gain: float
+    adaptive_hover_fast_min_z_error: float
+    adaptive_hover_fast_stable_signal: float
+    adaptive_hover_fast_stable_z_error: float
+    adaptive_hover_fast_stable_samples: int
+    adaptive_hover_fast_decay_s: float
     max_yaw_rate_deg_s: float
     command_print_period_s: float
+
+
+@dataclass(frozen=True)
+class HoverAcquisitionSection:
+    enabled: bool
+    estimator_mode_only: bool
+    require_armed: bool
+    initial_thrust: float
+    min_thrust: float
+    max_probe_thrust: float
+    thrust_step_per_s: float
+    thrust_trim_step_per_s: float
+    velocity_gain: float
+    accel_gain: float
+    accel_deadband_m_s2: float
+    target_vz_m_s: float
+    max_up_vz_m_s: float
+    min_duration_s: float
+    max_duration_s: float
+    stable_duration_s: float
+    stable_vz_abs_m_s: float
+    stable_accel_abs_m_s2: float
+    lift_confirm_z_m: float
+    lift_confirm_vz_m_s: float
+    relative_airborne_z_m: float
+    min_confidence: float
+    print_period_s: float
 
 
 @dataclass(frozen=True)
@@ -231,6 +265,7 @@ class PilotConfig:
     race: RaceSection
     planner: PlannerSection
     controller: ControllerSection
+    hover_acquisition: HoverAcquisitionSection
     command: CommandSection
     hover: HoverSection
 
@@ -254,6 +289,7 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
     race_raw = _section(raw, "race")
     planner_raw = _section(raw, "planner")
     controller_raw = _section(raw, "controller")
+    hover_acquisition_raw = _section(raw, "hover_acquisition")
     command_raw = _section(raw, "command")
     hover_raw = _section(raw, "hover")
 
@@ -495,8 +531,108 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 "adaptive_hover_min_confidence",
                 0.0,
             ),
+            adaptive_hover_fast_enabled=_bool(
+                controller_raw,
+                "adaptive_hover_fast_enabled",
+                True,
+            ),
+            adaptive_hover_fast_gain=_float(
+                controller_raw,
+                "adaptive_hover_fast_gain",
+                0.25,
+            ),
+            adaptive_hover_fast_min_z_error=_float(
+                controller_raw,
+                "adaptive_hover_fast_min_z_error",
+                0.05,
+            ),
+            adaptive_hover_fast_stable_signal=_float(
+                controller_raw,
+                "adaptive_hover_fast_stable_signal",
+                0.08,
+            ),
+            adaptive_hover_fast_stable_z_error=_float(
+                controller_raw,
+                "adaptive_hover_fast_stable_z_error",
+                0.15,
+            ),
+            adaptive_hover_fast_stable_samples=_int(
+                controller_raw,
+                "adaptive_hover_fast_stable_samples",
+                20,
+            ),
+            adaptive_hover_fast_decay_s=_float(
+                controller_raw,
+                "adaptive_hover_fast_decay_s",
+                3.0,
+            ),
             max_yaw_rate_deg_s=_float(controller_raw, "max_yaw_rate_deg_s", 90.0),
             command_print_period_s=_float(controller_raw, "command_print_period_s", 1.0),
+        ),
+        hover_acquisition=HoverAcquisitionSection(
+            enabled=_bool(hover_acquisition_raw, "enabled", True),
+            estimator_mode_only=_bool(
+                hover_acquisition_raw,
+                "estimator_mode_only",
+                True,
+            ),
+            require_armed=_bool(hover_acquisition_raw, "require_armed", True),
+            initial_thrust=_float(
+                hover_acquisition_raw,
+                "initial_thrust",
+                _float(controller_raw, "thrust_hover_initial", 0.5),
+            ),
+            min_thrust=_float(hover_acquisition_raw, "min_thrust", 0.0),
+            max_probe_thrust=_float(hover_acquisition_raw, "max_probe_thrust", 1.0),
+            thrust_step_per_s=_float(
+                hover_acquisition_raw,
+                "thrust_step_per_s",
+                0.25,
+            ),
+            thrust_trim_step_per_s=_float(
+                hover_acquisition_raw,
+                "thrust_trim_step_per_s",
+                0.12,
+            ),
+            velocity_gain=_float(hover_acquisition_raw, "velocity_gain", 0.35),
+            accel_gain=_float(hover_acquisition_raw, "accel_gain", 0.05),
+            accel_deadband_m_s2=_float(
+                hover_acquisition_raw,
+                "accel_deadband_m_s2",
+                0.30,
+            ),
+            target_vz_m_s=_float(hover_acquisition_raw, "target_vz_m_s", 0.10),
+            max_up_vz_m_s=_float(hover_acquisition_raw, "max_up_vz_m_s", 0.80),
+            min_duration_s=_float(hover_acquisition_raw, "min_duration_s", 0.75),
+            max_duration_s=_float(hover_acquisition_raw, "max_duration_s", 4.0),
+            stable_duration_s=_float(
+                hover_acquisition_raw,
+                "stable_duration_s",
+                0.50,
+            ),
+            stable_vz_abs_m_s=_float(
+                hover_acquisition_raw,
+                "stable_vz_abs_m_s",
+                0.25,
+            ),
+            stable_accel_abs_m_s2=_float(
+                hover_acquisition_raw,
+                "stable_accel_abs_m_s2",
+                0.80,
+            ),
+            lift_confirm_z_m=_float(hover_acquisition_raw, "lift_confirm_z_m", 0.15),
+            lift_confirm_vz_m_s=_float(
+                hover_acquisition_raw,
+                "lift_confirm_vz_m_s",
+                0.15,
+            ),
+            relative_airborne_z_m=_float(
+                hover_acquisition_raw,
+                "relative_airborne_z_m",
+                _float(hover_acquisition_raw, "airborne_z_m", 0.25),
+            ),
+            min_confidence=_float(hover_acquisition_raw, "min_confidence", 0.0),
+            print_period_s=_float(hover_acquisition_raw, "print_period_s", 0.5),
         ),
         command=CommandSection(
             type=_str(command_raw, "type", "set_attitude_target"),
@@ -572,6 +708,14 @@ def _validate(config: PilotConfig) -> None:
         raise RuntimeError(
             "controller adaptive_hover_min/adaptive_hover_max must stay within [0.0, 1.0]."
         )
+    if not 0.0 <= config.hover_acquisition.min_thrust <= config.hover_acquisition.max_probe_thrust <= 1.0:
+        raise RuntimeError(
+            "hover_acquisition min_thrust/max_probe_thrust must stay within [0.0, 1.0]."
+        )
+    if not 0.0 <= config.hover_acquisition.initial_thrust <= 1.0:
+        raise RuntimeError("hover_acquisition initial_thrust must stay within [0.0, 1.0].")
+    if config.hover_acquisition.max_duration_s <= 0.0:
+        raise RuntimeError("hover_acquisition max_duration_s must be positive.")
 
 
 def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:

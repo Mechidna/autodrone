@@ -19,6 +19,8 @@ class AdaptiveHoverDebug:
     z_error: float = 0.0
     vz_error: float = 0.0
     dt: float = 0.0
+    gain: float = 0.0
+    fast_weight: float = 0.0
 
 
 class AdaptiveHoverThrust:
@@ -45,6 +47,13 @@ class AdaptiveHoverThrust:
         max_z_error: float = 2.0,
         saturation_margin: float = 0.03,
         min_confidence: float = 0.0,
+        fast_enabled: bool = False,
+        fast_gain: float = 0.25,
+        fast_min_z_error: float = 0.05,
+        fast_stable_signal: float = 0.08,
+        fast_stable_z_error: float = 0.15,
+        fast_stable_samples: int = 20,
+        fast_decay_s: float = 3.0,
     ):
         self.enabled = bool(enabled)
         self.gain = max(0.0, float(gain))
@@ -59,10 +68,23 @@ class AdaptiveHoverThrust:
         self.max_z_error = max(0.0, float(max_z_error))
         self.saturation_margin = _clamp(saturation_margin, 0.0, 0.49)
         self.min_confidence = _clamp(min_confidence, 0.0, 1.0)
+        self.fast_enabled = bool(fast_enabled)
+        self.fast_gain = max(self.gain, float(fast_gain))
+        self.fast_min_z_error = max(0.0, float(fast_min_z_error))
+        self.fast_stable_signal = max(0.0, float(fast_stable_signal))
+        self.fast_stable_z_error = max(0.0, float(fast_stable_z_error))
+        self.fast_stable_samples = max(1, int(fast_stable_samples))
+        self.fast_decay_s = max(0.0, float(fast_decay_s))
+        self.fast_weight = 1.0 if self.fast_enabled else 0.0
+        self.stable_sample_count = 0
 
         self.value = _clamp(initial_thrust, self.min_value, self.max_value)
         self.last_update_time: float | None = None
         self.last_debug = AdaptiveHoverDebug(value=self.value, status="init")
+
+    def set_value(self, value: float, *, status: str = "external") -> AdaptiveHoverDebug:
+        self.value = _clamp(value, self.min_value, self.max_value)
+        return self._debug(status)
 
     def update(
         self,
@@ -117,18 +139,65 @@ class AdaptiveHoverThrust:
 
         signal = vz_error + self.z_gain * z_error
         signal = _clamp(signal, -self.max_signal, self.max_signal)
+        gain = self._gain_for_sample(
+            signal=signal,
+            z_error=z_error,
+            ref_vz=ref_vz,
+            dt=dt,
+        )
         self.value = _clamp(
-            self.value + self.gain * signal * dt,
+            self.value + gain * signal * dt,
             self.min_value,
             self.max_value,
         )
+        status = "fast" if gain > self.gain else "active"
         return self._debug(
-            "active",
+            status,
             signal=signal,
             z_error=z_error,
             vz_error=vz_error,
             dt=dt,
+            gain=gain,
         )
+
+    def _gain_for_sample(
+        self,
+        *,
+        signal: float,
+        z_error: float,
+        ref_vz: float,
+        dt: float,
+    ) -> float:
+        stable = (
+            abs(float(signal)) <= self.fast_stable_signal
+            and abs(float(z_error)) <= self.fast_stable_z_error
+        )
+        if stable:
+            self.stable_sample_count += 1
+        else:
+            self.stable_sample_count = 0
+
+        if (
+            self.fast_enabled
+            and self.fast_weight > 0.0
+            and self.stable_sample_count >= self.fast_stable_samples
+        ):
+            if self.fast_decay_s <= 0.0:
+                self.fast_weight = 0.0
+            else:
+                self.fast_weight = max(0.0, self.fast_weight - dt / self.fast_decay_s)
+
+        fast_allowed = (
+            self.fast_enabled
+            and self.fast_weight > 0.0
+            and z_error > self.fast_min_z_error
+            and ref_vz >= 0.0
+            and signal > 0.0
+        )
+        if not fast_allowed:
+            return self.gain
+
+        return self.gain + self.fast_weight * (self.fast_gain - self.gain)
 
     def _debug(
         self,
@@ -138,6 +207,7 @@ class AdaptiveHoverThrust:
         z_error: float = 0.0,
         vz_error: float = 0.0,
         dt: float = 0.0,
+        gain: float | None = None,
     ) -> AdaptiveHoverDebug:
         self.last_debug = AdaptiveHoverDebug(
             value=float(self.value),
@@ -146,6 +216,8 @@ class AdaptiveHoverThrust:
             z_error=float(z_error),
             vz_error=float(vz_error),
             dt=float(dt),
+            gain=float(self.gain if gain is None else gain),
+            fast_weight=float(self.fast_weight),
         )
         return self.last_debug
 
