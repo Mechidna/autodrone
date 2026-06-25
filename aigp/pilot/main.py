@@ -61,6 +61,7 @@ def update_autonomy_command():
         return
 
     active_track_count = 0
+    latest_state_estimate = None
     try:
         cmd = autonomy_adapter.update(
             frame=frame,
@@ -75,9 +76,11 @@ def update_autonomy_command():
         active_track_count = int(
             getattr(autonomy_adapter.autonomy, "active_track_count", 0)
         )
+        latest_state_estimate = getattr(autonomy_adapter, "latest_state_estimate", None)
         status = "ok"
     except Exception as exc:
         cmd = None
+        latest_state_estimate = getattr(autonomy_adapter, "latest_state_estimate", None)
         status = f"error:{exc}"
 
     with lock:
@@ -85,6 +88,7 @@ def update_autonomy_command():
         shared_data["latest_autonomy_command_wall_time"] = time.time()
         shared_data["latest_autonomy_command_status"] = status
         shared_data["latest_autonomy_active_track_count"] = active_track_count
+        shared_data["latest_state_estimate"] = latest_state_estimate
 
 
 if RUNNER_MODE == "px4":

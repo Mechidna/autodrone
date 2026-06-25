@@ -49,6 +49,25 @@ class TelemetrySection:
 
 
 @dataclass(frozen=True)
+class StateEstimationSection:
+    mode: str
+    mavlink_truth_logging: bool
+    init_position_source: str
+    use_imu_prediction: bool
+    use_vision_correction: bool
+    vision_correction_source: str
+    max_imu_dt_s: float
+    max_state_age_s: float
+    vision_correction_alpha: float
+    vision_correction_max_residual_m: float
+    vision_correction_min_confidence: float
+    known_gate_positions_neu: tuple[tuple[float, float, float], ...]
+    gravity_m_s2: float
+    max_imu_accel_m_s2: float
+    max_imu_velocity_m_s: float
+
+
+@dataclass(frozen=True)
 class TimesyncSection:
     request_hz: float
 
@@ -164,6 +183,17 @@ class ControllerSection:
     thrust_min: float
     thrust_max: float
     fallback_thrust: float
+    adaptive_hover_enabled: bool
+    adaptive_hover_gain: float
+    adaptive_hover_z_gain: float
+    adaptive_hover_min: float
+    adaptive_hover_max: float
+    adaptive_hover_max_signal: float
+    adaptive_hover_max_ref_vz: float
+    adaptive_hover_max_ref_az: float
+    adaptive_hover_max_z_error: float
+    adaptive_hover_saturation_margin: float
+    adaptive_hover_min_confidence: float
     max_yaw_rate_deg_s: float
     command_print_period_s: float
 
@@ -192,6 +222,7 @@ class PilotConfig:
     runtime: RuntimeSection
     mavlink: MavlinkSection
     telemetry: TelemetrySection
+    state_estimation: StateEstimationSection
     timesync: TimesyncSection
     vision: VisionSection
     camera: CameraSection
@@ -214,6 +245,7 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
     runtime_raw = _section(raw, "runtime")
     mavlink_raw = _section(raw, "mavlink")
     telemetry_raw = _section(raw, "telemetry")
+    state_estimation_raw = _section(raw, "state_estimation")
     timesync_raw = _section(raw, "timesync")
     vision_raw = _section(raw, "vision")
     camera_raw = _section(_section(raw, "camera"), "competition")
@@ -267,6 +299,54 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             max_state_age_s=_float(telemetry_raw, "max_state_age_s", 0.5),
             store_highres_imu=_bool(telemetry_raw, "store_highres_imu", True),
             store_timesync=_bool(telemetry_raw, "store_timesync", True),
+        ),
+        state_estimation=StateEstimationSection(
+            mode=_str(state_estimation_raw, "mode", "auto").lower(),
+            mavlink_truth_logging=_bool(
+                state_estimation_raw,
+                "mavlink_truth_logging",
+                True,
+            ),
+            init_position_source=_str(
+                state_estimation_raw,
+                "init_position_source",
+                "zero",
+            ).lower(),
+            use_imu_prediction=_bool(state_estimation_raw, "use_imu_prediction", True),
+            use_vision_correction=_bool(state_estimation_raw, "use_vision_correction", True),
+            vision_correction_source=_str(
+                state_estimation_raw,
+                "vision_correction_source",
+                "known_gates",
+            ).lower(),
+            max_imu_dt_s=_float(state_estimation_raw, "max_imu_dt_s", 0.05),
+            max_state_age_s=_float(
+                state_estimation_raw,
+                "max_state_age_s",
+                _float(telemetry_raw, "max_state_age_s", 0.5),
+            ),
+            vision_correction_alpha=_float(
+                state_estimation_raw,
+                "vision_correction_alpha",
+                0.25,
+            ),
+            vision_correction_max_residual_m=_float(
+                state_estimation_raw,
+                "vision_correction_max_residual_m",
+                3.0,
+            ),
+            vision_correction_min_confidence=_float(
+                state_estimation_raw,
+                "vision_correction_min_confidence",
+                0.2,
+            ),
+            known_gate_positions_neu=tuple(
+                _vec3_tuple(item)
+                for item in (state_estimation_raw.get("known_gate_positions_neu", ()) or ())
+            ),
+            gravity_m_s2=_float(state_estimation_raw, "gravity_m_s2", 9.81),
+            max_imu_accel_m_s2=_float(state_estimation_raw, "max_imu_accel_m_s2", 20.0),
+            max_imu_velocity_m_s=_float(state_estimation_raw, "max_imu_velocity_m_s", 8.0),
         ),
         timesync=TimesyncSection(
             request_hz=_float(timesync_raw, "request_hz", 10.0),
@@ -376,10 +456,45 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             max_acc_xy=_float(controller_raw, "max_acc_xy", 2.0),
             max_acc_z_up=_float(controller_raw, "max_acc_z_up", 2.5),
             max_acc_z_down=_float(controller_raw, "max_acc_z_down", 2.0),
-            thrust_hover=_float(controller_raw, "thrust_hover", 0.74),
-            thrust_min=_float(controller_raw, "thrust_min", 0.60),
-            thrust_max=_float(controller_raw, "thrust_max", 0.85),
-            fallback_thrust=_float(controller_raw, "fallback_thrust", _float(controller_raw, "thrust_hover", 0.74)),
+            thrust_hover=_float(
+                controller_raw,
+                "thrust_hover_initial",
+                _float(controller_raw, "thrust_hover", 0.5),
+            ),
+            thrust_min=0.0,
+            thrust_max=1.0,
+            fallback_thrust=_float(
+                controller_raw,
+                "fallback_thrust_initial",
+                _float(
+                    controller_raw,
+                    "fallback_thrust",
+                    _float(
+                        controller_raw,
+                        "thrust_hover_initial",
+                        _float(controller_raw, "thrust_hover", 0.5),
+                    ),
+                ),
+            ),
+            adaptive_hover_enabled=_bool(controller_raw, "adaptive_hover_enabled", True),
+            adaptive_hover_gain=_float(controller_raw, "adaptive_hover_gain", 0.04),
+            adaptive_hover_z_gain=_float(controller_raw, "adaptive_hover_z_gain", 0.30),
+            adaptive_hover_min=_float(controller_raw, "adaptive_hover_min", 0.0),
+            adaptive_hover_max=_float(controller_raw, "adaptive_hover_max", 1.0),
+            adaptive_hover_max_signal=_float(controller_raw, "adaptive_hover_max_signal", 1.0),
+            adaptive_hover_max_ref_vz=_float(controller_raw, "adaptive_hover_max_ref_vz", 1.0),
+            adaptive_hover_max_ref_az=_float(controller_raw, "adaptive_hover_max_ref_az", 1.5),
+            adaptive_hover_max_z_error=_float(controller_raw, "adaptive_hover_max_z_error", 2.0),
+            adaptive_hover_saturation_margin=_float(
+                controller_raw,
+                "adaptive_hover_saturation_margin",
+                0.03,
+            ),
+            adaptive_hover_min_confidence=_float(
+                controller_raw,
+                "adaptive_hover_min_confidence",
+                0.0,
+            ),
             max_yaw_rate_deg_s=_float(controller_raw, "max_yaw_rate_deg_s", 90.0),
             command_print_period_s=_float(controller_raw, "command_print_period_s", 1.0),
         ),
@@ -412,6 +527,25 @@ def _validate(config: PilotConfig) -> None:
             f"Invalid vision.source={config.vision.source!r}. "
             "Use vision.source='udp' or vision.source='ros'."
         )
+    if config.state_estimation.mode not in ("mavlink", "auto", "estimator"):
+        raise RuntimeError(
+            f"Invalid state_estimation.mode={config.state_estimation.mode!r}. "
+            "Use 'mavlink', 'auto', or 'estimator'."
+        )
+    if config.state_estimation.init_position_source not in ("zero", "mavlink_once"):
+        raise RuntimeError(
+            "state_estimation.init_position_source must be 'zero' or 'mavlink_once'."
+        )
+    if config.state_estimation.vision_correction_source not in (
+        "none",
+        "known_gates",
+        "stable_tracks",
+        "known_gates_or_stable_tracks",
+    ):
+        raise RuntimeError(
+            "state_estimation.vision_correction_source must be 'none', "
+            "'known_gates', 'stable_tracks', or 'known_gates_or_stable_tracks'."
+        )
     if config.command.stream_hz <= 0.0:
         raise RuntimeError("command.stream_hz must be positive.")
     if config.command.max_hz <= 0.0:
@@ -427,6 +561,16 @@ def _validate(config: PilotConfig) -> None:
         raise RuntimeError(
             f"runtime.control_hz={config.runtime.control_hz} must be below "
             f"command.max_hz={config.command.max_hz}."
+        )
+    if not 0.0 <= config.controller.thrust_min <= config.controller.thrust_max <= 1.0:
+        raise RuntimeError("controller thrust_min/thrust_max must stay within [0.0, 1.0].")
+    if not 0.0 <= config.controller.thrust_hover <= 1.0:
+        raise RuntimeError("controller thrust_hover_initial must stay within [0.0, 1.0].")
+    if not 0.0 <= config.controller.fallback_thrust <= 1.0:
+        raise RuntimeError("controller fallback_thrust must stay within [0.0, 1.0].")
+    if not 0.0 <= config.controller.adaptive_hover_min <= config.controller.adaptive_hover_max <= 1.0:
+        raise RuntimeError(
+            "controller adaptive_hover_min/adaptive_hover_max must stay within [0.0, 1.0]."
         )
 
 
@@ -495,6 +639,16 @@ def _float_tuple(value: Any, default: tuple[float, ...], length: int) -> tuple[f
     if len(values) != length:
         values = list(default)
     return tuple(float(item) for item in values)
+
+
+def _vec3_tuple(value: Any) -> tuple[float, float, float]:
+    try:
+        values = tuple(float(item) for item in value)
+    except (TypeError, ValueError):
+        values = ()
+    if len(values) != 3:
+        raise RuntimeError("known_gate_positions_neu entries must contain exactly 3 numbers.")
+    return values
 
 
 def _optional_device(value: Any) -> Optional[int | str]:

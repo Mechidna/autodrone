@@ -16,7 +16,9 @@ from autonomy_core.planning.minimum_snap_planner_multi_time_optimized import (
 )
 from autonomy_core.planning.trajectory_manager import allocate_segment_times
 from autonomy_core.perception.gate_memory import GateMemory
+from adaptive_hover_thrust import AdaptiveHoverThrust
 from runtime_config import load_runtime_config
+from vehicle_state_estimator import VehicleStateEstimator
 
 
 @dataclass(frozen=True)
@@ -125,6 +127,8 @@ class PyAIPilotAutonomyAPI:
         self.gate_memory.max_committed_match_distance = (
             gate_memory_config.max_committed_match_distance
         )
+        self.state_estimator = VehicleStateEstimator(self.config)
+        self.last_state_estimate = None
         self._last_gate_memory_frame_key = None
         self._last_stable_gate_print_signature = None
         self._last_race_order_print_signature = None
@@ -145,23 +149,53 @@ class PyAIPilotAutonomyAPI:
             thrust_min=self.config.controller.thrust_min,
             thrust_max=self.config.controller.thrust_max,
         )
+        self.adaptive_hover = AdaptiveHoverThrust(
+            initial_thrust=self.config.controller.thrust_hover,
+            enabled=self.config.controller.adaptive_hover_enabled,
+            gain=self.config.controller.adaptive_hover_gain,
+            z_gain=self.config.controller.adaptive_hover_z_gain,
+            min_value=self.config.controller.adaptive_hover_min,
+            max_value=self.config.controller.adaptive_hover_max,
+            max_signal=self.config.controller.adaptive_hover_max_signal,
+            max_ref_vz=self.config.controller.adaptive_hover_max_ref_vz,
+            max_ref_az=self.config.controller.adaptive_hover_max_ref_az,
+            max_z_error=self.config.controller.adaptive_hover_max_z_error,
+            saturation_margin=self.config.controller.adaptive_hover_saturation_margin,
+            min_confidence=self.config.controller.adaptive_hover_min_confidence,
+        )
+        self.hover_thrust = float(self.adaptive_hover.value)
 
     def update(self, snapshot) -> AutonomyCommandRad | None:
-        yaw_rad = float(getattr(snapshot, "yaw_rad", 0.0))
+        snapshot.stable_gate_landmarks_neu = self._stable_gate_landmarks_neu()
+        estimate = self.state_estimator.update(snapshot)
+        self.last_state_estimate = estimate
 
-        if snapshot.pos_neu is None or snapshot.vel_neu is None:
+        if not estimate.valid:
             return None
 
-        pos = np.asarray(snapshot.pos_neu, dtype=float).reshape(3)
+        pos = np.asarray(estimate.pos_neu, dtype=float).reshape(3)
         vel = np.nan_to_num(
-            np.asarray(snapshot.vel_neu, dtype=float).reshape(3),
+            np.asarray(estimate.vel_neu, dtype=float).reshape(3),
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
         )
+        yaw_rad = float(estimate.yaw_rad)
 
         if not np.all(np.isfinite(pos)):
             return None
+
+        snapshot.pos_neu = pos.copy()
+        snapshot.vel_neu = vel.copy()
+        snapshot.pos_ned = np.array([pos[0], pos[1], -pos[2]], dtype=float)
+        snapshot.vel_ned = np.array([vel[0], vel[1], -vel[2]], dtype=float)
+        snapshot.latest_perception = (
+            self.state_estimator.project_perception_with_estimated_state(
+                getattr(snapshot, "latest_perception", None),
+                estimate,
+                snapshot,
+            )
+        )
 
         self._install_gate_centers(self._gates_from_snapshot(snapshot))
 
@@ -185,13 +219,23 @@ class PyAIPilotAutonomyAPI:
             yaw=desired_yaw,
         )
 
+        self.tracker.thrust_hover = float(self.adaptive_hover.value)
         roll_rad, pitch_rad, yaw_cmd_rad, thrust, _ = self.tracker.update(state, ref)
+        thrust = float(np.clip(thrust, 0.0, 1.0))
+        hover_debug = self.adaptive_hover.update(
+            state=state,
+            ref=ref,
+            thrust_cmd=thrust,
+            estimator_valid=bool(estimate.valid),
+            estimator_confidence=float(estimate.confidence),
+        )
+        self.hover_thrust = float(self.adaptive_hover.value)
+        self.tracker.thrust_hover = self.hover_thrust
 
         # Preserve autonomy_api6's PX4/Gazebo sign convention.
         roll_rad = -float(roll_rad)
         pitch_rad = -float(pitch_rad)
         yaw_cmd_rad = float(yaw_cmd_rad)
-        thrust = float(np.clip(thrust, 0.0, 1.0))
 
         self._trace_autonomy(
             pos=pos,
@@ -204,6 +248,7 @@ class PyAIPilotAutonomyAPI:
             pitch_rad=pitch_rad,
             yaw_rad=yaw_cmd_rad,
             thrust=thrust,
+            hover_debug=hover_debug,
         )
 
         return AutonomyCommandRad(
@@ -225,6 +270,7 @@ class PyAIPilotAutonomyAPI:
         pitch_rad: float,
         yaw_rad: float,
         thrust: float,
+        hover_debug=None,
     ) -> None:
         now = time.time()
         if now - self._last_trace_print_time < self._trace_period_s:
@@ -242,11 +288,55 @@ class PyAIPilotAutonomyAPI:
             target_txt = fmt_vec(target_arr)
             dist_txt = f"{float(np.linalg.norm(np.asarray(pos) - target_arr)):.2f}"
 
+        state_source = "unknown"
+        truth_error_txt = "nan"
+        correction_txt = "none"
+        if self.last_state_estimate is not None:
+            state_source = str(self.last_state_estimate.source)
+            truth_error = self.last_state_estimate.truth_error_m
+            if truth_error is not None and math.isfinite(float(truth_error)):
+                truth_error_txt = f"{float(truth_error):.2f}"
+            correction_source = str(
+                getattr(self.last_state_estimate, "vision_correction_source", "")
+            )
+            correction_residual = getattr(
+                self.last_state_estimate,
+                "vision_correction_residual_m",
+                None,
+            )
+            correction_count = int(
+                getattr(self.last_state_estimate, "vision_correction_count", 0)
+            )
+            if (
+                correction_source
+                and correction_residual is not None
+                and math.isfinite(float(correction_residual))
+                and correction_count > 0
+            ):
+                correction_txt = (
+                    f"{correction_source}@{float(correction_residual):.2f}/{correction_count}"
+                )
+
+        hover_txt = "nan"
+        hover_status = "none"
+        hover_signal_txt = "0.00"
+        hover_err_txt = "(0.00,0.00)"
+        if hover_debug is not None:
+            hover_txt = f"{float(hover_debug.value):.3f}"
+            hover_status = str(hover_debug.status)
+            hover_signal_txt = f"{float(hover_debug.signal):.2f}"
+            hover_err_txt = (
+                f"({float(hover_debug.z_error):.2f},{float(hover_debug.vz_error):.2f})"
+            )
+
         print(
             "autonomy_trace "
             f"gate_idx={self.current_gate_idx} "
             f"active_track={self.active_target_track_id} "
             f"tracks={self.active_track_count} "
+            f"state={state_source} "
+            f"truth_err={truth_error_txt} "
+            f"corr={correction_txt} "
             f"tau={tau:.2f}/{float(self.planner.total_time):.2f} "
             f"dist={dist_txt} "
             f"pos_neu={fmt_vec(pos)} "
@@ -255,7 +345,11 @@ class PyAIPilotAutonomyAPI:
             f"v_ref={fmt_vec(v_ref)} "
             f"a_ref={fmt_vec(a_ref)} "
             f"cmd_deg=({math.degrees(roll_rad):.2f},{math.degrees(pitch_rad):.2f},{math.degrees(yaw_rad):.2f}) "
-            f"thrust={thrust:.3f}",
+            f"thrust={thrust:.3f} "
+            f"hover={hover_txt} "
+            f"hover_adapt={hover_status} "
+            f"hover_sig={hover_signal_txt} "
+            f"hover_err_z_vz={hover_err_txt}",
             flush=True,
         )
 
@@ -390,6 +484,12 @@ class PyAIPilotAutonomyAPI:
                 return perception_gates
 
         return self._track_gates_from_snapshot(snapshot)
+
+    def _stable_gate_landmarks_neu(self) -> list[np.ndarray]:
+        return [
+            np.asarray(track.center, dtype=float).reshape(3).copy()
+            for track in self.gate_memory.get_stable_tracks()
+        ]
 
     def _perception_gates_from_snapshot(self, snapshot) -> list[np.ndarray]:
         latest_perception = getattr(snapshot, "latest_perception", None)

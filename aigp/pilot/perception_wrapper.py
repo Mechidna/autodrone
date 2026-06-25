@@ -145,7 +145,11 @@ class PerceptionWrapper:
 
         try:
             raw_detections = self._detect_camera_only(image)
-            if drone_pos_ned is not None and drone_rpy is not None:
+            if (
+                self._should_project_with_mavlink_pose()
+                and drone_pos_ned is not None
+                and drone_rpy is not None
+            ):
                 raw_detections = self._project_detections_to_world(
                     raw_detections,
                     drone_pos_ned=drone_pos_ned,
@@ -161,6 +165,12 @@ class PerceptionWrapper:
             for index, detection in enumerate(raw_detections)
         ]
         return latest_perception
+
+    def _should_project_with_mavlink_pose(self) -> bool:
+        if str(self.config.state_estimation.mode).lower() == "estimator":
+            return False
+        source = str(self.world_pose_source).lower()
+        return source not in ("camera_only", "none", "estimator")
 
     def _empty_latest_perception(self, *, frame_data, perception_wall_time: float) -> dict[str, Any]:
         return {

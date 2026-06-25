@@ -24,6 +24,7 @@ class HoverHoldTarget:
     z: float
     yaw_rad: Optional[float]
     mode: str = "hold"
+    source: str = "mavlink"
 
 
 class HoverHold:
@@ -56,6 +57,7 @@ class HoverHold:
             print(
                 "hover_hold captured:",
                 f"mode={self.target.mode}",
+                f"source={self.target.source}",
                 f"x={self.target.x:.2f}",
                 f"y={self.target.y:.2f}",
                 f"z={self.target.z:.2f}",
@@ -73,27 +75,33 @@ class HoverHold:
             with lock:
                 odometry = data.get("odometry")
                 local_position_ned = data.get("local_position_ned")
+                state_estimate = data.get("latest_state_estimate")
                 attitude = data.get("attitude")
                 active_track_count = data.get("latest_autonomy_active_track_count")
                 track_gates = data.get("track_gates")
         else:
             odometry = data.get("odometry")
             local_position_ned = data.get("local_position_ned")
+            state_estimate = data.get("latest_state_estimate")
             attitude = data.get("attitude")
             active_track_count = data.get("latest_autonomy_active_track_count")
             track_gates = data.get("track_gates")
 
-        position = self._fresh_position_ned(odometry)
-        if position is None:
-            position = self._fresh_position_ned(local_position_ned)
+        estimate = self._fresh_estimator_state(state_estimate)
+        source = "estimator" if estimate is not None else "mavlink"
+        if estimate is not None:
+            position, velocity, yaw_rad = estimate
+        else:
+            position = self._fresh_position_ned(odometry)
+            if position is None:
+                position = self._fresh_position_ned(local_position_ned)
+            velocity = self._fresh_velocity_ned(odometry)
+            if velocity is None:
+                velocity = self._fresh_velocity_ned(local_position_ned)
+            yaw_rad = self._fresh_yaw(attitude)
         if position is None:
             return None
 
-        velocity = self._fresh_velocity_ned(odometry)
-        if velocity is None:
-            velocity = self._fresh_velocity_ned(local_position_ned)
-
-        yaw_rad = self._fresh_yaw(attitude)
         z = position[2]
         mode = "hold"
 
@@ -113,7 +121,57 @@ class HoverHold:
             z=z,
             yaw_rad=yaw_rad,
             mode=mode,
+            source=source,
         )
+
+    def _fresh_estimator_state(
+        self,
+        state_estimate,
+    ) -> Optional[tuple[tuple[float, float, float], Optional[tuple[float, float, float]], Optional[float]]]:
+        if not isinstance(state_estimate, dict) or self._is_stale(state_estimate):
+            return None
+        if not bool(state_estimate.get("valid", False)):
+            return None
+        if str(state_estimate.get("source", "")).lower() != "estimator":
+            return None
+
+        position = self._tuple3(state_estimate.get("pos_ned"))
+        if position is None:
+            pos_neu = self._tuple3(state_estimate.get("pos_neu"))
+            if pos_neu is not None:
+                position = (pos_neu[0], pos_neu[1], -pos_neu[2])
+        if position is None:
+            return None
+
+        velocity = self._tuple3(state_estimate.get("vel_ned"))
+        if velocity is None:
+            vel_neu = self._tuple3(state_estimate.get("vel_neu"))
+            if vel_neu is not None:
+                velocity = (vel_neu[0], vel_neu[1], -vel_neu[2])
+
+        yaw_rad = None
+        try:
+            yaw = float(state_estimate.get("yaw_rad"))
+        except (TypeError, ValueError):
+            yaw = float("nan")
+        if math.isfinite(yaw):
+            yaw_rad = yaw
+
+        return position, velocity, yaw_rad
+
+    @staticmethod
+    def _tuple3(value) -> Optional[tuple[float, float, float]]:
+        if value is None:
+            return None
+        try:
+            if len(value) != 3:
+                return None
+            out = tuple(float(item) for item in value)
+        except (TypeError, ValueError):
+            return None
+        if all(math.isfinite(item) for item in out):
+            return out
+        return None
 
     def _fresh_position_ned(self, source) -> Optional[tuple[float, float, float]]:
         if not isinstance(source, dict) or self._is_stale(source):

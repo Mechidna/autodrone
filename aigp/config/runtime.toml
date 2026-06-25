@@ -29,6 +29,27 @@ max_state_age_s = 0.5
 store_highres_imu = true
 store_timesync = true
 
+[state_estimation]
+mode = "estimator"                    # mavlink | auto | estimator
+mavlink_truth_logging = true
+init_position_source = "zero"    # zero | mavlink_once
+use_imu_prediction = true
+use_vision_correction = true
+vision_correction_source = "known_gates_or_stable_tracks" # none | known_gates | stable_tracks | known_gates_or_stable_tracks
+max_imu_dt_s = 0.05
+max_state_age_s = 0.5
+vision_correction_alpha = 0.25
+vision_correction_max_residual_m = 3.0
+vision_correction_min_confidence = 0.2
+known_gate_positions_neu = [
+    [0.0, 8.0, 1.5],
+    [0.8, 16.0, 1.5],
+    [-0.8, 24.0, 1.5],
+]
+gravity_m_s2 = 9.81
+max_imu_accel_m_s2 = 20.0
+max_imu_velocity_m_s = 8.0
+
 [timesync]
 request_hz = 10
 
@@ -117,10 +138,19 @@ kv = [2.0, 2.0, 2.6]
 max_acc_xy = 2.0
 max_acc_z_up = 2.5
 max_acc_z_down = 2.0
-thrust_hover = 0.74
-thrust_min = 0.60
-thrust_max = 0.85
-fallback_thrust = 0.74
+thrust_hover_initial = 0.5
+fallback_thrust_initial = 0.5       # last-resort initial guess only
+adaptive_hover_enabled = true
+adaptive_hover_gain = 0.04
+adaptive_hover_z_gain = 0.30
+adaptive_hover_min = 0.0
+adaptive_hover_max = 1.0
+adaptive_hover_max_signal = 1.0
+adaptive_hover_max_ref_vz = 1.0
+adaptive_hover_max_ref_az = 1.5
+adaptive_hover_max_z_error = 2.0
+adaptive_hover_saturation_margin = 0.03
+adaptive_hover_min_confidence = 0.0
 max_tilt_deg = 20.0
 max_yaw_rate_deg_s = 90.0
 command_print_period_s = 1.0
