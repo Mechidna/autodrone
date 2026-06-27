@@ -75,7 +75,16 @@ class PyAIPilotAutonomyAPI:
         self.gate_centers_neu = []
         self.gate_track_ids = []
         self._candidate_gate_track_ids = []
+        self.gate_source_mode = str(self.config.gate_source.mode).lower()
+        self.ground_truth_gate_positions_neu = [
+            np.asarray(gate, dtype=float).reshape(3).copy()
+            for gate in self.config.gate_source.known_gate_positions_neu
+        ]
+        self.ground_truth_gate_track_ids = [
+            -(idx + 1) for idx in range(len(self.ground_truth_gate_positions_neu))
+        ]
         self._last_gate_signature = None
+        self._last_ground_truth_gate_print_signature = None
         self.active_track_count = 0
 
         self.current_gate_idx = 0
@@ -157,6 +166,13 @@ class PyAIPilotAutonomyAPI:
         self._last_race_order_print_signature = None
         self._last_trace_print_time = 0.0
         self._trace_period_s = 0.5
+        print(
+            "[GATE_SOURCE_CONFIG] "
+            f"mode={self.gate_source_mode} "
+            f"known_gates={len(self.ground_truth_gate_positions_neu)} "
+            f"allow_ground_truth={int(bool(self.config.gate_source.allow_ground_truth))}",
+            flush=True,
+        )
 
         self.planner = MultiSegmentMinimumSnapPlanner()
         self.tracker = RPGHighLevelTracker(
@@ -607,12 +623,43 @@ class PyAIPilotAutonomyAPI:
         return self.last_desired_yaw
 
     def _gates_from_snapshot(self, snapshot) -> list[np.ndarray]:
+        if self.gate_source_mode == "ground_truth":
+            self._observe_perception_for_diagnostics(snapshot)
+            return self._ground_truth_gates_from_config()
+
         if self.use_perception:
             perception_gates = self._perception_gates_from_snapshot(snapshot)
             if perception_gates:
                 return perception_gates
 
         return self._track_gates_from_snapshot(snapshot)
+
+    def _observe_perception_for_diagnostics(self, snapshot) -> None:
+        latest_perception = getattr(snapshot, "latest_perception", None)
+        if isinstance(latest_perception, dict):
+            self._update_gate_memory(latest_perception)
+
+    def _ground_truth_gates_from_config(self) -> list[np.ndarray]:
+        gates = [gate.copy() for gate in self.ground_truth_gate_positions_neu]
+        track_ids = list(self.ground_truth_gate_track_ids)
+        if self.race_gate_count is not None:
+            limit = min(int(self.race_gate_count), len(gates))
+            gates = gates[:limit]
+            track_ids = track_ids[:limit]
+
+        self._candidate_gate_track_ids = track_ids
+        signature = tuple(
+            (track_id, *self._rounded_gate(gate, decimals=2))
+            for track_id, gate in zip(track_ids, gates)
+        )
+        if signature != self._last_ground_truth_gate_print_signature:
+            coords = " ".join(
+                f"id={track_id}:({gate[0]:.2f}, {gate[1]:.2f}, {gate[2]:.2f})"
+                for track_id, gate in zip(track_ids, gates)
+            )
+            print(f"autonomy_wrapper ground truth gates NEU: {coords}", flush=True)
+            self._last_ground_truth_gate_print_signature = signature
+        return gates
 
     def _stable_gate_landmarks_neu(self) -> list[dict[str, object]]:
         return self.estimator_landmark_map.update_from_tracks(
@@ -893,7 +940,7 @@ class PyAIPilotAutonomyAPI:
                 ):
                     continue
 
-            self.gate_memory.add_detection(
+            memory_result = self.gate_memory.add_detection(
                 center=arr.copy(),
                 confidence=confidence,
                 timestamp=timestamp,
@@ -901,8 +948,168 @@ class PyAIPilotAutonomyAPI:
                 reprojection_error=reprojection_error,
                 solver_name="latest_perception",
             )
+            self._maybe_print_perception_chain_event(detection, memory_result)
 
         self.gate_memory.prune(timestamp)
+
+    def _maybe_print_perception_chain_event(
+        self,
+        detection: dict,
+        memory_result: dict | None,
+    ) -> None:
+        if not isinstance(memory_result, dict) or not memory_result.get("accepted", False):
+            return
+
+        events = []
+        if memory_result.get("reason") == "new_track":
+            events.append("new_track")
+        if memory_result.get("committed_now", False):
+            events.append("committed")
+        if memory_result.get("stable_now", False):
+            events.append("stable")
+        if not events:
+            return
+
+        track_id = memory_result.get("track_id")
+        track = None
+        try:
+            if track_id is not None:
+                track = self.gate_memory.get_track_by_id(int(track_id))
+        except (TypeError, ValueError):
+            track = None
+
+        for event in events:
+            self._print_perception_chain_event(event, detection, memory_result, track)
+
+    def _print_perception_chain_event(
+        self,
+        event: str,
+        detection: dict,
+        memory_result: dict,
+        track,
+    ) -> None:
+        track_id = memory_result.get("track_id", "none")
+        hits = getattr(track, "hits", "none")
+        committed = getattr(track, "committed", memory_result.get("committed", False))
+        stable = getattr(track, "is_stable", memory_result.get("stable", False))
+        track_center = getattr(track, "center", memory_result.get("center"))
+        world_std = getattr(track, "center_world_std", None)
+        cam_median = self._track_camera_median(track)
+        rpy_rad = detection.get("drone_rpy_rad_used")
+        rpy_deg = None if rpy_rad is None else np.rad2deg(np.asarray(rpy_rad, dtype=float))
+        method = str(detection.get("body_to_world_method_used", ""))
+
+        print(
+            "[PERCEPTION_CHAIN] "
+            f"event={event} "
+            f"track={track_id} "
+            f"reason={memory_result.get('reason', '')} "
+            f"hits={hits} "
+            f"committed={bool(committed)} "
+            f"stable={bool(stable)} "
+            f"order={self._blank_na(detection.get('pnp_selected_order'))} "
+            f"solver={self._blank_na(detection.get('pnp_selected_solver'))} "
+            f"debug_best_order={self._blank_na(detection.get('pnp_debug_best_order'))} "
+            f"reproj={self._fmt_float(detection.get('reprojection_error'), precision=2)} "
+            f"conf={self._fmt_float(detection.get('memory_confidence'), precision=2)} "
+            f"cam={self._fmt_vec(detection.get('gate_center_camera'), precision=2)} "
+            f"body={self._fmt_vec(detection.get('gate_center_body_frd'), precision=2)} "
+            f"world_neu={self._fmt_vec(detection.get('gate_center_world'), precision=2)} "
+            f"world_ned={self._fmt_vec(detection.get('gate_center_world_ned'), precision=2)} "
+            f"track_center={self._fmt_vec(track_center, precision=2)} "
+            f"cam_median={self._fmt_vec(cam_median, precision=2)} "
+            f"world_std={self._fmt_vec(world_std, precision=2)} "
+            f"drone_ned={self._fmt_vec(detection.get('drone_pos_ned'), precision=2)} "
+            f"rpy_deg={self._fmt_vec(rpy_deg, precision=1)} "
+            f"kp={self._fmt_keypoints(detection)} "
+            f"method={method}",
+            flush=True,
+        )
+
+    @staticmethod
+    def _track_camera_median(track):
+        if track is None:
+            return None
+        camera_points = [
+            obs.center_camera
+            for obs in getattr(track, "obs_history", [])
+            if getattr(obs, "center_camera", None) is not None
+            and not bool(getattr(obs, "is_outlier", False))
+        ]
+        if not camera_points:
+            return None
+        arr = np.asarray(camera_points, dtype=float).reshape(-1, 3)
+        if not np.all(np.isfinite(arr)):
+            arr = arr[np.all(np.isfinite(arr), axis=1)]
+        if arr.size == 0:
+            return None
+        return np.median(arr, axis=0)
+
+    @staticmethod
+    def _fmt_vec(value, precision: int = 2) -> str:
+        if value is None:
+            return "none"
+        try:
+            arr = np.asarray(value, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            return "none"
+        if arr.size < 3:
+            return "none"
+        vals = []
+        for val in arr[:3]:
+            if math.isfinite(float(val)):
+                vals.append(f"{float(val):.{int(precision)}f}")
+            else:
+                vals.append("nan")
+        return "(" + ",".join(vals) + ")"
+
+    @staticmethod
+    def _fmt_float(value, precision: int = 2) -> str:
+        try:
+            val = float(value)
+        except (TypeError, ValueError):
+            return "nan"
+        if not math.isfinite(val):
+            return "nan"
+        return f"{val:.{int(precision)}f}"
+
+    @staticmethod
+    def _blank_na(value) -> str:
+        text = str(value or "")
+        return text if text else "n/a"
+
+    @staticmethod
+    def _fmt_keypoints(detection: dict) -> str:
+        keypoints = detection.get("keypoints_px")
+        if keypoints is None:
+            return "none"
+        try:
+            kp = np.asarray(keypoints, dtype=float)
+        except (TypeError, ValueError):
+            return "none"
+        if kp.ndim != 2 or kp.shape[0] < 4 or kp.shape[1] < 2:
+            return "none"
+
+        conf = detection.get("keypoint_conf")
+        conf_arr = None
+        if conf is not None:
+            try:
+                conf_arr = np.asarray(conf, dtype=float).reshape(-1)
+            except (TypeError, ValueError):
+                conf_arr = None
+
+        items = []
+        for idx in range(4):
+            u = float(kp[idx, 0])
+            v = float(kp[idx, 1])
+            if not math.isfinite(u) or not math.isfinite(v):
+                items.append(f"{idx}:nan,nan")
+                continue
+            if conf_arr is not None and conf_arr.size > idx and math.isfinite(float(conf_arr[idx])):
+                items.append(f"{idx}:{u:.0f},{v:.0f},{float(conf_arr[idx]):.2f}")
+            else:
+                items.append(f"{idx}:{u:.0f},{v:.0f}")
+        return "[" + " ".join(items) + "]"
 
     @staticmethod
     def _perception_frame_key(latest_perception: dict):

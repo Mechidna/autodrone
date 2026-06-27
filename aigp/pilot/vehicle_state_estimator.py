@@ -127,11 +127,16 @@ class VehicleStateEstimator:
             camera_translation_body = np.zeros(3, dtype=float)
 
         pos_ned = local_neu_to_ned(estimate.pos_neu)
-        rot_ned_body = body_frd_to_local_ned_rotmat(
-            float(getattr(snapshot, "roll_rad", 0.0)),
-            float(getattr(snapshot, "pitch_rad", 0.0)),
-            float(getattr(snapshot, "yaw_rad", estimate.yaw_rad)),
+        rpy_used = np.array(
+            [
+                float(getattr(snapshot, "roll_rad", 0.0)),
+                float(getattr(snapshot, "pitch_rad", 0.0)),
+                float(getattr(snapshot, "yaw_rad", estimate.yaw_rad)),
+            ],
+            dtype=float,
         )
+        rpy_used[2] += self._perception_yaw_correction_rad(latest_perception)
+        rot_ned_body = body_frd_to_local_ned_rotmat(*rpy_used)
 
         projected = dict(latest_perception)
         projected["world_frame"] = "estimator_local_neu"
@@ -157,6 +162,7 @@ class VehicleStateEstimator:
             out["gate_center_world"] = gate_world_neu.copy()
             out["drone_pos_ned"] = pos_ned.copy()
             out["drone_pos_neu"] = estimate.pos_neu.copy()
+            out["drone_rpy_rad_used"] = rpy_used.copy()
             out["drone_state_source"] = estimate.source
             out["body_to_world_method_used"] = (
                 f"vehicle_state_estimator:{estimate.source}"
@@ -243,7 +249,8 @@ class VehicleStateEstimator:
         rot_ned_body = body_frd_to_local_ned_rotmat(
             float(getattr(snapshot, "roll_rad", 0.0)),
             float(getattr(snapshot, "pitch_rad", 0.0)),
-            float(getattr(snapshot, "yaw_rad", 0.0)),
+            float(getattr(snapshot, "yaw_rad", 0.0))
+            + self._perception_yaw_correction_rad(latest_perception),
         )
         camera_translation_body = self._vec3(
             latest_perception.get("camera_translation_body")
@@ -553,6 +560,17 @@ class VehicleStateEstimator:
         if np.all(np.isfinite(arr)):
             return arr.copy()
         return None
+
+    @staticmethod
+    def _perception_yaw_correction_rad(latest_perception: dict) -> float:
+        if not isinstance(latest_perception, dict):
+            return 0.0
+        value = latest_perception.get("perception_yaw_correction_rad")
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        return out if math.isfinite(out) else 0.0
 
     @staticmethod
     def _finite_float(value) -> Optional[float]:

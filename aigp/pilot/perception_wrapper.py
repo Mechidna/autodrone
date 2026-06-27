@@ -9,11 +9,11 @@ import numpy as np
 from autonomy_core.core.competition_config import VADR_TS_002
 from autonomy_core.core.frame_conventions import (
     body_frd_to_local_ned_rotmat,
-    camera_translation_body_frd,
     local_ned_to_neu,
     local_neu_to_ned,
     official_camera_to_body_frd_rotmat,
 )
+from perception_geometry_audit import PerceptionGeometryAudit
 from runtime_config import load_runtime_config
 
 
@@ -63,12 +63,38 @@ class PerceptionWrapper:
 
         self.gate_perception = gate_perception
         camera_to_body = official_camera_to_body_frd_rotmat(VADR_TS_002)
-        self.camera_translation_body = camera_translation_body_frd(VADR_TS_002)
+        self.camera_translation_body = np.asarray(
+            self.config.camera.body_translation_m,
+            dtype=float,
+        ).reshape(3)
+        self.perception_yaw_correction_deg = float(
+            self.config.camera.yaw_correction_deg
+        )
+        self.perception_yaw_correction_rad = math.radians(
+            self.perception_yaw_correction_deg
+        )
         self.camera_to_body = np.asarray(camera_to_body, dtype=float).reshape(3, 3)
         self.object_points_m = np.asarray(
             getattr(self.gate_perception, "model_points", VADR_TS_002.gate_inner_object_points_m),
             dtype=float,
         ).reshape(4, 3)
+        self.geometry_audit = PerceptionGeometryAudit(
+            self.config.perception_geometry_audit
+        )
+        print(
+            "[PERCEPTION_CONFIG] "
+            f"backend={self.backend} "
+            f"transform_mode={self.transform_mode} "
+            f"world_pose_source={self.world_pose_source} "
+            f"camera_mount_profile={self.config.camera.mount_profile} "
+            f"perception_yaw_correction_deg={self.perception_yaw_correction_deg:.3f} "
+            f"K={self._fmt_array(self.camera_matrix, precision=3)} "
+            f"dist={self._fmt_array(self.dist_coeffs, precision=4)} "
+            f"camera_to_body={self._fmt_array(self.camera_to_body, precision=4)} "
+            f"camera_translation_body={self._fmt_array(self.camera_translation_body, precision=4)} "
+            f"object_points_m={self._fmt_array(self.object_points_m, precision=3)}",
+            flush=True,
+        )
 
     @staticmethod
     def _matrix3(value, default) -> np.ndarray:
@@ -154,6 +180,7 @@ class PerceptionWrapper:
                     raw_detections,
                     drone_pos_ned=drone_pos_ned,
                     drone_rpy_rad=drone_rpy,
+                    frame_id=int(latest_perception.get("frame_id", -1)),
                 )
         except Exception as exc:
             print(f"[perception_wrapper] update failed: {exc}", flush=True)
@@ -182,6 +209,8 @@ class PerceptionWrapper:
             "dist_coeffs": self.dist_coeffs.copy(),
             "camera_to_body": self.camera_to_body.copy(),
             "camera_translation_body": self.camera_translation_body.copy(),
+            "perception_yaw_correction_rad": float(self.perception_yaw_correction_rad),
+            "perception_yaw_correction_deg": float(self.perception_yaw_correction_deg),
             "world_frame": "mavlink_local_ned_projected_to_neu",
             "body_frame": "mavlink_body_frd",
             "transform_mode": self.transform_mode,
@@ -265,12 +294,38 @@ class PerceptionWrapper:
                 "gate_center_world": None,
                 "gate_center_world_ned": None,
                 "reprojection_error": float(debug.get("reprojection_error", np.nan)),
+                "reprojected_corners": debug.get("reprojected_corners", None),
                 "ordered_corners": debug.get("ordered_corners"),
                 "raw_corners": debug.get("raw_corners"),
                 "gate_normal_camera": debug.get("gate_normal_camera", None),
                 "rvec": debug.get("rvec"),
                 "tvec": debug.get("tvec", gate_camera),
                 "yolo_keypoints": debug.get("yolo_keypoints", None),
+                "yolo_bbox": debug.get("yolo_bbox", None),
+                "pnp_candidates": debug.get("pnp_candidates", ()),
+                "pnp_candidate_summary": debug.get("pnp_candidate_summary", ""),
+                "pnp_formulation_debug": debug.get("pnp_formulation_debug", ()),
+                "pnp_selected_order": debug.get("pnp_selected_order", ""),
+                "pnp_selected_solver": debug.get("pnp_selected_solver", ""),
+                "pnp_selected_score": self._float_or_default(
+                    debug.get("pnp_selected_score"),
+                    np.nan,
+                    allow_nan=True,
+                ),
+                "pnp_selected_reprojection_error": self._float_or_default(
+                    debug.get("pnp_selected_reprojection_error"),
+                    np.nan,
+                    allow_nan=True,
+                ),
+                "pnp_selected_reason": debug.get("pnp_selected_reason", ""),
+                "pnp_debug_best_order": debug.get("pnp_debug_best_order", ""),
+                "pnp_live_vs_debug_best_order_mismatch": bool(
+                    debug.get("pnp_live_vs_debug_best_order_mismatch", False)
+                ),
+                "allow_pnp_corner_reordering": bool(
+                    debug.get("allow_pnp_corner_reordering", False)
+                ),
+                "keypoint_polygon_winding": debug.get("keypoint_polygon_winding", ""),
                 "detection_index": int(debug.get("detection_index", -1)),
                 "processed_detection_index": int(debug.get("processed_detection_index", -1)),
                 "camera_to_body_matrix_used": self.camera_to_body.copy(),
@@ -284,15 +339,33 @@ class PerceptionWrapper:
         *,
         drone_pos_ned: np.ndarray,
         drone_rpy_rad: np.ndarray,
+        frame_id: Optional[int] = None,
     ) -> list[dict[str, Any]]:
-        return [
+        drone_rpy_used = self._perception_rpy(drone_rpy_rad)
+        projected = [
             self._project_detection_to_world(
                 detection,
                 drone_pos_ned=drone_pos_ned,
-                drone_rpy_rad=drone_rpy_rad,
+                drone_rpy_rad=drone_rpy_used,
+                drone_rpy_raw_rad=drone_rpy_rad,
             )
             for detection in detections
         ]
+        try:
+            self.geometry_audit.maybe_print(
+                projected,
+                drone_pos_ned=np.asarray(drone_pos_ned, dtype=float).reshape(3),
+                drone_rpy_rad=drone_rpy_used,
+                camera_matrix=self.camera_matrix,
+                camera_to_body=self.camera_to_body,
+                camera_translation_body=self.camera_translation_body,
+                object_points_m=self.object_points_m,
+                frame_id=frame_id,
+            )
+        except Exception as exc:
+            print(f"[GEOM_AUDIT] disabled_after_error={exc}", flush=True)
+            self.geometry_audit.enabled = False
+        return projected
 
     def _project_detection_to_world(
         self,
@@ -300,6 +373,7 @@ class PerceptionWrapper:
         *,
         drone_pos_ned: np.ndarray,
         drone_rpy_rad: np.ndarray,
+        drone_rpy_raw_rad: Optional[np.ndarray] = None,
     ) -> dict[str, Any]:
         out = dict(detection)
         gate_camera = self._vec3(out.get("gate_center_camera"), default=None)
@@ -321,7 +395,12 @@ class PerceptionWrapper:
         out["gate_center_world"] = gate_world_neu.copy()
         out["drone_pos_ned"] = drone_pos_ned.copy()
         out["drone_pos_neu"] = local_ned_to_neu(drone_pos_ned)
-        out["drone_rpy_rad_mavlink"] = np.asarray(drone_rpy_rad, dtype=float).reshape(3).copy()
+        if drone_rpy_raw_rad is None:
+            drone_rpy_raw_rad = drone_rpy_rad
+        out["drone_rpy_rad_mavlink"] = np.asarray(drone_rpy_raw_rad, dtype=float).reshape(3).copy()
+        out["drone_rpy_rad_used"] = np.asarray(drone_rpy_rad, dtype=float).reshape(3).copy()
+        out["perception_yaw_correction_rad"] = float(self.perception_yaw_correction_rad)
+        out["perception_yaw_correction_deg"] = float(self.perception_yaw_correction_deg)
         out["camera_to_body_matrix_used"] = self.camera_to_body.copy()
         out["camera_translation_body_used"] = self.camera_translation_body.copy()
         out["body_to_world_method_used"] = (
@@ -338,6 +417,11 @@ class PerceptionWrapper:
             out["gate_normal_world"] = local_ned_to_neu(normal_world_ned)
 
         return out
+
+    def _perception_rpy(self, drone_rpy_rad: np.ndarray) -> np.ndarray:
+        rpy = np.asarray(drone_rpy_rad, dtype=float).reshape(3).copy()
+        rpy[2] += float(self.perception_yaw_correction_rad)
+        return rpy
 
     def _normalize_detection(self, detection: dict[str, Any], index: int) -> dict[str, Any]:
         detection_id = self._detection_id(detection, index)
@@ -395,6 +479,47 @@ class PerceptionWrapper:
                 allow_nan=True,
             ),
             "reprojection_error": float(detection.get("reprojection_error", np.nan)),
+            "pnp_selected_order": str(detection.get("pnp_selected_order", "")),
+            "pnp_selected_solver": str(detection.get("pnp_selected_solver", "")),
+            "pnp_selected_score": self._float_or_default(
+                detection.get("pnp_selected_score"),
+                np.nan,
+                allow_nan=True,
+            ),
+            "pnp_selected_reprojection_error": self._float_or_default(
+                detection.get("pnp_selected_reprojection_error"),
+                np.nan,
+                allow_nan=True,
+            ),
+            "pnp_selected_reason": str(detection.get("pnp_selected_reason", "")),
+            "pnp_debug_best_order": str(detection.get("pnp_debug_best_order", "")),
+            "pnp_live_vs_debug_best_order_mismatch": bool(
+                detection.get("pnp_live_vs_debug_best_order_mismatch", False)
+            ),
+            "allow_pnp_corner_reordering": bool(
+                detection.get("allow_pnp_corner_reordering", False)
+            ),
+            "keypoint_polygon_winding": str(detection.get("keypoint_polygon_winding", "")),
+            "drone_pos_ned": self._vec3(detection.get("drone_pos_ned"), default=None),
+            "drone_pos_neu": self._vec3(detection.get("drone_pos_neu"), default=None),
+            "drone_rpy_rad_used": self._vec3(
+                detection.get("drone_rpy_rad_used", detection.get("drone_rpy_rad_mavlink")),
+                default=None,
+            ),
+            "perception_yaw_correction_rad": self._float_or_default(
+                detection.get("perception_yaw_correction_rad"),
+                self.perception_yaw_correction_rad,
+                allow_nan=False,
+            ),
+            "perception_yaw_correction_deg": self._float_or_default(
+                detection.get("perception_yaw_correction_deg"),
+                self.perception_yaw_correction_deg,
+                allow_nan=False,
+            ),
+            "camera_translation_body_used": self._vec3(
+                detection.get("camera_translation_body_used"),
+                default=None,
+            ),
             "camera_to_body_matrix_used": self.camera_to_body.copy(),
             "body_to_world_method_used": detection.get("body_to_world_method_used", ""),
         }
@@ -457,6 +582,17 @@ class PerceptionWrapper:
         if math.isfinite(out) or (allow_nan and math.isnan(out)):
             return out
         return float(default)
+
+    @staticmethod
+    def _fmt_array(value, precision: int = 3) -> str:
+        arr = np.asarray(value, dtype=float)
+        return np.array2string(
+            arr,
+            precision=int(precision),
+            suppress_small=True,
+            separator=",",
+            max_line_width=1000,
+        )
 
     def _position_neu(self, source) -> Optional[np.ndarray]:
         if not isinstance(source, dict):

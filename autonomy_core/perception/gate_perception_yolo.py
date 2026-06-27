@@ -2,9 +2,17 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from collections import deque
-from ultralytics import YOLO
 
 from autonomy_core.core.competition_config import VADR_TS_002, planar_square_object_points_m
+
+try:
+    from ultralytics import YOLO
+except ModuleNotFoundError:  # pragma: no cover - exercised in environments without YOLO.
+    YOLO = None
+
+
+def default_live_pnp_corner_reordering(corners_are_semantic: bool) -> bool:
+    return not bool(corners_are_semantic)
 
 
 class GatePerception:
@@ -37,13 +45,19 @@ class GatePerception:
                 "GatePerception now uses YOLO. Pass yolo_model_path='runs/pose/.../weights/best.pt'"
             )
         self.yolo_model_path = str(yolo_model_path)
+        if YOLO is None:
+            raise ModuleNotFoundError(
+                "GatePerception requires the 'ultralytics' package for YOLO inference"
+            )
         self.yolo_model = YOLO(self.yolo_model_path)
         self.yolo_conf = float(yolo_conf)
         self.yolo_imgsz = int(yolo_imgsz)
         self.yolo_device = yolo_device
         self.preprocess_mode = preprocess_mode
         self.corners_are_semantic = True  # YOLO pose outputs TL, TR, BR, BL directly.
-        self.allow_pnp_corner_reordering = True
+        self.allow_pnp_corner_reordering = default_live_pnp_corner_reordering(
+            self.corners_are_semantic
+        )
 
         print(f"[YOLO PERCEPTION] model={self.yolo_model_path}")
         print(f"[YOLO PERCEPTION] preprocess_mode={self.preprocess_mode}, conf={self.yolo_conf}, imgsz={self.yolo_imgsz}")

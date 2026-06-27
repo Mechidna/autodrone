@@ -105,6 +105,9 @@ class CameraSection:
     cx: float
     cy: float
     dist_coeffs: tuple[float, ...]
+    body_translation_m: tuple[float, float, float]
+    mount_profile: str
+    yaw_correction_deg: float
 
     @property
     def matrix(self) -> tuple[tuple[float, float, float], ...]:
@@ -132,6 +135,24 @@ class PerceptionSection:
     min_depth_m_for_memory: float
     max_depth_m_for_memory: float
     reject_negative_depth: bool
+
+
+@dataclass(frozen=True)
+class PerceptionGeometryAuditSection:
+    enabled: bool
+    print_period_s: float
+    max_prints: int
+    max_match_distance_m: float
+    known_gate_positions_neu: tuple[tuple[float, float, float], ...]
+    gate_right_axis_neu: tuple[float, float, float]
+    gate_up_axis_neu: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class GateSourceSection:
+    mode: str
+    allow_ground_truth: bool
+    known_gate_positions_neu: tuple[tuple[float, float, float], ...]
 
 
 @dataclass(frozen=True)
@@ -277,6 +298,8 @@ class PilotConfig:
     vision: VisionSection
     camera: CameraSection
     perception: PerceptionSection
+    perception_geometry_audit: PerceptionGeometryAuditSection
+    gate_source: GateSourceSection
     gate_memory: GateMemorySection
     race: RaceSection
     planner: PlannerSection
@@ -299,8 +322,12 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
     state_estimation_raw = _section(raw, "state_estimation")
     timesync_raw = _section(raw, "timesync")
     vision_raw = _section(raw, "vision")
-    camera_raw = _section(_section(raw, "camera"), "competition")
+    camera_parent_raw = _section(raw, "camera")
+    camera_raw = _section(camera_parent_raw, "competition")
+    camera_mount_raw = _section(camera_parent_raw, "mount")
     perception_raw = _section(raw, "perception")
+    perception_geometry_audit_raw = _section(raw, "perception_geometry_audit")
+    gate_source_raw = _section(raw, "gate_source")
     gate_memory_raw = _section(raw, "gate_memory")
     race_raw = _section(raw, "race")
     planner_raw = _section(raw, "planner")
@@ -313,6 +340,43 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
     control_hz = _float(runtime_raw, "control_hz", _float(command_raw, "stream_hz", 50.0))
     command_stream_hz = _float(command_raw, "stream_hz", control_hz)
     mavlink_port_override = _env_int("MAVLINK_PORT", None)
+    camera_mount_profile, camera_body_translation_m, camera_yaw_correction_deg = _resolve_camera_mount(
+        _env_str(
+            "CAMERA_MOUNT_PROFILE",
+            _str(camera_mount_raw, "profile", _str(camera_raw, "mount_profile", "auto")),
+        ),
+        runner_mode=runner_mode,
+        competition_body_translation_m=_float_tuple(
+            camera_mount_raw.get("competition_body_translation_m"),
+            (0.0, 0.0, 0.0),
+            3,
+        ),
+        competition_yaw_correction_deg=_float(
+            camera_mount_raw,
+            "competition_yaw_correction_deg",
+            0.0,
+        ),
+        px4_x500_body_translation_m=_float_tuple(
+            camera_mount_raw.get("px4_x500_mono_cam_body_translation_m"),
+            (0.12, -0.03, -0.242),
+            3,
+        ),
+        px4_x500_yaw_correction_deg=_float(
+            camera_mount_raw,
+            "px4_x500_mono_cam_yaw_correction_deg",
+            0.0,
+        ),
+        custom_body_translation_m=_float_tuple(
+            camera_mount_raw.get("custom_body_translation_m"),
+            _float_tuple(camera_raw.get("body_translation_m"), (0.0, 0.0, 0.0), 3),
+            3,
+        ),
+        custom_yaw_correction_deg=_float(
+            camera_mount_raw,
+            "custom_yaw_correction_deg",
+            _float(camera_raw, "yaw_correction_deg", 0.0),
+        ),
+    )
 
     port_px4 = _int(mavlink_raw, "port_px4", 14540)
     port_competition = _int(mavlink_raw, "port_competition", 14550)
@@ -469,6 +533,9 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             cx=_float(camera_raw, "cx", 320.0),
             cy=_float(camera_raw, "cy", 180.0),
             dist_coeffs=tuple(_float_list(camera_raw.get("dist_coeffs"), [0.0] * 5)),
+            body_translation_m=camera_body_translation_m,
+            mount_profile=camera_mount_profile,
+            yaw_correction_deg=camera_yaw_correction_deg,
         ),
         perception=PerceptionSection(
             enabled=_bool(perception_raw, "enabled", True),
@@ -501,6 +568,43 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 _float(planner_raw, "max_detection_range_m", 25.0),
             ),
             reject_negative_depth=_bool(perception_raw, "reject_negative_depth", True),
+        ),
+        perception_geometry_audit=PerceptionGeometryAuditSection(
+            enabled=_bool(perception_geometry_audit_raw, "enabled", False),
+            print_period_s=_float(perception_geometry_audit_raw, "print_period_s", 0.5),
+            max_prints=_int(perception_geometry_audit_raw, "max_prints", 80),
+            max_match_distance_m=_float(
+                perception_geometry_audit_raw,
+                "max_match_distance_m",
+                5.0,
+            ),
+            known_gate_positions_neu=tuple(
+                _vec3_tuple(item)
+                for item in (
+                    perception_geometry_audit_raw.get("known_gate_positions_neu", ())
+                    or ()
+                )
+            ),
+            gate_right_axis_neu=_vec3_tuple(
+                perception_geometry_audit_raw.get("gate_right_axis_neu", (1.0, 0.0, 0.0))
+            ),
+            gate_up_axis_neu=_vec3_tuple(
+                perception_geometry_audit_raw.get("gate_up_axis_neu", (0.0, 0.0, 1.0))
+            ),
+        ),
+        gate_source=GateSourceSection(
+            mode=_env_str(
+                "GATE_SOURCE_MODE",
+                _str(gate_source_raw, "mode", "perception"),
+            ).lower(),
+            allow_ground_truth=_bool(gate_source_raw, "allow_ground_truth", False),
+            known_gate_positions_neu=tuple(
+                _vec3_tuple(item)
+                for item in (
+                    gate_source_raw.get("known_gate_positions_neu", ())
+                    or ()
+                )
+            ),
         ),
         gate_memory=GateMemorySection(
             association_radius=_float(gate_memory_raw, "association_radius", 1.5),
@@ -746,11 +850,71 @@ def _validate(config: PilotConfig) -> None:
             f"Invalid runner_mode={config.runtime.runner_mode!r}. "
             "Use runner_mode='px4' or runner_mode='competition'."
         )
+    if config.camera.mount_profile not in ("competition", "px4_x500_mono_cam", "custom"):
+        raise RuntimeError(
+            f"Invalid camera mount profile={config.camera.mount_profile!r}. "
+            "Use 'auto', 'competition', 'px4_x500_mono_cam', or 'custom'."
+        )
+    if (
+        config.runtime.runner_mode == "competition"
+        and any(abs(float(item)) > 1e-9 for item in config.camera.body_translation_m)
+    ):
+        raise RuntimeError(
+            "camera.body_translation_m must resolve to [0, 0, 0] in "
+            "runner_mode='competition'. VADR-TS-002 defines the camera and body "
+            "frames as the same origin; PX4 validation camera offsets must stay "
+            "in runner_mode='px4'."
+        )
+    if (
+        config.runtime.runner_mode == "competition"
+        and abs(float(config.camera.yaw_correction_deg)) > 1e-9
+    ):
+        raise RuntimeError(
+            "camera.yaw_correction_deg must resolve to 0.0 in "
+            "runner_mode='competition'. VADR-TS-002 defines the official camera/body "
+            "transform; PX4 validation yaw corrections must stay in runner_mode='px4'."
+        )
     if config.vision.source not in ("udp", "ros"):
         raise RuntimeError(
             f"Invalid vision.source={config.vision.source!r}. "
             "Use vision.source='udp' or vision.source='ros'."
         )
+    if config.runtime.runner_mode == "competition" and config.perception_geometry_audit.enabled:
+        raise RuntimeError(
+            "perception_geometry_audit is debug-only and may use known sim gate "
+            "positions. Disable it before running runner_mode='competition'."
+        )
+    if config.gate_source.mode not in ("perception", "ground_truth"):
+        raise RuntimeError(
+            f"Invalid gate_source.mode={config.gate_source.mode!r}. "
+            "Use 'perception' or 'ground_truth'."
+        )
+    if config.gate_source.mode == "ground_truth":
+        if config.runtime.runner_mode == "competition":
+            raise RuntimeError(
+                "gate_source.mode='ground_truth' is debug-only and not competition-valid. "
+                "VADR-TS-002 does not provide fixed gate coordinates to contestant "
+                "software."
+            )
+        if not config.gate_source.allow_ground_truth:
+            raise RuntimeError(
+                "gate_source.mode='ground_truth' requires "
+                "gate_source.allow_ground_truth=true to make the sim-truth dependency "
+                "explicit."
+            )
+        if not config.gate_source.known_gate_positions_neu:
+            raise RuntimeError(
+                "gate_source.known_gate_positions_neu must contain at least one gate "
+                "when gate_source.mode='ground_truth'."
+            )
+        if (
+            config.race.gate_count is not None
+            and len(config.gate_source.known_gate_positions_neu) < config.race.gate_count
+        ):
+            raise RuntimeError(
+                "gate_source.known_gate_positions_neu must contain at least "
+                "race.gate_count entries when gate_source.mode='ground_truth'."
+            )
     if config.state_estimation.mode not in ("mavlink", "auto", "estimator"):
         raise RuntimeError(
             f"Invalid state_estimation.mode={config.state_estimation.mode!r}. "
@@ -848,9 +1012,19 @@ def _validate(config: PilotConfig) -> None:
         ),
         ("perception.min_depth_m_for_memory", config.perception.min_depth_m_for_memory),
         ("perception.max_depth_m_for_memory", config.perception.max_depth_m_for_memory),
+        (
+            "perception_geometry_audit.print_period_s",
+            config.perception_geometry_audit.print_period_s,
+        ),
+        (
+            "perception_geometry_audit.max_match_distance_m",
+            config.perception_geometry_audit.max_match_distance_m,
+        ),
     ):
         if float(value) < 0.0:
             raise RuntimeError(f"{key} must be non-negative.")
+    if config.perception_geometry_audit.max_prints < 0:
+        raise RuntimeError("perception_geometry_audit.max_prints must be non-negative.")
     if (
         config.perception.max_depth_m_for_memory > 0.0
         and config.perception.min_depth_m_for_memory > config.perception.max_depth_m_for_memory
@@ -885,6 +1059,30 @@ def _validate(config: PilotConfig) -> None:
 def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
     value = raw.get(key, {})
     return value if isinstance(value, dict) else {}
+
+
+def _resolve_camera_mount(
+    profile: str,
+    *,
+    runner_mode: str,
+    competition_body_translation_m: tuple[float, float, float],
+    competition_yaw_correction_deg: float,
+    px4_x500_body_translation_m: tuple[float, float, float],
+    px4_x500_yaw_correction_deg: float,
+    custom_body_translation_m: tuple[float, float, float],
+    custom_yaw_correction_deg: float,
+) -> tuple[str, tuple[float, float, float], float]:
+    requested = str(profile or "auto").strip().lower()
+    if requested == "auto":
+        requested = "competition" if str(runner_mode).lower() == "competition" else "px4_x500_mono_cam"
+
+    if requested == "competition":
+        return "competition", competition_body_translation_m, float(competition_yaw_correction_deg)
+    if requested == "px4_x500_mono_cam":
+        return "px4_x500_mono_cam", px4_x500_body_translation_m, float(px4_x500_yaw_correction_deg)
+    if requested == "custom":
+        return "custom", custom_body_translation_m, float(custom_yaw_correction_deg)
+    return requested, custom_body_translation_m, float(custom_yaw_correction_deg)
 
 
 def _str(raw: dict[str, Any], key: str, default: str) -> str:

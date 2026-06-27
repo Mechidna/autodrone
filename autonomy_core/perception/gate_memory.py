@@ -25,6 +25,7 @@ class GateTrack:
     first_seen_time: float = 0.0
     last_seen_time: float = 0.0
     committed: bool = False
+    planning_center: Optional[np.ndarray] = None
 
     # Raw measurement history used for commit consistency checks / debugging
     measurement_history: List[np.ndarray] = field(default_factory=list)
@@ -142,7 +143,12 @@ class GateTrack:
             is_outlier=is_outlier,
         )
 
-        err = float(np.linalg.norm(measurement - self.center))
+        reference = (
+            self.planning_center
+            if self.planning_center is not None
+            else self.center
+        )
+        err = float(np.linalg.norm(measurement - reference))
         self.recent_errors.append(err)
         if is_outlier:
             self.outlier_count += 1
@@ -372,6 +378,8 @@ class GateMemory:
                 return
 
         tr.committed = True
+        tr.planning_center = tr.center.copy()
+        tr.center = tr.planning_center.copy()
         if not self.use_lookahead_gate_filter:
             tr.is_stable = True
             tr.filtered_center_world = tr.center.copy()
@@ -390,6 +398,8 @@ class GateMemory:
 
     def _update_track_filter(self, tr: GateTrack):
         was_stable = bool(tr.is_stable)
+        if tr.committed and tr.planning_center is None:
+            tr.planning_center = tr.center.copy()
         observations = list(tr.obs_history[-self.history_size:])
         if len(observations) == 0:
             tr.promotion_blocked_reason = "no_observations"
@@ -416,7 +426,7 @@ class GateMemory:
             filtered_world = np.mean(inlier_world, axis=0)
             tr.filtered_center_world = filtered_world.copy()
             tr.center_world_std = np.std(inlier_world, axis=0) if len(inlier_world) > 1 else np.zeros(3)
-            if not tr.is_stable:
+            if not tr.committed and not tr.is_stable:
                 tr.center = filtered_world.copy()
         else:
             tr.filtered_center_world = tr.center.copy()
@@ -469,13 +479,19 @@ class GateMemory:
             tr.stability_score = 0.0
         else:
             tr.is_stable = True
-            tr.center = tr.filtered_center_world.copy()
+            if not tr.committed:
+                tr.center = tr.filtered_center_world.copy()
+            elif tr.planning_center is None:
+                tr.planning_center = tr.center.copy()
             std_score = 1.0 - min(world_std_norm / max(self.max_center_std_for_stable, 1e-6), 1.0)
             reproj_score = 1.0
             if np.isfinite(reproj):
                 reproj_score = 1.0 - min(reproj / max(self.max_reprojection_error_for_stable, 1e-6), 1.0)
             hit_score = min(tr.hits / max(float(self.min_hits_for_stable), 1.0), 2.0) / 2.0
             tr.stability_score = float(0.45 * std_score + 0.35 * reproj_score + 0.20 * hit_score)
+
+        if tr.committed and tr.planning_center is not None:
+            tr.center = tr.planning_center.copy()
 
         if tr.is_stable and not was_stable:
             self.last_track_stable_now = True
@@ -499,13 +515,23 @@ class GateMemory:
         if source is None or target is None:
             return None
 
-        source_center = source.center.copy()
-        target_center = target.center.copy()
+        source_center = (
+            source.planning_center
+            if source.planning_center is not None
+            else source.center
+        ).copy()
+        target_center = (
+            target.planning_center
+            if target.planning_center is not None
+            else target.center
+        ).copy()
         source_weight = max(float(source.hits), 1.0)
         target_weight = max(float(target.hits), 1.0)
-        target.center = (
-            target.center * target_weight + source.center * source_weight
+        merged_center = (
+            target_center * target_weight + source_center * source_weight
         ) / (target_weight + source_weight)
+        target.center = merged_center.copy()
+        target.planning_center = merged_center.copy()
         target.confidence_sum += source.confidence_sum
         target.hits += source.hits
         target.last_seen_time = max(target.last_seen_time, source.last_seen_time)

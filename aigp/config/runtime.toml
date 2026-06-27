@@ -30,7 +30,7 @@ store_highres_imu = true
 store_timesync = true
 
 [state_estimation]
-mode = "estimator"                    # mavlink | auto | estimator
+mode = "mavlink"                    # mavlink | auto | estimator
 mavlink_truth_logging = true
 init_position_source = "zero"    # zero | mavlink_once
 use_imu_prediction = true
@@ -80,6 +80,17 @@ cx = 320.0
 cy = 180.0
 dist_coeffs = [0.0, 0.0, 0.0, 0.0, 0.0]
 
+[camera.mount]
+profile = "auto" # auto | competition | px4_x500_mono_cam | custom
+competition_body_translation_m = [0.0, 0.0, 0.0]
+competition_yaw_correction_deg = 0.0
+# PX4 x500_mono_cam SDF pose: .12 .03 .242 relative to base_link.
+# Converted from Gazebo body FLU to MAVLink body FRD: x forward, y right, z down.
+px4_x500_mono_cam_body_translation_m = [0.12, -0.03, -0.242]
+px4_x500_mono_cam_yaw_correction_deg = -5.86
+custom_body_translation_m = [0.0, 0.0, 0.0]
+custom_yaw_correction_deg = 0.0
+
 [perception]
 enabled = true
 backend = "yolo"                 # blue | orange | yolo
@@ -96,6 +107,28 @@ max_reprojection_error_for_memory = 5.0
 min_depth_m_for_memory = 0.5
 max_depth_m_for_memory = 25.0
 reject_negative_depth = true
+
+[perception_geometry_audit]
+enabled = true                    # debug/PX4 only; disable for competition
+print_period_s = 0.5
+max_prints = 120
+max_match_distance_m = 5.0
+known_gate_positions_neu = [
+  [0.0, 8.0, 1.5],
+  [0.8, 16.0, 1.5],
+  [-0.8, 24.0, 1.5],
+]
+gate_right_axis_neu = [1.0, 0.0, 0.0]
+gate_up_axis_neu = [0.0, 0.0, 1.0]
+
+[gate_source]
+mode = "perception"               # perception | ground_truth
+allow_ground_truth = false         # debug/PX4 only; not competition-valid
+known_gate_positions_neu = [
+  [0.0, 8.0, 1.5],
+  [0.8, 16.0, 1.5],
+  [-0.8, 24.0, 1.5],
+]
 
 [gate_memory]
 association_radius = 1.5
@@ -171,7 +204,7 @@ command_print_period_s = 1.0
 
 [hover_acquisition]
 enabled = true
-estimator_mode_only = true
+estimator_mode_only = false
 require_armed = true
 initial_thrust = 0.5
 min_thrust = 0.0
