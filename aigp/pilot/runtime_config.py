@@ -52,6 +52,8 @@ class TelemetrySection:
 class StateEstimationSection:
     mode: str
     mavlink_truth_logging: bool
+    run_shadow_estimator: bool
+    shadow_trace_period_s: float
     init_position_source: str
     use_imu_prediction: bool
     use_vision_correction: bool
@@ -62,9 +64,25 @@ class StateEstimationSection:
     vision_correction_alpha: float
     vision_correction_alpha_xy: float
     vision_correction_alpha_z: float
+    vision_correction_velocity_alpha_xy: float
+    vision_correction_velocity_alpha_z: float
+    vision_correction_bias_alpha_xy: float
+    vision_correction_bias_alpha_z: float
+    vision_correction_min_velocity_dt_s: float
+    vision_correction_max_velocity_dt_s: float
+    vision_correction_velocity_min_measurements: int
+    vision_correction_velocity_max_residual_m: float
+    vision_correction_max_visual_speed_m_s: float
+    vision_correction_max_velocity_innovation_m_s: float
+    vision_correction_max_velocity_delta_m_s: float
+    vision_correction_max_accel_bias_m_s2: float
+    vision_correction_max_bias_delta_m_s2: float
     vision_correction_max_delta_m: float
     vision_correction_max_residual_m: float
     vision_correction_min_confidence: float
+    vision_correction_min_measurements: int
+    vision_correction_single_landmark_max_residual_m: float
+    vision_correction_max_avg_residual_m: float
     estimator_landmark_min_hits: int
     estimator_landmark_min_observation_time_s: float
     estimator_landmark_max_center_std_m: float
@@ -423,6 +441,16 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 "mavlink_truth_logging",
                 True,
             ),
+            run_shadow_estimator=_bool(
+                state_estimation_raw,
+                "run_shadow_estimator",
+                False,
+            ),
+            shadow_trace_period_s=_float(
+                state_estimation_raw,
+                "shadow_trace_period_s",
+                0.5,
+            ),
             init_position_source=_str(
                 state_estimation_raw,
                 "init_position_source",
@@ -459,7 +487,72 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             vision_correction_alpha_z=_float(
                 state_estimation_raw,
                 "vision_correction_alpha_z",
-                0.0,
+                0.08,
+            ),
+            vision_correction_velocity_alpha_xy=_float(
+                state_estimation_raw,
+                "vision_correction_velocity_alpha_xy",
+                0.10,
+            ),
+            vision_correction_velocity_alpha_z=_float(
+                state_estimation_raw,
+                "vision_correction_velocity_alpha_z",
+                0.20,
+            ),
+            vision_correction_bias_alpha_xy=_float(
+                state_estimation_raw,
+                "vision_correction_bias_alpha_xy",
+                0.01,
+            ),
+            vision_correction_bias_alpha_z=_float(
+                state_estimation_raw,
+                "vision_correction_bias_alpha_z",
+                0.03,
+            ),
+            vision_correction_min_velocity_dt_s=_float(
+                state_estimation_raw,
+                "vision_correction_min_velocity_dt_s",
+                0.10,
+            ),
+            vision_correction_max_velocity_dt_s=_float(
+                state_estimation_raw,
+                "vision_correction_max_velocity_dt_s",
+                1.00,
+            ),
+            vision_correction_velocity_min_measurements=_int(
+                state_estimation_raw,
+                "vision_correction_velocity_min_measurements",
+                3,
+            ),
+            vision_correction_velocity_max_residual_m=_float(
+                state_estimation_raw,
+                "vision_correction_velocity_max_residual_m",
+                0.30,
+            ),
+            vision_correction_max_visual_speed_m_s=_float(
+                state_estimation_raw,
+                "vision_correction_max_visual_speed_m_s",
+                4.00,
+            ),
+            vision_correction_max_velocity_innovation_m_s=_float(
+                state_estimation_raw,
+                "vision_correction_max_velocity_innovation_m_s",
+                2.00,
+            ),
+            vision_correction_max_velocity_delta_m_s=_float(
+                state_estimation_raw,
+                "vision_correction_max_velocity_delta_m_s",
+                1.00,
+            ),
+            vision_correction_max_accel_bias_m_s2=_float(
+                state_estimation_raw,
+                "vision_correction_max_accel_bias_m_s2",
+                2.00,
+            ),
+            vision_correction_max_bias_delta_m_s2=_float(
+                state_estimation_raw,
+                "vision_correction_max_bias_delta_m_s2",
+                0.30,
             ),
             vision_correction_max_delta_m=_float(
                 state_estimation_raw,
@@ -475,6 +568,21 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 state_estimation_raw,
                 "vision_correction_min_confidence",
                 0.2,
+            ),
+            vision_correction_min_measurements=_int(
+                state_estimation_raw,
+                "vision_correction_min_measurements",
+                2,
+            ),
+            vision_correction_single_landmark_max_residual_m=_float(
+                state_estimation_raw,
+                "vision_correction_single_landmark_max_residual_m",
+                0.35,
+            ),
+            vision_correction_max_avg_residual_m=_float(
+                state_estimation_raw,
+                "vision_correction_max_avg_residual_m",
+                0.8,
             ),
             estimator_landmark_min_hits=_int(
                 state_estimation_raw,
@@ -924,6 +1032,13 @@ def _validate(config: PilotConfig) -> None:
         raise RuntimeError(
             "state_estimation.init_position_source must be 'zero' or 'mavlink_once'."
         )
+    if config.state_estimation.run_shadow_estimator and (
+        config.state_estimation.shadow_trace_period_s <= 0.0
+    ):
+        raise RuntimeError(
+            "state_estimation.shadow_trace_period_s must be positive when "
+            "run_shadow_estimator=true."
+        )
     if config.state_estimation.vision_correction_source not in (
         "none",
         "known_gates",
@@ -933,6 +1048,44 @@ def _validate(config: PilotConfig) -> None:
         raise RuntimeError(
             "state_estimation.vision_correction_source must be 'none', "
             "'known_gates', 'stable_tracks', or 'known_gates_or_stable_tracks'."
+        )
+    if config.state_estimation.vision_correction_min_measurements < 1:
+        raise RuntimeError(
+            "state_estimation.vision_correction_min_measurements must be >= 1."
+        )
+    if config.state_estimation.vision_correction_min_velocity_dt_s < 0.0:
+        raise RuntimeError(
+            "state_estimation.vision_correction_min_velocity_dt_s must be >= 0."
+        )
+    if (
+        config.state_estimation.vision_correction_max_velocity_dt_s > 0.0
+        and config.state_estimation.vision_correction_max_velocity_dt_s
+        < config.state_estimation.vision_correction_min_velocity_dt_s
+    ):
+        raise RuntimeError(
+            "state_estimation.vision_correction_max_velocity_dt_s must be >= "
+            "vision_correction_min_velocity_dt_s, or <= 0 to disable the max."
+        )
+    if config.state_estimation.vision_correction_max_velocity_delta_m_s < 0.0:
+        raise RuntimeError(
+            "state_estimation.vision_correction_max_velocity_delta_m_s must be >= 0."
+        )
+    if config.state_estimation.vision_correction_max_accel_bias_m_s2 < 0.0:
+        raise RuntimeError(
+            "state_estimation.vision_correction_max_accel_bias_m_s2 must be >= 0."
+        )
+    if config.state_estimation.vision_correction_max_bias_delta_m_s2 < 0.0:
+        raise RuntimeError(
+            "state_estimation.vision_correction_max_bias_delta_m_s2 must be >= 0."
+        )
+    if config.state_estimation.vision_correction_single_landmark_max_residual_m < 0.0:
+        raise RuntimeError(
+            "state_estimation.vision_correction_single_landmark_max_residual_m "
+            "must be >= 0."
+        )
+    if config.state_estimation.vision_correction_max_avg_residual_m < 0.0:
+        raise RuntimeError(
+            "state_estimation.vision_correction_max_avg_residual_m must be >= 0."
         )
     source_uses_known_gates = config.state_estimation.vision_correction_source in (
         "known_gates",
@@ -991,6 +1144,31 @@ def _validate(config: PilotConfig) -> None:
         raise RuntimeError("state_estimation.vision_correction_max_delta_m must be non-negative.")
     if config.state_estimation.vision_correction_max_residual_m < 0.0:
         raise RuntimeError("state_estimation.vision_correction_max_residual_m must be non-negative.")
+    if config.state_estimation.vision_correction_velocity_min_measurements < 1:
+        raise RuntimeError(
+            "state_estimation.vision_correction_velocity_min_measurements "
+            "must be at least 1."
+        )
+    for key, value in (
+        (
+            "vision_correction_velocity_max_residual_m",
+            config.state_estimation.vision_correction_velocity_max_residual_m,
+        ),
+        (
+            "vision_correction_max_visual_speed_m_s",
+            config.state_estimation.vision_correction_max_visual_speed_m_s,
+        ),
+        (
+            "vision_correction_max_velocity_innovation_m_s",
+            config.state_estimation.vision_correction_max_velocity_innovation_m_s,
+        ),
+        (
+            "vision_correction_max_velocity_delta_m_s",
+            config.state_estimation.vision_correction_max_velocity_delta_m_s,
+        ),
+    ):
+        if float(value) < 0.0:
+            raise RuntimeError(f"state_estimation.{key} must be non-negative.")
     if config.state_estimation.estimator_landmark_min_hits < 1:
         raise RuntimeError("state_estimation.estimator_landmark_min_hits must be at least 1.")
     for key, value in (

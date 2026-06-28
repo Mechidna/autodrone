@@ -160,12 +160,22 @@ class PyAIPilotAutonomyAPI:
             ),
         )
         self.state_estimator = VehicleStateEstimator(self.config)
+        self.shadow_state_estimator = (
+            VehicleStateEstimator(self.config, mode_override="estimator")
+            if bool(state_estimation_config.run_shadow_estimator)
+            else None
+        )
         self.last_state_estimate = None
+        self.last_shadow_state_estimate = None
         self._last_gate_memory_frame_key = None
         self._last_stable_gate_print_signature = None
         self._last_race_order_print_signature = None
         self._last_trace_print_time = 0.0
         self._trace_period_s = 0.5
+        self._last_shadow_trace_print_time = 0.0
+        self._shadow_trace_period_s = float(
+            state_estimation_config.shadow_trace_period_s
+        )
         print(
             "[GATE_SOURCE_CONFIG] "
             f"mode={self.gate_source_mode} "
@@ -220,6 +230,7 @@ class PyAIPilotAutonomyAPI:
         snapshot.stable_gate_landmarks_neu = self._stable_gate_landmarks_neu()
         estimate = self.state_estimator.update(snapshot)
         self.last_state_estimate = estimate
+        self._update_shadow_estimator(snapshot)
 
         if not estimate.valid:
             return None
@@ -359,6 +370,88 @@ class PyAIPilotAutonomyAPI:
             flush=True,
         )
 
+    def _update_shadow_estimator(self, snapshot) -> None:
+        if self.shadow_state_estimator is None:
+            return
+        estimate = self.shadow_state_estimator.update(snapshot)
+        self.last_shadow_state_estimate = estimate
+        self._trace_shadow_estimator(estimate)
+
+    def _trace_shadow_estimator(self, estimate) -> None:
+        now = time.time()
+        if now - self._last_shadow_trace_print_time < self._shadow_trace_period_s:
+            return
+        self._last_shadow_trace_print_time = now
+
+        def fmt_vec(value) -> str:
+            if value is None:
+                return "None"
+            try:
+                arr = np.asarray(value, dtype=float).reshape(3)
+            except (TypeError, ValueError):
+                return "None"
+            if not np.all(np.isfinite(arr)):
+                return "None"
+            return f"({arr[0]:.2f},{arr[1]:.2f},{arr[2]:.2f})"
+
+        def fmt_float(value) -> str:
+            try:
+                out = float(value)
+            except (TypeError, ValueError):
+                return "nan"
+            return f"{out:.3f}" if math.isfinite(out) else "nan"
+
+        correction_source = str(
+            getattr(estimate, "vision_correction_source", "")
+        )
+        correction_residual = getattr(
+            estimate,
+            "vision_correction_residual_m",
+            None,
+        )
+        correction_count = int(
+            getattr(estimate, "vision_correction_count", 0)
+        )
+        correction_txt = "none"
+        if (
+            correction_source
+            and correction_residual is not None
+            and math.isfinite(float(correction_residual))
+        ):
+            correction_txt = (
+                f"{correction_source}@{float(correction_residual):.2f}/"
+                f"{correction_count}"
+            )
+
+        truth_error = getattr(estimate, "truth_error_m", None)
+        truth_error_txt = (
+            "nan"
+            if truth_error is None or not math.isfinite(float(truth_error))
+            else f"{float(truth_error):.2f}"
+        )
+
+        print(
+            "shadow_estimator_trace "
+            f"valid={int(bool(getattr(estimate, 'valid', False)))} "
+            f"truth_err={truth_error_txt} "
+            f"imu_dt={fmt_float(getattr(estimate, 'imu_dt_s', None))} "
+            f"raw_accel_body={fmt_vec(getattr(estimate, 'raw_accel_body', None))} "
+            f"computed_acc_neu={fmt_vec(getattr(estimate, 'computed_acc_neu', None))} "
+            f"pos_neu={fmt_vec(getattr(estimate, 'pos_neu', None))} "
+            f"truth_pos_neu={fmt_vec(getattr(estimate, 'truth_pos_neu', None))} "
+            f"est_minus_truth_neu={fmt_vec(getattr(estimate, 'position_error_neu', None))} "
+            f"integrated_vel_neu={fmt_vec(getattr(estimate, 'vel_neu', None))} "
+            f"visual_vel_neu={fmt_vec(getattr(estimate, 'visual_velocity_neu', None))} "
+            f"visual_dt={fmt_float(getattr(estimate, 'visual_velocity_dt_s', None))} "
+            f"visual_ref_reset={int(bool(getattr(estimate, 'visual_reference_reset', False)))} "
+            f"visual_vel_reason={str(getattr(estimate, 'visual_velocity_reason', '') or 'none')} "
+            f"mavlink_vel_neu={fmt_vec(getattr(estimate, 'truth_vel_neu', None))} "
+            f"vel_minus_mavlink_neu={fmt_vec(getattr(estimate, 'velocity_error_neu', None))} "
+            f"accel_bias_neu={fmt_vec(getattr(estimate, 'accel_bias_neu', None))} "
+            f"corr={correction_txt}",
+            flush=True,
+        )
+
     def _trace_autonomy(
         self,
         pos,
@@ -391,12 +484,21 @@ class PyAIPilotAutonomyAPI:
 
         state_source = "unknown"
         truth_error_txt = "nan"
+        truth_pos_txt = "None"
         correction_txt = "none"
         if self.last_state_estimate is not None:
             state_source = str(self.last_state_estimate.source)
             truth_error = self.last_state_estimate.truth_error_m
             if truth_error is not None and math.isfinite(float(truth_error)):
                 truth_error_txt = f"{float(truth_error):.2f}"
+            truth_pos = getattr(self.last_state_estimate, "truth_pos_neu", None)
+            if truth_pos is not None:
+                try:
+                    truth_pos_arr = np.asarray(truth_pos, dtype=float).reshape(3)
+                except (TypeError, ValueError):
+                    truth_pos_arr = None
+                if truth_pos_arr is not None and np.all(np.isfinite(truth_pos_arr)):
+                    truth_pos_txt = fmt_vec(truth_pos_arr)
             correction_source = str(
                 getattr(self.last_state_estimate, "vision_correction_source", "")
             )
@@ -459,6 +561,7 @@ class PyAIPilotAutonomyAPI:
             f"active_replan_held={int(target_diag.suppress_active_replan)} "
             f"state={state_source} "
             f"truth_err={truth_error_txt} "
+            f"truth_pos_neu={truth_pos_txt} "
             f"corr={correction_txt} "
             f"tau={tau:.2f}/{float(self.planner.total_time):.2f} "
             f"dist={dist_txt} "
@@ -583,7 +686,17 @@ class PyAIPilotAutonomyAPI:
         if distance >= self.pass_radius_m:
             return False
 
-        self.target_manager.mark_passed(pos_neu=pos, distance_m=distance)
+        truth_pos = None
+        truth_error = None
+        if self.last_state_estimate is not None:
+            truth_pos = getattr(self.last_state_estimate, "truth_pos_neu", None)
+            truth_error = getattr(self.last_state_estimate, "truth_error_m", None)
+        self.target_manager.mark_passed(
+            pos_neu=pos,
+            distance_m=distance,
+            truth_pos_neu=truth_pos,
+            truth_error_m=truth_error,
+        )
         self._sync_target_manager_state(clear_unlocked_current=True)
         self.active_waypoints = None
         self.active_times = None

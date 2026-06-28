@@ -160,17 +160,39 @@ class TargetManager:
         self.suppress_active_replan = True
         return [gate.copy() for _, gate in entries], [track_id for track_id, _ in entries]
 
-    def mark_passed(self, *, pos_neu, distance_m: float) -> None:
+    def mark_passed(
+        self,
+        *,
+        pos_neu,
+        distance_m: float,
+        truth_pos_neu=None,
+        truth_error_m=None,
+    ) -> None:
         completed_id = self.active_target_track_id
         if completed_id is not None:
             self.completed_track_ids.add(int(completed_id))
+
+        truth_txt = ""
+        if truth_pos_neu is not None:
+            try:
+                truth_txt += f" truth_pos={self._fmt_vec(self._as_vec3(truth_pos_neu))}"
+            except (TypeError, ValueError):
+                pass
+        if truth_error_m is not None:
+            try:
+                truth_error = float(truth_error_m)
+            except (TypeError, ValueError):
+                truth_error = float("nan")
+            if math.isfinite(truth_error):
+                truth_txt += f" truth_err={truth_error:.2f}"
 
         print(
             "target_manager passed "
             f"gate_idx={self.current_gate_idx} "
             f"track={self._track_text(completed_id)} "
             f"dist={float(distance_m):.2f} "
-            f"pos={self._fmt_vec(self._as_vec3(pos_neu))}",
+            f"pos={self._fmt_vec(self._as_vec3(pos_neu))}"
+            f"{truth_txt}",
             flush=True,
         )
         self.current_gate_idx += 1
