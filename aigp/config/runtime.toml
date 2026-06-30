@@ -30,7 +30,7 @@ store_highres_imu = true
 store_timesync = true
 
 [state_estimation]
-mode = "estimator"                    # mavlink | auto | estimator
+mode = "mavlink"                    # mavlink | auto | estimator
 mavlink_truth_logging = true
 run_shadow_estimator = true
 shadow_trace_period_s = 0.50
@@ -72,6 +72,52 @@ known_gate_positions_neu = []
 gravity_m_s2 = 9.81
 max_imu_accel_m_s2 = 20.0
 max_imu_velocity_m_s = 8.0
+
+[visual_odometry]
+enabled = true
+min_keypoint_conf = 0.35
+min_features = 4
+min_dt_s = 0.05
+max_dt_s = 0.35
+max_match_center_shift_px = 90.0
+max_match_depth_delta_m = 4.0
+max_corner_delta_std_m = 0.35
+max_visual_speed_m_s = 4.0
+max_velocity_innovation_m_s = 2.0
+position_alpha_xy = 0.10
+position_alpha_z = 0.05
+max_position_delta_m = 0.50
+trace = true
+trace_period_s = 0.50
+
+[feature_visual_odometry]
+enabled = true
+fuse_velocity = true
+detector = "gftt"                 # gftt | orb
+max_features = 600
+quality_level = 0.01
+min_distance_px = 8.0
+block_size_px = 7
+min_tracks = 45
+redetect_below_tracks = 120
+min_inliers = 30
+min_inlier_ratio = 0.55
+min_dt_s = 0.05
+max_dt_s = 0.35
+lk_win_size_px = 21
+lk_max_level = 3
+lk_max_iter = 30
+lk_epsilon = 0.01
+max_forward_backward_error_px = 1.5
+border_margin_px = 6.0
+max_median_flow_px = 90.0
+ransac_threshold_px = 1.5
+ransac_prob = 0.999
+min_scale_speed_m_s = 0.20
+max_visual_speed_m_s = 4.0
+max_velocity_innovation_m_s = 2.0
+trace = true
+trace_period_s = 0.50
 
 [timesync]
 request_hz = 10

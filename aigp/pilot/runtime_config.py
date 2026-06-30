@@ -95,6 +95,56 @@ class StateEstimationSection:
 
 
 @dataclass(frozen=True)
+class VisualOdometrySection:
+    enabled: bool
+    min_keypoint_conf: float
+    min_features: int
+    min_dt_s: float
+    max_dt_s: float
+    max_match_center_shift_px: float
+    max_match_depth_delta_m: float
+    max_corner_delta_std_m: float
+    max_visual_speed_m_s: float
+    max_velocity_innovation_m_s: float
+    position_alpha_xy: float
+    position_alpha_z: float
+    max_position_delta_m: float
+    trace: bool
+    trace_period_s: float
+
+
+@dataclass(frozen=True)
+class FeatureVisualOdometrySection:
+    enabled: bool
+    fuse_velocity: bool
+    detector: str
+    max_features: int
+    quality_level: float
+    min_distance_px: float
+    block_size_px: int
+    min_tracks: int
+    redetect_below_tracks: int
+    min_inliers: int
+    min_inlier_ratio: float
+    min_dt_s: float
+    max_dt_s: float
+    lk_win_size_px: int
+    lk_max_level: int
+    lk_max_iter: int
+    lk_epsilon: float
+    max_forward_backward_error_px: float
+    border_margin_px: float
+    max_median_flow_px: float
+    ransac_threshold_px: float
+    ransac_prob: float
+    min_scale_speed_m_s: float
+    max_visual_speed_m_s: float
+    max_velocity_innovation_m_s: float
+    trace: bool
+    trace_period_s: float
+
+
+@dataclass(frozen=True)
 class TimesyncSection:
     request_hz: float
 
@@ -312,6 +362,8 @@ class PilotConfig:
     mavlink: MavlinkSection
     telemetry: TelemetrySection
     state_estimation: StateEstimationSection
+    visual_odometry: VisualOdometrySection
+    feature_visual_odometry: FeatureVisualOdometrySection
     timesync: TimesyncSection
     vision: VisionSection
     camera: CameraSection
@@ -338,6 +390,8 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
     mavlink_raw = _section(raw, "mavlink")
     telemetry_raw = _section(raw, "telemetry")
     state_estimation_raw = _section(raw, "state_estimation")
+    visual_odometry_raw = _section(raw, "visual_odometry")
+    feature_visual_odometry_raw = _section(raw, "feature_visual_odometry")
     timesync_raw = _section(raw, "timesync")
     vision_raw = _section(raw, "vision")
     camera_parent_raw = _section(raw, "camera")
@@ -616,6 +670,96 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             gravity_m_s2=_float(state_estimation_raw, "gravity_m_s2", 9.81),
             max_imu_accel_m_s2=_float(state_estimation_raw, "max_imu_accel_m_s2", 20.0),
             max_imu_velocity_m_s=_float(state_estimation_raw, "max_imu_velocity_m_s", 8.0),
+        ),
+        visual_odometry=VisualOdometrySection(
+            enabled=_bool(visual_odometry_raw, "enabled", True),
+            min_keypoint_conf=_float(visual_odometry_raw, "min_keypoint_conf", 0.35),
+            min_features=_int(visual_odometry_raw, "min_features", 4),
+            min_dt_s=_float(visual_odometry_raw, "min_dt_s", 0.05),
+            max_dt_s=_float(visual_odometry_raw, "max_dt_s", 0.35),
+            max_match_center_shift_px=_float(
+                visual_odometry_raw,
+                "max_match_center_shift_px",
+                90.0,
+            ),
+            max_match_depth_delta_m=_float(
+                visual_odometry_raw,
+                "max_match_depth_delta_m",
+                4.0,
+            ),
+            max_corner_delta_std_m=_float(
+                visual_odometry_raw,
+                "max_corner_delta_std_m",
+                0.35,
+            ),
+            max_visual_speed_m_s=_float(
+                visual_odometry_raw,
+                "max_visual_speed_m_s",
+                _float(state_estimation_raw, "vision_correction_max_visual_speed_m_s", 4.0),
+            ),
+            max_velocity_innovation_m_s=_float(
+                visual_odometry_raw,
+                "max_velocity_innovation_m_s",
+                _float(
+                    state_estimation_raw,
+                    "vision_correction_max_velocity_innovation_m_s",
+                    2.0,
+                ),
+            ),
+            position_alpha_xy=_float(visual_odometry_raw, "position_alpha_xy", 0.10),
+            position_alpha_z=_float(visual_odometry_raw, "position_alpha_z", 0.05),
+            max_position_delta_m=_float(visual_odometry_raw, "max_position_delta_m", 0.50),
+            trace=_bool(visual_odometry_raw, "trace", True),
+            trace_period_s=_float(visual_odometry_raw, "trace_period_s", 0.50),
+        ),
+        feature_visual_odometry=FeatureVisualOdometrySection(
+            enabled=_bool(feature_visual_odometry_raw, "enabled", True),
+            fuse_velocity=_bool(feature_visual_odometry_raw, "fuse_velocity", True),
+            detector=_str(feature_visual_odometry_raw, "detector", "gftt").lower(),
+            max_features=_int(feature_visual_odometry_raw, "max_features", 600),
+            quality_level=_float(feature_visual_odometry_raw, "quality_level", 0.01),
+            min_distance_px=_float(feature_visual_odometry_raw, "min_distance_px", 8.0),
+            block_size_px=_int(feature_visual_odometry_raw, "block_size_px", 7),
+            min_tracks=_int(feature_visual_odometry_raw, "min_tracks", 45),
+            redetect_below_tracks=_int(
+                feature_visual_odometry_raw,
+                "redetect_below_tracks",
+                120,
+            ),
+            min_inliers=_int(feature_visual_odometry_raw, "min_inliers", 30),
+            min_inlier_ratio=_float(feature_visual_odometry_raw, "min_inlier_ratio", 0.55),
+            min_dt_s=_float(feature_visual_odometry_raw, "min_dt_s", 0.05),
+            max_dt_s=_float(feature_visual_odometry_raw, "max_dt_s", 0.35),
+            lk_win_size_px=_int(feature_visual_odometry_raw, "lk_win_size_px", 21),
+            lk_max_level=_int(feature_visual_odometry_raw, "lk_max_level", 3),
+            lk_max_iter=_int(feature_visual_odometry_raw, "lk_max_iter", 30),
+            lk_epsilon=_float(feature_visual_odometry_raw, "lk_epsilon", 0.01),
+            max_forward_backward_error_px=_float(
+                feature_visual_odometry_raw,
+                "max_forward_backward_error_px",
+                1.5,
+            ),
+            border_margin_px=_float(feature_visual_odometry_raw, "border_margin_px", 6.0),
+            max_median_flow_px=_float(feature_visual_odometry_raw, "max_median_flow_px", 90.0),
+            ransac_threshold_px=_float(feature_visual_odometry_raw, "ransac_threshold_px", 1.5),
+            ransac_prob=_float(feature_visual_odometry_raw, "ransac_prob", 0.999),
+            min_scale_speed_m_s=_float(feature_visual_odometry_raw, "min_scale_speed_m_s", 0.20),
+            max_visual_speed_m_s=_float(
+                feature_visual_odometry_raw,
+                "max_visual_speed_m_s",
+                _float(state_estimation_raw, "vision_correction_max_visual_speed_m_s", 4.0),
+            ),
+            max_velocity_innovation_m_s=_float(
+                feature_visual_odometry_raw,
+                "max_velocity_innovation_m_s",
+                _float(
+                    state_estimation_raw,
+                    "vision_correction_max_velocity_innovation_m_s",
+                    2.0,
+                ),
+            ),
+            trace=_bool(feature_visual_odometry_raw, "trace", True),
+            trace_period_s=_float(feature_visual_odometry_raw, "trace_period_s", 0.50),
         ),
         timesync=TimesyncSection(
             request_hz=_float(timesync_raw, "request_hz", 10.0),
@@ -1169,6 +1313,57 @@ def _validate(config: PilotConfig) -> None:
     ):
         if float(value) < 0.0:
             raise RuntimeError(f"state_estimation.{key} must be non-negative.")
+    if config.feature_visual_odometry.detector not in ("gftt", "orb"):
+        raise RuntimeError("feature_visual_odometry.detector must be 'gftt' or 'orb'.")
+    for key, value in (
+        ("max_features", config.feature_visual_odometry.max_features),
+        ("min_tracks", config.feature_visual_odometry.min_tracks),
+        ("redetect_below_tracks", config.feature_visual_odometry.redetect_below_tracks),
+        ("min_inliers", config.feature_visual_odometry.min_inliers),
+        ("block_size_px", config.feature_visual_odometry.block_size_px),
+        ("lk_win_size_px", config.feature_visual_odometry.lk_win_size_px),
+        ("lk_max_iter", config.feature_visual_odometry.lk_max_iter),
+    ):
+        if int(value) < 1:
+            raise RuntimeError(f"feature_visual_odometry.{key} must be at least 1.")
+    if config.feature_visual_odometry.lk_win_size_px % 2 == 0:
+        raise RuntimeError("feature_visual_odometry.lk_win_size_px must be odd.")
+    for key, value in (
+        ("quality_level", config.feature_visual_odometry.quality_level),
+        ("min_distance_px", config.feature_visual_odometry.min_distance_px),
+        ("min_inlier_ratio", config.feature_visual_odometry.min_inlier_ratio),
+        ("min_dt_s", config.feature_visual_odometry.min_dt_s),
+        ("max_dt_s", config.feature_visual_odometry.max_dt_s),
+        (
+            "max_forward_backward_error_px",
+            config.feature_visual_odometry.max_forward_backward_error_px,
+        ),
+        ("border_margin_px", config.feature_visual_odometry.border_margin_px),
+        ("max_median_flow_px", config.feature_visual_odometry.max_median_flow_px),
+        ("ransac_threshold_px", config.feature_visual_odometry.ransac_threshold_px),
+        ("ransac_prob", config.feature_visual_odometry.ransac_prob),
+        ("min_scale_speed_m_s", config.feature_visual_odometry.min_scale_speed_m_s),
+        ("max_visual_speed_m_s", config.feature_visual_odometry.max_visual_speed_m_s),
+        (
+            "max_velocity_innovation_m_s",
+            config.feature_visual_odometry.max_velocity_innovation_m_s,
+        ),
+        ("trace_period_s", config.feature_visual_odometry.trace_period_s),
+    ):
+        if float(value) < 0.0:
+            raise RuntimeError(f"feature_visual_odometry.{key} must be non-negative.")
+    if not 0.0 <= config.feature_visual_odometry.min_inlier_ratio <= 1.0:
+        raise RuntimeError("feature_visual_odometry.min_inlier_ratio must be within [0, 1].")
+    if not 0.0 < config.feature_visual_odometry.ransac_prob <= 1.0:
+        raise RuntimeError("feature_visual_odometry.ransac_prob must be within (0, 1].")
+    if (
+        config.feature_visual_odometry.max_dt_s > 0.0
+        and config.feature_visual_odometry.max_dt_s
+        < config.feature_visual_odometry.min_dt_s
+    ):
+        raise RuntimeError(
+            "feature_visual_odometry.max_dt_s must be >= min_dt_s, or <= 0 to disable the max."
+        )
     if config.state_estimation.estimator_landmark_min_hits < 1:
         raise RuntimeError("state_estimation.estimator_landmark_min_hits must be at least 1.")
     for key, value in (

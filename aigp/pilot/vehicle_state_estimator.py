@@ -13,6 +13,8 @@ from autonomy_core.core.frame_conventions import (
     local_ned_to_neu,
     local_neu_to_ned,
 )
+from feature_visual_odometry import FeatureVisualOdometry
+from visual_odometry import GateKeypointVisualOdometry, VisualOdometryMeasurement
 
 
 @dataclass(frozen=True)
@@ -67,7 +69,13 @@ class VehicleStateEstimator:
         self.last_visual_measured_pos_neu: Optional[np.ndarray] = None
         self.last_visual_debug_print_time = 0.0
         self.last_visual_debug_signature: Optional[tuple[object, ...]] = None
+        self.last_temporal_vo_trace_time = 0.0
+        self.last_temporal_vo_trace_signature: Optional[tuple[object, ...]] = None
+        self.last_feature_vo_trace_time = 0.0
+        self.last_feature_vo_trace_signature: Optional[tuple[object, ...]] = None
         self.last_source = "uninitialized"
+        self.visual_odometry = GateKeypointVisualOdometry(config)
+        self.feature_visual_odometry = FeatureVisualOdometry(config)
         self.last_vision_correction = {
             "source": "",
             "residual_m": None,
@@ -277,21 +285,70 @@ class VehicleStateEstimator:
         if not bool(self.config.state_estimation.use_vision_correction):
             return self._vision_no_correction("disabled", visual_now)
 
+        latest_perception = getattr(snapshot, "latest_perception", None)
+        feature_vo_measurement = self._measure_feature_vo(
+            snapshot,
+            latest_perception if isinstance(latest_perception, dict) else None,
+            visual_now,
+        )
+        temporal_vo_measurement = None
+
         source_mode = str(self.config.state_estimation.vision_correction_source).lower()
         if source_mode == "none":
-            return self._vision_no_correction("source_none", visual_now)
+            visual_odometry_correction = self._apply_preferred_visual_odometry(
+                feature_vo_measurement,
+                temporal_vo_measurement,
+                visual_now,
+            )
+            return self._prefer_visual_odometry_no_correction(
+                visual_odometry_correction,
+                "source_none",
+                visual_now,
+            )
 
-        latest_perception = getattr(snapshot, "latest_perception", None)
         if not isinstance(latest_perception, dict):
-            return self._vision_no_correction("no_perception", visual_now)
+            visual_odometry_correction = self._apply_preferred_visual_odometry(
+                feature_vo_measurement,
+                temporal_vo_measurement,
+                visual_now,
+            )
+            return self._prefer_visual_odometry_no_correction(
+                visual_odometry_correction,
+                "no_perception",
+                visual_now,
+            )
 
         detections = latest_perception.get("detections")
         if not detections:
-            return self._vision_no_correction("no_detections", visual_now)
+            visual_odometry_correction = self._apply_preferred_visual_odometry(
+                feature_vo_measurement,
+                temporal_vo_measurement,
+                visual_now,
+            )
+            return self._prefer_visual_odometry_no_correction(
+                visual_odometry_correction,
+                "no_detections",
+                visual_now,
+            )
+
+        temporal_vo_measurement = self._measure_temporal_vo(
+            latest_perception,
+            snapshot,
+            visual_now,
+        )
+        visual_odometry_correction = self._apply_preferred_visual_odometry(
+            feature_vo_measurement,
+            temporal_vo_measurement,
+            visual_now,
+        )
 
         landmarks = self._vision_landmarks(snapshot, source_mode)
         if not landmarks:
-            return self._vision_no_correction("no_landmarks", visual_now)
+            return self._prefer_visual_odometry_no_correction(
+                visual_odometry_correction,
+                "no_landmarks",
+                visual_now,
+            )
 
         rot_ned_body = body_frd_to_local_ned_rotmat(
             float(getattr(snapshot, "roll_rad", 0.0)),
@@ -346,7 +403,11 @@ class VehicleStateEstimator:
             sources.append(landmark_source)
 
         if not measurements:
-            return self._vision_no_correction("no_measurements", visual_now)
+            return self._prefer_visual_odometry_no_correction(
+                visual_odometry_correction,
+                "no_measurements",
+                visual_now,
+            )
 
         unique_sources = sorted(set(sources))
         correction_count = len(unique_sources)
@@ -389,7 +450,8 @@ class VehicleStateEstimator:
             and weighted_residual <= single_landmark_max_residual
         )
         if not enough_support and not low_residual_single:
-            return self._vision_rejection(
+            return self._prefer_visual_odometry_rejection(
+                visual_odometry_correction,
                 "reject:insufficient_landmark_support",
                 weighted_residual,
                 correction_count,
@@ -397,7 +459,8 @@ class VehicleStateEstimator:
             )
 
         if max_avg_residual > 0.0 and weighted_residual > max_avg_residual:
-            return self._vision_rejection(
+            return self._prefer_visual_odometry_rejection(
+                visual_odometry_correction,
                 "reject:high_avg_residual",
                 weighted_residual,
                 correction_count,
@@ -428,9 +491,204 @@ class VehicleStateEstimator:
             "visual_velocity_reason": str(visual_update["visual_velocity_reason"]),
             "visual_reference_reset": bool(visual_update["visual_reference_reset"]),
         }
+        correction = self._merge_temporal_vo(correction, visual_odometry_correction)
         self.last_vision_correction = correction
         self._trace_visual_correction(correction, visual_now)
         return correction
+
+    def _measure_temporal_vo(
+        self,
+        latest_perception: dict,
+        snapshot,
+        now: float,
+    ) -> VisualOdometryMeasurement:
+        measurement = self.visual_odometry.update(
+            latest_perception,
+            roll_rad=float(getattr(snapshot, "roll_rad", 0.0)),
+            pitch_rad=float(getattr(snapshot, "pitch_rad", 0.0)),
+            yaw_rad=float(getattr(snapshot, "yaw_rad", 0.0)),
+            estimated_pos_neu=self.pos_neu,
+            estimated_vel_neu=self.vel_neu,
+            now=now,
+        )
+        self._trace_temporal_vo(measurement, now)
+        return measurement
+
+    def _measure_feature_vo(
+        self,
+        snapshot,
+        latest_perception: Optional[dict],
+        now: float,
+    ) -> VisualOdometryMeasurement:
+        measurement = self.feature_visual_odometry.update(
+            getattr(snapshot, "image_bgr", None),
+            latest_perception,
+            roll_rad=float(getattr(snapshot, "roll_rad", 0.0)),
+            pitch_rad=float(getattr(snapshot, "pitch_rad", 0.0)),
+            yaw_rad=float(getattr(snapshot, "yaw_rad", 0.0)),
+            estimated_pos_neu=self.pos_neu,
+            estimated_vel_neu=self.vel_neu,
+            now=now,
+        )
+        self._trace_feature_vo(measurement, now)
+        return measurement
+
+    def _apply_preferred_visual_odometry(
+        self,
+        feature_measurement: Optional[VisualOdometryMeasurement],
+        temporal_measurement: Optional[VisualOdometryMeasurement],
+        now: float,
+    ) -> Optional[dict[str, object]]:
+        if (
+            feature_measurement is not None
+            and feature_measurement.valid
+            and feature_measurement.velocity_neu is not None
+            and bool(self.config.feature_visual_odometry.fuse_velocity)
+        ):
+            return self._apply_visual_odometry_measurement(
+                feature_measurement,
+                "feature_vo",
+                now,
+                apply_position=False,
+            )
+
+        if (
+            temporal_measurement is not None
+            and temporal_measurement.valid
+            and temporal_measurement.velocity_neu is not None
+        ):
+            return self._apply_visual_odometry_measurement(
+                temporal_measurement,
+                "gate_keypoint_vo",
+                now,
+                apply_position=True,
+            )
+
+        return None
+
+    def _apply_visual_odometry_measurement(
+        self,
+        measurement: VisualOdometryMeasurement,
+        source: str,
+        now: float,
+        *,
+        apply_position: bool,
+    ) -> dict[str, object]:
+        if not measurement.valid or measurement.velocity_neu is None:
+            return self._empty_vision_correction()
+
+        if apply_position:
+            self._correct_position_from_temporal_vo(measurement)
+        self._correct_velocity_and_bias_from_visual_velocity(
+            measurement.velocity_neu,
+            now,
+            dt_override_s=measurement.dt_s,
+        )
+
+        return {
+            "source": source,
+            "residual_m": measurement.residual_m,
+            "count": int(measurement.feature_count),
+            "visual_velocity_neu": measurement.velocity_neu.copy(),
+            "visual_dt_s": measurement.dt_s,
+            "visual_velocity_reason": source,
+            "visual_reference_reset": bool(measurement.reference_reset),
+            "wall_time": float(now),
+        }
+
+    def _correct_position_from_temporal_vo(
+        self,
+        measurement: VisualOdometryMeasurement,
+    ) -> None:
+        if measurement.pose_neu is None:
+            return
+
+        target = np.asarray(measurement.pose_neu, dtype=float).reshape(3)
+        if not np.all(np.isfinite(target)):
+            return
+
+        delta = target - self.pos_neu
+        max_delta = float(max(0.0, self.config.visual_odometry.max_position_delta_m))
+        if max_delta > 0.0:
+            delta_norm = float(np.linalg.norm(delta))
+            if delta_norm > max_delta:
+                delta = delta * (max_delta / max(delta_norm, 1e-9))
+
+        alpha_xy = float(
+            np.clip(self.config.visual_odometry.position_alpha_xy, 0.0, 1.0)
+        )
+        alpha_z = float(np.clip(self.config.visual_odometry.position_alpha_z, 0.0, 1.0))
+        self.pos_neu[:2] = self.pos_neu[:2] + alpha_xy * delta[:2]
+        self.pos_neu[2] = self.pos_neu[2] + alpha_z * delta[2]
+
+    def _prefer_temporal_vo(
+        self,
+        temporal_vo_correction: Optional[dict[str, object]],
+        fallback: dict[str, object],
+    ) -> dict[str, object]:
+        if temporal_vo_correction is None:
+            return fallback
+        self.last_vision_correction = temporal_vo_correction
+        self._trace_visual_correction(
+            temporal_vo_correction,
+            self._finite_float(temporal_vo_correction.get("wall_time")),
+        )
+        return temporal_vo_correction
+
+    def _prefer_visual_odometry_no_correction(
+        self,
+        visual_odometry_correction: Optional[dict[str, object]],
+        reason: str,
+        now: Optional[float],
+    ) -> dict[str, object]:
+        if visual_odometry_correction is None:
+            return self._vision_no_correction(reason, now)
+        return self._prefer_temporal_vo(
+            visual_odometry_correction,
+            self._empty_vision_correction(),
+        )
+
+    def _prefer_visual_odometry_rejection(
+        self,
+        visual_odometry_correction: Optional[dict[str, object]],
+        reason: str,
+        residual_m: float,
+        count: int,
+        now: Optional[float],
+    ) -> dict[str, object]:
+        if visual_odometry_correction is None:
+            return self._vision_rejection(reason, residual_m, count, now)
+        return self._prefer_temporal_vo(
+            visual_odometry_correction,
+            self._empty_vision_correction(),
+        )
+
+    @staticmethod
+    def _merge_temporal_vo(
+        correction: dict[str, object],
+        temporal_vo_correction: Optional[dict[str, object]],
+    ) -> dict[str, object]:
+        if temporal_vo_correction is None:
+            return correction
+
+        merged = dict(correction)
+        source = str(merged.get("source", "") or "")
+        vo_source = str(temporal_vo_correction.get("source", "") or "visual_odometry")
+        if source and source != vo_source:
+            merged["source"] = f"{source}+{vo_source}"
+        else:
+            merged["source"] = vo_source
+        merged["visual_velocity_neu"] = temporal_vo_correction.get("visual_velocity_neu")
+        merged["visual_dt_s"] = temporal_vo_correction.get("visual_dt_s")
+        merged["visual_velocity_reason"] = temporal_vo_correction.get(
+            "visual_velocity_reason",
+            vo_source,
+        )
+        merged["visual_reference_reset"] = temporal_vo_correction.get(
+            "visual_reference_reset",
+            False,
+        )
+        return merged
 
     def _apply_visual_filter_update(
         self,
@@ -656,6 +914,8 @@ class VehicleStateEstimator:
         self,
         visual_velocity: np.ndarray,
         now: float,
+        *,
+        dt_override_s: Optional[float] = None,
     ) -> None:
         velocity_delta = visual_velocity - self.vel_neu
         max_velocity_delta = float(
@@ -700,7 +960,12 @@ class VehicleStateEstimator:
         self.vel_neu[:2] = self.vel_neu[:2] + vel_alpha_xy * velocity_delta[:2]
         self.vel_neu[2] = self.vel_neu[2] + vel_alpha_z * velocity_delta[2]
 
-        dt = float(now) - float(self.last_visual_update_time)
+        if dt_override_s is None:
+            if self.last_visual_update_time is None:
+                return
+            dt = float(now) - float(self.last_visual_update_time)
+        else:
+            dt = float(dt_override_s)
         if dt <= 0.0:
             return
 
@@ -765,6 +1030,112 @@ class VehicleStateEstimator:
                 self.accel_bias_neu = self.accel_bias_neu * (
                     max_bias / max(bias_norm, 1e-9)
                 )
+
+    def _trace_temporal_vo(
+        self,
+        measurement: VisualOdometryMeasurement,
+        now: Optional[float],
+    ) -> None:
+        if not bool(self.config.visual_odometry.trace):
+            return
+        if now is None:
+            now = time.time()
+
+        signature = (
+            bool(measurement.valid),
+            str(measurement.reason),
+            int(measurement.feature_count),
+            int(measurement.track_count),
+        )
+        elapsed = float(now) - float(self.last_temporal_vo_trace_time)
+        min_period = float(max(0.0, self.config.visual_odometry.trace_period_s))
+        if signature == self.last_temporal_vo_trace_signature and elapsed < min_period:
+            return
+
+        self.last_temporal_vo_trace_signature = signature
+        self.last_temporal_vo_trace_time = float(now)
+
+        residual = measurement.residual_m
+        residual_txt = (
+            "nan"
+            if residual is None or not math.isfinite(float(residual))
+            else f"{float(residual):.2f}"
+        )
+        dt = measurement.dt_s
+        dt_txt = "nan" if dt is None or not math.isfinite(float(dt)) else f"{float(dt):.3f}"
+        speed = measurement.speed_m_s
+        speed_txt = (
+            "nan"
+            if speed is None or not math.isfinite(float(speed))
+            else f"{float(speed):.2f}"
+        )
+        print(
+            "temporal_vo_debug "
+            f"valid={int(measurement.valid)} "
+            f"reason={measurement.reason} "
+            f"dt={dt_txt} "
+            f"features={int(measurement.feature_count)} "
+            f"tracks={int(measurement.track_count)} "
+            f"residual={residual_txt} "
+            f"speed={speed_txt} "
+            f"delta_neu={self._fmt_vec_debug(measurement.delta_neu)} "
+            f"vel_neu={self._fmt_vec_debug(measurement.velocity_neu)} "
+            f"vo_pose_neu={self._fmt_vec_debug(measurement.pose_neu)}",
+            flush=True,
+        )
+
+    def _trace_feature_vo(
+        self,
+        measurement: VisualOdometryMeasurement,
+        now: Optional[float],
+    ) -> None:
+        if not bool(self.config.feature_visual_odometry.trace):
+            return
+        if now is None:
+            now = time.time()
+
+        signature = (
+            bool(measurement.valid),
+            str(measurement.reason),
+            int(measurement.feature_count),
+            int(measurement.track_count),
+        )
+        elapsed = float(now) - float(self.last_feature_vo_trace_time)
+        min_period = float(max(0.0, self.config.feature_visual_odometry.trace_period_s))
+        if signature == self.last_feature_vo_trace_signature and elapsed < min_period:
+            return
+
+        self.last_feature_vo_trace_signature = signature
+        self.last_feature_vo_trace_time = float(now)
+
+        residual = measurement.residual_m
+        residual_txt = (
+            "nan"
+            if residual is None or not math.isfinite(float(residual))
+            else f"{float(residual):.2f}"
+        )
+        dt = measurement.dt_s
+        dt_txt = "nan" if dt is None or not math.isfinite(float(dt)) else f"{float(dt):.3f}"
+        speed = measurement.speed_m_s
+        speed_txt = (
+            "nan"
+            if speed is None or not math.isfinite(float(speed))
+            else f"{float(speed):.2f}"
+        )
+        print(
+            "feature_vo_debug "
+            f"valid={int(measurement.valid)} "
+            f"reason={measurement.reason} "
+            f"dt={dt_txt} "
+            f"inliers={int(measurement.feature_count)} "
+            f"tracks={int(measurement.track_count)} "
+            f"residual_px={residual_txt} "
+            f"speed={speed_txt} "
+            f"delta_neu={self._fmt_vec_debug(measurement.delta_neu)} "
+            f"vel_neu={self._fmt_vec_debug(measurement.velocity_neu)} "
+            f"vo_pose_neu={self._fmt_vec_debug(measurement.pose_neu)}",
+            flush=True,
+        )
 
     def _vision_rejection(
         self,
@@ -1023,6 +1394,12 @@ class VehicleStateEstimator:
         self.last_visual_measured_pos_neu = None
         self.last_visual_debug_print_time = 0.0
         self.last_visual_debug_signature = None
+        self.last_temporal_vo_trace_time = 0.0
+        self.last_temporal_vo_trace_signature = None
+        self.last_feature_vo_trace_time = 0.0
+        self.last_feature_vo_trace_signature = None
+        self.visual_odometry.reset()
+        self.feature_visual_odometry.reset()
         self.last_wall_time = now
         self.initialized = True
 
@@ -1034,6 +1411,12 @@ class VehicleStateEstimator:
         self.last_visual_measured_pos_neu = None
         self.last_visual_debug_print_time = 0.0
         self.last_visual_debug_signature = None
+        self.last_temporal_vo_trace_time = 0.0
+        self.last_temporal_vo_trace_signature = None
+        self.last_feature_vo_trace_time = 0.0
+        self.last_feature_vo_trace_signature = None
+        self.visual_odometry.reset()
+        self.feature_visual_odometry.reset()
         self.last_wall_time = truth.wall_time
         self.initialized = True
         self.last_source = truth.source
