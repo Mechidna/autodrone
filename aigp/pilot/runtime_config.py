@@ -279,6 +279,7 @@ class ControllerSection:
     max_acc_xy: float
     max_acc_z_up: float
     max_acc_z_down: float
+    lateral_accel_gain_xy: tuple[float, float]
     thrust_hover: float
     thrust_min: float
     thrust_max: float
@@ -330,10 +331,83 @@ class HoverAcquisitionSection:
     lift_confirm_z_m: float
     lift_confirm_vz_m_s: float
     relative_airborne_z_m: float
+    min_release_z_m: float
     min_confidence: float
     overshoot_thrust_step_per_s: float
+    overshoot_max_thrust_drop: float
+    z_hold_enabled: bool
+    z_hold_kp: float
+    z_hold_kv: float
+    z_hold_max_correction: float
     reset_hover_on_disarm: bool
     release_on_timeout_while_unstable: bool
+    print_period_s: float
+
+
+@dataclass(frozen=True)
+class ThrustScaleCalibrationSection:
+    enabled: bool
+    estimator_mode_only: bool
+    require_hover_acquisition: bool
+    require_armed: bool
+    initial_delay_s: float
+    min_duration_s: float
+    max_duration_s: float
+    phase_duration_s: float
+    settle_duration_s: float
+    probe_delta_thrust: float
+    min_probe_delta_thrust: float
+    max_probe_delta_thrust: float
+    min_samples: int
+    accel_filter_alpha: float
+    accel_deadband_m_s2: float
+    min_abs_accel_m_s2: float
+    max_abs_accel_m_s2: float
+    max_abs_vz_m_s: float
+    max_relative_z_m: float
+    z_hold_enabled: bool
+    z_hold_kp: float
+    z_hold_kv: float
+    z_hold_max_correction: float
+    min_gain: float
+    max_gain: float
+    result_alpha: float
+    print_period_s: float
+
+
+@dataclass(frozen=True)
+class LateralResponseCalibrationSection:
+    enabled: bool
+    estimator_mode_only: bool
+    require_thrust_scale_calibration: bool
+    require_armed: bool
+    initial_delay_s: float
+    min_duration_s: float
+    max_duration_s: float
+    phase_duration_s: float
+    settle_duration_s: float
+    probe_accel_m_s2: float
+    min_probe_accel_m_s2: float
+    max_probe_accel_m_s2: float
+    max_tilt_deg: float
+    min_samples_per_axis: int
+    accel_filter_alpha: float
+    accel_deadband_m_s2: float
+    min_abs_accel_m_s2: float
+    max_abs_accel_m_s2: float
+    max_cross_axis_ratio: float
+    max_abs_vxy_m_s: float
+    max_xy_displacement_m: float
+    max_relative_z_m: float
+    max_sign_ratio_disagreement: float
+    z_hold_enabled: bool
+    z_hold_kp: float
+    z_hold_kv: float
+    z_hold_max_correction: float
+    min_gain: float
+    max_gain: float
+    result_alpha: float
+    tilt_thrust_compensation: bool
     print_period_s: float
 
 
@@ -375,6 +449,8 @@ class PilotConfig:
     planner: PlannerSection
     controller: ControllerSection
     hover_acquisition: HoverAcquisitionSection
+    thrust_scale_calibration: ThrustScaleCalibrationSection
+    lateral_response_calibration: LateralResponseCalibrationSection
     command: CommandSection
     hover: HoverSection
 
@@ -405,6 +481,8 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
     planner_raw = _section(raw, "planner")
     controller_raw = _section(raw, "controller")
     hover_acquisition_raw = _section(raw, "hover_acquisition")
+    thrust_scale_calibration_raw = _section(raw, "thrust_scale_calibration")
+    lateral_response_calibration_raw = _section(raw, "lateral_response_calibration")
     command_raw = _section(raw, "command")
     hover_raw = _section(raw, "hover")
 
@@ -426,6 +504,16 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
         competition_yaw_correction_deg=_float(
             camera_mount_raw,
             "competition_yaw_correction_deg",
+            0.0,
+        ),
+        racer_body_translation_m=_float_tuple(
+            camera_mount_raw.get("racer_mono_cam_body_translation_m"),
+            (0.0, 0.0, 0.0),
+            3,
+        ),
+        racer_yaw_correction_deg=_float(
+            camera_mount_raw,
+            "racer_mono_cam_yaw_correction_deg",
             0.0,
         ),
         px4_x500_body_translation_m=_float_tuple(
@@ -919,6 +1007,11 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             max_acc_xy=_float(controller_raw, "max_acc_xy", 2.0),
             max_acc_z_up=_float(controller_raw, "max_acc_z_up", 2.5),
             max_acc_z_down=_float(controller_raw, "max_acc_z_down", 2.0),
+            lateral_accel_gain_xy=_float_tuple(
+                controller_raw.get("lateral_accel_gain_xy"),
+                (1.0, 1.0),
+                2,
+            ),
             thrust_hover=_float(
                 controller_raw,
                 "thrust_hover_initial",
@@ -1060,11 +1153,29 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 "relative_airborne_z_m",
                 _float(hover_acquisition_raw, "airborne_z_m", 0.25),
             ),
+            min_release_z_m=_float(
+                hover_acquisition_raw,
+                "min_release_z_m",
+                _float(hover_acquisition_raw, "relative_airborne_z_m", 0.15),
+            ),
             min_confidence=_float(hover_acquisition_raw, "min_confidence", 0.0),
             overshoot_thrust_step_per_s=_float(
                 hover_acquisition_raw,
                 "overshoot_thrust_step_per_s",
                 0.60,
+            ),
+            overshoot_max_thrust_drop=_float(
+                hover_acquisition_raw,
+                "overshoot_max_thrust_drop",
+                0.0,
+            ),
+            z_hold_enabled=_bool(hover_acquisition_raw, "z_hold_enabled", True),
+            z_hold_kp=_float(hover_acquisition_raw, "z_hold_kp", 0.10),
+            z_hold_kv=_float(hover_acquisition_raw, "z_hold_kv", 0.08),
+            z_hold_max_correction=_float(
+                hover_acquisition_raw,
+                "z_hold_max_correction",
+                0.08,
             ),
             reset_hover_on_disarm=_bool(
                 hover_acquisition_raw,
@@ -1077,6 +1188,249 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 False,
             ),
             print_period_s=_float(hover_acquisition_raw, "print_period_s", 0.5),
+        ),
+        thrust_scale_calibration=ThrustScaleCalibrationSection(
+            enabled=_bool(thrust_scale_calibration_raw, "enabled", True),
+            estimator_mode_only=_bool(
+                thrust_scale_calibration_raw,
+                "estimator_mode_only",
+                False,
+            ),
+            require_hover_acquisition=_bool(
+                thrust_scale_calibration_raw,
+                "require_hover_acquisition",
+                True,
+            ),
+            require_armed=_bool(thrust_scale_calibration_raw, "require_armed", True),
+            initial_delay_s=_float(
+                thrust_scale_calibration_raw,
+                "initial_delay_s",
+                0.20,
+            ),
+            min_duration_s=_float(
+                thrust_scale_calibration_raw,
+                "min_duration_s",
+                0.80,
+            ),
+            max_duration_s=_float(
+                thrust_scale_calibration_raw,
+                "max_duration_s",
+                2.00,
+            ),
+            phase_duration_s=_float(
+                thrust_scale_calibration_raw,
+                "phase_duration_s",
+                0.25,
+            ),
+            settle_duration_s=_float(
+                thrust_scale_calibration_raw,
+                "settle_duration_s",
+                0.08,
+            ),
+            probe_delta_thrust=_float(
+                thrust_scale_calibration_raw,
+                "probe_delta_thrust",
+                0.04,
+            ),
+            min_probe_delta_thrust=_float(
+                thrust_scale_calibration_raw,
+                "min_probe_delta_thrust",
+                0.02,
+            ),
+            max_probe_delta_thrust=_float(
+                thrust_scale_calibration_raw,
+                "max_probe_delta_thrust",
+                0.08,
+            ),
+            min_samples=_int(thrust_scale_calibration_raw, "min_samples", 12),
+            accel_filter_alpha=_float(
+                thrust_scale_calibration_raw,
+                "accel_filter_alpha",
+                0.35,
+            ),
+            accel_deadband_m_s2=_float(
+                thrust_scale_calibration_raw,
+                "accel_deadband_m_s2",
+                0.05,
+            ),
+            min_abs_accel_m_s2=_float(
+                thrust_scale_calibration_raw,
+                "min_abs_accel_m_s2",
+                0.10,
+            ),
+            max_abs_accel_m_s2=_float(
+                thrust_scale_calibration_raw,
+                "max_abs_accel_m_s2",
+                6.00,
+            ),
+            max_abs_vz_m_s=_float(
+                thrust_scale_calibration_raw,
+                "max_abs_vz_m_s",
+                1.00,
+            ),
+            max_relative_z_m=_float(
+                thrust_scale_calibration_raw,
+                "max_relative_z_m",
+                0.75,
+            ),
+            z_hold_enabled=_bool(
+                thrust_scale_calibration_raw,
+                "z_hold_enabled",
+                True,
+            ),
+            z_hold_kp=_float(thrust_scale_calibration_raw, "z_hold_kp", 0.10),
+            z_hold_kv=_float(thrust_scale_calibration_raw, "z_hold_kv", 0.08),
+            z_hold_max_correction=_float(
+                thrust_scale_calibration_raw,
+                "z_hold_max_correction",
+                0.08,
+            ),
+            min_gain=_float(thrust_scale_calibration_raw, "min_gain", 0.03),
+            max_gain=_float(thrust_scale_calibration_raw, "max_gain", 0.30),
+            result_alpha=_float(thrust_scale_calibration_raw, "result_alpha", 1.0),
+            print_period_s=_float(thrust_scale_calibration_raw, "print_period_s", 0.5),
+        ),
+        lateral_response_calibration=LateralResponseCalibrationSection(
+            enabled=_bool(lateral_response_calibration_raw, "enabled", True),
+            estimator_mode_only=_bool(
+                lateral_response_calibration_raw,
+                "estimator_mode_only",
+                False,
+            ),
+            require_thrust_scale_calibration=_bool(
+                lateral_response_calibration_raw,
+                "require_thrust_scale_calibration",
+                True,
+            ),
+            require_armed=_bool(lateral_response_calibration_raw, "require_armed", True),
+            initial_delay_s=_float(
+                lateral_response_calibration_raw,
+                "initial_delay_s",
+                0.20,
+            ),
+            min_duration_s=_float(
+                lateral_response_calibration_raw,
+                "min_duration_s",
+                1.20,
+            ),
+            max_duration_s=_float(
+                lateral_response_calibration_raw,
+                "max_duration_s",
+                3.00,
+            ),
+            phase_duration_s=_float(
+                lateral_response_calibration_raw,
+                "phase_duration_s",
+                0.30,
+            ),
+            settle_duration_s=_float(
+                lateral_response_calibration_raw,
+                "settle_duration_s",
+                0.10,
+            ),
+            probe_accel_m_s2=_float(
+                lateral_response_calibration_raw,
+                "probe_accel_m_s2",
+                0.60,
+            ),
+            min_probe_accel_m_s2=_float(
+                lateral_response_calibration_raw,
+                "min_probe_accel_m_s2",
+                0.20,
+            ),
+            max_probe_accel_m_s2=_float(
+                lateral_response_calibration_raw,
+                "max_probe_accel_m_s2",
+                1.00,
+            ),
+            max_tilt_deg=_float(
+                lateral_response_calibration_raw,
+                "max_tilt_deg",
+                5.0,
+            ),
+            min_samples_per_axis=_int(
+                lateral_response_calibration_raw,
+                "min_samples_per_axis",
+                4,
+            ),
+            accel_filter_alpha=_float(
+                lateral_response_calibration_raw,
+                "accel_filter_alpha",
+                0.35,
+            ),
+            accel_deadband_m_s2=_float(
+                lateral_response_calibration_raw,
+                "accel_deadband_m_s2",
+                0.05,
+            ),
+            min_abs_accel_m_s2=_float(
+                lateral_response_calibration_raw,
+                "min_abs_accel_m_s2",
+                0.08,
+            ),
+            max_abs_accel_m_s2=_float(
+                lateral_response_calibration_raw,
+                "max_abs_accel_m_s2",
+                5.00,
+            ),
+            max_cross_axis_ratio=_float(
+                lateral_response_calibration_raw,
+                "max_cross_axis_ratio",
+                1.50,
+            ),
+            max_abs_vxy_m_s=_float(
+                lateral_response_calibration_raw,
+                "max_abs_vxy_m_s",
+                1.20,
+            ),
+            max_xy_displacement_m=_float(
+                lateral_response_calibration_raw,
+                "max_xy_displacement_m",
+                0.80,
+            ),
+            max_relative_z_m=_float(
+                lateral_response_calibration_raw,
+                "max_relative_z_m",
+                0.75,
+            ),
+            max_sign_ratio_disagreement=_float(
+                lateral_response_calibration_raw,
+                "max_sign_ratio_disagreement",
+                0.35,
+            ),
+            z_hold_enabled=_bool(
+                lateral_response_calibration_raw,
+                "z_hold_enabled",
+                True,
+            ),
+            z_hold_kp=_float(
+                lateral_response_calibration_raw,
+                "z_hold_kp",
+                0.10,
+            ),
+            z_hold_kv=_float(
+                lateral_response_calibration_raw,
+                "z_hold_kv",
+                0.08,
+            ),
+            z_hold_max_correction=_float(
+                lateral_response_calibration_raw,
+                "z_hold_max_correction",
+                0.08,
+            ),
+            min_gain=_float(lateral_response_calibration_raw, "min_gain", 0.50),
+            max_gain=_float(lateral_response_calibration_raw, "max_gain", 2.00),
+            result_alpha=_float(lateral_response_calibration_raw, "result_alpha", 1.0),
+            tilt_thrust_compensation=_bool(
+                lateral_response_calibration_raw,
+                "tilt_thrust_compensation",
+                True,
+            ),
+            print_period_s=_float(
+                lateral_response_calibration_raw,
+                "print_period_s",
+                0.5,
+            ),
         ),
         command=CommandSection(
             type=_str(command_raw, "type", "set_attitude_target"),
@@ -1102,10 +1456,16 @@ def _validate(config: PilotConfig) -> None:
             f"Invalid runner_mode={config.runtime.runner_mode!r}. "
             "Use runner_mode='px4' or runner_mode='competition'."
         )
-    if config.camera.mount_profile not in ("competition", "px4_x500_mono_cam", "custom"):
+    if config.camera.mount_profile not in (
+        "competition",
+        "racer_mono_cam",
+        "px4_x500_mono_cam",
+        "custom",
+    ):
         raise RuntimeError(
             f"Invalid camera mount profile={config.camera.mount_profile!r}. "
-            "Use 'auto', 'competition', 'px4_x500_mono_cam', or 'custom'."
+            "Use 'auto', 'competition', 'racer_mono_cam', "
+            "'px4_x500_mono_cam', or 'custom'."
         )
     if (
         config.runtime.runner_mode == "competition"
@@ -1277,6 +1637,8 @@ def _validate(config: PilotConfig) -> None:
         raise RuntimeError("controller thrust_hover_initial must stay within [0.0, 1.0].")
     if not 0.0 <= config.controller.fallback_thrust <= 1.0:
         raise RuntimeError("controller fallback_thrust must stay within [0.0, 1.0].")
+    if any(float(value) <= 0.0 for value in config.controller.lateral_accel_gain_xy):
+        raise RuntimeError("controller.lateral_accel_gain_xy values must be positive.")
     for key, value in (
         ("vision_correction_alpha", config.state_estimation.vision_correction_alpha),
         ("vision_correction_alpha_xy", config.state_estimation.vision_correction_alpha_xy),
@@ -1420,13 +1782,143 @@ def _validate(config: PilotConfig) -> None:
     for key, value in (
         ("max_relative_z_m", config.hover_acquisition.max_relative_z_m),
         ("max_settle_vz_m_s", config.hover_acquisition.max_settle_vz_m_s),
+        ("min_release_z_m", config.hover_acquisition.min_release_z_m),
         (
             "overshoot_thrust_step_per_s",
             config.hover_acquisition.overshoot_thrust_step_per_s,
         ),
+        (
+            "overshoot_max_thrust_drop",
+            config.hover_acquisition.overshoot_max_thrust_drop,
+        ),
+        ("z_hold_kp", config.hover_acquisition.z_hold_kp),
+        ("z_hold_kv", config.hover_acquisition.z_hold_kv),
+        ("z_hold_max_correction", config.hover_acquisition.z_hold_max_correction),
     ):
         if float(value) < 0.0:
             raise RuntimeError(f"hover_acquisition.{key} must be non-negative.")
+    if config.thrust_scale_calibration.max_duration_s <= 0.0:
+        raise RuntimeError("thrust_scale_calibration.max_duration_s must be positive.")
+    if config.thrust_scale_calibration.min_samples < 1:
+        raise RuntimeError("thrust_scale_calibration.min_samples must be at least 1.")
+    if (
+        config.thrust_scale_calibration.min_probe_delta_thrust < 0.0
+        or config.thrust_scale_calibration.max_probe_delta_thrust < 0.0
+        or config.thrust_scale_calibration.probe_delta_thrust < 0.0
+    ):
+        raise RuntimeError("thrust_scale_calibration probe thrust values must be non-negative.")
+    if (
+        config.thrust_scale_calibration.min_probe_delta_thrust
+        > config.thrust_scale_calibration.max_probe_delta_thrust
+    ):
+        raise RuntimeError(
+            "thrust_scale_calibration.min_probe_delta_thrust must be <= "
+            "max_probe_delta_thrust."
+        )
+    if (
+        config.thrust_scale_calibration.min_gain <= 0.0
+        or config.thrust_scale_calibration.max_gain < config.thrust_scale_calibration.min_gain
+    ):
+        raise RuntimeError(
+            "thrust_scale_calibration gain bounds must be positive and ordered."
+        )
+    for key, value in (
+        ("initial_delay_s", config.thrust_scale_calibration.initial_delay_s),
+        ("min_duration_s", config.thrust_scale_calibration.min_duration_s),
+        ("phase_duration_s", config.thrust_scale_calibration.phase_duration_s),
+        ("settle_duration_s", config.thrust_scale_calibration.settle_duration_s),
+        ("accel_filter_alpha", config.thrust_scale_calibration.accel_filter_alpha),
+        ("accel_deadband_m_s2", config.thrust_scale_calibration.accel_deadband_m_s2),
+        ("min_abs_accel_m_s2", config.thrust_scale_calibration.min_abs_accel_m_s2),
+        ("max_abs_accel_m_s2", config.thrust_scale_calibration.max_abs_accel_m_s2),
+        ("max_abs_vz_m_s", config.thrust_scale_calibration.max_abs_vz_m_s),
+        ("max_relative_z_m", config.thrust_scale_calibration.max_relative_z_m),
+        ("z_hold_kp", config.thrust_scale_calibration.z_hold_kp),
+        ("z_hold_kv", config.thrust_scale_calibration.z_hold_kv),
+        (
+            "z_hold_max_correction",
+            config.thrust_scale_calibration.z_hold_max_correction,
+        ),
+        ("result_alpha", config.thrust_scale_calibration.result_alpha),
+        ("print_period_s", config.thrust_scale_calibration.print_period_s),
+    ):
+        if float(value) < 0.0:
+            raise RuntimeError(f"thrust_scale_calibration.{key} must be non-negative.")
+    if not 0.0 <= config.thrust_scale_calibration.accel_filter_alpha <= 1.0:
+        raise RuntimeError(
+            "thrust_scale_calibration.accel_filter_alpha must be within [0.0, 1.0]."
+        )
+    if not 0.0 <= config.thrust_scale_calibration.result_alpha <= 1.0:
+        raise RuntimeError(
+            "thrust_scale_calibration.result_alpha must be within [0.0, 1.0]."
+        )
+    if config.lateral_response_calibration.max_duration_s <= 0.0:
+        raise RuntimeError("lateral_response_calibration.max_duration_s must be positive.")
+    if config.lateral_response_calibration.min_samples_per_axis < 1:
+        raise RuntimeError(
+            "lateral_response_calibration.min_samples_per_axis must be at least 1."
+        )
+    if (
+        config.lateral_response_calibration.min_probe_accel_m_s2 < 0.0
+        or config.lateral_response_calibration.max_probe_accel_m_s2 < 0.0
+        or config.lateral_response_calibration.probe_accel_m_s2 < 0.0
+    ):
+        raise RuntimeError(
+            "lateral_response_calibration probe accelerations must be non-negative."
+        )
+    if (
+        config.lateral_response_calibration.min_probe_accel_m_s2
+        > config.lateral_response_calibration.max_probe_accel_m_s2
+    ):
+        raise RuntimeError(
+            "lateral_response_calibration.min_probe_accel_m_s2 must be <= "
+            "max_probe_accel_m_s2."
+        )
+    if (
+        config.lateral_response_calibration.min_gain <= 0.0
+        or config.lateral_response_calibration.max_gain
+        < config.lateral_response_calibration.min_gain
+    ):
+        raise RuntimeError(
+            "lateral_response_calibration gain bounds must be positive and ordered."
+        )
+    for key, value in (
+        ("initial_delay_s", config.lateral_response_calibration.initial_delay_s),
+        ("min_duration_s", config.lateral_response_calibration.min_duration_s),
+        ("phase_duration_s", config.lateral_response_calibration.phase_duration_s),
+        ("settle_duration_s", config.lateral_response_calibration.settle_duration_s),
+        ("max_tilt_deg", config.lateral_response_calibration.max_tilt_deg),
+        ("accel_filter_alpha", config.lateral_response_calibration.accel_filter_alpha),
+        ("accel_deadband_m_s2", config.lateral_response_calibration.accel_deadband_m_s2),
+        ("min_abs_accel_m_s2", config.lateral_response_calibration.min_abs_accel_m_s2),
+        ("max_abs_accel_m_s2", config.lateral_response_calibration.max_abs_accel_m_s2),
+        ("max_cross_axis_ratio", config.lateral_response_calibration.max_cross_axis_ratio),
+        ("max_abs_vxy_m_s", config.lateral_response_calibration.max_abs_vxy_m_s),
+        ("max_xy_displacement_m", config.lateral_response_calibration.max_xy_displacement_m),
+        ("max_relative_z_m", config.lateral_response_calibration.max_relative_z_m),
+        (
+            "max_sign_ratio_disagreement",
+            config.lateral_response_calibration.max_sign_ratio_disagreement,
+        ),
+        ("z_hold_kp", config.lateral_response_calibration.z_hold_kp),
+        ("z_hold_kv", config.lateral_response_calibration.z_hold_kv),
+        (
+            "z_hold_max_correction",
+            config.lateral_response_calibration.z_hold_max_correction,
+        ),
+        ("result_alpha", config.lateral_response_calibration.result_alpha),
+        ("print_period_s", config.lateral_response_calibration.print_period_s),
+    ):
+        if float(value) < 0.0:
+            raise RuntimeError(f"lateral_response_calibration.{key} must be non-negative.")
+    if not 0.0 <= config.lateral_response_calibration.accel_filter_alpha <= 1.0:
+        raise RuntimeError(
+            "lateral_response_calibration.accel_filter_alpha must be within [0.0, 1.0]."
+        )
+    if not 0.0 <= config.lateral_response_calibration.result_alpha <= 1.0:
+        raise RuntimeError(
+            "lateral_response_calibration.result_alpha must be within [0.0, 1.0]."
+        )
 
 
 def _section(raw: dict[str, Any], key: str) -> dict[str, Any]:
@@ -1440,6 +1932,8 @@ def _resolve_camera_mount(
     runner_mode: str,
     competition_body_translation_m: tuple[float, float, float],
     competition_yaw_correction_deg: float,
+    racer_body_translation_m: tuple[float, float, float],
+    racer_yaw_correction_deg: float,
     px4_x500_body_translation_m: tuple[float, float, float],
     px4_x500_yaw_correction_deg: float,
     custom_body_translation_m: tuple[float, float, float],
@@ -1447,10 +1941,12 @@ def _resolve_camera_mount(
 ) -> tuple[str, tuple[float, float, float], float]:
     requested = str(profile or "auto").strip().lower()
     if requested == "auto":
-        requested = "competition" if str(runner_mode).lower() == "competition" else "px4_x500_mono_cam"
+        requested = "competition" if str(runner_mode).lower() == "competition" else "racer_mono_cam"
 
     if requested == "competition":
         return "competition", competition_body_translation_m, float(competition_yaw_correction_deg)
+    if requested == "racer_mono_cam":
+        return "racer_mono_cam", racer_body_translation_m, float(racer_yaw_correction_deg)
     if requested == "px4_x500_mono_cam":
         return "px4_x500_mono_cam", px4_x500_body_translation_m, float(px4_x500_yaw_correction_deg)
     if requested == "custom":

@@ -3,7 +3,6 @@ from timesync import TimeSync
 from vision_rx import VisionRX
 from mavlink_rx import MAVLinkRX
 from controller import Controller
-from ros_camera_rx import RosCameraRX
 from autonomy_adapter import AutonomyAdapter
 from perception_adapter import PerceptionAdapter
 
@@ -45,6 +44,8 @@ def setup_components(shared_data, system_boot_ms, config):
     vision_source = config.vision.source
 
     if vision_source == "ros":
+        from ros_camera_rx import RosCameraRX
+
         print("Setting up ROS2 camera rx...", flush=True)
         vision_rx = RosCameraRX(
             shared_data,

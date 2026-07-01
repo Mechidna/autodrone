@@ -145,9 +145,14 @@ cy = 180.0
 dist_coeffs = [0.0, 0.0, 0.0, 0.0, 0.0]
 
 [camera.mount]
-profile = "auto" # auto | competition | px4_x500_mono_cam | custom
+profile = "auto" # auto | competition | racer_mono_cam | px4_x500_mono_cam | custom
 competition_body_translation_m = [0.0, 0.0, 0.0]
 competition_yaw_correction_deg = 0.0
+# VADR-TS-002 / racer_mono_cam: camera optical origin is coincident with the
+# vehicle body origin. The 20 deg upward pitch is modeled in the SDF and in
+# frame_conventions.py.
+racer_mono_cam_body_translation_m = [0.0, 0.0, 0.0]
+racer_mono_cam_yaw_correction_deg = 0.0
 # PX4 x500_mono_cam SDF pose: .12 .03 .242 relative to base_link.
 # Converted from Gazebo body FLU to MAVLink body FRD: x forward, y right, z down.
 px4_x500_mono_cam_body_translation_m = [0.12, -0.03, -0.242]
@@ -160,7 +165,8 @@ enabled = true
 backend = "yolo"                 # blue | orange | yolo
 hz = 30
 gate_size_m = 1.5
-yolo_model_path = "/home/paolo/datasets/gazebo_gate_yolo_pose_ab_runs/partial/weights/best.pt"
+#yolo_model_path = "/home/paolo/datasets/gazebo_gate_yolo_pose_ab_runs/partial/weights/best.pt"
+yolo_model_path = "/home/paolo/datasets/gazebo_gate_yolo_pose_racer_runs/smoke_512_half/weights/best.pt"
 preprocess_mode = "raw"
 yolo_conf = 0.1
 yolo_imgsz = 640
@@ -178,9 +184,12 @@ print_period_s = 0.5
 max_prints = 120
 max_match_distance_m = 5.0
 known_gate_positions_neu = [
-  [0.0, 8.0, 1.5],
-  [0.8, 16.0, 1.5],
-  [-0.8, 24.0, 1.5],
+  [-0.066791, 26.362353, 5.472618],
+  [1.376291, 51.516703, 7.507039],
+  [1.085099, 76.717552, 15.039470],
+  [-1.452183, 101.175034, 21.214009],
+  [1.926545, 127.584734, 13.432194],
+  [0.333895, 154.563193, 20.417188],
 ]
 gate_right_axis_neu = [1.0, 0.0, 0.0]
 gate_up_axis_neu = [0.0, 0.0, 1.0]
@@ -189,9 +198,12 @@ gate_up_axis_neu = [0.0, 0.0, 1.0]
 mode = "perception"               # perception | ground_truth
 allow_ground_truth = false         # debug/PX4 only; not competition-valid
 known_gate_positions_neu = [
-  [0.0, 8.0, 1.5],
-  [0.8, 16.0, 1.5],
-  [-0.8, 24.0, 1.5],
+  [-0.066791, 26.362353, 5.472618],
+  [1.376291, 51.516703, 7.507039],
+  [1.085099, 76.717552, 15.039470],
+  [-1.452183, 101.175034, 21.214009],
+  [1.926545, 127.584734, 13.432194],
+  [0.333895, 154.563193, 20.417188],
 ]
 
 [gate_memory]
@@ -215,7 +227,7 @@ max_committed_match_distance = 0.60
 min_observation_time = 0.50
 
 [race]
-gate_count = 3
+gate_count = 6
 pass_radius_m = 1.25
 clear_radius_m = 1.75
 debounce_s = 0.75
@@ -226,8 +238,8 @@ active_target_lost_grace_s = 2.0
 vmax = 2.5
 amax = 2.0
 t_min = 1.0
-safe_min_target_z = 1.0
-safe_max_target_z = 3.0
+safe_min_target_z = -inf
+safe_max_target_z = inf
 target_z_mode = "observed_clamped" # observed_clamped | expected
 replan_target_shift_m = 1.0
 replan_after_trajectory_s = 0.25
@@ -242,6 +254,7 @@ kv = [2.0, 2.0, 2.6]
 max_acc_xy = 2.0
 max_acc_z_up = 2.5
 max_acc_z_down = 2.0
+lateral_accel_gain_xy = [1.0, 1.0]
 thrust_hover_initial = 0.5
 fallback_thrust_initial = 0.5       # last-resort initial guess only
 adaptive_hover_enabled = true
@@ -291,9 +304,78 @@ stable_accel_abs_m_s2 = 0.80
 lift_confirm_z_m = 0.15
 lift_confirm_vz_m_s = 0.15
 relative_airborne_z_m = 0.25   # relative to estimator start, not gate altitude
+min_release_z_m = 0.15          # relative to acquisition start, not gate altitude
 min_confidence = 0.0
+overshoot_max_thrust_drop = 0.0
+z_hold_enabled = true
+z_hold_kp = 0.10
+z_hold_kv = 0.08
+z_hold_max_correction = 0.08
 reset_hover_on_disarm = true
 release_on_timeout_while_unstable = false
+print_period_s = 0.5
+
+[thrust_scale_calibration]
+enabled = true
+estimator_mode_only = false
+require_hover_acquisition = true
+require_armed = true
+initial_delay_s = 0.20
+min_duration_s = 0.80
+max_duration_s = 2.00
+phase_duration_s = 0.60
+settle_duration_s = 0.08
+probe_delta_thrust = 0.04
+min_probe_delta_thrust = 0.02
+max_probe_delta_thrust = 0.08
+min_samples = 12
+accel_filter_alpha = 0.35
+accel_deadband_m_s2 = 0.05
+min_abs_accel_m_s2 = 0.10
+max_abs_accel_m_s2 = 6.00
+max_abs_vz_m_s = 1.00
+max_relative_z_m = 0.75
+z_hold_enabled = true
+z_hold_kp = 0.10
+z_hold_kv = 0.08
+z_hold_max_correction = 0.08
+min_gain = 0.03
+max_gain = 0.30
+result_alpha = 1.0
+print_period_s = 0.5
+
+[lateral_response_calibration]
+enabled = true
+estimator_mode_only = false
+require_thrust_scale_calibration = true
+require_armed = true
+initial_delay_s = 0.20
+min_duration_s = 3.60
+max_duration_s = 5.00
+phase_duration_s = 0.80
+settle_duration_s = 0.30
+probe_accel_m_s2 = 0.70
+min_probe_accel_m_s2 = 0.20
+max_probe_accel_m_s2 = 1.00
+max_tilt_deg = 5.0
+min_samples_per_axis = 8
+accel_filter_alpha = 0.35
+accel_deadband_m_s2 = 0.05
+min_abs_accel_m_s2 = 0.08
+max_abs_accel_m_s2 = 5.00
+max_cross_axis_ratio = 1.50
+max_abs_vxy_m_s = 1.20
+max_xy_displacement_m = 0.80
+max_relative_z_m = 0.75
+max_sign_ratio_disagreement = 0.35
+z_hold_enabled = true
+z_hold_kp = 0.10
+z_hold_kv = 0.08
+z_hold_max_correction = 0.08
+min_gain = 0.50
+max_gain = 1.25
+result_alpha = 0.25
+tilt_thrust_compensation = true
 print_period_s = 0.5
 
 [command]

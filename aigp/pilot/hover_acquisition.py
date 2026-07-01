@@ -40,6 +40,11 @@ class HoverAcquisitionDebug:
     lift_confirmed: bool
     stable_time_s: float
     armed: Optional[bool]
+    release_z_m: float
+    z_hold_error_m: float
+    z_hold_vz_error_m_s: float
+    z_hold_thrust_correction: float
+    overshoot_thrust_floor: float
 
 
 @dataclass(frozen=True)
@@ -92,10 +97,22 @@ class HoverAcquisition:
         self.lift_confirm_z_m = max(0.0, float(section.lift_confirm_z_m))
         self.lift_confirm_vz_m_s = max(0.0, float(section.lift_confirm_vz_m_s))
         self.relative_airborne_z_m = max(0.0, float(section.relative_airborne_z_m))
+        self.min_release_z_m = max(0.0, float(section.min_release_z_m))
         self.min_confidence = _clamp(section.min_confidence, 0.0, 1.0)
         self.overshoot_thrust_step_per_s = max(
             0.0,
             float(section.overshoot_thrust_step_per_s),
+        )
+        self.overshoot_max_thrust_drop = max(
+            0.0,
+            float(section.overshoot_max_thrust_drop),
+        )
+        self.z_hold_enabled = bool(section.z_hold_enabled)
+        self.z_hold_kp = max(0.0, float(section.z_hold_kp))
+        self.z_hold_kv = max(0.0, float(section.z_hold_kv))
+        self.z_hold_max_correction = max(
+            0.0,
+            float(section.z_hold_max_correction),
         )
         self.reset_hover_on_disarm = bool(section.reset_hover_on_disarm)
         self.release_on_timeout_while_unstable = bool(
@@ -107,7 +124,9 @@ class HoverAcquisition:
         self.last_update_time: Optional[float] = None
         self.initial_z: Optional[float] = None
         self.hover_thrust = self.initial_thrust
+        self.command_thrust = self.initial_thrust
         self.lift_confirmed = False
+        self.lift_confirmed_thrust: Optional[float] = None
         self.stable_since: Optional[float] = None
         self.last_debug = self._debug(
             status="init",
@@ -163,6 +182,8 @@ class HoverAcquisition:
                 if self.reset_hover_on_disarm
                 else max(current_hover, self.initial_thrust)
             )
+            self.hover_thrust = thrust
+            self.command_thrust = thrust
             debug = self._debug(
                 status="waiting_armed",
                 active=True,
@@ -197,7 +218,11 @@ class HoverAcquisition:
                 if self.reset_hover_on_disarm
                 else max(current_hover, self.initial_thrust)
             )
+            self.command_thrust = self.hover_thrust
             self.lift_confirmed = state_z >= self.relative_airborne_z_m
+            self.lift_confirmed_thrust = (
+                self.command_thrust if self.lift_confirmed else None
+            )
             self.stable_since = None
             elapsed_s = 0.0
             dt_s = 0.0
@@ -208,25 +233,54 @@ class HoverAcquisition:
                 dt_s = 0.0
             self.last_update_time = now
 
-        z_rel_m = state_z - float(self.initial_z if self.initial_z is not None else state_z)
-        self._update_lift_confirmation(state_z=state_z, z_rel_m=z_rel_m, vz_m_s=state_vz)
+        z_rel_m = state_z - float(
+            self.initial_z if self.initial_z is not None else state_z
+        )
+        self._update_lift_confirmation(
+            state_z=state_z,
+            z_rel_m=z_rel_m,
+            vz_m_s=state_vz,
+            command_thrust=self.command_thrust,
+        )
         overshoot = self._overshoot(z_rel_m=z_rel_m, vz_m_s=state_vz)
         if overshoot:
             self.lift_confirmed = True
+            if self.lift_confirmed_thrust is None:
+                self.lift_confirmed_thrust = self.command_thrust
             self.stable_since = None
+        (
+            z_hold_error_m,
+            z_hold_vz_error_m_s,
+            z_hold_thrust_correction,
+        ) = self._z_hold_terms(z_rel_m=z_rel_m, vz_m_s=state_vz)
+        overshoot_thrust_floor = math.nan
 
         if dt_s > 0.0:
-            self.hover_thrust = self._next_thrust(
-                hover_thrust=self.hover_thrust,
+            self.command_thrust = self._next_command_thrust(
+                command_thrust=self.command_thrust,
                 vz_m_s=state_vz,
                 az_m_s2=az_m_s2,
                 dt_s=dt_s,
                 overshoot=overshoot,
             )
+            if self._stable_sample_ok(
+                elapsed_s=elapsed_s,
+                z_rel_m=z_rel_m,
+                vz_m_s=state_vz,
+                az_m_s2=az_m_s2,
+            ):
+                self.hover_thrust = self._learn_hover_estimate(
+                    hover_thrust=self.hover_thrust,
+                    command_thrust=self.command_thrust,
+                    dt_s=dt_s,
+                )
+
+        command_thrust = self._command_with_z_hold(z_hold_thrust_correction)
 
         stable_time_s = self._stable_time(
             now=now,
             elapsed_s=elapsed_s,
+            z_rel_m=z_rel_m,
             vz_m_s=state_vz,
             az_m_s2=az_m_s2,
         )
@@ -241,11 +295,13 @@ class HoverAcquisition:
             status = "stable" if stable_time_s >= self.stable_duration_s else "timeout"
             if timed_out and not self.lift_confirmed:
                 status = "timeout_lift_unconfirmed"
+            if stable_time_s >= self.stable_duration_s:
+                self.hover_thrust = self.command_thrust
             debug = self._debug(
                 status=status,
                 active=False,
                 completed=True,
-                thrust=self.hover_thrust,
+                thrust=command_thrust,
                 hover_thrust=self.hover_thrust,
                 elapsed_s=elapsed_s,
                 dt_s=dt_s,
@@ -254,6 +310,11 @@ class HoverAcquisition:
                 az_m_s2=az_m_s2,
                 stable_time_s=stable_time_s,
                 armed=armed,
+                release_z_m=self.min_release_z_m,
+                z_hold_error_m=z_hold_error_m,
+                z_hold_vz_error_m_s=z_hold_vz_error_m_s,
+                z_hold_thrust_correction=z_hold_thrust_correction,
+                overshoot_thrust_floor=overshoot_thrust_floor,
             )
             return HoverAcquisitionResult(
                 command=None,
@@ -271,7 +332,7 @@ class HoverAcquisition:
             status=status,
             active=True,
             completed=False,
-            thrust=self.hover_thrust,
+            thrust=command_thrust,
             hover_thrust=self.hover_thrust,
             elapsed_s=elapsed_s,
             dt_s=dt_s,
@@ -280,22 +341,27 @@ class HoverAcquisition:
             az_m_s2=az_m_s2,
             stable_time_s=stable_time_s,
             armed=armed,
+            release_z_m=self.min_release_z_m,
+            z_hold_error_m=z_hold_error_m,
+            z_hold_vz_error_m_s=z_hold_vz_error_m_s,
+            z_hold_thrust_correction=z_hold_thrust_correction,
+            overshoot_thrust_floor=overshoot_thrust_floor,
         )
         return HoverAcquisitionResult(
             command=HoverAcquisitionCommand(
                 roll_rad=0.0,
                 pitch_rad=0.0,
                 yaw_rad=yaw_rad,
-                thrust=self.hover_thrust,
+                thrust=command_thrust,
             ),
             hover_thrust=self.hover_thrust,
             debug=debug,
         )
 
-    def _next_thrust(
+    def _next_command_thrust(
         self,
         *,
-        hover_thrust: float,
+        command_thrust: float,
         vz_m_s: float,
         az_m_s2: float,
         dt_s: float,
@@ -327,20 +393,27 @@ class HoverAcquisition:
         elif self.max_up_vz_m_s > 0.0 and vz_m_s > self.max_up_vz_m_s:
             rate = min(rate, -down_limit)
 
-        return _clamp(
-            hover_thrust + rate * dt_s,
-            self.min_thrust,
-            self.max_probe_thrust,
-        )
+        thrust = command_thrust + rate * dt_s
+        return _clamp(thrust, self.min_thrust, self.max_probe_thrust)
 
     def _overshoot(self, *, z_rel_m: float, vz_m_s: float) -> bool:
-        return (
-            (self.max_relative_z_m > 0.0 and z_rel_m >= self.max_relative_z_m)
-            or (self.max_up_vz_m_s > 0.0 and vz_m_s > self.max_up_vz_m_s)
+        high_above_band = (
+            self.max_relative_z_m > 0.0 and z_rel_m >= self.max_relative_z_m
+        )
+        if (
+            high_above_band
+            and self.max_settle_vz_m_s > 0.0
+            and vz_m_s < -self.max_settle_vz_m_s
+        ):
+            high_above_band = False
+        return high_above_band or (
+            self.max_up_vz_m_s > 0.0 and vz_m_s > self.max_up_vz_m_s
         )
 
     def _release_unsafe(self, *, z_rel_m: float, vz_m_s: float, overshoot: bool) -> bool:
         if not self.lift_confirmed:
+            return True
+        if self.min_release_z_m > 0.0 and z_rel_m < self.min_release_z_m:
             return True
         if overshoot:
             return True
@@ -355,20 +428,16 @@ class HoverAcquisition:
         *,
         now: float,
         elapsed_s: float,
+        z_rel_m: float,
         vz_m_s: float,
         az_m_s2: float,
     ) -> float:
-        accel_stable = (
-            not math.isfinite(az_m_s2)
-            or abs(az_m_s2) <= self.stable_accel_abs_m_s2
-        )
-        stable = (
-            self.lift_confirmed
-            and elapsed_s >= self.min_duration_s
-            and abs(vz_m_s) <= self.stable_vz_abs_m_s
-            and accel_stable
-        )
-        if stable:
+        if self._stable_sample_ok(
+            elapsed_s=elapsed_s,
+            z_rel_m=z_rel_m,
+            vz_m_s=vz_m_s,
+            az_m_s2=az_m_s2,
+        ):
             if self.stable_since is None:
                 self.stable_since = now
             return max(0.0, now - self.stable_since)
@@ -376,12 +445,40 @@ class HoverAcquisition:
         self.stable_since = None
         return 0.0
 
+    def _stable_sample_ok(
+        self,
+        *,
+        elapsed_s: float,
+        z_rel_m: float,
+        vz_m_s: float,
+        az_m_s2: float,
+    ) -> bool:
+        accel_stable = (
+            not math.isfinite(az_m_s2)
+            or abs(az_m_s2) <= self.stable_accel_abs_m_s2
+        )
+        release_height_ok = (
+            self.min_release_z_m <= 0.0 or z_rel_m >= self.min_release_z_m
+        )
+        upper_height_ok = (
+            self.max_relative_z_m <= 0.0 or z_rel_m <= self.max_relative_z_m
+        )
+        return (
+            self.lift_confirmed
+            and elapsed_s >= self.min_duration_s
+            and release_height_ok
+            and upper_height_ok
+            and abs(vz_m_s) <= self.stable_vz_abs_m_s
+            and accel_stable
+        )
+
     def _update_lift_confirmation(
         self,
         *,
         state_z: float,
         z_rel_m: float,
         vz_m_s: float,
+        command_thrust: float,
     ) -> None:
         if self.lift_confirmed:
             return
@@ -389,6 +486,63 @@ class HoverAcquisition:
             state_z >= self.relative_airborne_z_m
             or z_rel_m >= self.lift_confirm_z_m
             or vz_m_s >= self.lift_confirm_vz_m_s
+        )
+        if self.lift_confirmed:
+            self.lift_confirmed_thrust = float(command_thrust)
+
+    def _z_hold_terms(self, *, z_rel_m: float, vz_m_s: float) -> tuple[float, float, float]:
+        if (
+            not self.z_hold_enabled
+            or not self.lift_confirmed
+            or self.z_hold_max_correction <= 0.0
+        ):
+            return 0.0, 0.0, 0.0
+
+        z_error_m = float(self.min_release_z_m - z_rel_m)
+        vz_error_m_s = float(-vz_m_s)
+        correction = self.z_hold_kp * z_error_m + self.z_hold_kv * vz_error_m_s
+        if not math.isfinite(correction):
+            correction = 0.0
+        if self.max_relative_z_m > 0.0 and z_rel_m > self.max_relative_z_m:
+            correction = min(correction, 0.0)
+        correction = _clamp(
+            correction,
+            -self.z_hold_max_correction,
+            self.z_hold_max_correction,
+        )
+        return z_error_m, vz_error_m_s, correction
+
+    def _command_with_z_hold(self, z_hold_thrust_correction: float) -> float:
+        thrust = self.command_thrust + self._finite_float(
+            z_hold_thrust_correction,
+            0.0,
+        )
+        return _clamp(thrust, self.min_thrust, self.max_probe_thrust)
+
+    def _learn_hover_estimate(
+        self,
+        *,
+        hover_thrust: float,
+        command_thrust: float,
+        dt_s: float,
+    ) -> float:
+        if dt_s <= 0.0:
+            return hover_thrust
+        alpha = _clamp(dt_s / max(self.stable_duration_s, 0.05), 0.0, 1.0)
+        learned = float(hover_thrust) + alpha * (
+            float(command_thrust) - float(hover_thrust)
+        )
+        return _clamp(learned, self.min_thrust, self.max_probe_thrust)
+
+    def _overshoot_thrust_floor(self) -> float:
+        if self.overshoot_max_thrust_drop <= 0.0:
+            return math.nan
+        if self.lift_confirmed_thrust is None:
+            return math.nan
+        return _clamp(
+            float(self.lift_confirmed_thrust) - self.overshoot_max_thrust_drop,
+            self.min_thrust,
+            self.max_probe_thrust,
         )
 
     def _inactive(self, status: str, hover_thrust: float) -> HoverAcquisitionResult:
@@ -413,7 +567,9 @@ class HoverAcquisition:
         self.last_update_time = None
         self.initial_z = None
         self.hover_thrust = self.initial_thrust
+        self.command_thrust = self.initial_thrust
         self.lift_confirmed = False
+        self.lift_confirmed_thrust = None
         self.stable_since = None
 
     def _debug(
@@ -431,6 +587,11 @@ class HoverAcquisition:
         az_m_s2: float,
         stable_time_s: float,
         armed: Optional[bool],
+        release_z_m: float = 0.0,
+        z_hold_error_m: float = 0.0,
+        z_hold_vz_error_m_s: float = 0.0,
+        z_hold_thrust_correction: float = 0.0,
+        overshoot_thrust_floor: float = math.nan,
     ) -> HoverAcquisitionDebug:
         self.last_debug = HoverAcquisitionDebug(
             status=str(status),
@@ -446,6 +607,11 @@ class HoverAcquisition:
             lift_confirmed=bool(self.lift_confirmed),
             stable_time_s=float(stable_time_s),
             armed=armed,
+            release_z_m=float(release_z_m),
+            z_hold_error_m=float(z_hold_error_m),
+            z_hold_vz_error_m_s=float(z_hold_vz_error_m_s),
+            z_hold_thrust_correction=float(z_hold_thrust_correction),
+            overshoot_thrust_floor=float(overshoot_thrust_floor),
         )
         return self.last_debug
 

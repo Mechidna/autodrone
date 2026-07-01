@@ -30,10 +30,10 @@ from flight_logger import FlightLogger
 # Shared telemetry object
 # -------------------------------------------------
 telemetry = GetTelemetry()
-CAMERA_OFFSET_BODY = np.array([0.12, 0.03, 0.242], dtype=float)
+CAMERA_OFFSET_BODY = np.array([0.0, 0.0, 0.0], dtype=float)
 GAZEBO_DYNAMIC_POSE_TOPIC = "/world/gate_test_1500mm_blue/dynamic_pose/info"
-GAZEBO_MODEL_NAME = "x500_mono_cam_0"
-GAZEBO_POSE_SOURCE = "gazebo_dynamic_pose_x500_mono_cam_0"
+GAZEBO_MODEL_NAME = "racer_mono_cam_0"
+GAZEBO_POSE_SOURCE = "gazebo_dynamic_pose_racer_mono_cam_0"
 
 
 def rotate_vector_by_quaternion(quat_xyzw, vector):

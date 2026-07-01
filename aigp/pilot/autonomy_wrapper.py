@@ -19,8 +19,10 @@ from autonomy_core.perception.gate_memory import GateMemory
 from adaptive_hover_thrust import AdaptiveHoverThrust
 from estimator_landmark_map import EstimatorLandmarkMap
 from hover_acquisition import HoverAcquisition
+from lateral_response_calibration import LateralResponseCalibration
 from runtime_config import load_runtime_config
 from target_manager import TargetManager
+from thrust_scale_calibration import ThrustScaleCalibration
 from vehicle_state_estimator import VehicleStateEstimator
 
 
@@ -194,6 +196,7 @@ class PyAIPilotAutonomyAPI:
             max_acc_xy=self.config.controller.max_acc_xy,
             max_acc_z_up=self.config.controller.max_acc_z_up,
             max_acc_z_down=self.config.controller.max_acc_z_down,
+            lateral_accel_gain_xy=self.config.controller.lateral_accel_gain_xy,
             thrust_hover=self.config.controller.thrust_hover,
             thrust_min=self.config.controller.thrust_min,
             thrust_max=self.config.controller.thrust_max,
@@ -225,6 +228,10 @@ class PyAIPilotAutonomyAPI:
         self.hover_thrust = float(self.adaptive_hover.value)
         self.hover_acquisition = HoverAcquisition(self.config)
         self._last_hover_acquisition_trace_time = 0.0
+        self.thrust_scale_calibration = ThrustScaleCalibration(self.config)
+        self._last_thrust_scale_calibration_trace_time = 0.0
+        self.lateral_response_calibration = LateralResponseCalibration(self.config)
+        self._last_lateral_response_calibration_trace_time = 0.0
 
     def update(self, snapshot) -> AutonomyCommandRad | None:
         snapshot.stable_gate_landmarks_neu = self._stable_gate_landmarks_neu()
@@ -278,6 +285,63 @@ class PyAIPilotAutonomyAPI:
 
             if acquisition_result.command is not None:
                 command = acquisition_result.command
+                return AutonomyCommandRad(
+                    roll_rad=command.roll_rad,
+                    pitch_rad=command.pitch_rad,
+                    yaw_rad=command.yaw_rad,
+                    thrust=command.thrust,
+                )
+
+        if not self.thrust_scale_calibration.completed:
+            calibration_result = self.thrust_scale_calibration.update(
+                snapshot=snapshot,
+                estimate=estimate,
+                hover_thrust=self.adaptive_hover.value,
+                hover_acquisition_completed=self.hover_acquisition.completed,
+                current_thrust_from_acc_gain=self.tracker.thrust_from_acc_gain,
+            )
+            if calibration_result.thrust_from_acc_gain is not None:
+                self.tracker.thrust_from_acc_gain = float(
+                    calibration_result.thrust_from_acc_gain
+                )
+            if calibration_result.debug.active or calibration_result.debug.completed:
+                self._trace_thrust_scale_calibration(
+                    pos,
+                    calibration_result.debug,
+                )
+
+            if calibration_result.command is not None:
+                command = calibration_result.command
+                return AutonomyCommandRad(
+                    roll_rad=command.roll_rad,
+                    pitch_rad=command.pitch_rad,
+                    yaw_rad=command.yaw_rad,
+                    thrust=command.thrust,
+                )
+
+        if not self.lateral_response_calibration.completed:
+            lateral_result = self.lateral_response_calibration.update(
+                snapshot=snapshot,
+                estimate=estimate,
+                hover_thrust=self.adaptive_hover.value,
+                thrust_scale_calibration_completed=(
+                    self.thrust_scale_calibration.completed
+                ),
+                current_lateral_accel_gain_xy=self.tracker.lateral_accel_gain_xy,
+            )
+            if lateral_result.lateral_accel_gain_xy is not None:
+                self.tracker.lateral_accel_gain_xy = np.asarray(
+                    lateral_result.lateral_accel_gain_xy,
+                    dtype=float,
+                ).reshape(2)
+            if lateral_result.debug.active or lateral_result.debug.completed:
+                self._trace_lateral_response_calibration(
+                    pos,
+                    lateral_result.debug,
+                )
+
+            if lateral_result.command is not None:
+                command = lateral_result.command
                 return AutonomyCommandRad(
                     roll_rad=command.roll_rad,
                     pitch_rad=command.pitch_rad,
@@ -360,12 +424,107 @@ class PyAIPilotAutonomyAPI:
             f"armed={debug.armed} "
             f"elapsed={debug.elapsed_s:.2f} "
             f"z_rel={debug.z_rel_m:.2f} "
+            f"release_z={debug.release_z_m:.2f} "
             f"vz={debug.vz_m_s:.2f} "
             f"az={debug.az_m_s2:.2f} "
             f"thrust={debug.thrust:.3f} "
             f"hover={debug.hover_thrust:.3f} "
+            f"z_hold_err={debug.z_hold_error_m:.2f} "
+            f"z_hold_vz_err={debug.z_hold_vz_error_m_s:.2f} "
+            f"z_hold_corr={debug.z_hold_thrust_correction:.3f} "
+            f"overshoot_floor={debug.overshoot_thrust_floor:.3f} "
             f"lift={int(debug.lift_confirmed)} "
             f"stable={debug.stable_time_s:.2f} "
+            f"pos_neu=({arr[0]:.2f},{arr[1]:.2f},{arr[2]:.2f})",
+            flush=True,
+        )
+
+    def _trace_thrust_scale_calibration(self, pos, debug) -> None:
+        now = time.time()
+        period_s = float(self.config.thrust_scale_calibration.print_period_s)
+        if (
+            not bool(debug.completed)
+            and now - self._last_thrust_scale_calibration_trace_time < period_s
+        ):
+            return
+        self._last_thrust_scale_calibration_trace_time = now
+
+        arr = np.asarray(pos, dtype=float).reshape(3)
+        print(
+            "thrust_scale_calibration "
+            f"status={debug.status} "
+            f"active={int(debug.active)} "
+            f"done={int(debug.completed)} "
+            f"armed={debug.armed} "
+            f"elapsed={debug.elapsed_s:.2f} "
+            f"z_rel={debug.z_rel_m:.2f} "
+            f"vz={debug.vz_m_s:.2f} "
+            f"az={debug.az_m_s2:.2f} "
+            f"az_src={debug.accel_source} "
+            f"thrust={debug.thrust:.3f} "
+            f"hover={debug.hover_thrust:.3f} "
+            f"delta={debug.thrust_delta:.3f} "
+            f"z_hold_err={debug.z_hold_error_m:.2f} "
+            f"z_hold_vz_err={debug.z_hold_vz_error_m_s:.2f} "
+            f"z_hold_corr={debug.z_hold_thrust_correction:.3f} "
+            f"samples={debug.samples} "
+            f"accel_per_thrust={debug.accel_per_thrust:.2f} "
+            f"thrust_gain={debug.thrust_from_acc_gain:.4f} "
+            f"conf={debug.confidence:.2f} "
+            f"pos_neu=({arr[0]:.2f},{arr[1]:.2f},{arr[2]:.2f})",
+            flush=True,
+        )
+
+    def _trace_lateral_response_calibration(self, pos, debug) -> None:
+        now = time.time()
+        period_s = float(self.config.lateral_response_calibration.print_period_s)
+        if (
+            not bool(debug.completed)
+            and now - self._last_lateral_response_calibration_trace_time < period_s
+        ):
+            return
+        self._last_lateral_response_calibration_trace_time = now
+
+        arr = np.asarray(pos, dtype=float).reshape(3)
+        cmd_xy = debug.command_accel_xy_m_s2
+        sample_cmd_xy = debug.sampled_command_accel_xy_m_s2
+        acc_xy = debug.measured_accel_xy_m_s2
+        sample_acc_xy = debug.sampled_measured_accel_xy_m_s2
+        ratio_xy = debug.response_ratio_xy
+        gain_xy = debug.lateral_accel_gain_xy
+        samples_xy = debug.samples_xy
+        signed_samples_xy = debug.signed_samples_xy
+        print(
+            "lateral_response_calibration "
+            f"status={debug.status} "
+            f"active={int(debug.active)} "
+            f"done={int(debug.completed)} "
+            f"armed={debug.armed} "
+            f"elapsed={debug.elapsed_s:.2f} "
+            f"xy_rel={debug.xy_rel_m:.2f} "
+            f"vxy={debug.vxy_m_s:.2f} "
+            f"z_rel={debug.z_rel_m:.2f} "
+            f"z_hold_err={debug.z_hold_error_m:.2f} "
+            f"z_hold_vz_err={debug.z_hold_vz_error_m_s:.2f} "
+            f"z_hold_corr={debug.z_hold_thrust_correction:.3f} "
+            f"acc_src={debug.accel_source} "
+            f"cmd_acc_xy=({cmd_xy[0]:.2f},{cmd_xy[1]:.2f}) "
+            f"meas_acc_xy=({acc_xy[0]:.2f},{acc_xy[1]:.2f}) "
+            f"sample_cmd_xy=({sample_cmd_xy[0]:.2f},{sample_cmd_xy[1]:.2f}) "
+            f"sample_meas_xy=({sample_acc_xy[0]:.2f},{sample_acc_xy[1]:.2f}) "
+            f"sample_axis={debug.sampled_axis} "
+            f"sample_age={debug.sampled_age_s:.2f} "
+            f"sample_ratio={debug.sampled_response_ratio:.2f} "
+            f"sample_status={debug.sampled_status} "
+            f"cmd_deg=({math.degrees(debug.roll_rad):.2f},{math.degrees(debug.pitch_rad):.2f}) "
+            f"thrust={debug.thrust:.3f} "
+            f"hover={debug.hover_thrust:.3f} "
+            f"ratio_xy=({ratio_xy[0]:.2f},{ratio_xy[1]:.2f}) "
+            f"lat_gain=({gain_xy[0]:.3f},{gain_xy[1]:.3f}) "
+            f"samples_xy=({samples_xy[0]},{samples_xy[1]}) "
+            f"signed_samples_xy=({signed_samples_xy[0]},{signed_samples_xy[1]},"
+            f"{signed_samples_xy[2]},{signed_samples_xy[3]}) "
+            f"conf={debug.confidence:.2f} "
             f"pos_neu=({arr[0]:.2f},{arr[1]:.2f},{arr[2]:.2f})",
             flush=True,
         )
@@ -537,6 +696,10 @@ class PyAIPilotAutonomyAPI:
             hover_fast_txt = f"{float(hover_debug.fast_weight):.2f}"
 
         target_diag = self.target_manager.diagnostics()
+        lateral_gain = np.asarray(
+            self.tracker.lateral_accel_gain_xy,
+            dtype=float,
+        ).reshape(2)
         target_shift_txt = "nan"
         target_shift_xy_txt = "nan"
         target_shift_z_txt = "nan"
@@ -573,6 +736,8 @@ class PyAIPilotAutonomyAPI:
             f"cmd_deg=({math.degrees(roll_rad):.2f},{math.degrees(pitch_rad):.2f},{math.degrees(yaw_rad):.2f}) "
             f"thrust={thrust:.3f} "
             f"hover={hover_txt} "
+            f"thrust_gain={float(self.tracker.thrust_from_acc_gain):.4f} "
+            f"lat_gain=({lateral_gain[0]:.3f},{lateral_gain[1]:.3f}) "
             f"hover_adapt={hover_status} "
             f"hover_sig={hover_signal_txt} "
             f"hover_err_z_vz={hover_err_txt} "

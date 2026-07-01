@@ -76,6 +76,7 @@ class RPGHighLevelTracker:
         thrust_min=0.30,
         thrust_max=0.80,
         thrust_from_acc_gain=None,
+        lateral_accel_gain_xy=(1.0, 1.0),
     ):
         self.m = float(mass)
         self.g = float(gravity)
@@ -97,6 +98,10 @@ class RPGHighLevelTracker:
         self.thrust_from_acc_gain = (
             1.0 / self.g if thrust_from_acc_gain is None else float(thrust_from_acc_gain)
         )
+        self.lateral_accel_gain_xy = np.asarray(
+            lateral_accel_gain_xy,
+            dtype=float,
+        ).reshape(2)
 
     def _limit_acceleration(self, a_cmd_no_g):
         """
@@ -153,8 +158,14 @@ class RPGHighLevelTracker:
         # Saturate translational demand to something your drone can actually do
         a_cmd_no_g = self._limit_acceleration(a_cmd_raw_no_g)
 
+        # Calibrate lateral acceleration demand into the attitude command path.
+        a_cmd_attitude_no_g = a_cmd_no_g.copy()
+        a_cmd_attitude_no_g[:2] = (
+            a_cmd_attitude_no_g[:2] * self.lateral_accel_gain_xy
+        )
+
         # Add gravity compensation (z-up world frame)
-        a_des = a_cmd_no_g + np.array([0.0, 0.0, self.g], dtype=float)
+        a_des = a_cmd_attitude_no_g + np.array([0.0, 0.0, self.g], dtype=float)
 
         # Desired body z-axis aligns with desired acceleration direction
         z_b_des = normalize(a_des)
@@ -193,6 +204,7 @@ class RPGHighLevelTracker:
             "a_fb": a_fb,
             "a_cmd_raw_no_g": a_cmd_raw_no_g,
             "a_cmd_no_g": a_cmd_no_g,
+            "a_cmd_attitude_no_g": a_cmd_attitude_no_g,
             "a_des": a_des,
             "z_b_des": z_b_des,
             "R_des": R_des,
@@ -201,6 +213,7 @@ class RPGHighLevelTracker:
             "thrust_cmd_after_clamp": thrust_cmd,
             "thrust_limited": bool(thrust_cmd != thrust_raw_before_clamp),
             "hover_thrust": self.thrust_hover,
+            "lateral_accel_gain_xy": self.lateral_accel_gain_xy.copy(),
         }
 
         return roll_des, pitch_des, yaw_cmd, thrust_cmd, debug
