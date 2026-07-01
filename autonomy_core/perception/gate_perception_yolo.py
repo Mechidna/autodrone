@@ -15,6 +15,17 @@ def default_live_pnp_corner_reordering(corners_are_semantic: bool) -> bool:
     return not bool(corners_are_semantic)
 
 
+def normalize_keypoint_order(value) -> str:
+    order = str(value or "semantic").strip().lower()
+    if order in ("semantic", "physical", "physical_semantic"):
+        return "semantic"
+    if order in ("image", "image_ordered", "screen", "tltrbrbl"):
+        return "image"
+    raise ValueError(
+        f"Unsupported YOLO keypoint order {value!r}; use 'semantic' or 'image'."
+    )
+
+
 class GatePerception:
 
     def __init__(self,
@@ -25,7 +36,8 @@ class GatePerception:
                  yolo_conf=0.1,
                  yolo_imgsz=640,
                  yolo_device=None,
-                 preprocess_mode="distinctive"):
+                 preprocess_mode="distinctive",
+                 keypoint_order="semantic"):
 
         self.gate_size = gate_size
         self.pose_history = deque(maxlen=smoothing_window)
@@ -54,13 +66,17 @@ class GatePerception:
         self.yolo_imgsz = int(yolo_imgsz)
         self.yolo_device = yolo_device
         self.preprocess_mode = preprocess_mode
-        self.corners_are_semantic = True  # YOLO pose outputs TL, TR, BR, BL directly.
+        self.keypoint_order = normalize_keypoint_order(keypoint_order)
+        # semantic: keypoint IDs are fixed physical gate corners.
+        # image: keypoint IDs are image-space TL/TR/BR/BL and PnP must try corner permutations.
+        self.corners_are_semantic = self.keypoint_order == "semantic"
         self.allow_pnp_corner_reordering = default_live_pnp_corner_reordering(
             self.corners_are_semantic
         )
 
         print(f"[YOLO PERCEPTION] model={self.yolo_model_path}")
         print(f"[YOLO PERCEPTION] preprocess_mode={self.preprocess_mode}, conf={self.yolo_conf}, imgsz={self.yolo_imgsz}")
+        print(f"[YOLO PERCEPTION] keypoint_order={self.keypoint_order}")
         print("[LIVE PNP] using IPPE_SQUARE candidate sweep")
         print(f"[LIVE PNP] allow_pnp_corner_reordering={self.allow_pnp_corner_reordering}")
 
@@ -392,8 +408,11 @@ class GatePerception:
 
     def detect_gate_candidates(self, frame):
         """
-        Returns a list of 4-point arrays in TL, TR, BR, BL order.
-        These are YOLO-predicted inner opening corners, not HSV outer-frame corners.
+        Returns a list of 4-point arrays.
+
+        In semantic mode, indices are fixed physical gate corners. In image mode,
+        indices are image-space TL/TR/BR/BL and PnP is allowed to remap them to
+        the physical model points.
         """
         if frame is None:
             return []
@@ -550,8 +569,8 @@ class GatePerception:
         if pts.shape[0] < 4:
             return None
 
-        # YOLO pose labels already provide semantic order: TL, TR, BR, BL.
-        # Do not reorder using sum/diff, because that can scramble keypoint identity.
+        # Semantic labels already provide fixed physical gate-corner IDs. Do not
+        # reorder by image location because that would scramble the physical ID.
         if getattr(self, "corners_are_semantic", False) and pts.shape[0] == 4:
             return pts.astype(np.float32)
 

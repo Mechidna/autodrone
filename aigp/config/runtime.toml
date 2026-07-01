@@ -171,6 +171,7 @@ preprocess_mode = "raw"
 yolo_conf = 0.1
 yolo_imgsz = 640
 yolo_device = 0
+yolo_keypoint_order = "image"    # image for current autolabeler output; semantic for fixed physical corner IDs
 transform_mode = "physical_direct_rad_x_mirror"
 world_pose_source = "mavsdk"
 max_reprojection_error_for_memory = 5.0
@@ -184,12 +185,12 @@ print_period_s = 0.5
 max_prints = 120
 max_match_distance_m = 5.0
 known_gate_positions_neu = [
-  [-0.066791, 26.362353, 5.472618],
-  [1.376291, 51.516703, 7.507039],
-  [1.085099, 76.717552, 15.039470],
-  [-1.452183, 101.175034, 21.214009],
-  [1.926545, 127.584734, 13.432194],
-  [0.333895, 154.563193, 20.417188],
+  [-1.111371, 12.614718, 3.595973],
+  [0.221441, 24.070117, 2.163723],
+  [-0.050616, 35.213420, 1.501237],
+  [1.488134, 48.088183, 3.178262],
+  [2.058026, 58.992011, 7.154122],
+  [-0.962093, 71.786590, 6.997298],
 ]
 gate_right_axis_neu = [1.0, 0.0, 0.0]
 gate_up_axis_neu = [0.0, 0.0, 1.0]
@@ -198,12 +199,12 @@ gate_up_axis_neu = [0.0, 0.0, 1.0]
 mode = "perception"               # perception | ground_truth
 allow_ground_truth = false         # debug/PX4 only; not competition-valid
 known_gate_positions_neu = [
-  [-0.066791, 26.362353, 5.472618],
-  [1.376291, 51.516703, 7.507039],
-  [1.085099, 76.717552, 15.039470],
-  [-1.452183, 101.175034, 21.214009],
-  [1.926545, 127.584734, 13.432194],
-  [0.333895, 154.563193, 20.417188],
+  [-1.111371, 12.614718, 3.595973],
+  [0.221441, 24.070117, 2.163723],
+  [-0.050616, 35.213420, 1.501237],
+  [1.488134, 48.088183, 3.178262],
+  [2.058026, 58.992011, 7.154122],
+  [-0.962093, 71.786590, 6.997298],
 ]
 
 [gate_memory]
@@ -229,6 +230,9 @@ min_observation_time = 0.50
 [race]
 gate_count = 6
 pass_radius_m = 1.25
+pass_lateral_radius_m = 0.75
+pass_plane_tolerance_m = 0.05
+pass_through_m = 1.0
 clear_radius_m = 1.75
 debounce_s = 0.75
 expected_gate_altitude_m = 1.5
