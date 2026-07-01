@@ -58,6 +58,7 @@ class PerceptionWrapper:
                 else perception_config.yolo_device,
                 preprocess_mode=preprocess_mode
                 or perception_config.preprocess_mode,
+                yolo_keypoint_order=perception_config.yolo_keypoint_order,
                 gate_size_m=perception_config.gate_size_m,
             )
 
@@ -86,6 +87,7 @@ class PerceptionWrapper:
             f"backend={self.backend} "
             f"transform_mode={self.transform_mode} "
             f"world_pose_source={self.world_pose_source} "
+            f"yolo_keypoint_order={perception_config.yolo_keypoint_order} "
             f"camera_mount_profile={self.config.camera.mount_profile} "
             f"perception_yaw_correction_deg={self.perception_yaw_correction_deg:.3f} "
             f"K={self._fmt_array(self.camera_matrix, precision=3)} "
@@ -116,6 +118,7 @@ class PerceptionWrapper:
         yolo_imgsz: int,
         yolo_device: Optional[int | str],
         preprocess_mode: str,
+        yolo_keypoint_order: str,
         gate_size_m: float,
     ):
         if self.backend in ("yolo", "pose", "yolo_pose"):
@@ -128,6 +131,7 @@ class PerceptionWrapper:
                 yolo_imgsz=int(yolo_imgsz),
                 yolo_device=yolo_device,
                 preprocess_mode=str(preprocess_mode),
+                keypoint_order=str(yolo_keypoint_order),
             )
 
         if self.backend in ("orange", "hsv_orange"):

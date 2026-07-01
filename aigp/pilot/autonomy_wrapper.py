@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from autonomy_core.core.competition_config import VADR_TS_002
 from autonomy_core.controller.attitude_controller3 import (
     RPGHighLevelTracker,
     Reference,
@@ -18,6 +19,7 @@ from autonomy_core.planning.trajectory_manager import allocate_segment_times
 from autonomy_core.perception.gate_memory import GateMemory
 from adaptive_hover_thrust import AdaptiveHoverThrust
 from estimator_landmark_map import EstimatorLandmarkMap
+from gate_pass_geometry import check_gate_plane_pass, unit_vector_from_to
 from hover_acquisition import HoverAcquisition
 from lateral_response_calibration import LateralResponseCalibration
 from runtime_config import load_runtime_config
@@ -64,6 +66,22 @@ class PyAIPilotAutonomyAPI:
             if pass_radius_m is None
             else float(pass_radius_m)
         )
+        spec_gate_lateral_radius_m = float(VADR_TS_002.gate_inner_half_extent_m)
+        configured_lateral_radius_m = float(self.config.race.pass_lateral_radius_m)
+        self.gate_pass_lateral_radius_m = (
+            spec_gate_lateral_radius_m
+            if configured_lateral_radius_m <= 0.0
+            else min(configured_lateral_radius_m, spec_gate_lateral_radius_m)
+        )
+        self.gate_plane_tolerance_m = max(
+            0.0,
+            float(self.config.race.pass_plane_tolerance_m),
+        )
+        self.gate_pass_through_m = max(
+            float(VADR_TS_002.gate_depth_m),
+            float(self.config.race.pass_through_m),
+            0.0,
+        )
         self.camera_matrix = np.asarray(self.config.camera.matrix, dtype=float).reshape(3, 3)
         self.dist_coeffs = np.asarray(self.config.camera.dist_coeffs, dtype=float).reshape(-1)
         self.race_gate_count = (
@@ -105,6 +123,12 @@ class PyAIPilotAutonomyAPI:
         )
         self.active_waypoints = None
         self.active_times = None
+        self.active_gate_normal = None
+        self.previous_gate_pass_position = None
+        self.gate_plane_crossed = False
+        self.near_gate_but_not_crossed = False
+        self.gate_progress_along_approach = float("nan")
+        self.gate_lateral_error = float("nan")
         self.last_planned_gate_idx = -1
         self.trajectory_start_time = 0.0
         self.last_desired_yaw = 0.0
@@ -767,6 +791,14 @@ class PyAIPilotAutonomyAPI:
             self.last_active_target_center = None
             self.active_target_lost_time = None
 
+    def _reset_gate_pass_state(self) -> None:
+        self.active_gate_normal = None
+        self.previous_gate_pass_position = None
+        self.gate_plane_crossed = False
+        self.near_gate_but_not_crossed = False
+        self.gate_progress_along_approach = float("nan")
+        self.gate_lateral_error = float("nan")
+
     def _path_plan(self, pos: np.ndarray, vel: np.ndarray) -> bool:
         if not self.gate_centers_neu:
             return False
@@ -789,7 +821,23 @@ class PyAIPilotAutonomyAPI:
         )
         self._sync_target_manager_state()
 
-        waypoints = np.vstack([pos, target])
+        normal = unit_vector_from_to(pos, target, fallback=self.active_gate_normal)
+        self.active_gate_normal = None if normal is None else normal.copy()
+        self.previous_gate_pass_position = np.asarray(pos, dtype=float).reshape(3).copy()
+        self.gate_plane_crossed = False
+        self.near_gate_but_not_crossed = False
+        self.gate_lateral_error = float("nan")
+        self.gate_progress_along_approach = (
+            float(np.dot(pos - target, normal))
+            if normal is not None
+            else float("nan")
+        )
+
+        if normal is None:
+            waypoints = np.vstack([pos, target])
+        else:
+            pass_through_target = target + normal * self.gate_pass_through_m
+            waypoints = np.vstack([pos, target, pass_through_target])
         times = allocate_segment_times(
             waypoints,
             current_vel=vel,
@@ -847,8 +895,46 @@ class PyAIPilotAutonomyAPI:
             target = self.gate_centers_neu[self.current_gate_idx]
         else:
             return False
+
+        pos = np.asarray(pos, dtype=float).reshape(3)
+        target = np.asarray(target, dtype=float).reshape(3)
         distance = float(np.linalg.norm(pos - target))
-        if distance >= self.pass_radius_m:
+        normal = self.active_gate_normal
+        if normal is None:
+            start = (
+                self.previous_gate_pass_position
+                if self.previous_gate_pass_position is not None
+                else pos
+            )
+            normal = unit_vector_from_to(start, target)
+            self.active_gate_normal = None if normal is None else normal.copy()
+        if normal is None:
+            self.previous_gate_pass_position = pos.copy()
+            self.gate_progress_along_approach = float("nan")
+            return False
+
+        previous_pos = self.previous_gate_pass_position
+        if previous_pos is None:
+            self.previous_gate_pass_position = pos.copy()
+            self.gate_progress_along_approach = float(np.dot(pos - target, normal))
+            return False
+
+        pass_result = check_gate_plane_pass(
+            previous_position=previous_pos,
+            position=pos,
+            center=target,
+            normal=normal,
+            lateral_radius_m=self.gate_pass_lateral_radius_m,
+            plane_tolerance_m=self.gate_plane_tolerance_m,
+        )
+        self.previous_gate_pass_position = pos.copy()
+        self.gate_plane_crossed = bool(self.gate_plane_crossed or pass_result.crossed_plane)
+        self.near_gate_but_not_crossed = bool(
+            not pass_result.passed and distance <= self.pass_radius_m
+        )
+        self.gate_progress_along_approach = float(pass_result.signed_progress_m)
+        self.gate_lateral_error = float(pass_result.lateral_error_m)
+        if not pass_result.passed:
             return False
 
         truth_pos = None
@@ -859,10 +945,14 @@ class PyAIPilotAutonomyAPI:
         self.target_manager.mark_passed(
             pos_neu=pos,
             distance_m=distance,
+            pass_reason=pass_result.reason,
+            plane_progress_m=pass_result.signed_progress_m,
+            lateral_error_m=pass_result.lateral_error_m,
             truth_pos_neu=truth_pos,
             truth_error_m=truth_error,
         )
         self._sync_target_manager_state(clear_unlocked_current=True)
+        self._reset_gate_pass_state()
         self.active_waypoints = None
         self.active_times = None
         return True
@@ -1485,6 +1575,7 @@ class PyAIPilotAutonomyAPI:
             self.active_target_track_id = None
             self.last_active_target_center = None
             self.active_target_lost_time = None
+            self._reset_gate_pass_state()
             self.active_waypoints = None
             self.active_times = None
             self.last_planned_gate_idx = -1
@@ -1518,6 +1609,7 @@ class PyAIPilotAutonomyAPI:
             )
             if self.active_target_track_id is not None:
                 self.last_active_target_center = next_target.copy()
+            self._reset_gate_pass_state()
             self.active_waypoints = None
             self.active_times = None
             self.last_planned_gate_idx = -1

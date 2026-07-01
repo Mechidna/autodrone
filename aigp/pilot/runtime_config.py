@@ -197,6 +197,7 @@ class PerceptionSection:
     yolo_conf: float
     yolo_imgsz: int
     yolo_device: Optional[int | str]
+    yolo_keypoint_order: str
     transform_mode: str
     world_pose_source: str
     max_reprojection_error_for_memory: float
@@ -249,6 +250,9 @@ class GateMemorySection:
 class RaceSection:
     gate_count: Optional[int]
     pass_radius_m: float
+    pass_lateral_radius_m: float
+    pass_plane_tolerance_m: float
+    pass_through_m: float
     clear_radius_m: float
     debounce_s: float
     expected_gate_altitude_m: float
@@ -890,6 +894,11 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             yolo_conf=_float(perception_raw, "yolo_conf", 0.1),
             yolo_imgsz=_int(perception_raw, "yolo_imgsz", 640),
             yolo_device=_optional_device(perception_raw.get("yolo_device")),
+            yolo_keypoint_order=_str(
+                perception_raw,
+                "yolo_keypoint_order",
+                "semantic",
+            ).lower(),
             transform_mode=_str(perception_raw, "transform_mode", "competition_official_ned"),
             world_pose_source=_str(perception_raw, "world_pose_source", "mavsdk"),
             max_reprojection_error_for_memory=_float(
@@ -981,6 +990,9 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 _int_optional(runtime_raw, "race_gate_count", 3),
             ),
             pass_radius_m=_float(race_raw, "pass_radius_m", _float(planner_raw, "pass_radius_m", 1.25)),
+            pass_lateral_radius_m=_float(race_raw, "pass_lateral_radius_m", 0.75),
+            pass_plane_tolerance_m=_float(race_raw, "pass_plane_tolerance_m", 0.05),
+            pass_through_m=_float(race_raw, "pass_through_m", 1.0),
             clear_radius_m=_float(race_raw, "clear_radius_m", 1.75),
             debounce_s=_float(race_raw, "debounce_s", 0.75),
             expected_gate_altitude_m=_float(race_raw, "expected_gate_altitude_m", 1.5),
@@ -1490,6 +1502,12 @@ def _validate(config: PilotConfig) -> None:
         raise RuntimeError(
             f"Invalid vision.source={config.vision.source!r}. "
             "Use vision.source='udp' or vision.source='ros'."
+        )
+    if config.perception.yolo_keypoint_order not in ("semantic", "image"):
+        raise RuntimeError(
+            f"Invalid perception.yolo_keypoint_order={config.perception.yolo_keypoint_order!r}. "
+            "Use 'semantic' for fixed physical gate corners or 'image' for "
+            "image-space TL/TR/BR/BL labels."
         )
     if config.runtime.runner_mode == "competition" and config.perception_geometry_audit.enabled:
         raise RuntimeError(

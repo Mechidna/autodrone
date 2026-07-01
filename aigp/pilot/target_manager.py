@@ -167,15 +167,34 @@ class TargetManager:
         distance_m: float,
         truth_pos_neu=None,
         truth_error_m=None,
+        pass_reason: str | None = None,
+        plane_progress_m: float | None = None,
+        lateral_error_m: float | None = None,
     ) -> None:
         completed_id = self.active_target_track_id
         if completed_id is not None:
             self.completed_track_ids.add(int(completed_id))
 
-        truth_txt = ""
+        extra_txt = ""
+        if pass_reason:
+            extra_txt += f" reason={pass_reason}"
+        if plane_progress_m is not None:
+            try:
+                plane_progress = float(plane_progress_m)
+            except (TypeError, ValueError):
+                plane_progress = float("nan")
+            if math.isfinite(plane_progress):
+                extra_txt += f" plane={plane_progress:.2f}"
+        if lateral_error_m is not None:
+            try:
+                lateral_error = float(lateral_error_m)
+            except (TypeError, ValueError):
+                lateral_error = float("nan")
+            if math.isfinite(lateral_error):
+                extra_txt += f" lateral={lateral_error:.2f}"
         if truth_pos_neu is not None:
             try:
-                truth_txt += f" truth_pos={self._fmt_vec(self._as_vec3(truth_pos_neu))}"
+                extra_txt += f" truth_pos={self._fmt_vec(self._as_vec3(truth_pos_neu))}"
             except (TypeError, ValueError):
                 pass
         if truth_error_m is not None:
@@ -184,7 +203,7 @@ class TargetManager:
             except (TypeError, ValueError):
                 truth_error = float("nan")
             if math.isfinite(truth_error):
-                truth_txt += f" truth_err={truth_error:.2f}"
+                extra_txt += f" truth_err={truth_error:.2f}"
 
         print(
             "target_manager passed "
@@ -192,7 +211,7 @@ class TargetManager:
             f"track={self._track_text(completed_id)} "
             f"dist={float(distance_m):.2f} "
             f"pos={self._fmt_vec(self._as_vec3(pos_neu))}"
-            f"{truth_txt}",
+            f"{extra_txt}",
             flush=True,
         )
         self.current_gate_idx += 1
