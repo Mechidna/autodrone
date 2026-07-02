@@ -201,6 +201,12 @@ class PerceptionSection:
     transform_mode: str
     world_pose_source: str
     max_reprojection_error_for_memory: float
+    min_keypoint_conf_for_memory: float
+    keypoint_border_margin_px: float
+    min_quad_area_px2_for_memory: float
+    max_keypoint_opposite_edge_ratio: float
+    max_pnp_size_depth_disagreement_m: float
+    max_pnp_size_depth_disagreement_ratio: float
     min_depth_m_for_memory: float
     max_depth_m_for_memory: float
     reject_negative_depth: bool
@@ -212,6 +218,15 @@ class PerceptionGeometryAuditSection:
     print_period_s: float
     max_prints: int
     max_match_distance_m: float
+    reference_pose_source: str
+    gazebo_dynamic_pose_topic: str
+    gazebo_model_name: str
+    gazebo_camera_link_name: str
+    gazebo_allow_pose_fallback: bool
+    gazebo_camera_mount_xyz: tuple[float, float, float]
+    gazebo_camera_mount_rpy: tuple[float, float, float]
+    gazebo_rotation_mode: str
+    gazebo_optical_mode: str
     known_gate_positions_neu: tuple[tuple[float, float, float], ...]
     gate_right_axis_neu: tuple[float, float, float]
     gate_up_axis_neu: tuple[float, float, float]
@@ -241,6 +256,7 @@ class GateMemorySection:
     max_center_std_for_stable: float
     max_camera_std_for_stable: float
     max_reprojection_error_for_stable: float
+    min_keypoint_conf_for_stable: float
     max_outlier_distance: float
     max_committed_match_distance: float
     min_observation_time: float
@@ -267,6 +283,29 @@ class PlannerSection:
     safe_min_target_z: float
     safe_max_target_z: float
     replan_target_shift_m: float
+    horizon_gates: int
+    passthrough_velocity_enabled: bool
+    passthrough_speed_m_s: float
+    active_target_preempt_enabled: bool
+    active_target_preempt_min_active_distance_m: float
+    active_target_preempt_margin_m: float
+    active_target_preempt_lateral_radius_m: float
+    active_target_shift_enabled: bool
+    active_target_shift_threshold_m: float
+    active_target_shift_required_frames: int
+    active_target_shift_replan_min_interval_s: float
+    active_target_shift_alpha: float
+    active_target_shift_min_keypoint_conf: float
+    active_target_shift_max_reprojection_error: float
+    active_target_shift_max_world_std_m: float
+    active_target_shift_max_step_m: float
+    active_target_shift_max_total_m: float
+    active_target_shift_near_gate_distance_m: float
+    active_target_shift_max_near_gate_xy_m: float
+    active_target_shift_max_near_gate_z_m: float
+    race_order_front_blocker_enabled: bool
+    race_order_front_blocker_margin_m: float
+    race_order_front_blocker_lateral_radius_m: float
     replan_after_trajectory_s: float
     replan_min_interval_s: float
     max_detection_range_m: float
@@ -549,6 +588,13 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             port_competition = mavlink_port_override
         else:
             port_px4 = mavlink_port_override
+
+    perception_world_pose_source = _env_str(
+        "PERCEPTION_WORLD_POSE_SOURCE",
+        _str(perception_raw, "world_pose_source", "mavsdk"),
+    ).lower()
+    if runner_mode == "competition" and perception_world_pose_source == "gazebo_camera_sim":
+        perception_world_pose_source = "mavsdk"
 
     config = PilotConfig(
         profile=_str(raw, "profile", "py_aipilot_example"),
@@ -900,11 +946,41 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 "semantic",
             ).lower(),
             transform_mode=_str(perception_raw, "transform_mode", "competition_official_ned"),
-            world_pose_source=_str(perception_raw, "world_pose_source", "mavsdk"),
+            world_pose_source=perception_world_pose_source,
             max_reprojection_error_for_memory=_float(
                 perception_raw,
                 "max_reprojection_error_for_memory",
-                5.0,
+                1.5,
+            ),
+            min_keypoint_conf_for_memory=_float(
+                perception_raw,
+                "min_keypoint_conf_for_memory",
+                0.75,
+            ),
+            keypoint_border_margin_px=_float(
+                perception_raw,
+                "keypoint_border_margin_px",
+                4.0,
+            ),
+            min_quad_area_px2_for_memory=_float(
+                perception_raw,
+                "min_quad_area_px2_for_memory",
+                0.0,
+            ),
+            max_keypoint_opposite_edge_ratio=_float(
+                perception_raw,
+                "max_keypoint_opposite_edge_ratio",
+                1.35,
+            ),
+            max_pnp_size_depth_disagreement_m=_float(
+                perception_raw,
+                "max_pnp_size_depth_disagreement_m",
+                1.5,
+            ),
+            max_pnp_size_depth_disagreement_ratio=_float(
+                perception_raw,
+                "max_pnp_size_depth_disagreement_ratio",
+                0.20,
             ),
             min_depth_m_for_memory=_float(
                 perception_raw,
@@ -927,6 +1003,53 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 "max_match_distance_m",
                 5.0,
             ),
+            reference_pose_source=_str(
+                perception_geometry_audit_raw,
+                "reference_pose_source",
+                "runtime",
+            ).lower(),
+            gazebo_dynamic_pose_topic=_str(
+                perception_geometry_audit_raw,
+                "gazebo_dynamic_pose_topic",
+                "auto",
+            ),
+            gazebo_model_name=_str(
+                perception_geometry_audit_raw,
+                "gazebo_model_name",
+                "racer_mono_cam_0",
+            ),
+            gazebo_camera_link_name=_str(
+                perception_geometry_audit_raw,
+                "gazebo_camera_link_name",
+                "camera_link",
+            ),
+            gazebo_allow_pose_fallback=_bool(
+                perception_geometry_audit_raw,
+                "gazebo_allow_pose_fallback",
+                True,
+            ),
+            gazebo_camera_mount_xyz=_vec3_tuple(
+                perception_geometry_audit_raw.get(
+                    "gazebo_camera_mount_xyz",
+                    (0.0, 0.0, 0.0),
+                )
+            ),
+            gazebo_camera_mount_rpy=_vec3_tuple(
+                perception_geometry_audit_raw.get(
+                    "gazebo_camera_mount_rpy",
+                    (0.0, -0.3490658503988659, 0.0),
+                )
+            ),
+            gazebo_rotation_mode=_str(
+                perception_geometry_audit_raw,
+                "gazebo_rotation_mode",
+                "transpose",
+            ).lower(),
+            gazebo_optical_mode=_str(
+                perception_geometry_audit_raw,
+                "gazebo_optical_mode",
+                "physical_minus_y",
+            ).lower(),
             known_gate_positions_neu=tuple(
                 _vec3_tuple(item)
                 for item in (
@@ -973,7 +1096,12 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             max_reprojection_error_for_stable=_float(
                 gate_memory_raw,
                 "max_reprojection_error_for_stable",
-                3.0,
+                1.25,
+            ),
+            min_keypoint_conf_for_stable=_float(
+                gate_memory_raw,
+                "min_keypoint_conf_for_stable",
+                0.80,
             ),
             max_outlier_distance=_float(gate_memory_raw, "max_outlier_distance", 0.60),
             max_committed_match_distance=_float(
@@ -1005,6 +1133,112 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             safe_min_target_z=_float(planner_raw, "safe_min_target_z", 1.0),
             safe_max_target_z=_float(planner_raw, "safe_max_target_z", 3.0),
             replan_target_shift_m=_float(planner_raw, "replan_target_shift_m", 1.0),
+            horizon_gates=max(1, _int(planner_raw, "horizon_gates", 3)),
+            passthrough_velocity_enabled=_bool(
+                planner_raw,
+                "passthrough_velocity_enabled",
+                True,
+            ),
+            passthrough_speed_m_s=_float(planner_raw, "passthrough_speed_m_s", 2.5),
+            active_target_preempt_enabled=_bool(
+                planner_raw,
+                "active_target_preempt_enabled",
+                True,
+            ),
+            active_target_preempt_min_active_distance_m=_float(
+                planner_raw,
+                "active_target_preempt_min_active_distance_m",
+                6.0,
+            ),
+            active_target_preempt_margin_m=_float(
+                planner_raw,
+                "active_target_preempt_margin_m",
+                2.0,
+            ),
+            active_target_preempt_lateral_radius_m=_float(
+                planner_raw,
+                "active_target_preempt_lateral_radius_m",
+                6.0,
+            ),
+            active_target_shift_enabled=_bool(
+                planner_raw,
+                "active_target_shift_enabled",
+                False,
+            ),
+            active_target_shift_threshold_m=_float(
+                planner_raw,
+                "active_target_shift_threshold_m",
+                0.45,
+            ),
+            active_target_shift_required_frames=max(
+                1,
+                _int(planner_raw, "active_target_shift_required_frames", 3),
+            ),
+            active_target_shift_replan_min_interval_s=_float(
+                planner_raw,
+                "active_target_shift_replan_min_interval_s",
+                0.5,
+            ),
+            active_target_shift_alpha=_float(
+                planner_raw,
+                "active_target_shift_alpha",
+                0.3,
+            ),
+            active_target_shift_min_keypoint_conf=_float(
+                planner_raw,
+                "active_target_shift_min_keypoint_conf",
+                0.75,
+            ),
+            active_target_shift_max_reprojection_error=_float(
+                planner_raw,
+                "active_target_shift_max_reprojection_error",
+                1.25,
+            ),
+            active_target_shift_max_world_std_m=_float(
+                planner_raw,
+                "active_target_shift_max_world_std_m",
+                0.30,
+            ),
+            active_target_shift_max_step_m=_float(
+                planner_raw,
+                "active_target_shift_max_step_m",
+                0.60,
+            ),
+            active_target_shift_max_total_m=_float(
+                planner_raw,
+                "active_target_shift_max_total_m",
+                3.00,
+            ),
+            active_target_shift_near_gate_distance_m=_float(
+                planner_raw,
+                "active_target_shift_near_gate_distance_m",
+                2.0,
+            ),
+            active_target_shift_max_near_gate_xy_m=_float(
+                planner_raw,
+                "active_target_shift_max_near_gate_xy_m",
+                0.35,
+            ),
+            active_target_shift_max_near_gate_z_m=_float(
+                planner_raw,
+                "active_target_shift_max_near_gate_z_m",
+                0.25,
+            ),
+            race_order_front_blocker_enabled=_bool(
+                planner_raw,
+                "race_order_front_blocker_enabled",
+                True,
+            ),
+            race_order_front_blocker_margin_m=_float(
+                planner_raw,
+                "race_order_front_blocker_margin_m",
+                3.0,
+            ),
+            race_order_front_blocker_lateral_radius_m=_float(
+                planner_raw,
+                "race_order_front_blocker_lateral_radius_m",
+                6.0,
+            ),
             replan_after_trajectory_s=_float(planner_raw, "replan_after_trajectory_s", 0.25),
             replan_min_interval_s=_float(planner_raw, "replan_min_interval_s", 0.3),
             max_detection_range_m=_float(planner_raw, "max_detection_range_m", 25.0),
@@ -1509,10 +1743,64 @@ def _validate(config: PilotConfig) -> None:
             "Use 'semantic' for fixed physical gate corners or 'image' for "
             "image-space TL/TR/BR/BL labels."
         )
+    if config.perception.world_pose_source not in (
+        "mavsdk",
+        "camera_only",
+        "none",
+        "estimator",
+        "gazebo_camera_sim",
+    ):
+        raise RuntimeError(
+            f"Invalid perception.world_pose_source={config.perception.world_pose_source!r}. "
+            "Use 'mavsdk', 'camera_only', 'none', 'estimator', or "
+            "'gazebo_camera_sim'."
+        )
+    if config.perception.world_pose_source == "gazebo_camera_sim":
+        if config.runtime.runner_mode != "px4":
+            raise RuntimeError(
+                "perception.world_pose_source='gazebo_camera_sim' is PX4/Gazebo "
+                "debug-only. Competition mode is resolved back to 'mavsdk'."
+            )
+        if config.vision.source != "ros":
+            raise RuntimeError(
+                "perception.world_pose_source='gazebo_camera_sim' requires "
+                "vision.source='ros' so the ROS camera frame can carry the "
+                "matching Gazebo dynamic pose."
+            )
     if config.runtime.runner_mode == "competition" and config.perception_geometry_audit.enabled:
         raise RuntimeError(
             "perception_geometry_audit is debug-only and may use known sim gate "
             "positions. Disable it before running runner_mode='competition'."
+        )
+    if config.perception_geometry_audit.reference_pose_source not in (
+        "runtime",
+        "gazebo",
+        "both",
+    ):
+        raise RuntimeError(
+            "Invalid perception_geometry_audit.reference_pose_source="
+            f"{config.perception_geometry_audit.reference_pose_source!r}. "
+            "Use 'runtime', 'gazebo', or 'both'."
+        )
+    if config.perception_geometry_audit.gazebo_rotation_mode not in (
+        "transpose",
+        "direct",
+    ):
+        raise RuntimeError(
+            "Invalid perception_geometry_audit.gazebo_rotation_mode="
+            f"{config.perception_geometry_audit.gazebo_rotation_mode!r}. "
+            "Use 'transpose' or 'direct'."
+        )
+    if config.perception_geometry_audit.gazebo_optical_mode not in (
+        "current",
+        "flip_y",
+        "physical",
+        "physical_minus_y",
+    ):
+        raise RuntimeError(
+            "Invalid perception_geometry_audit.gazebo_optical_mode="
+            f"{config.perception_geometry_audit.gazebo_optical_mode!r}. "
+            "Use 'current', 'flip_y', 'physical', or 'physical_minus_y'."
         )
     if config.gate_source.mode not in ("perception", "ground_truth"):
         raise RuntimeError(
@@ -1763,8 +2051,52 @@ def _validate(config: PilotConfig) -> None:
             "estimator_landmark_max_reprojection_error",
             config.state_estimation.estimator_landmark_max_reprojection_error,
         ),
+        (
+            "perception.max_reprojection_error_for_memory",
+            config.perception.max_reprojection_error_for_memory,
+        ),
+        (
+            "perception.min_keypoint_conf_for_memory",
+            config.perception.min_keypoint_conf_for_memory,
+        ),
+        (
+            "perception.keypoint_border_margin_px",
+            config.perception.keypoint_border_margin_px,
+        ),
+        (
+            "perception.min_quad_area_px2_for_memory",
+            config.perception.min_quad_area_px2_for_memory,
+        ),
+        (
+            "perception.max_keypoint_opposite_edge_ratio",
+            config.perception.max_keypoint_opposite_edge_ratio,
+        ),
+        (
+            "perception.max_pnp_size_depth_disagreement_m",
+            config.perception.max_pnp_size_depth_disagreement_m,
+        ),
+        (
+            "perception.max_pnp_size_depth_disagreement_ratio",
+            config.perception.max_pnp_size_depth_disagreement_ratio,
+        ),
         ("perception.min_depth_m_for_memory", config.perception.min_depth_m_for_memory),
         ("perception.max_depth_m_for_memory", config.perception.max_depth_m_for_memory),
+        (
+            "gate_memory.max_reprojection_error_for_stable",
+            config.gate_memory.max_reprojection_error_for_stable,
+        ),
+        (
+            "gate_memory.min_keypoint_conf_for_stable",
+            config.gate_memory.min_keypoint_conf_for_stable,
+        ),
+        (
+            "planner.race_order_front_blocker_margin_m",
+            config.planner.race_order_front_blocker_margin_m,
+        ),
+        (
+            "planner.race_order_front_blocker_lateral_radius_m",
+            config.planner.race_order_front_blocker_lateral_radius_m,
+        ),
         (
             "perception_geometry_audit.print_period_s",
             config.perception_geometry_audit.print_period_s,
@@ -1784,6 +2116,13 @@ def _validate(config: PilotConfig) -> None:
     ):
         raise RuntimeError(
             "perception.min_depth_m_for_memory must be <= max_depth_m_for_memory."
+        )
+    if (
+        config.perception.max_keypoint_opposite_edge_ratio > 0.0
+        and config.perception.max_keypoint_opposite_edge_ratio < 1.0
+    ):
+        raise RuntimeError(
+            "perception.max_keypoint_opposite_edge_ratio must be >= 1.0, or <= 0 to disable."
         )
     if not 0.0 <= config.controller.adaptive_hover_min <= config.controller.adaptive_hover_max <= 1.0:
         raise RuntimeError(

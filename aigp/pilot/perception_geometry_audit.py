@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import time
 from typing import Any, Optional
@@ -37,6 +38,19 @@ class PerceptionGeometryAudit:
             0.0,
             float(getattr(config_section, "max_match_distance_m", 5.0)),
         )
+        self.reference_pose_source = str(
+            getattr(config_section, "reference_pose_source", "runtime")
+        ).lower()
+        if self.reference_pose_source not in ("runtime", "gazebo", "both"):
+            self.reference_pose_source = "runtime"
+        self.use_runtime_reference = self.reference_pose_source in ("runtime", "both")
+        self.use_gazebo_reference = self.reference_pose_source in ("gazebo", "both")
+        self.gazebo_rotation_mode = str(
+            getattr(config_section, "gazebo_rotation_mode", "transpose")
+        ).lower()
+        self.gazebo_optical_mode = str(
+            getattr(config_section, "gazebo_optical_mode", "physical_minus_y")
+        ).lower()
         self.known_gate_positions_neu = self._vec3_array(
             getattr(config_section, "known_gate_positions_neu", ())
         )
@@ -67,6 +81,9 @@ class PerceptionGeometryAudit:
             f"print_period_s={self.print_period_s:.2f} "
             f"max_prints={self.max_prints} "
             f"max_match_distance_m={self.max_match_distance_m:.2f} "
+            f"reference_pose_source={self.reference_pose_source} "
+            f"gazebo_rotation_mode={self.gazebo_rotation_mode} "
+            f"gazebo_optical_mode={self.gazebo_optical_mode} "
             f"gate_right_neu={self._fmt_vec(self.gate_right_axis_neu, 2)} "
             f"gate_up_neu={self._fmt_vec(self.gate_up_axis_neu, 2)}",
             flush=True,
@@ -92,6 +109,12 @@ class PerceptionGeometryAudit:
         camera_translation_body: np.ndarray,
         object_points_m: np.ndarray,
         frame_id: Optional[int] = None,
+        gazebo_pose: Optional[dict[str, Any]] = None,
+        image_wall_time: Optional[float] = None,
+        image_ros_stamp_sec: Optional[int] = None,
+        image_ros_stamp_nanosec: Optional[int] = None,
+        attitude_wall_time: Optional[float] = None,
+        position_wall_time: Optional[float] = None,
     ) -> None:
         if not self.active:
             return
@@ -113,6 +136,12 @@ class PerceptionGeometryAudit:
                 camera_translation_body=camera_translation_body,
                 object_points_m=object_points_m,
                 frame_id=frame_id,
+                gazebo_pose=gazebo_pose,
+                image_wall_time=image_wall_time,
+                image_ros_stamp_sec=image_ros_stamp_sec,
+                image_ros_stamp_nanosec=image_ros_stamp_nanosec,
+                attitude_wall_time=attitude_wall_time,
+                position_wall_time=position_wall_time,
             )
             if result is None:
                 continue
@@ -135,6 +164,12 @@ class PerceptionGeometryAudit:
         camera_translation_body: np.ndarray,
         object_points_m: np.ndarray,
         frame_id: Optional[int] = None,
+        gazebo_pose: Optional[dict[str, Any]] = None,
+        image_wall_time: Optional[float] = None,
+        image_ros_stamp_sec: Optional[int] = None,
+        image_ros_stamp_nanosec: Optional[int] = None,
+        attitude_wall_time: Optional[float] = None,
+        position_wall_time: Optional[float] = None,
     ) -> Optional[dict[str, Any]]:
         if not self.active:
             return None
@@ -144,7 +179,32 @@ class PerceptionGeometryAudit:
         if gate_world_neu is None or gate_camera is None:
             return None
 
-        match_index, match_dist = self._nearest_known_gate(gate_world_neu)
+        gazebo_world_from_tvec_neu = None
+        if self.use_gazebo_reference:
+            gazebo_world_from_tvec_neu = self._world_from_camera_gazebo(
+                gate_camera=gate_camera,
+                gazebo_pose=gazebo_pose,
+            )
+
+        match_candidates = []
+        if self.use_runtime_reference:
+            runtime_index, runtime_dist = self._nearest_known_gate(gate_world_neu)
+            if runtime_index is not None:
+                match_candidates.append(("runtime", runtime_index, runtime_dist))
+        if self.use_gazebo_reference and gazebo_world_from_tvec_neu is not None:
+            gazebo_index, gazebo_dist = self._nearest_known_gate(gazebo_world_from_tvec_neu)
+            if gazebo_index is not None:
+                match_candidates.append(("gazebo", gazebo_index, gazebo_dist))
+        if not match_candidates and self.reference_pose_source != "runtime":
+            runtime_index, runtime_dist = self._nearest_known_gate(gate_world_neu)
+            if runtime_index is not None:
+                match_candidates.append(("runtime_fallback", runtime_index, runtime_dist))
+        if not match_candidates:
+            return None
+        match_source, match_index, match_dist = min(
+            match_candidates,
+            key=lambda item: float(item[2]),
+        )
         if match_index is None or match_dist > self.max_match_distance_m:
             return None
 
@@ -180,6 +240,16 @@ class PerceptionGeometryAudit:
             camera_translation_body=camera_translation_body,
             object_points_m=object_points_m,
         )
+        gazebo_expected_camera = self._expected_camera_gazebo(
+            known_gate_neu=known_gate_neu,
+            gazebo_pose=gazebo_pose,
+        )
+        gazebo_expected_keypoints = self.project_known_gate_keypoints_gazebo(
+            known_gate_neu=known_gate_neu,
+            gazebo_pose=gazebo_pose,
+            camera_matrix=camera_matrix,
+            object_points_m=object_points_m,
+        )
 
         observed_center = self._finite_mean_2d(observed_keypoints)
         expected_center = self._finite_mean_2d(expected_keypoints)
@@ -192,7 +262,50 @@ class PerceptionGeometryAudit:
         keypoint_corner_errors_px = self._keypoint_errors(observed_keypoints, expected_keypoints)
         observed_side_lengths_px = self._side_lengths(observed_keypoints)
         expected_side_lengths_px = self._side_lengths(expected_keypoints)
+        edge_ratio_obs_vs_gt = self._edge_ratio(observed_side_lengths_px, expected_side_lengths_px)
         keypoint_area_ratio = self._area_ratio(observed_keypoints, expected_keypoints)
+        gazebo_expected_center = self._finite_mean_2d(gazebo_expected_keypoints)
+        gazebo_center_error_px = (
+            observed_center - gazebo_expected_center
+            if observed_center is not None and gazebo_expected_center is not None
+            else np.full(2, np.nan, dtype=float)
+        )
+        gazebo_keypoint_rmse_px = self._keypoint_rmse(
+            observed_keypoints,
+            gazebo_expected_keypoints,
+        )
+        gazebo_keypoint_corner_errors_px = self._keypoint_errors(
+            observed_keypoints,
+            gazebo_expected_keypoints,
+        )
+        gazebo_expected_side_lengths_px = self._side_lengths(gazebo_expected_keypoints)
+        gazebo_edge_ratio_obs_vs_gt = self._edge_ratio(
+            observed_side_lengths_px,
+            gazebo_expected_side_lengths_px,
+        )
+        gazebo_area_ratio = self._area_ratio(
+            observed_keypoints,
+            gazebo_expected_keypoints,
+        )
+        gazebo_world_error_neu_m = (
+            gazebo_world_from_tvec_neu - known_gate_neu
+            if gazebo_world_from_tvec_neu is not None
+            else np.full(3, np.nan, dtype=float)
+        )
+        gazebo_world_error_norm_m = (
+            float(np.linalg.norm(gazebo_world_error_neu_m))
+            if np.all(np.isfinite(gazebo_world_error_neu_m))
+            else math.nan
+        )
+        gazebo_camera_error_m = (
+            gate_camera - gazebo_expected_camera
+            if gazebo_expected_camera is not None
+            else np.full(3, np.nan, dtype=float)
+        )
+        quad_area_px2 = self._finite_float(
+            detection.get("quad_area_px2"),
+            self._quad_area(observed_keypoints),
+        )
         size_depth_m = self._size_depth(observed_keypoints, camera_matrix, object_points_m)
         reprojected_keypoints = self._keypoints_from_value(detection.get("reprojected_corners"))
         reprojected_center = self._finite_mean_2d(reprojected_keypoints)
@@ -230,24 +343,65 @@ class PerceptionGeometryAudit:
             camera_to_body=camera_to_body,
             known_gate_neu=known_gate_neu,
         )
+        yaw_debug = self._yaw_debug(
+            drone_rpy_rad=drone_rpy_rad,
+            gazebo_pose=gazebo_pose,
+        )
+        timestamp_debug = self._timestamp_debug(
+            image_wall_time=image_wall_time,
+            image_ros_stamp_sec=image_ros_stamp_sec,
+            image_ros_stamp_nanosec=image_ros_stamp_nanosec,
+            attitude_wall_time=attitude_wall_time,
+            position_wall_time=position_wall_time,
+            gazebo_pose=gazebo_pose,
+        )
 
         return {
             "frame_id": frame_id,
             "detection_index": int(detection_index),
             "gate_index": int(match_index),
+            "match_source": str(match_source),
             "match_distance_m": float(match_dist),
             "world_error_neu_m": gate_world_neu - known_gate_neu,
             "world_error_norm_m": float(np.linalg.norm(gate_world_neu - known_gate_neu)),
             "body_error_m": pnp_body_from_origin - expected_body,
             "camera_error_m": gate_camera - expected_camera,
+            "world_neu_from_tvec_runtime": gate_world_neu,
+            "world_neu_from_tvec_gazebo_debug": (
+                gazebo_world_from_tvec_neu
+                if gazebo_world_from_tvec_neu is not None
+                else np.full(3, np.nan, dtype=float)
+            ),
+            "world_error_neu_gazebo_m": gazebo_world_error_neu_m,
+            "world_error_norm_gazebo_m": gazebo_world_error_norm_m,
+            "expected_camera_gazebo_m": (
+                gazebo_expected_camera
+                if gazebo_expected_camera is not None
+                else np.full(3, np.nan, dtype=float)
+            ),
+            "camera_error_gazebo_m": gazebo_camera_error_m,
+            "gazebo_pose_age_s": self._gazebo_pose_age_s(gazebo_pose),
+            "gazebo_pose_selection_method": self._gazebo_pose_selection_method(gazebo_pose),
+            "raw_yolo_keypoints_px": self._raw_yolo_keypoints_px(detection),
+            "expected_keypoints_px": expected_keypoints,
+            "expected_keypoints_gazebo_px": gazebo_expected_keypoints,
             "observed_keypoint_center_px": observed_center,
             "expected_keypoint_center_px": expected_center,
+            "expected_keypoint_center_gazebo_px": gazebo_expected_center,
             "keypoint_center_error_px": center_error_px,
+            "keypoint_center_error_gazebo_px": gazebo_center_error_px,
             "keypoint_rmse_px": keypoint_rmse_px,
+            "keypoint_rmse_gazebo_px": gazebo_keypoint_rmse_px,
             "keypoint_corner_errors_px": keypoint_corner_errors_px,
+            "keypoint_corner_errors_gazebo_px": gazebo_keypoint_corner_errors_px,
             "observed_side_lengths_px": observed_side_lengths_px,
             "expected_side_lengths_px": expected_side_lengths_px,
+            "expected_side_lengths_gazebo_px": gazebo_expected_side_lengths_px,
+            "edge_ratio_obs_vs_gt": edge_ratio_obs_vs_gt,
+            "edge_ratio_obs_vs_gazebo_gt": gazebo_edge_ratio_obs_vs_gt,
             "keypoint_area_ratio": keypoint_area_ratio,
+            "keypoint_area_ratio_gazebo": gazebo_area_ratio,
+            "quad_area_px2": quad_area_px2,
             "keypoint_confidence": keypoint_conf,
             "reprojected_center_error_px": reprojected_center_error_px,
             "pnp_camera_m": gate_camera,
@@ -274,6 +428,8 @@ class PerceptionGeometryAudit:
                 math.nan,
             ),
             "rpy_deg": np.degrees(drone_rpy_rad),
+            **yaw_debug,
+            **timestamp_debug,
         }
 
     def project_known_gate_keypoints(
@@ -309,6 +465,367 @@ class PerceptionGeometryAudit:
             points_px.append(self._project_camera_point(corner_camera, camera_matrix))
         return np.asarray(points_px, dtype=float).reshape(4, 2)
 
+    def project_known_gate_keypoints_gazebo(
+        self,
+        *,
+        known_gate_neu: np.ndarray,
+        gazebo_pose: Optional[dict[str, Any]],
+        camera_matrix: np.ndarray,
+        object_points_m: np.ndarray,
+    ) -> np.ndarray:
+        camera_matrix = np.asarray(camera_matrix, dtype=float).reshape(3, 3)
+        object_points_m = np.asarray(object_points_m, dtype=float).reshape(4, 3)
+        points_px = []
+        for obj in object_points_m:
+            corner_neu = (
+                np.asarray(known_gate_neu, dtype=float).reshape(3)
+                + float(obj[0]) * self.gate_right_axis_neu
+                + float(obj[1]) * self.gate_up_axis_neu
+            )
+            corner_camera = self._gazebo_world_neu_to_camera(
+                corner_neu,
+                gazebo_pose=gazebo_pose,
+            )
+            points_px.append(self._project_camera_point(corner_camera, camera_matrix))
+        return np.asarray(points_px, dtype=float).reshape(4, 2)
+
+    def _expected_camera_gazebo(
+        self,
+        *,
+        known_gate_neu: np.ndarray,
+        gazebo_pose: Optional[dict[str, Any]],
+    ) -> Optional[np.ndarray]:
+        point = self._gazebo_world_neu_to_camera(
+            np.asarray(known_gate_neu, dtype=float).reshape(3),
+            gazebo_pose=gazebo_pose,
+        )
+        if np.all(np.isfinite(point)):
+            return point
+        return None
+
+    def _gazebo_world_neu_to_camera(
+        self,
+        point_neu: np.ndarray,
+        *,
+        gazebo_pose: Optional[dict[str, Any]],
+    ) -> np.ndarray:
+        if not isinstance(gazebo_pose, dict):
+            return np.full(3, np.nan, dtype=float)
+        camera_pos = self._vec3(gazebo_pose.get("gazebo_camera_pos_world"))
+        camera_quat = self._quat4(gazebo_pose.get("gazebo_camera_quat_world"))
+        if camera_pos is None or camera_quat is None:
+            return np.full(3, np.nan, dtype=float)
+        point_gazebo = self._neu_to_gazebo_world(point_neu)
+        rel_world = point_gazebo - camera_pos
+        r_wc = self._quat_to_rotmat(camera_quat)
+        if self.gazebo_rotation_mode == "transpose":
+            point_body = r_wc.T @ rel_world
+        else:
+            point_body = r_wc @ rel_world
+        return self._gazebo_body_to_camera_optical(point_body)
+
+    def _world_from_camera_gazebo(
+        self,
+        *,
+        gate_camera: np.ndarray,
+        gazebo_pose: Optional[dict[str, Any]],
+    ) -> Optional[np.ndarray]:
+        if not isinstance(gazebo_pose, dict):
+            return None
+        camera_pos = self._vec3(gazebo_pose.get("gazebo_camera_pos_world"))
+        camera_quat = self._quat4(gazebo_pose.get("gazebo_camera_quat_world"))
+        if camera_pos is None or camera_quat is None:
+            return None
+        point_body = self._camera_optical_to_gazebo_body(gate_camera)
+        if not np.all(np.isfinite(point_body)):
+            return None
+        r_wc = self._quat_to_rotmat(camera_quat)
+        if self.gazebo_rotation_mode == "transpose":
+            rel_world = r_wc @ point_body
+        else:
+            rel_world = r_wc.T @ point_body
+        point_gazebo = camera_pos + rel_world
+        return self._gazebo_world_to_neu(point_gazebo)
+
+    def _gazebo_body_to_camera_optical(self, point_body: np.ndarray) -> np.ndarray:
+        body = np.asarray(point_body, dtype=float).reshape(3)
+        if self.gazebo_optical_mode in ("current", "flip_y"):
+            r_body_camera = np.array(
+                [
+                    [0.0, 0.0, 1.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, -1.0, 0.0],
+                ],
+                dtype=float,
+            )
+            camera = r_body_camera.T @ body
+            if self.gazebo_optical_mode == "flip_y":
+                camera[1] *= -1.0
+            return camera
+        if self.gazebo_optical_mode == "physical":
+            return np.array([body[1], -body[2], body[0]], dtype=float)
+        if self.gazebo_optical_mode == "physical_minus_y":
+            return np.array([-body[1], -body[2], body[0]], dtype=float)
+        return np.full(3, np.nan, dtype=float)
+
+    def _camera_optical_to_gazebo_body(self, point_camera: np.ndarray) -> np.ndarray:
+        camera = np.asarray(point_camera, dtype=float).reshape(3)
+        if self.gazebo_optical_mode in ("current", "flip_y"):
+            if self.gazebo_optical_mode == "flip_y":
+                camera = camera.copy()
+                camera[1] *= -1.0
+            r_body_camera = np.array(
+                [
+                    [0.0, 0.0, 1.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, -1.0, 0.0],
+                ],
+                dtype=float,
+            )
+            return r_body_camera @ camera
+        if self.gazebo_optical_mode == "physical":
+            return np.array([camera[2], camera[0], -camera[1]], dtype=float)
+        if self.gazebo_optical_mode == "physical_minus_y":
+            return np.array([camera[2], -camera[0], -camera[1]], dtype=float)
+        return np.full(3, np.nan, dtype=float)
+
+    @staticmethod
+    def _neu_to_gazebo_world(point_neu: np.ndarray) -> np.ndarray:
+        neu = np.asarray(point_neu, dtype=float).reshape(3)
+        return np.array([neu[1], neu[0], neu[2]], dtype=float)
+
+    @staticmethod
+    def _gazebo_world_to_neu(point_gazebo: np.ndarray) -> np.ndarray:
+        gazebo = np.asarray(point_gazebo, dtype=float).reshape(3)
+        return np.array([gazebo[1], gazebo[0], gazebo[2]], dtype=float)
+
+    @classmethod
+    def _quat4(cls, value: Any) -> Optional[np.ndarray]:
+        if value is None:
+            return None
+        try:
+            quat = np.asarray(value, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+        if quat.size < 4:
+            return None
+        quat = quat[:4].astype(float).copy()
+        norm = float(np.linalg.norm(quat))
+        if not math.isfinite(norm) or norm <= 1e-12:
+            return None
+        quat /= norm
+        if not np.all(np.isfinite(quat)):
+            return None
+        return quat
+
+    @staticmethod
+    def _quat_to_rotmat(quat_xyzw: np.ndarray) -> np.ndarray:
+        x, y, z, w = np.asarray(quat_xyzw, dtype=float).reshape(4)
+        return np.array(
+            [
+                [
+                    1.0 - 2.0 * (y * y + z * z),
+                    2.0 * (x * y - z * w),
+                    2.0 * (x * z + y * w),
+                ],
+                [
+                    2.0 * (x * y + z * w),
+                    1.0 - 2.0 * (x * x + z * z),
+                    2.0 * (y * z - x * w),
+                ],
+                [
+                    2.0 * (x * z - y * w),
+                    2.0 * (y * z + x * w),
+                    1.0 - 2.0 * (x * x + y * y),
+                ],
+            ],
+            dtype=float,
+        )
+
+    @staticmethod
+    def _gazebo_pose_age_s(gazebo_pose: Optional[dict[str, Any]]) -> float:
+        if not isinstance(gazebo_pose, dict):
+            return math.nan
+        try:
+            stamp = float(gazebo_pose.get("gazebo_pose_wall_time"))
+        except (TypeError, ValueError):
+            return math.nan
+        if not math.isfinite(stamp):
+            return math.nan
+        return time.time() - stamp
+
+    @staticmethod
+    def _gazebo_pose_selection_method(gazebo_pose: Optional[dict[str, Any]]) -> str:
+        if not isinstance(gazebo_pose, dict):
+            return ""
+        return str(gazebo_pose.get("gazebo_pose_selection_method", ""))
+
+    def _yaw_debug(
+        self,
+        *,
+        drone_rpy_rad: np.ndarray,
+        gazebo_pose: Optional[dict[str, Any]],
+    ) -> dict[str, float]:
+        rpy = np.asarray(drone_rpy_rad, dtype=float).reshape(3)
+        runtime_yaw_rad = float(rpy[2])
+        model_raw_rad = self._gazebo_quat_yaw_raw_rad(
+            self._gazebo_pose_value(gazebo_pose, "gazebo_model_quat_world")
+        )
+        camera_raw_rad = self._gazebo_quat_yaw_raw_rad(
+            self._gazebo_pose_value(gazebo_pose, "gazebo_camera_quat_world")
+        )
+        model_runtime_rad = self._gazebo_raw_yaw_to_runtime_yaw(model_raw_rad)
+        camera_runtime_rad = self._gazebo_raw_yaw_to_runtime_yaw(camera_raw_rad)
+        yaw_runtime_minus_camera_deg = self._angle_delta_deg(
+            runtime_yaw_rad,
+            camera_runtime_rad,
+        )
+        yaw_runtime_minus_model_deg = self._angle_delta_deg(
+            runtime_yaw_rad,
+            model_runtime_rad,
+        )
+        yaw_runtime_minus_gazebo_deg = (
+            yaw_runtime_minus_camera_deg
+            if math.isfinite(yaw_runtime_minus_camera_deg)
+            else yaw_runtime_minus_model_deg
+        )
+        return {
+            "runtime_yaw_used_by_perception_deg": self._rad_to_deg(runtime_yaw_rad),
+            "gazebo_model_yaw_deg": self._rad_to_deg(model_runtime_rad),
+            "gazebo_camera_yaw_deg": self._rad_to_deg(camera_runtime_rad),
+            "gazebo_model_yaw_raw_gazebo_deg": self._rad_to_deg(model_raw_rad),
+            "gazebo_camera_yaw_raw_gazebo_deg": self._rad_to_deg(camera_raw_rad),
+            "yaw_runtime_minus_gazebo_deg": yaw_runtime_minus_gazebo_deg,
+            "yaw_runtime_minus_gazebo_model_deg": yaw_runtime_minus_model_deg,
+            "yaw_runtime_minus_gazebo_camera_deg": yaw_runtime_minus_camera_deg,
+        }
+
+    def _timestamp_debug(
+        self,
+        *,
+        image_wall_time: Optional[float],
+        image_ros_stamp_sec: Optional[int],
+        image_ros_stamp_nanosec: Optional[int],
+        attitude_wall_time: Optional[float],
+        position_wall_time: Optional[float],
+        gazebo_pose: Optional[dict[str, Any]],
+    ) -> dict[str, float]:
+        image_wall_time_s = self._finite_or_nan(image_wall_time)
+        gazebo_pose_wall_time_s = self._finite_or_nan(
+            self._gazebo_pose_value(gazebo_pose, "gazebo_pose_wall_time")
+        )
+        image_ros_time_s = self._ros_stamp_s(
+            image_ros_stamp_sec,
+            image_ros_stamp_nanosec,
+        )
+        gazebo_pose_ros_time_s = self._ros_stamp_s(
+            self._gazebo_pose_value(gazebo_pose, "gazebo_pose_ros_stamp_sec"),
+            self._gazebo_pose_value(gazebo_pose, "gazebo_pose_ros_stamp_nanosec"),
+        )
+        runtime_attitude_wall_time_s = self._finite_or_nan(attitude_wall_time)
+        runtime_position_wall_time_s = self._finite_or_nan(position_wall_time)
+        runtime_pose_wall_time_s = self._combined_pose_wall_time(
+            runtime_attitude_wall_time_s,
+            runtime_position_wall_time_s,
+        )
+        return {
+            "image_wall_time_s": image_wall_time_s,
+            "gazebo_pose_wall_time_s": gazebo_pose_wall_time_s,
+            "image_minus_gazebo_pose_wall_dt_s": self._time_delta_s(
+                image_wall_time_s,
+                gazebo_pose_wall_time_s,
+            ),
+            "image_ros_time_s": image_ros_time_s,
+            "gazebo_pose_ros_time_s": gazebo_pose_ros_time_s,
+            "image_minus_gazebo_pose_ros_dt_s": self._time_delta_s(
+                image_ros_time_s,
+                gazebo_pose_ros_time_s,
+            ),
+            "runtime_attitude_wall_time_s": runtime_attitude_wall_time_s,
+            "runtime_position_wall_time_s": runtime_position_wall_time_s,
+            "runtime_pose_wall_time_s": runtime_pose_wall_time_s,
+            "image_minus_runtime_attitude_wall_dt_s": self._time_delta_s(
+                image_wall_time_s,
+                runtime_attitude_wall_time_s,
+            ),
+            "image_minus_runtime_position_wall_dt_s": self._time_delta_s(
+                image_wall_time_s,
+                runtime_position_wall_time_s,
+            ),
+            "image_minus_runtime_pose_wall_dt_s": self._time_delta_s(
+                image_wall_time_s,
+                runtime_pose_wall_time_s,
+            ),
+        }
+
+    @staticmethod
+    def _gazebo_pose_value(gazebo_pose: Optional[dict[str, Any]], key: str) -> Any:
+        if not isinstance(gazebo_pose, dict):
+            return None
+        return gazebo_pose.get(key)
+
+    @classmethod
+    def _gazebo_quat_yaw_raw_rad(cls, quat_value: Any) -> float:
+        quat = cls._quat4(quat_value)
+        if quat is None:
+            return math.nan
+        rot = cls._quat_to_rotmat(quat)
+        yaw = math.atan2(float(rot[1, 0]), float(rot[0, 0]))
+        return cls._wrap_pi(yaw)
+
+    @classmethod
+    def _gazebo_raw_yaw_to_runtime_yaw(cls, gazebo_yaw_rad: float) -> float:
+        if not math.isfinite(float(gazebo_yaw_rad)):
+            return math.nan
+        return cls._wrap_pi((math.pi / 2.0) - float(gazebo_yaw_rad))
+
+    @classmethod
+    def _angle_delta_deg(cls, lhs_rad: float, rhs_rad: float) -> float:
+        if not math.isfinite(float(lhs_rad)) or not math.isfinite(float(rhs_rad)):
+            return math.nan
+        return math.degrees(cls._wrap_pi(float(lhs_rad) - float(rhs_rad)))
+
+    @staticmethod
+    def _rad_to_deg(value_rad: float) -> float:
+        try:
+            value = float(value_rad)
+        except (TypeError, ValueError):
+            return math.nan
+        return math.degrees(value) if math.isfinite(value) else math.nan
+
+    @staticmethod
+    def _finite_or_nan(value: Any) -> float:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return math.nan
+        return out if math.isfinite(out) else math.nan
+
+    @classmethod
+    def _ros_stamp_s(cls, sec: Any, nanosec: Any) -> float:
+        sec_f = cls._finite_or_nan(sec)
+        nanosec_f = cls._finite_or_nan(nanosec)
+        if not math.isfinite(sec_f) or not math.isfinite(nanosec_f):
+            return math.nan
+        return sec_f + nanosec_f * 1.0e-9
+
+    @staticmethod
+    def _time_delta_s(lhs_s: float, rhs_s: float) -> float:
+        if not math.isfinite(float(lhs_s)) or not math.isfinite(float(rhs_s)):
+            return math.nan
+        return float(lhs_s) - float(rhs_s)
+
+    @staticmethod
+    def _combined_pose_wall_time(attitude_wall_time_s: float, position_wall_time_s: float) -> float:
+        valid = [
+            float(value)
+            for value in (attitude_wall_time_s, position_wall_time_s)
+            if math.isfinite(float(value))
+        ]
+        if not valid:
+            return math.nan
+        return min(valid)
+
     def format_result(self, result: dict[str, Any]) -> str:
         frame = result.get("frame_id")
         frame_text = "" if frame is None else f" frame={int(frame)}"
@@ -317,20 +834,29 @@ class PerceptionGeometryAudit:
             f"gate={int(result['gate_index']) + 1} "
             f"det={int(result['detection_index'])}"
             f"{frame_text} "
+            f"match_source={result['match_source']} "
             f"match={float(result['match_distance_m']):.2f} "
             f"world_err={self._fmt_vec(result['world_error_neu_m'], 2)} "
             f"world_norm={float(result['world_error_norm_m']):.2f} "
+            f"gazebo_world_err={self._fmt_vec(result['world_error_neu_gazebo_m'], 2)} "
+            f"gazebo_world_norm={float(result['world_error_norm_gazebo_m']):.2f} "
             f"body_err={self._fmt_vec(result['body_error_m'], 2)} "
             f"cam_err={self._fmt_vec(result['camera_error_m'], 2)} "
+            f"gazebo_cam_err={self._fmt_vec(result['camera_error_gazebo_m'], 2)} "
             f"kp_obs={self._fmt_vec(result['observed_keypoint_center_px'], 1)} "
             f"kp_exp={self._fmt_vec(result['expected_keypoint_center_px'], 1)} "
             f"kp_err={self._fmt_vec(result['keypoint_center_error_px'], 1)} "
+            f"gazebo_kp_exp={self._fmt_vec(result['expected_keypoint_center_gazebo_px'], 1)} "
+            f"gazebo_kp_err={self._fmt_vec(result['keypoint_center_error_gazebo_px'], 1)} "
             f"kp_rmse={float(result['keypoint_rmse_px']):.1f} "
+            f"gazebo_kp_rmse={float(result['keypoint_rmse_gazebo_px']):.1f} "
             f"pnp_cam={self._fmt_vec(result['pnp_camera_m'], 2)} "
             f"exp_cam={self._fmt_vec(result['expected_camera_m'], 2)} "
+            f"gazebo_exp_cam={self._fmt_vec(result['expected_camera_gazebo_m'], 2)} "
             f"depth={float(result['pnp_depth_m']):.2f} "
             f"size_depth={float(result['size_depth_m']):.2f} "
             f"reproj={float(result['reprojection_error_px']):.2f} "
+            f"gazebo_pose_age={float(result['gazebo_pose_age_s']):.3f} "
             f"rpy_deg={self._fmt_vec(result['rpy_deg'], 1)}"
             "\n"
             "[GEOM_DIAG] "
@@ -339,6 +865,12 @@ class PerceptionGeometryAudit:
             f"{frame_text} "
             f"cam_bearing_err_deg={self._fmt_vec(result['camera_bearing_error_deg'], 1)} "
             f"yaw_corr_deg={float(result['yaw_correction_deg']):.2f} "
+            f"runtime_yaw_used_by_perception_deg={float(result['runtime_yaw_used_by_perception_deg']):.2f} "
+            f"gazebo_model_yaw_deg={float(result['gazebo_model_yaw_deg']):.2f} "
+            f"gazebo_camera_yaw_deg={float(result['gazebo_camera_yaw_deg']):.2f} "
+            f"yaw_runtime_minus_gazebo_deg={float(result['yaw_runtime_minus_gazebo_deg']):.2f} "
+            f"image_gazebo_ros_dt_s={float(result['image_minus_gazebo_pose_ros_dt_s']):.4f} "
+            f"image_gazebo_wall_dt_s={float(result['image_minus_gazebo_pose_wall_dt_s']):.4f} "
             f"range_ratio={float(result['horizontal_range_ratio']):.3f} "
             f"reproj_center_err_px={self._fmt_vec(result['reprojected_center_error_px'], 1)} "
             f"kconf={self._fmt_vec(result['keypoint_confidence'], 2)} "
@@ -355,9 +887,69 @@ class PerceptionGeometryAudit:
             f"det={int(result['detection_index'])}"
             f"{frame_text} "
             f"corner_err_px={self._fmt_corner_errors(result['keypoint_corner_errors_px'])} "
+            f"gazebo_corner_err_px={self._fmt_corner_errors(result['keypoint_corner_errors_gazebo_px'])} "
             f"side_obs_px={self._fmt_vec(result['observed_side_lengths_px'], 1)} "
             f"side_exp_px={self._fmt_vec(result['expected_side_lengths_px'], 1)} "
-            f"area_ratio={float(result['keypoint_area_ratio']):.2f}"
+            f"gazebo_side_exp_px={self._fmt_vec(result['expected_side_lengths_gazebo_px'], 1)} "
+            f"area_ratio={float(result['keypoint_area_ratio']):.2f} "
+            f"gazebo_area_ratio={float(result['keypoint_area_ratio_gazebo']):.2f}"
+            "\n"
+            "[PERCEPTION_DEBUG] "
+            f"gate={int(result['gate_index'])} "
+            f"gate_one_based={int(result['gate_index']) + 1} "
+            f"det={int(result['detection_index'])}"
+            f"{frame_text} "
+            f"match_source={self._json_value(result['match_source'])} "
+            f"raw_yolo_keypoints_px={self._json_value(result['raw_yolo_keypoints_px'])} "
+            f"keypoint_conf_per_corner={self._json_value(result['keypoint_confidence'])} "
+            f"keypoint_center_px={self._json_value(result['observed_keypoint_center_px'])} "
+            f"edge_top_px={self._json_value(self._side_item(result['observed_side_lengths_px'], 0))} "
+            f"edge_right_px={self._json_value(self._side_item(result['observed_side_lengths_px'], 1))} "
+            f"edge_bottom_px={self._json_value(self._side_item(result['observed_side_lengths_px'], 2))} "
+            f"edge_left_px={self._json_value(self._side_item(result['observed_side_lengths_px'], 3))} "
+            f"quad_area_px2={self._json_value(result['quad_area_px2'])} "
+            f"z_from_width_height={self._json_value(result['size_depth_m'])} "
+            f"expected_gt_projected_keypoints_px={self._json_value(result['expected_keypoints_px'])} "
+            f"expected_gt_projected_keypoints_runtime_px={self._json_value(result['expected_keypoints_px'])} "
+            f"expected_gt_projected_keypoints_gazebo_px={self._json_value(result['expected_keypoints_gazebo_px'])} "
+            f"per_corner_px_error_vs_gt={self._json_value(result['keypoint_corner_errors_px'])} "
+            f"per_corner_px_error_vs_runtime_gt={self._json_value(result['keypoint_corner_errors_px'])} "
+            f"per_corner_px_error_vs_gazebo_gt={self._json_value(result['keypoint_corner_errors_gazebo_px'])} "
+            f"center_px_error_vs_gt={self._json_value(result['keypoint_center_error_px'])} "
+            f"center_px_error_vs_runtime_gt={self._json_value(result['keypoint_center_error_px'])} "
+            f"center_px_error_vs_gazebo_gt={self._json_value(result['keypoint_center_error_gazebo_px'])} "
+            f"edge_ratio_obs_vs_gt={self._json_value(result['edge_ratio_obs_vs_gt'])} "
+            f"edge_ratio_obs_vs_runtime_gt={self._json_value(result['edge_ratio_obs_vs_gt'])} "
+            f"edge_ratio_obs_vs_gazebo_gt={self._json_value(result['edge_ratio_obs_vs_gazebo_gt'])} "
+            f"area_ratio_obs_vs_gt={self._json_value(result['keypoint_area_ratio'])} "
+            f"area_ratio_obs_vs_runtime_gt={self._json_value(result['keypoint_area_ratio'])} "
+            f"area_ratio_obs_vs_gazebo_gt={self._json_value(result['keypoint_area_ratio_gazebo'])} "
+            f"world_neu_from_tvec_runtime={self._json_value(result['world_neu_from_tvec_runtime'])} "
+            f"world_neu_from_tvec_gazebo_debug={self._json_value(result['world_neu_from_tvec_gazebo_debug'])} "
+            f"world_error_neu_runtime_m={self._json_value(result['world_error_neu_m'])} "
+            f"world_error_neu_gazebo_m={self._json_value(result['world_error_neu_gazebo_m'])} "
+            f"runtime_yaw_used_by_perception_deg={self._json_value(result['runtime_yaw_used_by_perception_deg'])} "
+            f"gazebo_model_yaw_deg={self._json_value(result['gazebo_model_yaw_deg'])} "
+            f"gazebo_camera_yaw_deg={self._json_value(result['gazebo_camera_yaw_deg'])} "
+            f"gazebo_model_yaw_raw_gazebo_deg={self._json_value(result['gazebo_model_yaw_raw_gazebo_deg'])} "
+            f"gazebo_camera_yaw_raw_gazebo_deg={self._json_value(result['gazebo_camera_yaw_raw_gazebo_deg'])} "
+            f"yaw_runtime_minus_gazebo_deg={self._json_value(result['yaw_runtime_minus_gazebo_deg'])} "
+            f"yaw_runtime_minus_gazebo_model_deg={self._json_value(result['yaw_runtime_minus_gazebo_model_deg'])} "
+            f"yaw_runtime_minus_gazebo_camera_deg={self._json_value(result['yaw_runtime_minus_gazebo_camera_deg'])} "
+            f"image_wall_time_s={self._json_value(result['image_wall_time_s'])} "
+            f"gazebo_pose_wall_time_s={self._json_value(result['gazebo_pose_wall_time_s'])} "
+            f"image_minus_gazebo_pose_wall_dt_s={self._json_value(result['image_minus_gazebo_pose_wall_dt_s'])} "
+            f"image_ros_time_s={self._json_value(result['image_ros_time_s'])} "
+            f"gazebo_pose_ros_time_s={self._json_value(result['gazebo_pose_ros_time_s'])} "
+            f"image_minus_gazebo_pose_ros_dt_s={self._json_value(result['image_minus_gazebo_pose_ros_dt_s'])} "
+            f"runtime_attitude_wall_time_s={self._json_value(result['runtime_attitude_wall_time_s'])} "
+            f"runtime_position_wall_time_s={self._json_value(result['runtime_position_wall_time_s'])} "
+            f"runtime_pose_wall_time_s={self._json_value(result['runtime_pose_wall_time_s'])} "
+            f"image_minus_runtime_attitude_wall_dt_s={self._json_value(result['image_minus_runtime_attitude_wall_dt_s'])} "
+            f"image_minus_runtime_position_wall_dt_s={self._json_value(result['image_minus_runtime_position_wall_dt_s'])} "
+            f"image_minus_runtime_pose_wall_dt_s={self._json_value(result['image_minus_runtime_pose_wall_dt_s'])} "
+            f"gazebo_pose_age_s={self._json_value(result['gazebo_pose_age_s'])} "
+            f"gazebo_pose_selection_method={self._json_value(result['gazebo_pose_selection_method'])}"
         )
 
     def _nearest_known_gate(self, gate_world_neu: np.ndarray) -> tuple[Optional[int], float]:
@@ -402,6 +994,13 @@ class PerceptionGeometryAudit:
             if np.all(np.isfinite(out)):
                 return out
         return None
+
+    @staticmethod
+    def _raw_yolo_keypoints_px(detection: dict[str, Any]) -> np.ndarray:
+        out = PerceptionGeometryAudit._keypoints_from_value(detection.get("yolo_keypoints"))
+        if out is not None:
+            return out
+        return np.full((4, 2), np.nan, dtype=float)
 
     @staticmethod
     def _keypoint_confidence(detection: dict[str, Any]) -> np.ndarray:
@@ -648,6 +1247,47 @@ class PerceptionGeometryAudit:
         )
 
     @staticmethod
+    def _side_item(values: Any, index: int) -> float:
+        try:
+            arr = np.asarray(values, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            return math.nan
+        if index < 0 or index >= arr.size:
+            return math.nan
+        value = float(arr[index])
+        return value if math.isfinite(value) else math.nan
+
+    @classmethod
+    def _json_value(cls, value: Any) -> str:
+        return json.dumps(
+            cls._jsonable(value),
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def _jsonable(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, np.ndarray):
+            return cls._jsonable(value.tolist())
+        if isinstance(value, dict):
+            return {str(key): cls._jsonable(val) for key, val in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._jsonable(item) for item in value]
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating, float)):
+            val = float(value)
+            if math.isfinite(val):
+                return val
+            if math.isnan(val):
+                return "nan"
+            return "inf" if val > 0.0 else "-inf"
+        if isinstance(value, (int, bool, str)):
+            return value
+        return str(value)
+
+    @staticmethod
     def _finite_mean_2d(points: Optional[np.ndarray]) -> Optional[np.ndarray]:
         if points is None:
             return None
@@ -694,6 +1334,15 @@ class PerceptionGeometryAudit:
             ],
             dtype=float,
         )
+
+    @staticmethod
+    def _edge_ratio(observed: np.ndarray, expected: np.ndarray) -> np.ndarray:
+        obs = np.asarray(observed, dtype=float).reshape(4)
+        exp = np.asarray(expected, dtype=float).reshape(4)
+        out = np.full(4, np.nan, dtype=float)
+        mask = np.isfinite(obs) & np.isfinite(exp) & (np.abs(exp) > 1e-9)
+        out[mask] = obs[mask] / exp[mask]
+        return out
 
     @classmethod
     def _area_ratio(cls, observed: Optional[np.ndarray], expected: np.ndarray) -> float:

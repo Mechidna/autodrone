@@ -132,10 +132,91 @@ class PyAIPilotAutonomyAPI:
         self.last_planned_gate_idx = -1
         self.trajectory_start_time = 0.0
         self.last_desired_yaw = 0.0
+        self.last_yaw_target_source = "init"
+        self.last_yaw_target = None
         self.replan_target_shift_m = float(self.config.planner.replan_target_shift_m)
         self.replan_after_trajectory_s = float(self.config.planner.replan_after_trajectory_s)
         self.replan_min_interval_s = float(self.config.planner.replan_min_interval_s)
         self.last_plan_wall_time = 0.0
+        self.planning_horizon_gates = max(1, int(self.config.planner.horizon_gates))
+        self.passthrough_velocity_enabled = bool(
+            self.config.planner.passthrough_velocity_enabled
+        )
+        self.passthrough_speed_m_s = max(
+            0.0,
+            float(self.config.planner.passthrough_speed_m_s),
+        )
+        self.active_target_preempt_enabled = bool(
+            self.config.planner.active_target_preempt_enabled
+        )
+        self.active_target_preempt_min_active_distance_m = max(
+            0.0,
+            float(self.config.planner.active_target_preempt_min_active_distance_m),
+        )
+        self.active_target_preempt_margin_m = max(
+            0.0,
+            float(self.config.planner.active_target_preempt_margin_m),
+        )
+        self.active_target_preempt_lateral_radius_m = max(
+            0.0,
+            float(self.config.planner.active_target_preempt_lateral_radius_m),
+        )
+        self.pending_active_target_preempt_track_id = None
+        self.pending_active_target_preempt_details = None
+        self.active_target_shift_enabled = bool(
+            self.config.planner.active_target_shift_enabled
+        )
+        self.active_target_shift_threshold_m = float(
+            self.config.planner.active_target_shift_threshold_m
+        )
+        self.active_target_shift_required_frames = max(
+            1,
+            int(self.config.planner.active_target_shift_required_frames),
+        )
+        self.active_target_shift_replan_min_interval_s = float(
+            self.config.planner.active_target_shift_replan_min_interval_s
+        )
+        self.active_target_shift_alpha = float(
+            np.clip(self.config.planner.active_target_shift_alpha, 0.0, 1.0)
+        )
+        self.active_target_shift_min_keypoint_conf = float(
+            self.config.planner.active_target_shift_min_keypoint_conf
+        )
+        self.active_target_shift_max_reprojection_error = float(
+            self.config.planner.active_target_shift_max_reprojection_error
+        )
+        self.active_target_shift_max_world_std_m = float(
+            self.config.planner.active_target_shift_max_world_std_m
+        )
+        self.active_target_shift_max_step_m = max(
+            0.0,
+            float(self.config.planner.active_target_shift_max_step_m),
+        )
+        self.active_target_shift_max_total_m = float(
+            self.config.planner.active_target_shift_max_total_m
+        )
+        self.active_target_shift_near_gate_distance_m = float(
+            self.config.planner.active_target_shift_near_gate_distance_m
+        )
+        self.active_target_shift_max_near_gate_xy_m = float(
+            self.config.planner.active_target_shift_max_near_gate_xy_m
+        )
+        self.active_target_shift_max_near_gate_z_m = float(
+            self.config.planner.active_target_shift_max_near_gate_z_m
+        )
+        self.race_order_front_blocker_enabled = bool(
+            self.config.planner.race_order_front_blocker_enabled
+        )
+        self.race_order_front_blocker_margin_m = max(
+            0.0,
+            float(self.config.planner.race_order_front_blocker_margin_m),
+        )
+        self.race_order_front_blocker_lateral_radius_m = max(
+            0.0,
+            float(self.config.planner.race_order_front_blocker_lateral_radius_m),
+        )
+        self.active_target_shift_frames = 0
+        self.active_target_shift_track_id = None
         self.planner_vmax = float(self.config.planner.vmax)
         self.planner_amax = float(self.config.planner.amax)
         self.planner_t_min = float(self.config.planner.t_min)
@@ -146,6 +227,24 @@ class PyAIPilotAutonomyAPI:
         self.max_detection_range_m = float(self.config.planner.max_detection_range_m)
         self.max_reprojection_error_for_memory = float(
             self.config.perception.max_reprojection_error_for_memory
+        )
+        self.min_keypoint_conf_for_memory = float(
+            self.config.perception.min_keypoint_conf_for_memory
+        )
+        self.keypoint_border_margin_px = float(
+            self.config.perception.keypoint_border_margin_px
+        )
+        self.min_quad_area_px2_for_memory = float(
+            self.config.perception.min_quad_area_px2_for_memory
+        )
+        self.max_keypoint_opposite_edge_ratio = float(
+            self.config.perception.max_keypoint_opposite_edge_ratio
+        )
+        self.max_pnp_size_depth_disagreement_m = float(
+            self.config.perception.max_pnp_size_depth_disagreement_m
+        )
+        self.max_pnp_size_depth_disagreement_ratio = float(
+            self.config.perception.max_pnp_size_depth_disagreement_ratio
         )
         self.min_depth_m_for_memory = float(self.config.perception.min_depth_m_for_memory)
         self.max_depth_m_for_memory = float(self.config.perception.max_depth_m_for_memory)
@@ -167,11 +266,15 @@ class PyAIPilotAutonomyAPI:
             max_center_std_for_stable=gate_memory_config.max_center_std_for_stable,
             max_camera_std_for_stable=gate_memory_config.max_camera_std_for_stable,
             max_reprojection_error_for_stable=gate_memory_config.max_reprojection_error_for_stable,
+            min_keypoint_conf_for_stable=gate_memory_config.min_keypoint_conf_for_stable,
             max_outlier_distance=gate_memory_config.max_outlier_distance,
             min_observation_time=gate_memory_config.min_observation_time,
         )
         self.gate_memory.max_committed_match_distance = (
             gate_memory_config.max_committed_match_distance
+        )
+        self.race_order_duplicate_radius_m = float(
+            self.gate_memory.duplicate_merge_radius
         )
         state_estimation_config = self.config.state_estimation
         self.estimator_landmark_map = EstimatorLandmarkMap(
@@ -196,6 +299,10 @@ class PyAIPilotAutonomyAPI:
         self._last_gate_memory_frame_key = None
         self._last_stable_gate_print_signature = None
         self._last_race_order_print_signature = None
+        self._last_race_order_duplicate_signature = None
+        self._last_race_order_front_blocker_signature = None
+        self._last_race_order_closer_blocker_signature = None
+        self._last_perception_reject_print_time = 0.0
         self._last_trace_print_time = 0.0
         self._trace_period_s = 0.5
         self._last_shadow_trace_print_time = 0.0
@@ -373,8 +480,9 @@ class PyAIPilotAutonomyAPI:
                     thrust=command.thrust,
                 )
 
+        shift_replanned = self._maybe_apply_active_target_shift(pos, vel)
         advanced = self._advance_gate_if_needed(pos)
-        if self._should_plan(advanced):
+        if not shift_replanned and self._should_plan(advanced):
             self._path_plan(pos, vel)
 
         if self.active_waypoints is None or self.planner.total_time <= 0.0:
@@ -664,6 +772,14 @@ class PyAIPilotAutonomyAPI:
             target_arr = np.asarray(target, dtype=float).reshape(3)
             target_txt = fmt_vec(target_arr)
             dist_txt = f"{float(np.linalg.norm(np.asarray(pos) - target_arr)):.2f}"
+        yaw_target_txt = "None"
+        if self.last_yaw_target is not None:
+            try:
+                yaw_target_arr = np.asarray(self.last_yaw_target, dtype=float).reshape(3)
+            except (TypeError, ValueError):
+                yaw_target_arr = None
+            if yaw_target_arr is not None and np.all(np.isfinite(yaw_target_arr)):
+                yaw_target_txt = fmt_vec(yaw_target_arr)
 
         state_source = "unknown"
         truth_error_txt = "nan"
@@ -757,6 +873,8 @@ class PyAIPilotAutonomyAPI:
             f"p_ref={fmt_vec(p_ref)} "
             f"v_ref={fmt_vec(v_ref)} "
             f"a_ref={fmt_vec(a_ref)} "
+            f"yaw_source={self.last_yaw_target_source} "
+            f"yaw_target_neu={yaw_target_txt} "
             f"cmd_deg=({math.degrees(roll_rad):.2f},{math.degrees(pitch_rad):.2f},{math.degrees(yaw_rad):.2f}) "
             f"thrust={thrust:.3f} "
             f"hover={hover_txt} "
@@ -799,6 +917,290 @@ class PyAIPilotAutonomyAPI:
         self.gate_progress_along_approach = float("nan")
         self.gate_lateral_error = float("nan")
 
+    @staticmethod
+    def _finite_vec3_or_none(value) -> np.ndarray | None:
+        try:
+            arr = np.asarray(value, dtype=float).reshape(3)
+        except (TypeError, ValueError):
+            return None
+        if not np.all(np.isfinite(arr)):
+            return None
+        return arr.copy()
+
+    def _track_filtered_center_for_navigation(
+        self,
+        track,
+    ) -> tuple[np.ndarray | None, dict]:
+        details = {
+            "ok": False,
+            "reason": "missing_track",
+            "reproj": float("nan"),
+            "kp_min": float("nan"),
+            "world_std": float("nan"),
+            "age_s": float("nan"),
+            "inliers": int(getattr(track, "inlier_count", 0)) if track is not None else 0,
+            "stable": bool(getattr(track, "is_stable", False)) if track is not None else False,
+        }
+        if track is None or not bool(getattr(track, "committed", False)):
+            return None, details
+
+        center = self._finite_vec3_or_none(
+            getattr(track, "filtered_center_world", None)
+        )
+        if center is None:
+            details["reason"] = "missing_filtered_center"
+            return None, details
+
+        if not bool(getattr(track, "is_stable", False)):
+            details["reason"] = str(getattr(track, "promotion_blocked_reason", "")) or "unstable"
+            return None, details
+
+        min_inliers = max(1, int(getattr(self.gate_memory, "min_hits_for_stable", 1)))
+        inliers = int(getattr(track, "inlier_count", 0))
+        details["inliers"] = inliers
+        if inliers < min_inliers:
+            details["reason"] = "insufficient_inliers"
+            return None, details
+
+        last_seen = self._finite_float(getattr(track, "last_seen_time", 0.0), 0.0)
+        stale_time = self._finite_float(getattr(self.gate_memory, "stale_time", 0.5), 0.5)
+        age_s = time.time() - last_seen if last_seen > 0.0 else float("inf")
+        details["age_s"] = age_s
+        if last_seen <= 0.0 or age_s > stale_time:
+            details["reason"] = "stale"
+            return None, details
+
+        world_std = getattr(track, "center_world_std", None)
+        world_std_arr = self._finite_vec3_or_none(world_std)
+        world_std_norm = (
+            float(np.linalg.norm(world_std_arr))
+            if world_std_arr is not None
+            else float("inf")
+        )
+        details["world_std"] = world_std_norm
+        max_world_std = float(self.active_target_shift_max_world_std_m)
+        if max_world_std > 0.0 and (
+            not math.isfinite(world_std_norm) or world_std_norm > max_world_std
+        ):
+            details["reason"] = "world_std_high"
+            return None, details
+
+        obs_history = getattr(track, "obs_history", [])
+        if not obs_history:
+            details["reason"] = "missing_observation"
+            return None, details
+        last_obs = obs_history[-1]
+        if bool(getattr(last_obs, "is_outlier", False)):
+            details["reason"] = "last_observation_outlier"
+            return None, details
+
+        reproj = self._finite_float(
+            getattr(last_obs, "reprojection_error", float("nan")),
+            float("nan"),
+            allow_nan=True,
+        )
+        details["reproj"] = reproj
+        max_reproj = float(self.active_target_shift_max_reprojection_error)
+        if max_reproj > 0.0 and (
+            not math.isfinite(reproj) or reproj > max_reproj
+        ):
+            details["reason"] = "reprojection_error_high"
+            return None, details
+
+        kp_min = self._finite_float(
+            getattr(last_obs, "keypoint_conf_min", float("nan")),
+            float("nan"),
+            allow_nan=True,
+        )
+        details["kp_min"] = kp_min
+        min_kp = float(self.active_target_shift_min_keypoint_conf)
+        if min_kp > 0.0 and (not math.isfinite(kp_min) or kp_min < min_kp):
+            details["reason"] = "keypoint_conf_low"
+            return None, details
+
+        details["ok"] = True
+        details["reason"] = "ok"
+        return center, details
+
+    def _active_track_filtered_center(self, track) -> np.ndarray | None:
+        center, _ = self._track_filtered_center_for_navigation(track)
+        return center
+
+    def _track_navigation_center(self, track) -> np.ndarray | None:
+        center, _ = self._track_filtered_center_for_navigation(track)
+        if center is not None:
+            return center
+        return self._finite_vec3_or_none(getattr(track, "center", None))
+
+    def _maybe_apply_active_target_shift(
+        self,
+        pos: np.ndarray,
+        vel: np.ndarray,
+    ) -> bool:
+        if (
+            not self.active_target_shift_enabled
+            or not self.use_perception
+            or self.active_waypoints is None
+            or self.planner.total_time <= 0.0
+            or self.gate_plane_crossed
+        ):
+            return False
+
+        diag = self.target_manager.diagnostics()
+        if not diag.locked or diag.active_track_id is None or diag.center_at_plan is None:
+            self.active_target_shift_frames = 0
+            self.active_target_shift_track_id = None
+            return False
+
+        try:
+            active_id = int(diag.active_track_id)
+        except (TypeError, ValueError):
+            self.active_target_shift_frames = 0
+            self.active_target_shift_track_id = None
+            return False
+        if active_id < 0:
+            self.active_target_shift_frames = 0
+            self.active_target_shift_track_id = None
+            return False
+
+        if self.active_target_shift_track_id != active_id:
+            self.active_target_shift_frames = 0
+            self.active_target_shift_track_id = active_id
+
+        track = self.gate_memory.get_track_by_id(active_id)
+        latest, quality = self._track_filtered_center_for_navigation(track)
+        if latest is None:
+            self.active_target_shift_frames = 0
+            return False
+
+        planned = self._finite_vec3_or_none(diag.center_at_plan)
+        if planned is None:
+            self.active_target_shift_frames = 0
+            return False
+
+        planned = self._apply_target_z_policy(planned)
+        latest = self._apply_target_z_policy(latest)
+        shift_vec = latest - planned
+        shift_m = float(np.linalg.norm(shift_vec))
+        shift_xy_m = float(np.linalg.norm(shift_vec[:2]))
+        shift_z_m = float(abs(shift_vec[2]))
+        if not math.isfinite(shift_m) or shift_m < self.active_target_shift_threshold_m:
+            self.active_target_shift_frames = 0
+            return False
+        max_total_m = float(self.active_target_shift_max_total_m)
+        if max_total_m > 0.0 and shift_m > max_total_m:
+            self.active_target_shift_frames = 0
+            return False
+
+        dist_to_target = float(np.linalg.norm(np.asarray(pos, dtype=float).reshape(3) - planned))
+        if dist_to_target <= self.active_target_shift_near_gate_distance_m:
+            self.active_target_shift_frames = 0
+            return False
+
+        self.active_target_shift_frames += 1
+        if self.active_target_shift_frames < self.active_target_shift_required_frames:
+            return False
+
+        now = time.time()
+        if now - self.last_plan_wall_time < self.active_target_shift_replan_min_interval_s:
+            return False
+
+        if self.active_target_shift_alpha <= 0.0:
+            self.active_target_shift_frames = 0
+            return False
+
+        correction_vec = self.active_target_shift_alpha * shift_vec
+        correction_m = float(np.linalg.norm(correction_vec))
+        max_step_m = float(self.active_target_shift_max_step_m)
+        if max_step_m > 0.0 and correction_m > max_step_m:
+            correction_vec *= max_step_m / correction_m
+            correction_m = max_step_m
+        corrected = self._apply_target_z_policy(
+            planned + correction_vec
+        )
+        target_idx = int(self.current_gate_idx)
+        if target_idx < 0 or target_idx >= len(self.gate_centers_neu):
+            self.active_target_shift_frames = 0
+            return False
+
+        print(
+            "active_target_shift correction "
+            f"gate_idx={target_idx} "
+            f"track={active_id} "
+            f"shift={shift_m:.2f} "
+            f"shift_xy={shift_xy_m:.2f} "
+            f"shift_z={shift_z_m:.2f} "
+            f"step={correction_m:.2f} "
+            f"frames={self.active_target_shift_frames} "
+            f"dist_to_target={dist_to_target:.2f} "
+            f"alpha={self.active_target_shift_alpha:.2f} "
+            f"reproj={self._fmt_float(quality.get('reproj'), precision=2)} "
+            f"kp_min={self._fmt_float(quality.get('kp_min'), precision=2)} "
+            f"world_std={self._fmt_float(quality.get('world_std'), precision=2)} "
+            f"inliers={int(quality.get('inliers', 0))} "
+            f"planned={self._fmt_vec(planned, precision=3)} "
+            f"latest={self._fmt_vec(latest, precision=3)} "
+            f"corrected={self._fmt_vec(corrected, precision=3)}",
+            flush=True,
+        )
+
+        self.gate_centers_neu[target_idx] = corrected.copy()
+        self.current_gate_pos = corrected.copy()
+        self.last_active_target_center = latest.copy()
+        self._reset_gate_pass_state()
+        self.active_waypoints = None
+        self.active_times = None
+        self.last_planned_gate_idx = -1
+        self._last_gate_signature = None
+        self.active_target_shift_frames = 0
+        return self._path_plan(pos, vel)
+
+    def _planning_horizon_targets(
+        self,
+        target_idx: int,
+        target: np.ndarray,
+        target_track_id,
+    ) -> tuple[list[np.ndarray], list]:
+        targets = [np.asarray(target, dtype=float).reshape(3).copy()]
+        track_ids = [target_track_id]
+        max_idx = min(
+            len(self.gate_centers_neu),
+            int(target_idx) + self.planning_horizon_gates,
+        )
+        for idx in range(int(target_idx) + 1, max_idx):
+            center = self._apply_target_z_policy(self.gate_centers_neu[idx])
+            if not np.all(np.isfinite(center)):
+                continue
+            track_id = self.gate_track_ids[idx] if idx < len(self.gate_track_ids) else None
+            if track_id is not None and int(track_id) in self.completed_track_ids:
+                continue
+            if np.linalg.norm(center - targets[-1]) < 1e-3:
+                continue
+            targets.append(center.copy())
+            track_ids.append(track_id)
+        return targets, track_ids
+
+    def _compute_passthrough_waypoint_velocities(
+        self,
+        waypoints: np.ndarray,
+    ) -> np.ndarray | None:
+        if not self.passthrough_velocity_enabled or self.passthrough_speed_m_s <= 0.0:
+            return None
+        waypoints = np.asarray(waypoints, dtype=float)
+        if waypoints.ndim != 2 or waypoints.shape[1] != 3 or len(waypoints) < 3:
+            return None
+
+        velocities = np.full_like(waypoints, np.nan, dtype=float)
+        for idx in range(1, len(waypoints) - 1):
+            direction = waypoints[idx + 1] - waypoints[idx - 1]
+            norm = float(np.linalg.norm(direction))
+            if not math.isfinite(norm) or norm < 1e-6:
+                continue
+            velocities[idx] = self.passthrough_speed_m_s * (direction / norm)
+        if not np.any(np.isfinite(velocities[1:-1])):
+            return None
+        return velocities
+
     def _path_plan(self, pos: np.ndarray, vel: np.ndarray) -> bool:
         if not self.gate_centers_neu:
             return False
@@ -833,11 +1235,24 @@ class PyAIPilotAutonomyAPI:
             else float("nan")
         )
 
-        if normal is None:
+        horizon_targets, horizon_track_ids = self._planning_horizon_targets(
+            target_idx,
+            target,
+            target_track_id,
+        )
+        if len(horizon_targets) >= 2:
+            waypoints = np.vstack([pos, *horizon_targets])
+            waypoint_velocities = self._compute_passthrough_waypoint_velocities(waypoints)
+            plan_mode = "gate_horizon"
+        elif normal is None:
             waypoints = np.vstack([pos, target])
+            waypoint_velocities = None
+            plan_mode = "single_gate"
         else:
             pass_through_target = target + normal * self.gate_pass_through_m
             waypoints = np.vstack([pos, target, pass_through_target])
+            waypoint_velocities = None
+            plan_mode = "single_gate_exit"
         times = allocate_segment_times(
             waypoints,
             current_vel=vel,
@@ -856,6 +1271,7 @@ class PyAIPilotAutonomyAPI:
             a_end=np.zeros(3, dtype=float),
             j_start=np.zeros(3, dtype=float),
             j_end=np.zeros(3, dtype=float),
+            waypoint_velocities=waypoint_velocities,
         )
 
         self.current_gate_pos = target.copy()
@@ -864,6 +1280,38 @@ class PyAIPilotAutonomyAPI:
         self.trajectory_start_time = time.time()
         self.last_plan_wall_time = self.trajectory_start_time
         self.last_planned_gate_idx = int(self.current_gate_idx)
+        waypoints_txt = "[" + ";".join(
+            self._fmt_vec(waypoint, precision=3) for waypoint in waypoints
+        ) + "]"
+        times_txt = "(" + ",".join(f"{float(item):.3f}" for item in times) + ")"
+        horizon_tracks_txt = "(" + ",".join(
+            str(track_id) if track_id is not None else "none"
+            for track_id in horizon_track_ids
+        ) + ")"
+        waypoint_velocities_txt = "none"
+        if waypoint_velocities is not None:
+            waypoint_velocities_txt = "[" + ";".join(
+                self._fmt_vec(velocity, precision=3)
+                if np.all(np.isfinite(velocity))
+                else "nan"
+                for velocity in waypoint_velocities
+            ) + "]"
+        print(
+            "plan_install "
+            f"gate_idx={self.current_gate_idx} "
+            f"track={target_track_id if target_track_id is not None else 'none'} "
+            f"mode={plan_mode} "
+            f"horizon_tracks={horizon_tracks_txt} "
+            f"total_time={float(self.planner.total_time):.3f} "
+            f"segments={max(0, int(len(waypoints) - 1))} "
+            f"target_neu={self._fmt_vec(target, precision=3)} "
+            f"normal_neu={self._fmt_vec(normal, precision=3) if normal is not None else 'none'} "
+            f"v_start_neu={self._fmt_vec(vel, precision=3)} "
+            f"waypoint_velocities_neu={waypoint_velocities_txt} "
+            f"times_s={times_txt} "
+            f"waypoints_neu={waypoints_txt}",
+            flush=True,
+        )
         return True
 
     def _apply_target_z_policy(self, target) -> np.ndarray:
@@ -942,6 +1390,25 @@ class PyAIPilotAutonomyAPI:
         if self.last_state_estimate is not None:
             truth_pos = getattr(self.last_state_estimate, "truth_pos_neu", None)
             truth_error = getattr(self.last_state_estimate, "truth_error_m", None)
+        completed_gate_idx = int(self.current_gate_idx)
+        completed_track_id = self.active_target_track_id
+        next_gate_idx = completed_gate_idx + 1
+        if self.race_gate_count is not None:
+            next_gate_idx = min(next_gate_idx, int(self.race_gate_count))
+        print(
+            "gate_pass "
+            f"gate_idx={completed_gate_idx} "
+            f"track={completed_track_id if completed_track_id is not None else 'none'} "
+            f"next_gate_idx={next_gate_idx} "
+            f"reason={pass_result.reason} "
+            f"distance={distance:.3f} "
+            f"plane_progress={float(pass_result.signed_progress_m):.3f} "
+            f"lateral_error={float(pass_result.lateral_error_m):.3f} "
+            f"pos_neu={self._fmt_vec(pos, precision=3)} "
+            f"target_neu={self._fmt_vec(target, precision=3)} "
+            f"truth_err={self._fmt_float(truth_error, precision=3)}",
+            flush=True,
+        )
         self.target_manager.mark_passed(
             pos_neu=pos,
             distance_m=distance,
@@ -976,19 +1443,69 @@ class PyAIPilotAutonomyAPI:
         pos: np.ndarray,
         current_yaw: float,
     ) -> float:
-        target = self.current_gate_pos
+        target, source = self._yaw_target_center()
+        self.last_yaw_target = None if target is None else target.copy()
+        self.last_yaw_target_source = source
         if target is not None:
             to_target = np.asarray(target[:2], dtype=float) - pos[:2]
-            if np.linalg.norm(to_target) > 1e-3:
+            if np.linalg.norm(to_target) > 0.30:
                 desired = math.atan2(float(to_target[1]), float(to_target[0]))
                 self.last_desired_yaw = self._wrap_pi(desired)
                 return self.last_desired_yaw
+            if np.isfinite(self.last_desired_yaw):
+                self.last_yaw_target_source = f"{source}_near_hold"
+                return self.last_desired_yaw
+            self.last_yaw_target_source = "current_yaw_near_target"
+            self.last_desired_yaw = self._wrap_pi(current_yaw)
+            return self.last_desired_yaw
 
         desired = self._reference_motion_yaw(v_ref, a_ref, self.last_desired_yaw)
+        self.last_yaw_target_source = "reference_motion"
         if not np.isfinite(desired):
             desired = current_yaw
+            self.last_yaw_target_source = "current_yaw"
         self.last_desired_yaw = self._wrap_pi(desired)
         return self.last_desired_yaw
+
+    def _yaw_target_center(self) -> tuple[np.ndarray | None, str]:
+        if self.use_perception and self.active_target_track_id is not None:
+            try:
+                active_id = int(self.active_target_track_id)
+            except (TypeError, ValueError):
+                active_id = None
+            if active_id is not None and active_id >= 0:
+                diag = self.target_manager.diagnostics()
+                try:
+                    diag_active_id = (
+                        None
+                        if diag.active_track_id is None
+                        else int(diag.active_track_id)
+                    )
+                except (TypeError, ValueError):
+                    diag_active_id = None
+                if (
+                    diag.locked
+                    and diag_active_id == active_id
+                    and diag.event == "live_active_seen"
+                ):
+                    latest = self._finite_vec3_or_none(diag.latest_center)
+                    if latest is not None:
+                        return (
+                            self._apply_target_z_policy(latest),
+                            "active_target_latest",
+                        )
+
+                track = self.gate_memory.get_track_by_id(active_id)
+                center, _ = self._track_filtered_center_for_navigation(track)
+                if center is not None:
+                    return self._apply_target_z_policy(center), "active_track_filtered"
+
+        if self.current_gate_pos is not None:
+            return (
+                self._apply_target_z_policy(self.current_gate_pos),
+                "locked_target",
+            )
+        return None, "none"
 
     def _gates_from_snapshot(self, snapshot) -> list[np.ndarray]:
         if self.gate_source_mode == "ground_truth":
@@ -1081,6 +1598,126 @@ class PyAIPilotAutonomyAPI:
 
         return gates
 
+    def _race_order_track_center(
+        self,
+        track_id: int,
+        committed_by_id: dict[int, object],
+    ) -> np.ndarray | None:
+        track = committed_by_id.get(int(track_id))
+        if track is None and hasattr(self, "gate_memory"):
+            track = self.gate_memory.get_track_by_id(int(track_id))
+        if track is None:
+            return None
+        return self._track_navigation_center(track)
+
+    def _race_order_duplicate_match(
+        self,
+        track_id: int,
+        accepted_ids: list[int],
+        committed_by_id: dict[int, object],
+    ) -> tuple[int, int, float] | None:
+        return self._race_order_duplicate_match_against_ids(
+            track_id,
+            accepted_ids,
+            committed_by_id,
+        )
+
+    def _race_order_duplicate_match_against_ids(
+        self,
+        track_id: int,
+        other_ids,
+        committed_by_id: dict[int, object],
+        radius: float | None = None,
+    ) -> tuple[int, int, float] | None:
+        radius = (
+            float(self.race_order_duplicate_radius_m)
+            if radius is None
+            else float(radius)
+        )
+        if radius <= 0.0:
+            return None
+        center = self._race_order_track_center(track_id, committed_by_id)
+        if center is None:
+            return None
+        best = None
+        seen = set()
+        for idx, accepted_id in enumerate(other_ids):
+            accepted_id = int(accepted_id)
+            if accepted_id == int(track_id) or accepted_id in seen:
+                continue
+            seen.add(accepted_id)
+            accepted_center = self._race_order_track_center(
+                accepted_id,
+                committed_by_id,
+            )
+            if accepted_center is None:
+                continue
+            dist = float(np.linalg.norm(center - accepted_center))
+            if not math.isfinite(dist) or dist > radius:
+                continue
+            if best is None or dist < best[2]:
+                best = (int(idx), int(accepted_id), dist)
+        return best
+
+    def _race_order_track_score(
+        self,
+        track_id: int,
+        committed_by_id: dict[int, object],
+    ) -> tuple[float, float, float, float, float, float]:
+        track = committed_by_id.get(int(track_id))
+        if track is None:
+            return (0.0, 0.0, 0.0, 0.0, -math.inf, -math.inf)
+
+        reproj = self._finite_float(
+            getattr(track, "reprojection_error_median", math.inf),
+            math.inf,
+        )
+        std = getattr(track, "center_world_std", None)
+        if std is not None:
+            std = self._finite_vec3_or_none(std)
+        std_norm = float(np.linalg.norm(std)) if std is not None else math.inf
+        if not math.isfinite(reproj):
+            reproj = math.inf
+        if not math.isfinite(std_norm):
+            std_norm = math.inf
+
+        return (
+            1.0 if bool(getattr(track, "is_stable", False)) else 0.0,
+            self._finite_float(getattr(track, "stability_score", 0.0), 0.0),
+            float(int(getattr(track, "inlier_count", 0))),
+            float(int(getattr(track, "hits", 0))),
+            -float(reproj),
+            -float(std_norm),
+        )
+
+    def _trace_race_order_duplicate_skips(self, skips: list[tuple]) -> None:
+        if not skips:
+            self._last_race_order_duplicate_signature = None
+            return
+        signature = tuple(
+            (
+                str(action),
+                int(track_id),
+                int(other_id),
+                round(float(dist), 2),
+            )
+            for action, track_id, other_id, dist in skips
+        )
+        if signature == self._last_race_order_duplicate_signature:
+            return
+        self._last_race_order_duplicate_signature = signature
+        entries = " ".join(
+            f"{action}={track_id}:near={other_id}:dist={float(dist):.2f}"
+            for action, track_id, other_id, dist in skips[:8]
+        )
+        extra = "" if len(skips) <= 8 else f" more={len(skips) - 8}"
+        print(
+            "race_order duplicate_filter "
+            f"radius={float(self.race_order_duplicate_radius_m):.2f} "
+            f"{entries}{extra}",
+            flush=True,
+        )
+
     def _refresh_perception_race_order(
         self,
         stable_tracks,
@@ -1089,11 +1726,48 @@ class PyAIPilotAutonomyAPI:
     ) -> None:
         current_pos = np.asarray(current_pos, dtype=float).reshape(3)
 
+        active_id = self.active_target_track_id
+        if active_id is not None:
+            active_id = int(active_id)
+        protected_ids = set(int(track_id) for track_id in self.completed_track_ids)
+        if active_id is not None:
+            protected_ids.add(int(active_id))
+
         accepted_ids = []
-        for track_id in self.race_order_track_ids:
+        duplicate_skips = []
+
+        def accept_track_id(track_id: int) -> None:
             track_id = int(track_id)
-            if track_id in committed_by_id and track_id not in accepted_ids:
+            if track_id not in committed_by_id:
+                return
+            if track_id in accepted_ids:
+                return
+            duplicate = self._race_order_duplicate_match(
+                track_id,
+                accepted_ids,
+                committed_by_id,
+            )
+            if duplicate is None:
                 accepted_ids.append(track_id)
+                return
+
+            duplicate_idx, duplicate_id, dist = duplicate
+            should_replace = (
+                duplicate_id not in protected_ids
+                and (
+                    track_id in protected_ids
+                    or self._race_order_track_score(track_id, committed_by_id)
+                    > self._race_order_track_score(duplicate_id, committed_by_id)
+                )
+            )
+            if should_replace:
+                accepted_ids[duplicate_idx] = track_id
+                duplicate_skips.append(("replace", duplicate_id, track_id, dist))
+            else:
+                duplicate_skips.append(("skip", track_id, duplicate_id, dist))
+
+        for track_id in self.race_order_track_ids:
+            accept_track_id(int(track_id))
 
         for track in stable_tracks:
             track_id = int(track.id)
@@ -1106,7 +1780,16 @@ class PyAIPilotAutonomyAPI:
                 and len(accepted_ids) >= self.race_gate_count
             ):
                 break
-            accepted_ids.append(track_id)
+            accept_track_id(track_id)
+
+        if active_id is not None and active_id in committed_by_id:
+            if active_id not in accepted_ids:
+                accepted_ids.insert(
+                    min(max(int(self.current_gate_idx), 0), len(accepted_ids)),
+                    active_id,
+                )
+        elif active_id is not None:
+            active_id = None
 
         prefix_len = min(max(int(self.current_gate_idx), 0), len(accepted_ids))
         completed_prefix = accepted_ids[:prefix_len]
@@ -1116,22 +1799,60 @@ class PyAIPilotAutonomyAPI:
             if track_id not in self.completed_track_ids
         ]
 
-        active_id = self.active_target_track_id
-        if active_id is not None:
-            active_id = int(active_id)
-
-        if active_id is not None and active_id in committed_by_id:
-            if active_id not in candidate_ids and active_id not in completed_prefix:
+        if (
+            active_id is not None
+            and active_id in committed_by_id
+            and active_id not in candidate_ids
+            and active_id not in completed_prefix
+        ):
+            duplicate = self._race_order_duplicate_match_against_ids(
+                active_id,
+                list(completed_prefix) + list(self.completed_track_ids),
+                committed_by_id,
+            )
+            if duplicate is None:
                 candidate_ids.insert(0, active_id)
-        elif active_id is not None:
-            active_id = None
+            else:
+                _, duplicate_id, dist = duplicate
+                duplicate_skips.append(
+                    ("skip_completed", active_id, duplicate_id, dist)
+                )
 
+        protected_duplicate_ids = list(completed_prefix) + list(self.completed_track_ids)
+        filtered_candidate_ids = []
+        for track_id in candidate_ids:
+            duplicate = self._race_order_duplicate_match_against_ids(
+                track_id,
+                protected_duplicate_ids + filtered_candidate_ids,
+                committed_by_id,
+            )
+            if duplicate is not None:
+                _, duplicate_id, dist = duplicate
+                duplicate_skips.append(
+                    ("skip_completed", track_id, duplicate_id, dist)
+                )
+                continue
+            filtered_candidate_ids.append(track_id)
+        candidate_ids = filtered_candidate_ids
+
+        self._trace_race_order_duplicate_skips(duplicate_skips)
+
+        self.pending_active_target_preempt_track_id = None
+        self.pending_active_target_preempt_details = None
         ordered_suffix = self._order_track_ids_by_progress(
             candidate_ids=candidate_ids,
             current_pos=current_pos,
             committed_by_id=committed_by_id,
             active_id=active_id,
+            protected_duplicate_ids=protected_duplicate_ids,
         )
+        details = self.pending_active_target_preempt_details
+        if (
+            details is not None
+            and ordered_suffix
+            and int(ordered_suffix[0]) == int(details["new_track_id"])
+        ):
+            self.pending_active_target_preempt_track_id = int(details["new_track_id"])
 
         order = completed_prefix + ordered_suffix
         if self.race_gate_count is not None:
@@ -1144,12 +1865,479 @@ class PyAIPilotAutonomyAPI:
         ):
             self.active_target_track_id = self.race_order_track_ids[self.current_gate_idx]
 
+    def _select_active_preempt_track(
+        self,
+        unique_ids: list[int],
+        current_pos: np.ndarray,
+        committed_by_id: dict[int, object],
+        active_id,
+    ) -> int | None:
+        if (
+            not self.active_target_preempt_enabled
+            or not self.target_manager.locked
+            or active_id is None
+        ):
+            return None
+
+        active_id = int(active_id)
+        if active_id not in unique_ids:
+            return None
+
+        active_center = self._race_order_track_center(active_id, committed_by_id)
+        if active_center is None:
+            return None
+
+        current_pos = np.asarray(current_pos, dtype=float).reshape(3)
+        active_vec = active_center - current_pos
+        active_dist = float(np.linalg.norm(active_vec))
+        if (
+            not math.isfinite(active_dist)
+            or active_dist < self.active_target_preempt_min_active_distance_m
+            or active_dist < 1e-6
+        ):
+            return None
+
+        direction = active_vec / active_dist
+        margin = float(self.active_target_preempt_margin_m)
+        lateral_limit = float(self.active_target_preempt_lateral_radius_m)
+        if lateral_limit <= 0.0:
+            lateral_limit = max(float(self.race_order_duplicate_radius_m), self.pass_radius_m)
+
+        best = None
+        for track_id in unique_ids:
+            track_id = int(track_id)
+            if track_id == active_id:
+                continue
+            center = self._race_order_track_center(track_id, committed_by_id)
+            if center is None:
+                continue
+
+            rel = center - current_pos
+            projection = float(np.dot(rel, direction))
+            if not math.isfinite(projection) or projection <= 0.25:
+                continue
+            if projection >= active_dist - margin:
+                continue
+
+            lateral_vec = rel - projection * direction
+            lateral = float(np.linalg.norm(lateral_vec))
+            if not math.isfinite(lateral) or lateral > lateral_limit:
+                continue
+
+            candidate_dist = float(np.linalg.norm(rel))
+            if not math.isfinite(candidate_dist) or candidate_dist + margin >= active_dist:
+                continue
+
+            key = (projection, candidate_dist, track_id)
+            if best is None or key < best[0]:
+                best = (
+                    key,
+                    {
+                        "old_track_id": active_id,
+                        "new_track_id": track_id,
+                        "active_dist": active_dist,
+                        "candidate_dist": candidate_dist,
+                        "projection": projection,
+                        "lateral": lateral,
+                    },
+                )
+
+        if best is None:
+            return None
+
+        self.pending_active_target_preempt_details = best[1]
+        return int(best[1]["new_track_id"])
+
+    def _front_blocker_track_for_unlocked_order(
+        self,
+        first_id: int,
+        unique_ids: list[int],
+        current_pos: np.ndarray,
+        committed_by_id: dict[int, object],
+        protected_duplicate_ids=None,
+    ) -> tuple[int | None, dict[str, float]]:
+        if (
+            not self.race_order_front_blocker_enabled
+            or self.target_manager.locked
+            or first_id not in committed_by_id
+        ):
+            return None, {}
+
+        first_center = self._race_order_track_center(first_id, committed_by_id)
+        if first_center is None:
+            return None, {}
+
+        current_pos = np.asarray(current_pos, dtype=float).reshape(3)
+        first_vec = first_center - current_pos
+        first_dist = float(np.linalg.norm(first_vec))
+        if not math.isfinite(first_dist) or first_dist < 1e-6:
+            return None, {}
+
+        direction = first_vec / first_dist
+        margin = float(self.race_order_front_blocker_margin_m)
+        lateral_limit = float(self.race_order_front_blocker_lateral_radius_m)
+        if lateral_limit <= 0.0:
+            lateral_limit = max(float(self.race_order_duplicate_radius_m), self.pass_radius_m)
+
+        unique_set = set(int(track_id) for track_id in unique_ids)
+        duplicate_guard_ids = (
+            unique_set
+            | set(int(track_id) for track_id in self.completed_track_ids)
+            | set(int(track_id) for track_id in (protected_duplicate_ids or []))
+        )
+        best = None
+        for track_id, track in committed_by_id.items():
+            track_id = int(track_id)
+            if track_id == int(first_id) or track_id in unique_set:
+                continue
+            if track_id in self.completed_track_ids:
+                continue
+            duplicate = self._race_order_duplicate_match_against_ids(
+                track_id,
+                duplicate_guard_ids,
+                committed_by_id,
+            )
+            if duplicate is not None:
+                continue
+            if not self._front_blocker_track_quality_ok(track):
+                continue
+
+            center = self._track_navigation_center(track)
+            if center is None:
+                continue
+            rel = center - current_pos
+            projection = float(np.dot(rel, direction))
+            if not math.isfinite(projection) or projection <= 0.25:
+                continue
+            if projection + margin >= first_dist:
+                continue
+
+            lateral_vec = rel - projection * direction
+            lateral = float(np.linalg.norm(lateral_vec))
+            if not math.isfinite(lateral) or lateral > lateral_limit:
+                continue
+
+            distance = float(np.linalg.norm(rel))
+            if not math.isfinite(distance):
+                continue
+
+            key = (projection, distance, track_id)
+            if best is None or key < best[0]:
+                best = (
+                    key,
+                    {
+                        "track_id": track_id,
+                        "first_track_id": int(first_id),
+                        "first_dist": first_dist,
+                        "projection": projection,
+                        "distance": distance,
+                        "lateral": lateral,
+                    },
+                )
+
+        if best is None:
+            return None, {}
+        details = best[1]
+        return int(details["track_id"]), details
+
+    def _front_blocker_track_quality_ok(self, track) -> bool:
+        if track is None or not bool(getattr(track, "committed", False)):
+            return False
+
+        min_hits = max(1, min(int(self.gate_memory.commit_hits), int(self.gate_memory.min_hits_for_stable)))
+        if int(getattr(track, "hits", 0)) < min_hits:
+            return False
+
+        obs_history = getattr(track, "obs_history", [])
+        if not obs_history:
+            return False
+        last_obs = obs_history[-1]
+        if bool(getattr(last_obs, "is_outlier", False)):
+            return False
+        if not bool(getattr(last_obs, "quality_ok", True)):
+            return False
+
+        reproj = self._finite_float(
+            getattr(last_obs, "reprojection_error", float("nan")),
+            float("nan"),
+            allow_nan=True,
+        )
+        max_reproj = float(self.max_reprojection_error_for_memory)
+        if max_reproj > 0.0 and (
+            not math.isfinite(reproj) or reproj > max_reproj
+        ):
+            return False
+
+        kp_min = self._finite_float(
+            getattr(last_obs, "keypoint_conf_min", float("nan")),
+            float("nan"),
+            allow_nan=True,
+        )
+        min_kp = float(self.min_keypoint_conf_for_memory)
+        if min_kp > 0.0 and (not math.isfinite(kp_min) or kp_min < min_kp):
+            return False
+
+        return True
+
+    def _track_plausible_blocker_center(self, track) -> np.ndarray | None:
+        center = self._finite_vec3_or_none(
+            getattr(track, "filtered_center_world", None)
+        )
+        if center is not None:
+            return center
+        return self._finite_vec3_or_none(getattr(track, "center", None))
+
+    def _closer_blocker_track_quality(
+        self,
+        track,
+        now: float,
+    ) -> tuple[bool, str, dict[str, float]]:
+        details: dict[str, float] = {}
+        if track is None:
+            return False, "missing_track", details
+        if bool(getattr(track, "is_stable", False)):
+            return False, "already_stable", details
+
+        committed = bool(getattr(track, "committed", False))
+        hits = int(getattr(track, "hits", 0))
+        min_hits = max(1, int(getattr(self.gate_memory, "commit_hits", 1)))
+        details["hits"] = float(hits)
+        if hits < min_hits:
+            return False, "insufficient_hits", details
+
+        last_seen = self._finite_float(
+            getattr(track, "last_seen_time", 0.0),
+            0.0,
+        )
+        stale_time = self._finite_float(
+            getattr(self.gate_memory, "stale_time", 0.5),
+            0.5,
+        )
+        age_s = now - last_seen if last_seen > 0.0 else float("inf")
+        details["age_s"] = float(age_s)
+        if last_seen <= 0.0 or age_s > stale_time:
+            return False, "stale", details
+
+        obs_history = getattr(track, "obs_history", [])
+        if not obs_history:
+            return False, "missing_observation", details
+        last_obs = obs_history[-1]
+        if bool(getattr(last_obs, "is_outlier", False)):
+            return False, "last_observation_outlier", details
+        if not bool(getattr(last_obs, "quality_ok", True)):
+            return False, str(getattr(last_obs, "quality_reason", "")) or "quality_bad", details
+
+        reproj = self._finite_float(
+            getattr(last_obs, "reprojection_error", float("nan")),
+            float("nan"),
+            allow_nan=True,
+        )
+        details["reproj"] = reproj
+        max_reproj = float(self.max_reprojection_error_for_memory)
+        if max_reproj > 0.0 and (
+            not math.isfinite(reproj) or reproj > max_reproj
+        ):
+            return False, "reprojection_error_high", details
+
+        kp_min = self._finite_float(
+            getattr(last_obs, "keypoint_conf_min", float("nan")),
+            float("nan"),
+            allow_nan=True,
+        )
+        details["kp_min"] = kp_min
+        min_kp = float(self.min_keypoint_conf_for_memory)
+        if min_kp > 0.0 and (not math.isfinite(kp_min) or kp_min < min_kp):
+            return False, "keypoint_conf_low", details
+
+        world_std = self._finite_vec3_or_none(getattr(track, "center_world_std", None))
+        world_std_norm = (
+            float(np.linalg.norm(world_std))
+            if world_std is not None
+            else float("nan")
+        )
+        details["world_std"] = world_std_norm
+        max_plausible_std = max(2.0, float(self.race_order_duplicate_radius_m))
+        if math.isfinite(world_std_norm) and world_std_norm > max_plausible_std:
+            return False, "world_std_implausible", details
+
+        return (
+            True,
+            "committed_unstable" if committed else "strong_uncommitted_candidate",
+            details,
+        )
+
+    def _closer_unstable_blocker_for_target(
+        self,
+        first_id: int,
+        unique_ids: list[int],
+        current_pos: np.ndarray,
+        committed_by_id: dict[int, object],
+        protected_duplicate_ids=None,
+    ) -> tuple[int | None, dict[str, float]]:
+        if (
+            not self.race_order_front_blocker_enabled
+            or self.target_manager.locked
+            or first_id not in committed_by_id
+        ):
+            return None, {}
+
+        first_center = self._race_order_track_center(first_id, committed_by_id)
+        if first_center is None:
+            return None, {}
+
+        current_pos = np.asarray(current_pos, dtype=float).reshape(3)
+        first_vec = first_center - current_pos
+        first_dist = float(np.linalg.norm(first_vec))
+        if not math.isfinite(first_dist) or first_dist < 1e-6:
+            return None, {}
+
+        direction = first_vec / first_dist
+        margin = float(self.race_order_front_blocker_margin_m)
+        lateral_limit = float(self.race_order_front_blocker_lateral_radius_m)
+        if lateral_limit <= 0.0:
+            lateral_limit = max(float(self.race_order_duplicate_radius_m), self.pass_radius_m)
+
+        unique_set = set(int(track_id) for track_id in unique_ids)
+        duplicate_guard_ids = (
+            unique_set
+            | set(int(track_id) for track_id in self.completed_track_ids)
+            | set(int(track_id) for track_id in (protected_duplicate_ids or []))
+        )
+        now = time.time()
+        best = None
+        for track in sorted(self.gate_memory.tracks, key=lambda tr: int(tr.id)):
+            track_id = int(track.id)
+            if track_id == int(first_id) or track_id in unique_set:
+                continue
+            if track_id in self.completed_track_ids:
+                continue
+            duplicate = self._race_order_duplicate_match_against_ids(
+                track_id,
+                duplicate_guard_ids,
+                committed_by_id,
+            )
+            if duplicate is not None:
+                continue
+
+            quality_ok, quality_reason, quality_details = (
+                self._closer_blocker_track_quality(track, now)
+            )
+            if not quality_ok:
+                continue
+
+            center = self._track_plausible_blocker_center(track)
+            if center is None:
+                continue
+
+            rel = center - current_pos
+            projection = float(np.dot(rel, direction))
+            if not math.isfinite(projection) or projection <= 0.25:
+                continue
+            if projection + margin >= first_dist:
+                continue
+
+            lateral_vec = rel - projection * direction
+            lateral = float(np.linalg.norm(lateral_vec))
+            if not math.isfinite(lateral) or lateral > lateral_limit:
+                continue
+
+            distance = float(np.linalg.norm(rel))
+            if not math.isfinite(distance) or distance + margin >= first_dist:
+                continue
+
+            key = (projection, distance, track_id)
+            if best is None or key < best[0]:
+                best = (
+                    key,
+                    {
+                        "track_id": track_id,
+                        "first_track_id": int(first_id),
+                        "first_dist": first_dist,
+                        "projection": projection,
+                        "distance": distance,
+                        "lateral": lateral,
+                        "reason": quality_reason,
+                        "hits": quality_details.get("hits", float("nan")),
+                        "age_s": quality_details.get("age_s", float("nan")),
+                        "reproj": quality_details.get("reproj", float("nan")),
+                        "kp_min": quality_details.get("kp_min", float("nan")),
+                        "world_std": quality_details.get("world_std", float("nan")),
+                    },
+                )
+
+        if best is None:
+            return None, {}
+        details = best[1]
+        return int(details["track_id"]), details
+
+    def _trace_closer_unstable_blocker(
+        self,
+        details: dict[str, float],
+    ) -> None:
+        if not details:
+            return
+        signature = (
+            int(details["track_id"]),
+            int(details["first_track_id"]),
+            round(float(details["first_dist"]), 1),
+            round(float(details["projection"]), 1),
+            round(float(details["lateral"]), 1),
+            str(details.get("reason", "")),
+        )
+        if signature == self._last_race_order_closer_blocker_signature:
+            return
+        self._last_race_order_closer_blocker_signature = signature
+        print(
+            "race_order closer_unstable_blocker "
+            f"track={int(details['track_id'])} "
+            f"before={int(details['first_track_id'])} "
+            f"reason={details.get('reason', '')} "
+            f"first_dist={float(details['first_dist']):.2f} "
+            f"projection={float(details['projection']):.2f} "
+            f"distance={float(details['distance']):.2f} "
+            f"lateral={float(details['lateral']):.2f} "
+            f"hits={self._fmt_float(details.get('hits'), precision=0)} "
+            f"age_s={self._fmt_float(details.get('age_s'), precision=2)} "
+            f"reproj={self._fmt_float(details.get('reproj'), precision=2)} "
+            f"kp_min={self._fmt_float(details.get('kp_min'), precision=2)} "
+            f"world_std={self._fmt_float(details.get('world_std'), precision=2)}",
+            flush=True,
+        )
+
+    def _trace_front_blocker_order(
+        self,
+        details: dict[str, float],
+    ) -> None:
+        if not details:
+            return
+        signature = (
+            int(details["track_id"]),
+            int(details["first_track_id"]),
+            round(float(details["first_dist"]), 1),
+            round(float(details["projection"]), 1),
+            round(float(details["lateral"]), 1),
+        )
+        if signature == self._last_race_order_front_blocker_signature:
+            return
+        self._last_race_order_front_blocker_signature = signature
+        print(
+            "race_order front_blocker "
+            f"track={int(details['track_id'])} "
+            f"before={int(details['first_track_id'])} "
+            f"first_dist={float(details['first_dist']):.2f} "
+            f"projection={float(details['projection']):.2f} "
+            f"distance={float(details['distance']):.2f} "
+            f"lateral={float(details['lateral']):.2f}",
+            flush=True,
+        )
+
     def _order_track_ids_by_progress(
         self,
         candidate_ids: list[int],
         current_pos: np.ndarray,
         committed_by_id: dict[int, object],
         active_id,
+        protected_duplicate_ids=None,
     ) -> list[int]:
         unique_ids = []
         for track_id in candidate_ids:
@@ -1162,9 +2350,23 @@ class PyAIPilotAutonomyAPI:
         current_pos = np.asarray(current_pos, dtype=float).reshape(3)
 
         def center_for(track_id: int) -> np.ndarray:
-            return np.asarray(committed_by_id[int(track_id)].center, dtype=float).reshape(3)
+            center = self._race_order_track_center(int(track_id), committed_by_id)
+            if center is None:
+                return np.asarray(
+                    committed_by_id[int(track_id)].center,
+                    dtype=float,
+                ).reshape(3)
+            return center
 
-        if active_id is not None and int(active_id) in unique_ids:
+        preempt_id = self._select_active_preempt_track(
+            unique_ids,
+            current_pos,
+            committed_by_id,
+            active_id,
+        )
+        if preempt_id is not None:
+            first_id = int(preempt_id)
+        elif active_id is not None and int(active_id) in unique_ids:
             first_id = int(active_id)
         else:
             first_id = min(
@@ -1174,6 +2376,31 @@ class PyAIPilotAutonomyAPI:
                     int(track_id),
                 ),
             )
+
+        if active_id is None:
+            blocker_id, blocker_details = self._closer_unstable_blocker_for_target(
+                first_id,
+                unique_ids,
+                current_pos,
+                committed_by_id,
+                protected_duplicate_ids=protected_duplicate_ids,
+            )
+            if blocker_id is not None:
+                self._trace_closer_unstable_blocker(blocker_details)
+                return []
+
+            blocker_id, blocker_details = self._front_blocker_track_for_unlocked_order(
+                first_id,
+                unique_ids,
+                current_pos,
+                committed_by_id,
+                protected_duplicate_ids=protected_duplicate_ids,
+            )
+            if blocker_id is not None:
+                first_id = int(blocker_id)
+                if blocker_id not in unique_ids:
+                    unique_ids.insert(0, blocker_id)
+                self._trace_front_blocker_order(blocker_details)
 
         rest = [track_id for track_id in unique_ids if track_id != first_id]
         if not rest:
@@ -1224,8 +2451,8 @@ class PyAIPilotAutonomyAPI:
             center = None
             track = committed_by_id.get(track_id)
             if track is not None:
-                center = np.asarray(track.center, dtype=float).reshape(3).copy()
-                if track_id == self.active_target_track_id:
+                center = self._track_navigation_center(track)
+                if center is not None and track_id == self.active_target_track_id:
                     self.last_active_target_center = center.copy()
                     self.active_target_lost_time = None
             elif (
@@ -1244,6 +2471,203 @@ class PyAIPilotAutonomyAPI:
             track_ids.append(track_id)
 
         return gates, track_ids
+
+    def _detection_memory_quality(
+        self,
+        detection: dict,
+        center_camera: np.ndarray | None,
+    ) -> tuple[bool, str, dict[str, float]]:
+        details: dict[str, float] = {}
+        keypoints = self._detection_keypoints_px(detection)
+        if keypoints is None:
+            return False, "missing_keypoints", details
+
+        conf = self._detection_keypoint_conf_array(detection)
+        if conf is None:
+            return False, "missing_keypoint_conf", details
+        min_conf = float(np.min(conf))
+        details["kp_min"] = min_conf
+        threshold = float(self.min_keypoint_conf_for_memory)
+        if threshold > 0.0 and min_conf < threshold:
+            return False, f"keypoint_conf_low:{min_conf:.2f}", details
+
+        margin = float(self.keypoint_border_margin_px)
+        if margin > 0.0:
+            width = float(self.config.camera.width)
+            height = float(self.config.camera.height)
+            x = keypoints[:, 0]
+            y = keypoints[:, 1]
+            if (
+                np.any(x <= margin)
+                or np.any(y <= margin)
+                or np.any(x >= width - 1.0 - margin)
+                or np.any(y >= height - 1.0 - margin)
+            ):
+                return False, "keypoint_on_image_border", details
+
+        area = self._quad_area_px2(keypoints)
+        details["quad_area_px2"] = area
+        min_area = float(self.min_quad_area_px2_for_memory)
+        if min_area > 0.0 and (not math.isfinite(area) or area < min_area):
+            return False, f"quad_area_small:{area:.1f}", details
+
+        edge_ratio = self._opposite_edge_ratio(keypoints)
+        details["opposite_edge_ratio"] = edge_ratio
+        max_edge_ratio = float(self.max_keypoint_opposite_edge_ratio)
+        if max_edge_ratio > 0.0 and (
+            not math.isfinite(edge_ratio) or edge_ratio > max_edge_ratio
+        ):
+            return False, f"opposite_edge_ratio_high:{edge_ratio:.2f}", details
+
+        if center_camera is not None:
+            z_size = self._keypoint_size_depth_m(keypoints)
+            pnp_z = float(center_camera[2])
+            details["z_from_width_height"] = z_size
+            details["pnp_z"] = pnp_z
+            if (
+                math.isfinite(z_size)
+                and z_size > 0.0
+                and math.isfinite(pnp_z)
+                and pnp_z > 0.0
+            ):
+                max_abs = float(self.max_pnp_size_depth_disagreement_m)
+                max_ratio = float(self.max_pnp_size_depth_disagreement_ratio)
+                allowed = 0.0
+                if max_abs > 0.0:
+                    allowed = max(allowed, max_abs)
+                if max_ratio > 0.0:
+                    allowed = max(allowed, max_ratio * z_size)
+                disagreement = abs(pnp_z - z_size)
+                details["size_depth_disagreement_m"] = disagreement
+                if allowed > 0.0 and disagreement > allowed:
+                    return (
+                        False,
+                        f"size_depth_disagreement:{disagreement:.2f}",
+                        details,
+                    )
+
+        return True, "ok", details
+
+    def _maybe_print_perception_memory_reject(
+        self,
+        detection: dict,
+        reason: str,
+        details: dict[str, float] | None = None,
+    ) -> None:
+        now = time.time()
+        if now - self._last_perception_reject_print_time < 0.5:
+            return
+        self._last_perception_reject_print_time = now
+        details = details or {}
+        print(
+            "perception_memory_reject "
+            f"reason={reason} "
+            f"det={self._blank_na(detection.get('detection_id'))} "
+            f"reproj={self._fmt_float(detection.get('reprojection_error'), precision=2)} "
+            f"kp_min={self._fmt_float(details.get('kp_min'), precision=2)} "
+            f"area={self._fmt_float(details.get('quad_area_px2'), precision=1)} "
+            f"edge_ratio={self._fmt_float(details.get('opposite_edge_ratio'), precision=2)} "
+            f"pnp_z={self._fmt_float(details.get('pnp_z'), precision=2)} "
+            f"z_size={self._fmt_float(details.get('z_from_width_height'), precision=2)}",
+            flush=True,
+        )
+
+    @staticmethod
+    def _detection_keypoints_px(detection: dict) -> np.ndarray | None:
+        for key in ("keypoints_px", "yolo_keypoints", "ordered_corners", "raw_corners"):
+            value = detection.get(key)
+            if value is None:
+                continue
+            try:
+                arr = np.asarray(value, dtype=float)
+            except (TypeError, ValueError):
+                continue
+            if arr.ndim >= 2 and arr.shape[0] >= 4 and arr.shape[1] >= 2:
+                keypoints = np.asarray(arr[:4, :2], dtype=float).reshape(4, 2)
+                if np.all(np.isfinite(keypoints)):
+                    return keypoints
+        return None
+
+    @staticmethod
+    def _detection_keypoint_conf_array(detection: dict) -> np.ndarray | None:
+        conf = detection.get("keypoint_conf")
+        if conf is not None:
+            try:
+                arr = np.asarray(conf, dtype=float).reshape(-1)[:4]
+            except (TypeError, ValueError):
+                arr = np.empty(0, dtype=float)
+            if arr.size >= 4 and np.all(np.isfinite(arr)):
+                return arr.astype(float).copy()
+
+        yolo_keypoints = detection.get("yolo_keypoints")
+        if yolo_keypoints is not None:
+            try:
+                keypoints = np.asarray(yolo_keypoints, dtype=float)
+            except (TypeError, ValueError):
+                keypoints = np.empty((0, 0), dtype=float)
+            if (
+                keypoints.ndim >= 2
+                and keypoints.shape[0] >= 4
+                and keypoints.shape[1] >= 3
+            ):
+                arr = np.asarray(keypoints[:4, 2], dtype=float).reshape(4)
+                if np.all(np.isfinite(arr)):
+                    return arr.copy()
+
+        return None
+
+    @staticmethod
+    def _quad_area_px2(keypoints: np.ndarray) -> float:
+        pts = np.asarray(keypoints, dtype=float).reshape(4, 2)
+        if not np.all(np.isfinite(pts)):
+            return float("nan")
+        return 0.5 * abs(
+            float(
+                np.dot(pts[:, 0], np.roll(pts[:, 1], -1))
+                - np.dot(pts[:, 1], np.roll(pts[:, 0], -1))
+            )
+        )
+
+    @staticmethod
+    def _opposite_edge_ratio(keypoints: np.ndarray) -> float:
+        pts = np.asarray(keypoints, dtype=float).reshape(4, 2)
+        edges = np.asarray(
+            [
+                np.linalg.norm(pts[1] - pts[0]),
+                np.linalg.norm(pts[2] - pts[1]),
+                np.linalg.norm(pts[3] - pts[2]),
+                np.linalg.norm(pts[0] - pts[3]),
+            ],
+            dtype=float,
+        )
+        if not np.all(np.isfinite(edges)) or np.any(edges <= 1.0):
+            return float("inf")
+        top_bottom = max(edges[0], edges[2]) / max(min(edges[0], edges[2]), 1e-6)
+        right_left = max(edges[1], edges[3]) / max(min(edges[1], edges[3]), 1e-6)
+        return float(max(top_bottom, right_left))
+
+    def _keypoint_size_depth_m(self, keypoints: np.ndarray) -> float:
+        pts = np.asarray(keypoints, dtype=float).reshape(4, 2)
+        if not np.all(np.isfinite(pts)):
+            return float("nan")
+        width_px = 0.5 * (
+            np.linalg.norm(pts[1] - pts[0])
+            + np.linalg.norm(pts[2] - pts[3])
+        )
+        height_px = 0.5 * (
+            np.linalg.norm(pts[3] - pts[0])
+            + np.linalg.norm(pts[2] - pts[1])
+        )
+        k = np.asarray(self.camera_matrix, dtype=float).reshape(3, 3)
+        gate_size = float(self.config.perception.gate_size_m)
+        depths = []
+        if width_px > 1.0 and math.isfinite(float(k[0, 0])):
+            depths.append(float(k[0, 0]) * gate_size / float(width_px))
+        if height_px > 1.0 and math.isfinite(float(k[1, 1])):
+            depths.append(float(k[1, 1]) * gate_size / float(height_px))
+        if not depths:
+            return float("nan")
+        return float(np.mean(depths))
 
     def _update_gate_memory(self, latest_perception: dict) -> None:
         frame_key = self._perception_frame_key(latest_perception)
@@ -1278,9 +2702,17 @@ class PyAIPilotAutonomyAPI:
                 allow_nan=True,
             )
             if (
-                math.isfinite(reprojection_error)
-                and reprojection_error > self.max_reprojection_error_for_memory
+                self.max_reprojection_error_for_memory > 0.0
+                and (
+                    not math.isfinite(reprojection_error)
+                    or reprojection_error > self.max_reprojection_error_for_memory
+                )
             ):
+                self._maybe_print_perception_memory_reject(
+                    detection,
+                    "reprojection_error_high",
+                    {},
+                )
                 continue
 
             center_camera = detection.get("gate_center_camera")
@@ -1308,13 +2740,31 @@ class PyAIPilotAutonomyAPI:
                 ):
                     continue
 
+            quality_ok, quality_reason, quality_details = (
+                self._detection_memory_quality(detection, center_camera)
+            )
+            if not quality_ok:
+                self._maybe_print_perception_memory_reject(
+                    detection,
+                    quality_reason,
+                    quality_details,
+                )
+                continue
+
+            keypoint_conf_min, keypoint_conf_mean = (
+                self._detection_keypoint_conf_summary(detection)
+            )
             memory_result = self.gate_memory.add_detection(
                 center=arr.copy(),
                 confidence=confidence,
                 timestamp=timestamp,
                 center_camera=center_camera,
                 reprojection_error=reprojection_error,
+                keypoint_conf_min=keypoint_conf_min,
+                keypoint_conf_mean=keypoint_conf_mean,
                 solver_name="latest_perception",
+                quality_ok=True,
+                quality_reason=quality_reason,
             )
             self._maybe_print_perception_chain_event(detection, memory_result)
 
@@ -1447,6 +2897,28 @@ class PyAIPilotAutonomyAPI:
         return text if text else "n/a"
 
     @staticmethod
+    def _detection_keypoint_conf_summary(detection: dict) -> tuple[float, float]:
+        conf = detection.get("keypoint_conf")
+        if conf is None:
+            yolo_keypoints = detection.get("yolo_keypoints")
+            if yolo_keypoints is not None:
+                try:
+                    keypoints = np.asarray(yolo_keypoints, dtype=float)
+                    if keypoints.ndim == 2 and keypoints.shape[0] >= 4 and keypoints.shape[1] >= 3:
+                        conf = keypoints[:4, 2]
+                except (TypeError, ValueError):
+                    conf = None
+        if conf is None:
+            return float("nan"), float("nan")
+        try:
+            arr = np.asarray(conf, dtype=float).reshape(-1)[:4]
+        except (TypeError, ValueError):
+            return float("nan"), float("nan")
+        if arr.size < 4 or not np.all(np.isfinite(arr)):
+            return float("nan"), float("nan")
+        return float(np.min(arr)), float(np.mean(arr))
+
+    @staticmethod
     def _fmt_keypoints(detection: dict) -> str:
         keypoints = detection.get("keypoints_px")
         if keypoints is None:
@@ -1522,16 +2994,78 @@ class PyAIPilotAutonomyAPI:
         self._candidate_gate_track_ids = track_ids
         return gates
 
+    def _maybe_preempt_active_target(
+        self,
+        gates: list[np.ndarray],
+        track_ids: list,
+    ) -> bool:
+        new_track_id = self.pending_active_target_preempt_track_id
+        self.pending_active_target_preempt_track_id = None
+        details = self.pending_active_target_preempt_details
+        self.pending_active_target_preempt_details = None
+        if (
+            new_track_id is None
+            or not self.target_manager.locked
+            or not gates
+            or not track_ids
+        ):
+            return False
+
+        gate_idx = max(0, int(self.current_gate_idx))
+        if gate_idx >= len(gates) or gate_idx >= len(track_ids):
+            return False
+        try:
+            installed_track_id = int(track_ids[gate_idx])
+        except (TypeError, ValueError):
+            return False
+        if installed_track_id != int(new_track_id):
+            return False
+
+        old_track_id = self.active_target_track_id
+        if old_track_id is None:
+            old_track_id = getattr(self.target_manager, "active_target_track_id", None)
+        if old_track_id is not None and int(old_track_id) == int(new_track_id):
+            return False
+
+        active_dist = details.get("active_dist") if isinstance(details, dict) else None
+        candidate_dist = details.get("candidate_dist") if isinstance(details, dict) else None
+        projection = details.get("projection") if isinstance(details, dict) else None
+        lateral = details.get("lateral") if isinstance(details, dict) else None
+        print(
+            "active_target_preempt "
+            f"gate_idx={gate_idx} "
+            f"old_track={old_track_id if old_track_id is not None else 'none'} "
+            f"new_track={int(new_track_id)} "
+            f"active_dist={self._fmt_float(active_dist, precision=2)} "
+            f"candidate_dist={self._fmt_float(candidate_dist, precision=2)} "
+            f"projection={self._fmt_float(projection, precision=2)} "
+            f"lateral={self._fmt_float(lateral, precision=2)} "
+            f"new_center={self._fmt_vec(gates[gate_idx], precision=3)}",
+            flush=True,
+        )
+
+        self.target_manager.clear_active(reason="preempt")
+        self._sync_target_manager_state(clear_unlocked_current=True)
+        self._reset_gate_pass_state()
+        self.active_waypoints = None
+        self.active_times = None
+        self.last_planned_gate_idx = -1
+        self.active_target_shift_frames = 0
+        self.active_target_shift_track_id = None
+        self._last_gate_signature = None
+        return True
+
     def _install_gate_centers(self, gates: list[np.ndarray]) -> None:
         track_ids = list(self._candidate_gate_track_ids)
         if len(track_ids) != len(gates):
             track_ids = [None] * len(gates)
 
+        preempted = self._maybe_preempt_active_target(gates, track_ids)
         signature = (
             int(self.current_gate_idx),
             self._gate_signature(gates, track_ids),
         )
-        if signature == self._last_gate_signature:
+        if not preempted and signature == self._last_gate_signature:
             return
 
         gates, track_ids = self.target_manager.update_live_targets(

@@ -345,3 +345,54 @@ def test_visual_velocity_rejects_implausible_speed():
     assert correction["visual_velocity_neu"] is None
     assert correction["visual_velocity_reason"] == "reject:visual_velocity_speed"
     np.testing.assert_allclose(estimator.vel_neu, np.zeros(3))
+
+
+def test_preserves_gazebo_camera_sim_world_projection():
+    estimator = _estimator([0.0, 0.0, 0.0])
+    latest_perception = {
+        "world_pose_source": "gazebo_camera_sim",
+        "world_frame": "gazebo_camera_sim_neu",
+        "camera_translation_body": np.zeros(3, dtype=float),
+        "detections": [
+            {
+                "gate_center_world": np.array([1.0, 2.0, 3.0], dtype=float),
+                "gate_center_world_ned": np.array([2.0, 1.0, -3.0], dtype=float),
+                "gate_center_body_frd": np.array([10.0, 0.0, 0.0], dtype=float),
+            }
+        ],
+    }
+    estimate = SimpleNamespace(
+        valid=True,
+        pos_neu=np.array([100.0, 100.0, 100.0], dtype=float),
+        yaw_rad=0.0,
+        source="mavlink",
+    )
+    snapshot = SimpleNamespace(roll_rad=0.0, pitch_rad=0.0, yaw_rad=0.0)
+
+    projected = estimator.project_perception_with_estimated_state(
+        latest_perception,
+        estimate,
+        snapshot,
+    )
+
+    assert projected["world_pose_source"] == "gazebo_camera_sim"
+    assert projected["world_frame"] == "gazebo_camera_sim_neu"
+    np.testing.assert_allclose(
+        projected["detections"][0]["gate_center_world"],
+        np.array([1.0, 2.0, 3.0]),
+    )
+
+
+def test_gazebo_camera_sim_skips_landmark_vision_correction():
+    estimator = _estimator([2.0, 0.0, 0.0])
+    snapshot = _snapshot(
+        [{"track_id": 1, "position_neu": np.array([10.0, 0.0, 0.0])}],
+        [_detection([10.0, 0.0, 0.0])],
+    )
+    snapshot.latest_perception["world_pose_source"] = "gazebo_camera_sim"
+
+    correction = estimator._correct_with_vision(snapshot)
+
+    assert correction["source"] == "gazebo_camera_sim_world_pose"
+    assert correction["count"] == 0
+    np.testing.assert_allclose(estimator.pos_neu, np.array([2.0, 0.0, 0.0]))

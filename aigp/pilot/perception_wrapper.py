@@ -35,7 +35,7 @@ class PerceptionWrapper:
         self.config = config if config is not None else load_runtime_config()
         perception_config = self.config.perception
         self.transform_mode = str(perception_config.transform_mode)
-        self.world_pose_source = str(perception_config.world_pose_source)
+        self.world_pose_source = str(perception_config.world_pose_source).lower()
         self.camera_matrix = self._matrix3(camera_matrix, self.config.camera.matrix)
         self.dist_coeffs = self._dist_coeffs(dist_coeffs, self.config.camera.dist_coeffs)
 
@@ -79,8 +79,17 @@ class PerceptionWrapper:
             getattr(self.gate_perception, "model_points", VADR_TS_002.gate_inner_object_points_m),
             dtype=float,
         ).reshape(4, 3)
+        audit_config = self.config.perception_geometry_audit
+        self.gazebo_rotation_mode = str(
+            getattr(audit_config, "gazebo_rotation_mode", "transpose")
+        ).lower()
+        self.gazebo_optical_mode = str(
+            getattr(audit_config, "gazebo_optical_mode", "physical_minus_y")
+        ).lower()
+        self.gazebo_camera_sim_max_pose_age_s = 0.25
+        self._last_gazebo_camera_sim_warning_s = -math.inf
         self.geometry_audit = PerceptionGeometryAudit(
-            self.config.perception_geometry_audit
+            audit_config
         )
         print(
             "[PERCEPTION_CONFIG] "
@@ -153,29 +162,53 @@ class PerceptionWrapper:
         attitude=None,
         odometry=None,
         local_position_ned=None,
+        gazebo_pose=None,
     ) -> dict[str, Any]:
         frame_data = self._frame_data(frame)
         image = frame_data.get("image")
+        frame_gazebo_pose = frame_data.get("gazebo_pose")
+        if isinstance(frame_gazebo_pose, dict):
+            gazebo_pose = frame_gazebo_pose
         perception_wall_time = time.time()
 
         latest_perception = self._empty_latest_perception(
             frame_data=frame_data,
             perception_wall_time=perception_wall_time,
         )
+        latest_perception["gazebo_pose"] = gazebo_pose
 
         if image is None:
             return latest_perception
 
-        drone_pos_ned = self._position_ned(odometry)
+        position_source = odometry
+        drone_pos_ned = self._position_ned(position_source)
         if drone_pos_ned is None:
-            drone_pos_ned = self._position_ned(local_position_ned)
-        drone_rpy = self._attitude_rpy(attitude)
+            position_source = local_position_ned
+            drone_pos_ned = self._position_ned(position_source)
+        attitude_source = attitude
+        drone_rpy = self._attitude_rpy(attitude_source)
         if drone_rpy is None:
-            drone_rpy = self._odometry_rpy(odometry)
+            attitude_source = odometry
+            drone_rpy = self._odometry_rpy(attitude_source)
 
         try:
             raw_detections = self._detect_camera_only(image)
-            if (
+            if self._should_project_with_gazebo_camera():
+                raw_detections = self._project_detections_with_gazebo_camera(
+                    raw_detections,
+                    gazebo_pose=gazebo_pose,
+                    drone_pos_ned=drone_pos_ned,
+                    drone_rpy_rad=drone_rpy,
+                    frame_id=int(latest_perception.get("frame_id", -1)),
+                    image_wall_time=self._float_or_none(frame_data.get("wall_time")),
+                    image_ros_stamp_sec=self._int_or_none(frame_data.get("ros_stamp_sec")),
+                    image_ros_stamp_nanosec=self._int_or_none(
+                        frame_data.get("ros_stamp_nanosec")
+                    ),
+                    attitude_wall_time=self._wall_time(attitude_source),
+                    position_wall_time=self._wall_time(position_source),
+                )
+            elif (
                 self._should_project_with_mavlink_pose()
                 and drone_pos_ned is not None
                 and drone_rpy is not None
@@ -185,6 +218,14 @@ class PerceptionWrapper:
                     drone_pos_ned=drone_pos_ned,
                     drone_rpy_rad=drone_rpy,
                     frame_id=int(latest_perception.get("frame_id", -1)),
+                    gazebo_pose=gazebo_pose,
+                    image_wall_time=self._float_or_none(frame_data.get("wall_time")),
+                    image_ros_stamp_sec=self._int_or_none(frame_data.get("ros_stamp_sec")),
+                    image_ros_stamp_nanosec=self._int_or_none(
+                        frame_data.get("ros_stamp_nanosec")
+                    ),
+                    attitude_wall_time=self._wall_time(attitude_source),
+                    position_wall_time=self._wall_time(position_source),
                 )
         except Exception as exc:
             print(f"[perception_wrapper] update failed: {exc}", flush=True)
@@ -197,17 +238,25 @@ class PerceptionWrapper:
         ]
         return latest_perception
 
+    def _should_project_with_gazebo_camera(self) -> bool:
+        return (
+            self.world_pose_source == "gazebo_camera_sim"
+            and str(self.config.runtime.runner_mode).lower() != "competition"
+        )
+
     def _should_project_with_mavlink_pose(self) -> bool:
         if str(self.config.state_estimation.mode).lower() == "estimator":
             return False
         source = str(self.world_pose_source).lower()
-        return source not in ("camera_only", "none", "estimator")
+        return source not in ("camera_only", "none", "estimator", "gazebo_camera_sim")
 
     def _empty_latest_perception(self, *, frame_data, perception_wall_time: float) -> dict[str, Any]:
         return {
             "frame_id": int(frame_data.get("frame_id", -1)),
             "image_sim_time_ns": frame_data.get("sim_time_ns"),
             "image_wall_time": float(frame_data.get("wall_time", 0.0)),
+            "image_ros_stamp_sec": frame_data.get("ros_stamp_sec"),
+            "image_ros_stamp_nanosec": frame_data.get("ros_stamp_nanosec"),
             "perception_wall_time": float(perception_wall_time),
             "camera_matrix": self.camera_matrix.copy(),
             "dist_coeffs": self.dist_coeffs.copy(),
@@ -215,10 +264,15 @@ class PerceptionWrapper:
             "camera_translation_body": self.camera_translation_body.copy(),
             "perception_yaw_correction_rad": float(self.perception_yaw_correction_rad),
             "perception_yaw_correction_deg": float(self.perception_yaw_correction_deg),
-            "world_frame": "mavlink_local_ned_projected_to_neu",
+            "world_frame": (
+                "gazebo_camera_sim_neu"
+                if self._should_project_with_gazebo_camera()
+                else "mavlink_local_ned_projected_to_neu"
+            ),
             "body_frame": "mavlink_body_frd",
             "transform_mode": self.transform_mode,
             "world_pose_source": self.world_pose_source,
+            "gazebo_pose": frame_data.get("gazebo_pose"),
             "detections": [],
         }
 
@@ -337,6 +391,127 @@ class PerceptionWrapper:
             })
         return detections
 
+    def _project_detections_with_gazebo_camera(
+        self,
+        detections: list[dict[str, Any]],
+        *,
+        gazebo_pose=None,
+        drone_pos_ned: Optional[np.ndarray] = None,
+        drone_rpy_rad: Optional[np.ndarray] = None,
+        frame_id: Optional[int] = None,
+        image_wall_time: Optional[float] = None,
+        image_ros_stamp_sec: Optional[int] = None,
+        image_ros_stamp_nanosec: Optional[int] = None,
+        attitude_wall_time: Optional[float] = None,
+        position_wall_time: Optional[float] = None,
+    ) -> list[dict[str, Any]]:
+        pose_ok, reason = self._gazebo_camera_pose_ok(gazebo_pose)
+        if not pose_ok:
+            self._maybe_warn_gazebo_camera_sim(
+                f"gazebo_camera_sim requested but Gazebo camera pose is unavailable: {reason}"
+            )
+            return detections
+
+        projected = [
+            self._project_detection_to_world_gazebo_camera(
+                detection,
+                gazebo_pose=gazebo_pose,
+                drone_pos_ned=drone_pos_ned,
+                drone_rpy_rad=drone_rpy_rad,
+            )
+            for detection in detections
+        ]
+
+        if drone_pos_ned is not None and drone_rpy_rad is not None:
+            try:
+                self.geometry_audit.maybe_print(
+                    projected,
+                    drone_pos_ned=np.asarray(drone_pos_ned, dtype=float).reshape(3),
+                    drone_rpy_rad=self._perception_rpy(drone_rpy_rad),
+                    camera_matrix=self.camera_matrix,
+                    camera_to_body=self.camera_to_body,
+                    camera_translation_body=self.camera_translation_body,
+                    object_points_m=self.object_points_m,
+                    frame_id=frame_id,
+                    gazebo_pose=gazebo_pose,
+                    image_wall_time=image_wall_time,
+                    image_ros_stamp_sec=image_ros_stamp_sec,
+                    image_ros_stamp_nanosec=image_ros_stamp_nanosec,
+                    attitude_wall_time=attitude_wall_time,
+                    position_wall_time=position_wall_time,
+                )
+            except Exception as exc:
+                print(f"[GEOM_AUDIT] disabled_after_error={exc}", flush=True)
+                self.geometry_audit.enabled = False
+        return projected
+
+    def _project_detection_to_world_gazebo_camera(
+        self,
+        detection: dict[str, Any],
+        *,
+        gazebo_pose: dict[str, Any],
+        drone_pos_ned: Optional[np.ndarray] = None,
+        drone_rpy_rad: Optional[np.ndarray] = None,
+    ) -> dict[str, Any]:
+        out = dict(detection)
+        gate_camera = self._vec3(out.get("gate_center_camera"), default=None)
+        if gate_camera is None:
+            return out
+
+        gate_world_neu = self._world_from_camera_gazebo(gate_camera, gazebo_pose)
+        if gate_world_neu is None:
+            return out
+
+        gate_body_frd = self.camera_to_body @ gate_camera
+        out["gate_center_body"] = gate_body_frd.copy()
+        out["gate_center_body_frd"] = gate_body_frd.copy()
+        out["gate_center_world"] = gate_world_neu.copy()
+        out["gate_center_world_ned"] = local_neu_to_ned(gate_world_neu)
+        out["world_pose_source"] = "gazebo_camera_sim"
+        out["body_to_world_method_used"] = (
+            f"gazebo_camera_sim:{self.gazebo_rotation_mode}:{self.gazebo_optical_mode}"
+        )
+        out["camera_to_body_matrix_used"] = self.camera_to_body.copy()
+        out["camera_translation_body_used"] = self.camera_translation_body.copy()
+        out["perception_yaw_correction_rad"] = float(self.perception_yaw_correction_rad)
+        out["perception_yaw_correction_deg"] = float(self.perception_yaw_correction_deg)
+        camera_pos_world = self._vec3(
+            gazebo_pose.get("gazebo_camera_pos_world"),
+            default=None,
+        )
+        if camera_pos_world is not None:
+            out["gazebo_camera_pos_world"] = camera_pos_world.copy()
+            out["gazebo_camera_pos_neu"] = self._gazebo_world_to_neu(camera_pos_world)
+        out["gazebo_camera_quat_world"] = self._quat4(
+            gazebo_pose.get("gazebo_camera_quat_world")
+        )
+        out["gazebo_pose_wall_time"] = self._float_or_none(
+            gazebo_pose.get("gazebo_pose_wall_time")
+        )
+        out["gazebo_pose_selection_method"] = str(
+            gazebo_pose.get("gazebo_pose_selection_method", "")
+        )
+        if drone_pos_ned is not None:
+            pos_ned = np.asarray(drone_pos_ned, dtype=float).reshape(3)
+            out["drone_pos_ned"] = pos_ned.copy()
+            out["drone_pos_neu"] = local_ned_to_neu(pos_ned)
+        if drone_rpy_rad is not None:
+            raw_rpy = np.asarray(drone_rpy_rad, dtype=float).reshape(3)
+            out["drone_rpy_rad_mavlink"] = raw_rpy.copy()
+            out["drone_rpy_rad_used"] = self._perception_rpy(raw_rpy)
+
+        gate_normal_camera = self._vec3(out.get("gate_normal_camera"), default=None)
+        if gate_normal_camera is not None:
+            normal_world_neu = self._vector_from_camera_gazebo(
+                gate_normal_camera,
+                gazebo_pose,
+            )
+            if normal_world_neu is not None:
+                out["gate_normal_world"] = normal_world_neu.copy()
+                out["gate_normal_world_ned"] = local_neu_to_ned(normal_world_neu)
+
+        return out
+
     def _project_detections_to_world(
         self,
         detections: list[dict[str, Any]],
@@ -344,6 +519,12 @@ class PerceptionWrapper:
         drone_pos_ned: np.ndarray,
         drone_rpy_rad: np.ndarray,
         frame_id: Optional[int] = None,
+        gazebo_pose=None,
+        image_wall_time: Optional[float] = None,
+        image_ros_stamp_sec: Optional[int] = None,
+        image_ros_stamp_nanosec: Optional[int] = None,
+        attitude_wall_time: Optional[float] = None,
+        position_wall_time: Optional[float] = None,
     ) -> list[dict[str, Any]]:
         drone_rpy_used = self._perception_rpy(drone_rpy_rad)
         projected = [
@@ -365,6 +546,12 @@ class PerceptionWrapper:
                 camera_translation_body=self.camera_translation_body,
                 object_points_m=self.object_points_m,
                 frame_id=frame_id,
+                gazebo_pose=gazebo_pose,
+                image_wall_time=image_wall_time,
+                image_ros_stamp_sec=image_ros_stamp_sec,
+                image_ros_stamp_nanosec=image_ros_stamp_nanosec,
+                attitude_wall_time=attitude_wall_time,
+                position_wall_time=position_wall_time,
             )
         except Exception as exc:
             print(f"[GEOM_AUDIT] disabled_after_error={exc}", flush=True)
@@ -524,6 +711,23 @@ class PerceptionWrapper:
                 detection.get("camera_translation_body_used"),
                 default=None,
             ),
+            "gazebo_camera_pos_neu": self._vec3(
+                detection.get("gazebo_camera_pos_neu"),
+                default=None,
+            ),
+            "gazebo_camera_pos_world": self._vec3(
+                detection.get("gazebo_camera_pos_world"),
+                default=None,
+            ),
+            "gazebo_camera_quat_world": self._quat4(
+                detection.get("gazebo_camera_quat_world")
+            ),
+            "gazebo_pose_wall_time": self._float_or_none(
+                detection.get("gazebo_pose_wall_time")
+            ),
+            "gazebo_pose_selection_method": str(
+                detection.get("gazebo_pose_selection_method", "")
+            ),
             "camera_to_body_matrix_used": self.camera_to_body.copy(),
             "body_to_world_method_used": detection.get("body_to_world_method_used", ""),
         }
@@ -586,6 +790,165 @@ class PerceptionWrapper:
         if math.isfinite(out) or (allow_nan and math.isnan(out)):
             return out
         return float(default)
+
+    @staticmethod
+    def _float_or_none(value) -> Optional[float]:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) else None
+
+    @staticmethod
+    def _int_or_none(value) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _wall_time(cls, source) -> Optional[float]:
+        if not isinstance(source, dict):
+            return None
+        return cls._float_or_none(source.get("wall_time"))
+
+    def _gazebo_camera_pose_ok(self, gazebo_pose) -> tuple[bool, str]:
+        if not isinstance(gazebo_pose, dict):
+            return False, "missing_pose"
+        if self._vec3(gazebo_pose.get("gazebo_camera_pos_world"), default=None) is None:
+            return False, "missing_camera_position"
+        if self._quat4(gazebo_pose.get("gazebo_camera_quat_world")) is None:
+            return False, "missing_camera_quaternion"
+        age_s = self._gazebo_pose_age_s(gazebo_pose)
+        max_age_s = float(self.gazebo_camera_sim_max_pose_age_s)
+        if max_age_s > 0.0 and (not math.isfinite(age_s) or age_s > max_age_s):
+            return False, f"stale_pose_age_s={age_s:.3f}"
+        return True, ""
+
+    def _maybe_warn_gazebo_camera_sim(self, message: str) -> None:
+        now_s = time.monotonic()
+        if now_s - self._last_gazebo_camera_sim_warning_s < 1.0:
+            return
+        self._last_gazebo_camera_sim_warning_s = now_s
+        print(f"[perception_wrapper] {message}", flush=True)
+
+    def _world_from_camera_gazebo(
+        self,
+        gate_camera: np.ndarray,
+        gazebo_pose: dict[str, Any],
+    ) -> Optional[np.ndarray]:
+        camera_pos = self._vec3(gazebo_pose.get("gazebo_camera_pos_world"), default=None)
+        camera_quat = self._quat4(gazebo_pose.get("gazebo_camera_quat_world"))
+        if camera_pos is None or camera_quat is None:
+            return None
+        point_body = self._camera_optical_to_gazebo_body(gate_camera)
+        if not np.all(np.isfinite(point_body)):
+            return None
+        r_wc = self._quat_to_rotmat(camera_quat)
+        if self.gazebo_rotation_mode == "transpose":
+            rel_world = r_wc @ point_body
+        else:
+            rel_world = r_wc.T @ point_body
+        return self._gazebo_world_to_neu(camera_pos + rel_world)
+
+    def _vector_from_camera_gazebo(
+        self,
+        vector_camera: np.ndarray,
+        gazebo_pose: dict[str, Any],
+    ) -> Optional[np.ndarray]:
+        camera_quat = self._quat4(gazebo_pose.get("gazebo_camera_quat_world"))
+        if camera_quat is None:
+            return None
+        vector_body = self._camera_optical_to_gazebo_body(vector_camera)
+        if not np.all(np.isfinite(vector_body)):
+            return None
+        r_wc = self._quat_to_rotmat(camera_quat)
+        if self.gazebo_rotation_mode == "transpose":
+            vector_world = r_wc @ vector_body
+        else:
+            vector_world = r_wc.T @ vector_body
+        return self._gazebo_world_to_neu(vector_world)
+
+    def _camera_optical_to_gazebo_body(self, point_camera: np.ndarray) -> np.ndarray:
+        camera = np.asarray(point_camera, dtype=float).reshape(3)
+        if self.gazebo_optical_mode in ("current", "flip_y"):
+            if self.gazebo_optical_mode == "flip_y":
+                camera = camera.copy()
+                camera[1] *= -1.0
+            r_body_camera = np.array(
+                [
+                    [0.0, 0.0, 1.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, -1.0, 0.0],
+                ],
+                dtype=float,
+            )
+            return r_body_camera @ camera
+        if self.gazebo_optical_mode == "physical":
+            return np.array([camera[2], camera[0], -camera[1]], dtype=float)
+        if self.gazebo_optical_mode == "physical_minus_y":
+            return np.array([camera[2], -camera[0], -camera[1]], dtype=float)
+        return np.full(3, np.nan, dtype=float)
+
+    @staticmethod
+    def _gazebo_world_to_neu(point_gazebo: np.ndarray) -> np.ndarray:
+        gazebo = np.asarray(point_gazebo, dtype=float).reshape(3)
+        return np.array([gazebo[1], gazebo[0], gazebo[2]], dtype=float)
+
+    @classmethod
+    def _quat4(cls, value) -> Optional[np.ndarray]:
+        if value is None:
+            return None
+        try:
+            quat = np.asarray(value, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            return None
+        if quat.size < 4:
+            return None
+        quat = quat[:4].astype(float).copy()
+        norm = float(np.linalg.norm(quat))
+        if not math.isfinite(norm) or norm <= 1e-12:
+            return None
+        quat /= norm
+        if not np.all(np.isfinite(quat)):
+            return None
+        return quat
+
+    @staticmethod
+    def _quat_to_rotmat(quat_xyzw: np.ndarray) -> np.ndarray:
+        x, y, z, w = np.asarray(quat_xyzw, dtype=float).reshape(4)
+        return np.array(
+            [
+                [
+                    1.0 - 2.0 * (y * y + z * z),
+                    2.0 * (x * y - z * w),
+                    2.0 * (x * z + y * w),
+                ],
+                [
+                    2.0 * (x * y + z * w),
+                    1.0 - 2.0 * (x * x + z * z),
+                    2.0 * (y * z - x * w),
+                ],
+                [
+                    2.0 * (x * z - y * w),
+                    2.0 * (y * z + x * w),
+                    1.0 - 2.0 * (x * x + y * y),
+                ],
+            ],
+            dtype=float,
+        )
+
+    @staticmethod
+    def _gazebo_pose_age_s(gazebo_pose) -> float:
+        if not isinstance(gazebo_pose, dict):
+            return math.nan
+        try:
+            stamp = float(gazebo_pose.get("gazebo_pose_wall_time"))
+        except (TypeError, ValueError):
+            return math.nan
+        if not math.isfinite(stamp):
+            return math.nan
+        return time.time() - stamp
 
     @staticmethod
     def _fmt_array(value, precision: int = 3) -> str:

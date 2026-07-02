@@ -44,6 +44,7 @@ class PerceptionAdapter:
                     "attitude": self.data.get("attitude"),
                     "odometry": self.data.get("odometry"),
                     "local_position_ned": self.data.get("local_position_ned"),
+                    "gazebo_pose": self.data.get("latest_gazebo_pose"),
                 }
 
         return {
@@ -51,6 +52,7 @@ class PerceptionAdapter:
             "attitude": self.data.get("attitude"),
             "odometry": self.data.get("odometry"),
             "local_position_ned": self.data.get("local_position_ned"),
+            "gazebo_pose": self.data.get("latest_gazebo_pose"),
         }
 
     def _write_perception(self, latest_perception, status):
@@ -108,6 +110,7 @@ class PerceptionAdapter:
                     attitude=inputs["attitude"],
                     odometry=inputs["odometry"],
                     local_position_ned=inputs["local_position_ned"],
+                    gazebo_pose=inputs["gazebo_pose"],
                 )
                 status = "ok"
             except Exception as exc:

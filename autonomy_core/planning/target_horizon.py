@@ -90,7 +90,11 @@ def _append_planning_lookahead_targets(
                 api.horizon_rejection_reason = "lookahead_completed_this_lap"
                 api.horizon_track_decisions[track_id] = "excluded:lookahead_completed_this_lap"
                 continue
-            if any(float(np.linalg.norm(center - p)) < api.gate_memory.commit_radius for p in existing_points):
+            duplicate_radius = max(
+                float(api.gate_memory.commit_radius),
+                float(getattr(api.gate_memory, "duplicate_merge_radius", 0.0)),
+            )
+            if any(float(np.linalg.norm(center - p)) < duplicate_radius for p in existing_points):
                 api.horizon_rejected_track_ids.append(track_id)
                 api.horizon_rejection_reason = "lookahead_duplicate_selected"
                 api.horizon_track_decisions[track_id] = "excluded:lookahead_duplicate_selected"
@@ -147,7 +151,11 @@ def _append_planning_lookahead_targets(
             if api.is_near_completed_gate(center):
                 api.horizon_rejection_reason = "raw_lookahead_completed_this_lap"
                 continue
-            if any(float(np.linalg.norm(center - p)) < api.gate_memory.commit_radius for p in existing_points):
+            duplicate_radius = max(
+                float(api.gate_memory.commit_radius),
+                float(getattr(api.gate_memory, "duplicate_merge_radius", 0.0)),
+            )
+            if any(float(np.linalg.norm(center - p)) < duplicate_radius for p in existing_points):
                 api.horizon_rejection_reason = "raw_lookahead_duplicate_selected"
                 continue
             if float(np.linalg.norm(center - current_pos)) > api.max_detection_range:

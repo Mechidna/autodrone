@@ -10,6 +10,10 @@ class GateObservation:
     center_camera: Optional[np.ndarray] = None
     reprojection_error: float = float("nan")
     confidence: float = 0.0
+    keypoint_conf_min: float = float("nan")
+    keypoint_conf_mean: float = float("nan")
+    quality_ok: bool = True
+    quality_reason: str = ""
     solver_name: str = ""
     active_gate_idx: Optional[int] = None
     hit_index: int = 0
@@ -52,6 +56,10 @@ class GateTrack:
         timestamp: float,
         center_camera: Optional[np.ndarray] = None,
         reprojection_error: float = float("nan"),
+        keypoint_conf_min: float = float("nan"),
+        keypoint_conf_mean: float = float("nan"),
+        quality_ok: bool = True,
+        quality_reason: str = "",
         solver_name: str = "",
         active_gate_idx: Optional[int] = None,
         history_size: int = 15,
@@ -74,6 +82,10 @@ class GateTrack:
             center_camera=None if camera is None else camera.copy(),
             reprojection_error=float(reprojection_error),
             confidence=float(confidence),
+            keypoint_conf_min=float(keypoint_conf_min),
+            keypoint_conf_mean=float(keypoint_conf_mean),
+            quality_ok=bool(quality_ok),
+            quality_reason=str(quality_reason or ""),
             solver_name=str(solver_name or ""),
             active_gate_idx=active_gate_idx,
             hit_index=int(self.hits),
@@ -93,6 +105,10 @@ class GateTrack:
         alpha: float = 0.35,
         center_camera: Optional[np.ndarray] = None,
         reprojection_error: float = float("nan"),
+        keypoint_conf_min: float = float("nan"),
+        keypoint_conf_mean: float = float("nan"),
+        quality_ok: bool = True,
+        quality_reason: str = "",
         solver_name: str = "",
         active_gate_idx: Optional[int] = None,
         history_size: int = 15,
@@ -104,6 +120,10 @@ class GateTrack:
             timestamp=timestamp,
             center_camera=center_camera,
             reprojection_error=reprojection_error,
+            keypoint_conf_min=keypoint_conf_min,
+            keypoint_conf_mean=keypoint_conf_mean,
+            quality_ok=quality_ok,
+            quality_reason=quality_reason,
             solver_name=solver_name,
             active_gate_idx=active_gate_idx,
             history_size=history_size,
@@ -121,6 +141,10 @@ class GateTrack:
         timestamp: float,
         center_camera: Optional[np.ndarray] = None,
         reprojection_error: float = float("nan"),
+        keypoint_conf_min: float = float("nan"),
+        keypoint_conf_mean: float = float("nan"),
+        quality_ok: bool = True,
+        quality_reason: str = "",
         solver_name: str = "",
         active_gate_idx: Optional[int] = None,
         history_size: int = 15,
@@ -137,6 +161,10 @@ class GateTrack:
             timestamp=timestamp,
             center_camera=center_camera,
             reprojection_error=reprojection_error,
+            keypoint_conf_min=keypoint_conf_min,
+            keypoint_conf_mean=keypoint_conf_mean,
+            quality_ok=quality_ok,
+            quality_reason=quality_reason,
             solver_name=solver_name,
             active_gate_idx=active_gate_idx,
             history_size=history_size,
@@ -191,6 +219,7 @@ class GateMemory:
         max_center_std_for_stable: float = 0.35,
         max_camera_std_for_stable: float = 0.35,
         max_reprojection_error_for_stable: float = 5.0,
+        min_keypoint_conf_for_stable: float = 0.0,
         max_outlier_distance: float = 0.75,
         min_observation_time: float = 0.25,
     ):
@@ -209,6 +238,7 @@ class GateMemory:
         self.max_center_std_for_stable = float(max_center_std_for_stable)
         self.max_camera_std_for_stable = float(max_camera_std_for_stable)
         self.max_reprojection_error_for_stable = float(max_reprojection_error_for_stable)
+        self.min_keypoint_conf_for_stable = float(min_keypoint_conf_for_stable)
         self.max_outlier_distance = float(max_outlier_distance)
         self.min_observation_time = float(min_observation_time)
         self.max_committed_match_distance = 0.8  # meters (start here)
@@ -313,6 +343,10 @@ class GateMemory:
         timestamp: float,
         center_camera: Optional[np.ndarray] = None,
         reprojection_error: float = float("nan"),
+        keypoint_conf_min: float = float("nan"),
+        keypoint_conf_mean: float = float("nan"),
+        quality_ok: bool = True,
+        quality_reason: str = "",
         solver_name: str = "",
         active_gate_idx: Optional[int] = None,
     ) -> GateTrack:
@@ -335,6 +369,10 @@ class GateMemory:
             timestamp=timestamp,
             center_camera=center_camera,
             reprojection_error=reprojection_error,
+            keypoint_conf_min=keypoint_conf_min,
+            keypoint_conf_mean=keypoint_conf_mean,
+            quality_ok=quality_ok,
+            quality_reason=quality_reason,
             solver_name=solver_name,
             active_gate_idx=active_gate_idx,
             history_size=self.history_size,
@@ -358,6 +396,12 @@ class GateMemory:
 
     def _maybe_commit(self, tr: GateTrack):
         if tr.committed:
+            return
+
+        quality_obs = [
+            obs for obs in tr.obs_history if bool(obs.quality_ok) and not bool(obs.is_outlier)
+        ]
+        if len(quality_obs) < self.commit_hits:
             return
 
         if tr.hits < self.commit_hits:
@@ -405,9 +449,26 @@ class GateMemory:
             tr.promotion_blocked_reason = "no_observations"
             return
 
-        filter_observations = [obs for obs in observations if not obs.is_outlier]
+        quality_observations = [obs for obs in observations if bool(obs.quality_ok)]
+        if len(quality_observations) == 0:
+            tr.inlier_count = 0
+            tr.outlier_count = sum(1 for obs in tr.obs_history if obs.is_outlier)
+            tr.filtered_center_world = tr.center.copy()
+            tr.filtered_center_camera = None
+            tr.center_world_std = np.full(3, np.nan)
+            tr.center_camera_std = np.full(3, np.nan)
+            tr.reprojection_error_mean = float("nan")
+            tr.reprojection_error_median = float("nan")
+            tr.promotion_blocked_reason = "no_quality_observations"
+            tr.is_stable = False
+            tr.stability_score = 0.0
+            return
+
+        filter_observations = [
+            obs for obs in quality_observations if not bool(obs.is_outlier)
+        ]
         if len(filter_observations) == 0:
-            filter_observations = observations
+            filter_observations = quality_observations
 
         world = np.asarray([obs.center_world for obs in filter_observations], dtype=float)
         median_world = np.median(world, axis=0)
@@ -449,25 +510,37 @@ class GateMemory:
             tr.reprojection_error_mean = float("nan")
             tr.reprojection_error_median = float("nan")
 
-        span = float(observations[-1].timestamp - observations[0].timestamp)
+        span_observations = inlier_obs if len(inlier_obs) > 0 else quality_observations
+        span = float(span_observations[-1].timestamp - span_observations[0].timestamp)
         world_std_norm = float(np.linalg.norm(tr.center_world_std)) if np.all(np.isfinite(tr.center_world_std)) else float("inf")
-        camera_std_norm = (
-            float(np.linalg.norm(tr.center_camera_std))
-            if np.all(np.isfinite(tr.center_camera_std))
-            else 0.0
-        )
         reproj = tr.reprojection_error_median
         reproj_ok = not np.isfinite(reproj) or reproj <= self.max_reprojection_error_for_stable
+        min_kp_conf = float("nan")
+        stable_obs = inlier_obs[-max(1, self.min_hits_for_stable):]
+        kp_conf = [
+            float(obs.keypoint_conf_min)
+            for obs in stable_obs
+            if np.isfinite(obs.keypoint_conf_min)
+        ]
+        if kp_conf:
+            min_kp_conf = float(min(kp_conf))
+        kp_conf_ok = (
+            self.min_keypoint_conf_for_stable <= 0.0
+            or (
+                len(kp_conf) >= min(self.min_hits_for_stable, len(stable_obs))
+                and min_kp_conf >= self.min_keypoint_conf_for_stable
+            )
+        )
 
         reason = ""
         if tr.hits < self.min_hits_for_stable:
             reason = "insufficient_hits"
         elif tr.inlier_count < self.min_hits_for_stable:
             reason = "insufficient_inliers"
+        elif not kp_conf_ok:
+            reason = "keypoint_conf_low"
         elif world_std_norm > self.max_center_std_for_stable:
             reason = "center_std_high"
-        elif camera_std_norm > self.max_camera_std_for_stable:
-            reason = "camera_std_high"
         elif not reproj_ok:
             reason = "reprojection_error_high"
         elif span < self.min_observation_time:
@@ -498,12 +571,13 @@ class GateMemory:
             self.last_track_state_change = "stable"
             print(
                 f"TRACK {tr.id} stable: hits={tr.hits} std={world_std_norm:.2f} "
-                f"reproj={tr.reprojection_error_median:.2f} score={tr.stability_score:.2f}"
+                f"reproj={tr.reprojection_error_median:.2f} "
+                f"kp={min_kp_conf:.2f} score={tr.stability_score:.2f}"
             )
         elif not tr.is_stable and tr.promotion_blocked_reason:
             print(
                 f"TRACK {tr.id} tentative: hits={tr.hits} std={world_std_norm:.2f} "
-                f"blocked={tr.promotion_blocked_reason}"
+                f"kp={min_kp_conf:.2f} blocked={tr.promotion_blocked_reason}"
             )
 
     def merge_track_into(self, source_id: int, target_id: int, reason: str = "duplicate_committed_track"):
@@ -616,8 +690,12 @@ class GateMemory:
         timestamp: float,
         center_camera: Optional[np.ndarray] = None,
         reprojection_error: float = float("nan"),
+        keypoint_conf_min: float = float("nan"),
+        keypoint_conf_mean: float = float("nan"),
         solver_name: str = "",
         active_gate_idx: Optional[int] = None,
+        quality_ok: bool = True,
+        quality_reason: str = "",
     ):
         """
         Add a new world-frame gate center measurement.
@@ -656,6 +734,16 @@ class GateMemory:
                 "center": center,
             }
 
+        if not bool(quality_ok):
+            return {
+                "accepted": False,
+                "reason": f"quality_rejected:{quality_reason or 'unknown'}",
+                "track_id": None,
+                "committed_now": False,
+                "committed": False,
+                "center": center,
+            }
+
         nearest = self._record_nearest_track_debug(center)
 
         # 1) Prefer matching an existing committed landmark
@@ -683,6 +771,10 @@ class GateMemory:
                     timestamp,
                     center_camera=center_camera,
                     reprojection_error=reprojection_error,
+                    keypoint_conf_min=keypoint_conf_min,
+                    keypoint_conf_mean=keypoint_conf_mean,
+                    quality_ok=quality_ok,
+                    quality_reason=quality_reason,
                     solver_name=solver_name,
                     active_gate_idx=active_gate_idx,
                     history_size=self.history_size,
@@ -713,6 +805,10 @@ class GateMemory:
                         timestamp,
                         center_camera=center_camera,
                         reprojection_error=reprojection_error,
+                        keypoint_conf_min=keypoint_conf_min,
+                        keypoint_conf_mean=keypoint_conf_mean,
+                        quality_ok=quality_ok,
+                        quality_reason=quality_reason,
                         solver_name=solver_name,
                         active_gate_idx=active_gate_idx,
                         history_size=self.history_size,
@@ -763,6 +859,10 @@ class GateMemory:
                 alpha=self.alpha,
                 center_camera=center_camera,
                 reprojection_error=reprojection_error,
+                keypoint_conf_min=keypoint_conf_min,
+                keypoint_conf_mean=keypoint_conf_mean,
+                quality_ok=quality_ok,
+                quality_reason=quality_reason,
                 solver_name=solver_name,
                 active_gate_idx=active_gate_idx,
                 history_size=self.history_size,
@@ -813,6 +913,10 @@ class GateMemory:
             timestamp,
             center_camera=center_camera,
             reprojection_error=reprojection_error,
+            keypoint_conf_min=keypoint_conf_min,
+            keypoint_conf_mean=keypoint_conf_mean,
+            quality_ok=quality_ok,
+            quality_reason=quality_reason,
             solver_name=solver_name,
             active_gate_idx=active_gate_idx,
         )

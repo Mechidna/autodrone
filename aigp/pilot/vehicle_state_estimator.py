@@ -149,6 +149,12 @@ class VehicleStateEstimator:
         if not detections:
             return latest_perception
 
+        if self._perception_world_pose_source(latest_perception) == "gazebo_camera_sim":
+            projected = dict(latest_perception)
+            projected["world_frame"] = "gazebo_camera_sim_neu"
+            projected["world_pose_source"] = "gazebo_camera_sim"
+            return projected
+
         camera_translation_body = self._vec3(
             latest_perception.get("camera_translation_body")
         )
@@ -328,6 +334,18 @@ class VehicleStateEstimator:
             return self._prefer_visual_odometry_no_correction(
                 visual_odometry_correction,
                 "no_detections",
+                visual_now,
+            )
+
+        if self._perception_world_pose_source(latest_perception) == "gazebo_camera_sim":
+            visual_odometry_correction = self._apply_preferred_visual_odometry(
+                feature_vo_measurement,
+                temporal_vo_measurement,
+                visual_now,
+            )
+            return self._prefer_visual_odometry_no_correction(
+                visual_odometry_correction,
+                "gazebo_camera_sim_world_pose",
                 visual_now,
             )
 
@@ -689,6 +707,12 @@ class VehicleStateEstimator:
             False,
         )
         return merged
+
+    @staticmethod
+    def _perception_world_pose_source(latest_perception) -> str:
+        if not isinstance(latest_perception, dict):
+            return ""
+        return str(latest_perception.get("world_pose_source", "")).lower()
 
     def _apply_visual_filter_update(
         self,
