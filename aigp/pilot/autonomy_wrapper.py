@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
 import math
+import os
+import re
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -26,6 +31,9 @@ from runtime_config import load_runtime_config
 from target_manager import TargetManager
 from thrust_scale_calibration import ThrustScaleCalibration
 from vehicle_state_estimator import VehicleStateEstimator
+
+
+GATE_MODEL_RE = re.compile(r"^racing_gate_(\d+)$")
 
 
 @dataclass(frozen=True)
@@ -369,6 +377,7 @@ class PyAIPilotAutonomyAPI:
         self._last_stable_gate_print_signature = None
         self._last_race_order_print_signature = None
         self._last_race_order_duplicate_signature = None
+        self._last_race_order_suffix_filter_signature = None
         self._last_race_order_front_blocker_signature = None
         self._last_race_order_closer_blocker_signature = None
         self._last_target_reject_signature = None
@@ -404,6 +413,7 @@ class PyAIPilotAutonomyAPI:
             f"allow_ground_truth={int(bool(self.config.gate_source.allow_ground_truth))}",
             flush=True,
         )
+        self._trace_canonical_gate_poses_from_active_world()
 
         self.planner = MultiSegmentMinimumSnapPlanner()
         self.tracker = RPGHighLevelTracker(
@@ -1739,6 +1749,31 @@ class PyAIPilotAutonomyAPI:
         )
         return planner
 
+    def _sample_planner_path_text(
+        self,
+        planner: MultiSegmentMinimumSnapPlanner,
+        *,
+        sample_count: int = 120,
+    ) -> str:
+        try:
+            total_time = float(planner.total_time)
+        except (TypeError, ValueError):
+            return "none"
+        if not math.isfinite(total_time) or total_time <= 0.0:
+            return "none"
+        count = max(2, min(200, int(sample_count)))
+        samples = []
+        for tau in np.linspace(0.0, total_time, count):
+            try:
+                position, _, _ = planner.sample(float(tau))
+            except Exception:
+                return "none"
+            point = np.asarray(position, dtype=float).reshape(3)
+            if not np.all(np.isfinite(point)):
+                return "none"
+            samples.append(self._fmt_vec(point, precision=3))
+        return "[" + ";".join(samples) + "]"
+
     def _validate_active_gate_plan_crossing(
         self,
         *,
@@ -2194,6 +2229,7 @@ class PyAIPilotAutonomyAPI:
             self._fmt_vec(waypoint, precision=3) for waypoint in waypoints
         ) + "]"
         times_txt = "(" + ",".join(f"{float(item):.3f}" for item in times) + ")"
+        plan_samples_txt = self._sample_planner_path_text(self.planner)
         horizon_tracks_txt = "(" + ",".join(
             str(track_id) if track_id is not None else "none"
             for track_id in horizon_track_ids
@@ -2223,7 +2259,8 @@ class PyAIPilotAutonomyAPI:
             f"terminal_policy={terminal_policy} "
             f"waypoint_velocities_neu={waypoint_velocities_txt} "
             f"times_s={times_txt} "
-            f"waypoints_neu={waypoints_txt}",
+            f"waypoints_neu={waypoints_txt} "
+            f"plan_samples_neu={plan_samples_txt}",
             flush=True,
         )
         return True
@@ -2389,6 +2426,7 @@ class PyAIPilotAutonomyAPI:
             self._fmt_vec(waypoint, precision=3) for waypoint in waypoints
         ) + "]"
         times_txt = "(" + ",".join(f"{float(item):.3f}" for item in times) + ")"
+        plan_samples_txt = self._sample_planner_path_text(self.planner)
         nearest_plausible = details.get(
             "nearest_plausible_distance",
             details.get("nearest_stable_distance", float("inf")),
@@ -2409,6 +2447,7 @@ class PyAIPilotAutonomyAPI:
             f"terminal_policy={terminal_policy} "
             f"times_s={times_txt} "
             f"waypoints_neu={waypoints_txt} "
+            f"plan_samples_neu={plan_samples_txt} "
             f"hits={self._fmt_float(details.get('hits'), precision=0)} "
             f"age_s={self._fmt_float(details.get('age_s'), precision=2)} "
             f"reproj={self._fmt_float(details.get('reproj'), precision=2)} "
@@ -2883,6 +2922,220 @@ class PyAIPilotAutonomyAPI:
             self._last_ground_truth_gate_print_signature = signature
         return gates
 
+    def _trace_canonical_gate_poses_from_active_world(self) -> None:
+        if str(self.config.runtime.runner_mode).lower() == "competition":
+            return
+        world_sdf = self._resolve_active_world_sdf()
+        if world_sdf is None:
+            return
+        poses = self._canonical_gate_pose_records_from_sdf(world_sdf)
+        if not poses:
+            return
+        payload = {
+            "source": "sdf",
+            "world_sdf": str(world_sdf),
+            "poses": poses,
+        }
+        print(
+            "canonical_gate_poses "
+            + json.dumps(payload, separators=(",", ":"), sort_keys=True),
+            flush=True,
+        )
+
+    def _resolve_active_world_sdf(self) -> Path | None:
+        names: list[str] = []
+        for env_name in ("AIGP_WORLD_SDF", "WORLD_SDF", "PX4_GZ_WORLD", "WORLD"):
+            value = os.environ.get(env_name)
+            if value:
+                names.append(value)
+
+        topic = str(
+            getattr(
+                self.config.perception_geometry_audit,
+                "gazebo_dynamic_pose_topic",
+                "",
+            )
+            or ""
+        )
+        match = re.match(r"^/world/([^/]+)/", topic)
+        if match:
+            names.append(match.group(1))
+
+        seen: set[Path] = set()
+        for value in names:
+            for candidate in self._world_sdf_candidates(value):
+                try:
+                    candidate = candidate.expanduser().resolve()
+                except OSError:
+                    candidate = candidate.expanduser()
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                if candidate.is_file():
+                    return candidate
+        return None
+
+    @staticmethod
+    def _world_sdf_candidates(value: str) -> list[Path]:
+        text = str(value).strip()
+        if not text:
+            return []
+
+        raw_path = Path(text).expanduser()
+        candidates: list[Path] = []
+        if raw_path.suffix == ".sdf" or raw_path.is_absolute() or "/" in text:
+            candidates.append(raw_path)
+            if raw_path.suffix != ".sdf":
+                candidates.append(raw_path.with_suffix(".sdf"))
+
+        world_name = raw_path.stem if raw_path.suffix == ".sdf" else raw_path.name
+        if world_name and "/" not in world_name:
+            world_roots = (
+                Path.home()
+                / "PX4-Autopilot"
+                / "PX4-Autopilot"
+                / "Tools"
+                / "simulation"
+                / "gz"
+                / "worlds",
+                Path.home()
+                / "PX4-Autopilot"
+                / "Tools"
+                / "simulation"
+                / "gz"
+                / "worlds",
+            )
+            candidates.extend(root / f"{world_name}.sdf" for root in world_roots)
+        return candidates
+
+    def _canonical_gate_pose_records_from_sdf(self, world_sdf: Path) -> list[dict[str, object]]:
+        try:
+            root = ET.parse(world_sdf).getroot()
+        except (OSError, ET.ParseError):
+            return []
+
+        records: list[dict[str, object]] = []
+        models = []
+        for model in root.findall(".//model"):
+            name = str(model.get("name") or "")
+            match = GATE_MODEL_RE.match(name)
+            if not match:
+                continue
+            pose = model.find("pose")
+            if pose is None:
+                continue
+            pose_values = self._parse_sdf_pose_values(pose.text)
+            if pose_values is None:
+                continue
+            models.append((int(match.group(1)), name, pose_values))
+
+        models.sort(key=lambda item: item[0])
+        if self.race_gate_count is not None:
+            models = models[: max(0, int(self.race_gate_count))]
+
+        for order, (sdf_gate_index, model_name, pose_values) in enumerate(models):
+            record = self._canonical_gate_pose_record_from_sdf_pose(
+                gate_id=order,
+                sdf_gate_index=sdf_gate_index,
+                model_name=model_name,
+                pose_values=pose_values,
+            )
+            if record is not None:
+                records.append(record)
+        return records
+
+    @staticmethod
+    def _parse_sdf_pose_values(text: str | None) -> tuple[float, float, float, float, float, float] | None:
+        if text is None:
+            return None
+        try:
+            values = tuple(float(part) for part in str(text).split())
+        except ValueError:
+            return None
+        if len(values) != 6 or not all(math.isfinite(value) for value in values):
+            return None
+        return values
+
+    @staticmethod
+    def _canonical_gate_pose_record_from_sdf_pose(
+        *,
+        gate_id: int,
+        sdf_gate_index: int,
+        model_name: str,
+        pose_values: tuple[float, float, float, float, float, float],
+    ) -> dict[str, object] | None:
+        x_m, y_m, z_m, roll_rad, pitch_rad, yaw_rad = pose_values
+        rot = PyAIPilotAutonomyAPI._sdf_rpy_rotmat(roll_rad, pitch_rad, yaw_rad)
+        local_center_sdf = np.array(
+            [0.0, 0.0, float(VADR_TS_002.gate_outer_half_extent_m)],
+            dtype=float,
+        )
+        center_sdf = np.array([x_m, y_m, z_m], dtype=float) + rot @ local_center_sdf
+        normal_sdf = rot @ np.array([1.0, 0.0, 0.0], dtype=float)
+        right_sdf = rot @ np.array([0.0, 1.0, 0.0], dtype=float)
+        up_sdf = rot @ np.array([0.0, 0.0, 1.0], dtype=float)
+
+        center_neu = PyAIPilotAutonomyAPI._sdf_vec_to_neu(center_sdf)
+        normal_neu = PyAIPilotAutonomyAPI._unit_vec(
+            PyAIPilotAutonomyAPI._sdf_vec_to_neu(normal_sdf)
+        )
+        right_neu = PyAIPilotAutonomyAPI._unit_vec(
+            PyAIPilotAutonomyAPI._sdf_vec_to_neu(right_sdf)
+        )
+        up_neu = PyAIPilotAutonomyAPI._unit_vec(
+            PyAIPilotAutonomyAPI._sdf_vec_to_neu(up_sdf)
+        )
+        if normal_neu is None or right_neu is None or up_neu is None:
+            return None
+
+        return {
+            "id": int(gate_id),
+            "sdf_gate_index": int(sdf_gate_index),
+            "sdf_model": str(model_name),
+            "center_neu": PyAIPilotAutonomyAPI._json_vec(center_neu),
+            "right_axis_neu": PyAIPilotAutonomyAPI._json_vec(right_neu),
+            "up_axis_neu": PyAIPilotAutonomyAPI._json_vec(up_neu),
+            "normal_neu": PyAIPilotAutonomyAPI._json_vec(normal_neu),
+            "sdf_pose": [float(value) for value in pose_values],
+        }
+
+    @staticmethod
+    def _sdf_rpy_rotmat(roll: float, pitch: float, yaw: float) -> np.ndarray:
+        cr, sr = math.cos(float(roll)), math.sin(float(roll))
+        cp, sp = math.cos(float(pitch)), math.sin(float(pitch))
+        cy, sy = math.cos(float(yaw)), math.sin(float(yaw))
+        rx = np.array(
+            [[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]],
+            dtype=float,
+        )
+        ry = np.array(
+            [[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]],
+            dtype=float,
+        )
+        rz = np.array(
+            [[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]],
+            dtype=float,
+        )
+        return rz @ ry @ rx
+
+    @staticmethod
+    def _sdf_vec_to_neu(value) -> np.ndarray:
+        arr = np.asarray(value, dtype=float).reshape(3)
+        return np.array([arr[1], arr[0], arr[2]], dtype=float)
+
+    @staticmethod
+    def _unit_vec(value) -> np.ndarray | None:
+        arr = np.asarray(value, dtype=float).reshape(3)
+        norm = float(np.linalg.norm(arr))
+        if not math.isfinite(norm) or norm <= 1e-9:
+            return None
+        return arr / norm
+
+    @staticmethod
+    def _json_vec(value) -> list[float]:
+        arr = np.asarray(value, dtype=float).reshape(-1)
+        return [float(item) for item in arr]
+
     def _stable_gate_landmarks_neu(self) -> list[dict[str, object]]:
         return self.estimator_landmark_map.update_from_tracks(
             self.gate_memory.get_stable_tracks()
@@ -3055,6 +3308,51 @@ class PyAIPilotAutonomyAPI:
             flush=True,
         )
 
+    def _trace_race_order_suffix_filter(self, skips: list[tuple]) -> None:
+        if not skips:
+            self._last_race_order_suffix_filter_signature = None
+            return
+
+        def rounded_dist(value):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return "nan"
+            return round(value, 2) if math.isfinite(value) else "nan"
+
+        signature = tuple(
+            (
+                int(track_id),
+                str(reason),
+                None if near_id is None else int(near_id),
+                rounded_dist(dist),
+            )
+            for track_id, reason, near_id, dist in skips[:8]
+        )
+        if signature == self._last_race_order_suffix_filter_signature:
+            return
+        self._last_race_order_suffix_filter_signature = signature
+
+        entries = []
+        for track_id, reason, near_id, dist in skips[:8]:
+            entry = f"skip={int(track_id)}:{reason}"
+            if near_id is not None:
+                entry += f":near={int(near_id)}"
+            try:
+                dist = float(dist)
+            except (TypeError, ValueError):
+                dist = float("nan")
+            if math.isfinite(dist):
+                entry += f":dist={dist:.2f}"
+            entries.append(entry)
+        extra = "" if len(skips) <= 8 else f" more={len(skips) - 8}"
+        print(
+            "race_order suffix_filter "
+            + " ".join(entries)
+            + extra,
+            flush=True,
+        )
+
     def _duplicate_center_match(
         self,
         center,
@@ -3141,11 +3439,6 @@ class PyAIPilotAutonomyAPI:
                 continue
             if track_id in accepted_ids:
                 continue
-            if (
-                self.race_gate_count is not None
-                and len(accepted_ids) >= self.race_gate_count
-            ):
-                break
             accept_track_id(track_id)
 
         if active_id is not None and active_id in committed_by_id:
@@ -3186,21 +3479,82 @@ class PyAIPilotAutonomyAPI:
 
         protected_duplicate_ids = list(completed_prefix) + list(self.completed_track_ids)
         filtered_candidate_ids = []
-        for track_id in candidate_ids:
-            duplicate = self._race_order_duplicate_match_against_ids(
+        filtered_candidate_centers: list[tuple[int, np.ndarray]] = []
+        protected_candidate_centers: list[tuple[int, np.ndarray]] = []
+        suffix_filter_skips = []
+
+        def duplicate_guard_center(track_id: int) -> np.ndarray | None:
+            track_id = int(track_id)
+            if track_id not in committed_by_id:
+                return None
+            center = self._physical_navigation_center(
                 track_id,
-                protected_duplicate_ids + filtered_candidate_ids,
                 committed_by_id,
+                require_fresh=False,
+            )
+            if center is None:
+                center = self._race_order_track_center(track_id, committed_by_id)
+            return None if center is None else center.copy()
+
+        def future_suffix_center(track_id: int) -> tuple[np.ndarray | None, str]:
+            track_id = int(track_id)
+            if track_id not in committed_by_id:
+                return None, "missing_track"
+            center = self._physical_navigation_center(
+                track_id,
+                committed_by_id,
+                require_fresh=self.use_perception,
+            )
+            if center is None:
+                return None, "missing_fresh_center"
+            reject_reason = self._target_rejection_reason(center, track_id)
+            if reject_reason:
+                return None, reject_reason
+            return center.copy(), ""
+
+        for protected_id in protected_duplicate_ids:
+            protected_center = duplicate_guard_center(int(protected_id))
+            if protected_center is not None:
+                protected_candidate_centers.append((int(protected_id), protected_center))
+
+        for track_id in candidate_ids:
+            track_id = int(track_id)
+            is_active_candidate = active_id is not None and track_id == int(active_id)
+            if is_active_candidate:
+                center = duplicate_guard_center(track_id)
+                filtered_candidate_ids.append(track_id)
+                if center is not None:
+                    filtered_candidate_centers.append((track_id, center.copy()))
+                continue
+            else:
+                center, reason = future_suffix_center(track_id)
+                if center is None:
+                    suffix_filter_skips.append((track_id, reason, None, float("nan")))
+                    continue
+
+            duplicate_guard = protected_candidate_centers + filtered_candidate_centers
+            duplicate_centers = [item[1] for item in duplicate_guard]
+            duplicate = (
+                None
+                if center is None
+                else self._duplicate_center_match(center, duplicate_centers)
             )
             if duplicate is not None:
-                _, duplicate_id, dist = duplicate
+                duplicate_idx, dist = duplicate
+                duplicate_id = duplicate_guard[duplicate_idx][0]
                 duplicate_skips.append(
                     ("skip_completed", track_id, duplicate_id, dist)
                 )
+                suffix_filter_skips.append(
+                    (track_id, "duplicate_suffix_or_completed", duplicate_id, dist)
+                )
                 continue
             filtered_candidate_ids.append(track_id)
+            if center is not None:
+                filtered_candidate_centers.append((track_id, center.copy()))
         candidate_ids = filtered_candidate_ids
 
+        self._trace_race_order_suffix_filter(suffix_filter_skips)
         self._trace_race_order_duplicate_skips(duplicate_skips)
 
         self.pending_active_target_preempt_track_id = None

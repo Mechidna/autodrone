@@ -1,3 +1,4 @@
+import math
 import time
 
 import numpy as np
@@ -46,6 +47,33 @@ def _stable_track(
         )
     ]
     return track
+
+
+def test_canonical_gate_pose_record_converts_sdf_pose_to_neu_axes():
+    yaw0 = PyAIPilotAutonomyAPI._canonical_gate_pose_record_from_sdf_pose(
+        gate_id=0,
+        sdf_gate_index=1,
+        model_name="racing_gate_1",
+        pose_values=(10.0, 2.0, 3.0, 0.0, 0.0, 0.0),
+    )
+
+    assert yaw0 is not None
+    np.testing.assert_allclose(yaw0["center_neu"], [2.0, 10.0, 4.35])
+    np.testing.assert_allclose(yaw0["right_axis_neu"], [1.0, 0.0, 0.0])
+    np.testing.assert_allclose(yaw0["up_axis_neu"], [0.0, 0.0, 1.0])
+    np.testing.assert_allclose(yaw0["normal_neu"], [0.0, 1.0, 0.0])
+
+    yaw90 = PyAIPilotAutonomyAPI._canonical_gate_pose_record_from_sdf_pose(
+        gate_id=1,
+        sdf_gate_index=2,
+        model_name="racing_gate_2",
+        pose_values=(10.0, 2.0, 3.0, 0.0, 0.0, math.pi / 2.0),
+    )
+
+    assert yaw90 is not None
+    np.testing.assert_allclose(yaw90["center_neu"], [2.0, 10.0, 4.35])
+    np.testing.assert_allclose(yaw90["normal_neu"], [1.0, 0.0, 0.0], atol=1e-12)
+    np.testing.assert_allclose(yaw90["right_axis_neu"], [0.0, -1.0, 0.0], atol=1e-12)
 
 
 def test_gate_pass_advances_inside_existing_horizon():
@@ -133,6 +161,48 @@ def test_race_order_collapses_duplicate_suffix_tracks():
     gates, track_ids = api._ordered_perception_gates(committed_by_id)
     assert track_ids == [10, 11, 187]
     np.testing.assert_allclose(gates[api.current_gate_idx], better_duplicate.filtered_center_world)
+
+
+def test_race_order_prunes_stale_duplicate_suffix_before_gate_count_cap():
+    api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=10)
+    completed = [
+        _stable_track(5, np.array([-0.26, 32.80, 4.78])),
+        _stable_track(4, np.array([1.50, 59.30, 10.87])),
+        _stable_track(20, np.array([-1.96, 91.64, 10.32])),
+        _stable_track(56, np.array([-2.53, 121.77, 11.87])),
+        _stable_track(65, np.array([2.47, 150.72, 20.39])),
+        _stable_track(115, np.array([-0.72, 181.80, 19.47])),
+        _stable_track(127, np.array([2.37, 209.21, 18.29])),
+        _stable_track(151, np.array([-0.66, 240.27, 14.16])),
+    ]
+    active = _stable_track(202, np.array([-3.95, 275.03, 13.49]))
+    stale_duplicate = _stable_track(59, np.array([-2.53, 121.77, 11.87]))
+    stale_time = time.time() - float(api.gate_memory.stale_time) - 1.0
+    stale_duplicate.last_seen_time = stale_time
+    stale_duplicate.obs_history[-1].timestamp = stale_time
+    final_gate = _stable_track(225, np.array([-0.22, 301.05, 9.16]), hits=40)
+    api.gate_memory.tracks = [*completed, active, stale_duplicate, final_gate]
+    api.current_gate_idx = 8
+    api.active_target_track_id = 202
+    api.completed_track_ids = {track.id for track in completed}
+    api.race_order_track_ids = [*(track.id for track in completed), 202, 59]
+
+    committed_by_id = {
+        int(track.id): track for track in api.gate_memory.get_committed_tracks()
+    }
+    api._refresh_perception_race_order(
+        stable_tracks=api.gate_memory.get_stable_tracks(),
+        committed_by_id=committed_by_id,
+        current_pos=np.array([-3.0, 266.0, 13.4]),
+    )
+
+    assert len(api.race_order_track_ids) == api.race_gate_count
+    assert api.race_order_track_ids[api.current_gate_idx] == 202
+    assert api.race_order_track_ids[api.current_gate_idx + 1] == 225
+    assert 59 not in api.race_order_track_ids
+    gates, track_ids = api._ordered_perception_gates(committed_by_id)
+    assert track_ids[api.current_gate_idx + 1] == 225
+    np.testing.assert_allclose(gates[api.current_gate_idx + 1], final_gate.filtered_center_world)
 
 
 def test_planning_horizon_skips_duplicate_future_waypoint():

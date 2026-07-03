@@ -219,7 +219,7 @@ class HoverAcquisition:
                 else max(current_hover, self.initial_thrust)
             )
             self.command_thrust = self.hover_thrust
-            self.lift_confirmed = state_z >= self.relative_airborne_z_m
+            self.lift_confirmed = self.relative_airborne_z_m <= 0.0
             self.lift_confirmed_thrust = (
                 self.command_thrust if self.lift_confirmed else None
             )
@@ -237,7 +237,6 @@ class HoverAcquisition:
             self.initial_z if self.initial_z is not None else state_z
         )
         self._update_lift_confirmation(
-            state_z=state_z,
             z_rel_m=z_rel_m,
             vz_m_s=state_vz,
             command_thrust=self.command_thrust,
@@ -285,16 +284,31 @@ class HoverAcquisition:
             az_m_s2=az_m_s2,
         )
         timed_out = self.max_duration_s > 0.0 and elapsed_s >= self.max_duration_s
-        release_blocked = (
-            timed_out
-            and not self.release_on_timeout_while_unstable
-            and self._release_unsafe(z_rel_m=z_rel_m, vz_m_s=state_vz, overshoot=overshoot)
+        strict_timeout_release = timed_out and not self._release_unsafe(
+            z_rel_m=z_rel_m,
+            vz_m_s=state_vz,
+            overshoot=overshoot,
         )
-        if stable_time_s >= self.stable_duration_s or (timed_out and not release_blocked):
+        relaxed_timeout_release = (
+            timed_out
+            and self.release_on_timeout_while_unstable
+            and self._timeout_release_safe(
+                z_rel_m=z_rel_m,
+                vz_m_s=state_vz,
+                overshoot=overshoot,
+            )
+        )
+        timeout_release = strict_timeout_release or relaxed_timeout_release
+        if stable_time_s >= self.stable_duration_s or timeout_release:
             self.completed = True
-            status = "stable" if stable_time_s >= self.stable_duration_s else "timeout"
+            if stable_time_s >= self.stable_duration_s:
+                status = "stable"
+            elif relaxed_timeout_release and not strict_timeout_release:
+                status = "timeout_safe"
+            else:
+                status = "timeout"
             if timed_out and not self.lift_confirmed:
-                status = "timeout_lift_unconfirmed"
+                status = f"{status}_lift_unconfirmed"
             if stable_time_s >= self.stable_duration_s:
                 self.hover_thrust = self.command_thrust
             debug = self._debug(
@@ -324,7 +338,7 @@ class HoverAcquisition:
 
         if overshoot:
             status = "overshoot_recover"
-        elif release_blocked:
+        elif timed_out:
             status = "timeout_recovering"
         else:
             status = "seeking_lift" if not self.lift_confirmed else "settling"
@@ -423,6 +437,17 @@ class HoverAcquisition:
             return True
         return False
 
+    def _timeout_release_safe(self, *, z_rel_m: float, vz_m_s: float, overshoot: bool) -> bool:
+        if overshoot:
+            return False
+        if not math.isfinite(z_rel_m) or not math.isfinite(vz_m_s):
+            return False
+        if self.max_settle_vz_m_s > 0.0 and abs(vz_m_s) > self.max_settle_vz_m_s:
+            return False
+        if self.max_relative_z_m > 0.0 and z_rel_m > self.max_relative_z_m:
+            return False
+        return True
+
     def _stable_time(
         self,
         *,
@@ -475,7 +500,6 @@ class HoverAcquisition:
     def _update_lift_confirmation(
         self,
         *,
-        state_z: float,
         z_rel_m: float,
         vz_m_s: float,
         command_thrust: float,
@@ -483,7 +507,8 @@ class HoverAcquisition:
         if self.lift_confirmed:
             return
         self.lift_confirmed = (
-            state_z >= self.relative_airborne_z_m
+            self.relative_airborne_z_m <= 0.0
+            or z_rel_m >= self.relative_airborne_z_m
             or z_rel_m >= self.lift_confirm_z_m
             or vz_m_s >= self.lift_confirm_vz_m_s
         )

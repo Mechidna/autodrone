@@ -200,16 +200,16 @@ gazebo_camera_mount_rpy = [0.0, -0.3490658503988659, 0.0]
 gazebo_rotation_mode = "transpose"
 gazebo_optical_mode = "physical_minus_y"
 known_gate_positions_neu = [
-  [-0.061534, 29.665372, 4.113394],
-  [1.585332, 60.449254, 10.929463],
-  [-2.040347, 93.421399, 10.395199],
-  [-2.406968, 121.440150, 11.917446],
-  [2.647982, 153.000409, 20.743638],
-  [-0.774401, 181.070447, 19.334631],
-  [2.362300, 212.273024, 18.143769],
-  [-0.705327, 243.773001, 13.782656],
-  [-3.958353, 275.095294, 13.493975],
-  [-0.210331, 304.098806, 8.804799],
+  [0.042238, 13.172596, 2.669784],
+  [1.492108, 23.982963, 3.793709],
+  [-2.017717, 36.950165, 3.204085],
+  [2.456324, 48.215863, 3.039035],
+  [-0.232134, 59.381193, 4.153849],
+  [-3.364511, 71.455475, 3.119014],
+  [-3.249112, 83.560633, 3.740319],
+  [1.803893, 95.513014, 3.925673],
+  [0.755285, 108.372980, 5.344258],
+  [1.743604, 119.542202, 7.285128],
 ]
 gate_right_axis_neu = [1.0, 0.0, 0.0]
 gate_up_axis_neu = [0.0, 0.0, 1.0]
@@ -218,16 +218,16 @@ gate_up_axis_neu = [0.0, 0.0, 1.0]
 mode = "perception"               # perception | ground_truth
 allow_ground_truth = false         # debug/PX4 only; not competition-valid
 known_gate_positions_neu = [
-  [-0.061534, 29.665372, 4.113394],
-  [1.585332, 60.449254, 10.929463],
-  [-2.040347, 93.421399, 10.395199],
-  [-2.406968, 121.440150, 11.917446],
-  [2.647982, 153.000409, 20.743638],
-  [-0.774401, 181.070447, 19.334631],
-  [2.362300, 212.273024, 18.143769],
-  [-0.705327, 243.773001, 13.782656],
-  [-3.958353, 275.095294, 13.493975],
-  [-0.210331, 304.098806, 8.804799],
+  [0.042238, 13.172596, 2.669784],
+  [1.492108, 23.982963, 3.793709],
+  [-2.017717, 36.950165, 3.204085],
+  [2.456324, 48.215863, 3.039035],
+  [-0.232134, 59.381193, 4.153849],
+  [-3.364511, 71.455475, 3.119014],
+  [-3.249112, 83.560633, 3.740319],
+  [1.803893, 95.513014, 3.925673],
+  [0.755285, 108.372980, 5.344258],
+  [1.743604, 119.542202, 7.285128],
 ]
 
 [gate_memory]
@@ -370,10 +370,10 @@ max_duration_s = 4.0
 stable_duration_s = 0.50
 stable_vz_abs_m_s = 0.25
 stable_accel_abs_m_s2 = 0.80
-lift_confirm_z_m = 0.15
+lift_confirm_z_m = 0.0
 lift_confirm_vz_m_s = 0.15
-relative_airborne_z_m = 0.25   # relative to estimator start, not gate altitude
-min_release_z_m = 0.15          # relative to acquisition start, not gate altitude
+relative_airborne_z_m = 0.0     # relative to acquisition start; 0 allows airborne/no-climb starts
+min_release_z_m = 0.0           # relative to acquisition start; 0 does not force a takeoff bump
 min_confidence = 0.0
 overshoot_max_thrust_drop = 0.0
 z_hold_enabled = true
@@ -381,7 +381,7 @@ z_hold_kp = 0.10
 z_hold_kv = 0.08
 z_hold_max_correction = 0.08
 reset_hover_on_disarm = true
-release_on_timeout_while_unstable = true
+release_on_timeout_while_unstable = true # safe-timeout only; still blocks overshoot/high vertical speed
 print_period_s = 0.5
 
 [thrust_scale_calibration]

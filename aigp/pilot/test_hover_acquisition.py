@@ -105,6 +105,70 @@ def test_does_not_release_after_falling_below_relative_release_height():
     assert low.debug.z_hold_thrust_correction > 0.0
 
 
+def test_relaxed_timeout_can_release_without_forcing_startup_climb():
+    acquisition = HoverAcquisition(
+        _config(
+            release_on_timeout_while_unstable=True,
+            min_release_z_m=0.15,
+            lift_confirm_z_m=0.15,
+            relative_airborne_z_m=0.25,
+            max_duration_s=1.0,
+        )
+    )
+
+    start = acquisition.update(
+        snapshot=_snapshot(),
+        estimate=_estimate(z=-20.0, vz=0.0),
+        hover_thrust=0.5,
+        now=0.0,
+    )
+    assert start.command is not None
+    assert not start.debug.lift_confirmed
+
+    timed_out = acquisition.update(
+        snapshot=_snapshot(),
+        estimate=_estimate(z=-20.0, vz=0.0),
+        hover_thrust=start.hover_thrust,
+        now=1.10,
+    )
+
+    assert timed_out.command is None
+    assert timed_out.debug.completed
+    assert timed_out.debug.status == "timeout_safe_lift_unconfirmed"
+
+
+def test_relaxed_timeout_does_not_release_while_high_above_start():
+    acquisition = HoverAcquisition(
+        _config(
+            release_on_timeout_while_unstable=True,
+            min_release_z_m=0.0,
+            lift_confirm_z_m=0.0,
+            relative_airborne_z_m=0.0,
+            max_duration_s=1.0,
+            max_relative_z_m=2.0,
+        )
+    )
+
+    start = acquisition.update(
+        snapshot=_snapshot(),
+        estimate=_estimate(z=0.0, vz=0.0),
+        hover_thrust=0.5,
+        now=0.0,
+    )
+    assert start.command is not None
+
+    high = acquisition.update(
+        snapshot=_snapshot(),
+        estimate=_estimate(z=8.0, vz=0.0),
+        hover_thrust=start.hover_thrust,
+        now=1.10,
+    )
+
+    assert high.command is not None
+    assert not high.debug.completed
+    assert high.debug.status == "overshoot_recover"
+
+
 def test_overshoot_recovery_has_no_artificial_thrust_floor():
     acquisition = HoverAcquisition(_config())
 

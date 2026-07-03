@@ -33,6 +33,10 @@ STRUCTURED_PREFIXES = (
     ("[PERCEPTION_DEBUG] ", "perception_debug"),
 )
 
+JSON_PREFIXES = (
+    ("canonical_gate_poses ", "canonical_gate_poses"),
+)
+
 GATE_LIST_PREFIXES = (
     ("autonomy_wrapper ground truth gates NEU:", "ground_truth_gates"),
     ("autonomy_wrapper stable perception gates NEU:", "stable_perception_gates"),
@@ -213,6 +217,21 @@ def _event_from_line(line: str) -> dict[str, Any] | None:
     for prefix, event in STRUCTURED_PREFIXES:
         if stripped.startswith(prefix):
             return _parse_key_value_line(stripped, event, stripped[len(prefix) :])
+
+    for prefix, event in JSON_PREFIXES:
+        if stripped.startswith(prefix):
+            body = stripped[len(prefix) :].strip()
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                payload = {"parse_error": True, "text": body}
+            if not isinstance(payload, dict):
+                payload = {"value": payload}
+            payload = dict(payload)
+            payload["event"] = event
+            payload["wall_time"] = time.time()
+            payload["raw"] = stripped
+            return payload
 
     for prefix, event in GATE_LIST_PREFIXES:
         if stripped.startswith(prefix):
