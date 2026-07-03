@@ -48,6 +48,7 @@ class GateTrack:
     promotion_blocked_reason: str = "insufficient_observations"
     outlier_count: int = 0
     inlier_count: int = 0
+    ever_stable: bool = False
 
     def append_observation(
         self,
@@ -566,6 +567,7 @@ class GateMemory:
         if tr.committed and tr.planning_center is not None:
             tr.center = tr.planning_center.copy()
 
+        tr.ever_stable = bool(tr.ever_stable or tr.is_stable)
         if tr.is_stable and not was_stable:
             self.last_track_stable_now = True
             self.last_track_state_change = "stable"
@@ -610,6 +612,7 @@ class GateMemory:
         target.hits += source.hits
         target.last_seen_time = max(target.last_seen_time, source.last_seen_time)
         target.committed = target.committed or source.committed
+        target.ever_stable = bool(target.ever_stable or source.ever_stable)
         target.measurement_history.extend(source.measurement_history)
         target.obs_history.extend(source.obs_history)
         target.obs_history = target.obs_history[-self.history_size:]
@@ -759,12 +762,13 @@ class GateMemory:
             self.last_track_center_before = tr.center.copy()
             self.association_attempted = True
             print(f"[ASSOC] trying match: dist={dist:.2f}, track_id={tr.id}")
-            outlier_threshold = self.max_outlier_distance if tr.is_stable else self.max_committed_match_distance
-            if (
-                dist < self.max_committed_match_distance
-                or (tr.is_stable and dist <= outlier_threshold)
-                or (not tr.is_stable and dist <= self.new_track_block_radius)
-            ):
+            ever_stable = bool(getattr(tr, "ever_stable", False) or tr.is_stable)
+            match_threshold = (
+                max(self.max_outlier_distance, self.max_committed_match_distance)
+                if ever_stable
+                else max(self.commit_radius, self.max_committed_match_distance)
+            )
+            if dist <= match_threshold:
                 tr.observe_without_moving(
                     center,
                     confidence,
@@ -797,41 +801,40 @@ class GateMemory:
                     "stable": tr.is_stable,
                     "center": tr.center.copy(),
                 }
-            else:
-                if tr.is_stable:
-                    tr.observe_without_moving(
-                        center,
-                        confidence,
-                        timestamp,
-                        center_camera=center_camera,
-                        reprojection_error=reprojection_error,
-                        keypoint_conf_min=keypoint_conf_min,
-                        keypoint_conf_mean=keypoint_conf_mean,
-                        quality_ok=quality_ok,
-                        quality_reason=quality_reason,
-                        solver_name=solver_name,
-                        active_gate_idx=active_gate_idx,
-                        history_size=self.history_size,
-                        is_outlier=True,
-                    )
-                    self._update_track_filter(tr)
-                    self.last_outlier_rejected = True
-                    print(
-                        f"TRACK {tr.id} observation rejected as outlier: "
-                        f"distance={dist:.2f} m from filtered center"
-                    )
-                    return {
-                        "accepted": False,
-                        "reason": f"stable_track_outlier:{dist:.2f}",
-                        "track_id": tr.id,
-                        "committed_now": False,
-                        "committed": True,
-                        "stable_now": False,
-                        "stable": tr.is_stable,
-                        "center": tr.center.copy(),
-                    }
-                # too far → do NOT match this committed track
-                pass
+
+            tr.observe_without_moving(
+                center,
+                confidence,
+                timestamp,
+                center_camera=center_camera,
+                reprojection_error=reprojection_error,
+                keypoint_conf_min=keypoint_conf_min,
+                keypoint_conf_mean=keypoint_conf_mean,
+                quality_ok=quality_ok,
+                quality_reason=quality_reason,
+                solver_name=solver_name,
+                active_gate_idx=active_gate_idx,
+                history_size=self.history_size,
+                is_outlier=True,
+            )
+            self._update_track_filter(tr)
+            self.last_outlier_rejected = True
+            self.last_track_center_after = tr.center.copy()
+            print(
+                f"TRACK {tr.id} observation rejected as outlier: "
+                f"distance={dist:.2f} m from committed center "
+                f"threshold={match_threshold:.2f}"
+            )
+            return {
+                "accepted": False,
+                "reason": f"committed_track_outlier:{dist:.2f}",
+                "track_id": tr.id,
+                "committed_now": False,
+                "committed": True,
+                "stable_now": False,
+                "stable": tr.is_stable,
+                "center": tr.center.copy(),
+            }
 
         # 2) Else try matching an uncommitted candidate
         tr = self._find_best_track(center, uncommitted_only=True)

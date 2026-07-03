@@ -47,6 +47,50 @@ def test_committed_track_keeps_fixed_planning_center_after_later_observations():
     np.testing.assert_allclose(memory.get_committed_centers()[0], initial)
 
 
+def test_large_residual_on_stable_committed_track_is_outlier_not_match():
+    memory = GateMemory(
+        association_radius=1.5,
+        commit_radius=0.6,
+        new_track_block_radius=4.5,
+        min_confidence_per_hit=0.0,
+        commit_hits=3,
+        commit_confidence_sum=0.0,
+        commit_spread_radius=0.2,
+        history_size=20,
+        min_hits_for_stable=3,
+        max_center_std_for_stable=0.6,
+        max_camera_std_for_stable=10.0,
+        max_reprojection_error_for_stable=100.0,
+        max_outlier_distance=0.6,
+        min_observation_time=0.0,
+    )
+    memory.max_committed_match_distance = 0.6
+    center = np.array([0.0, 0.0, 1.0])
+    for idx in range(3):
+        result = memory.add_detection(center, confidence=1.0, timestamp=float(idx))
+        assert result["accepted"] is True
+
+    track = memory.get_committed_tracks()[0]
+    assert track.is_stable
+    assert track.ever_stable
+    np.testing.assert_allclose(track.center, center)
+
+    far_same_region = np.array([2.5, 0.0, 1.0])
+    result = memory.add_detection(
+        far_same_region,
+        confidence=1.0,
+        timestamp=3.0,
+    )
+
+    assert result["accepted"] is False
+    assert result["reason"].startswith("committed_track_outlier")
+    track = memory.get_committed_tracks()[0]
+    assert track.obs_history[-1].is_outlier
+    assert track.ever_stable
+    np.testing.assert_allclose(track.center, center)
+    np.testing.assert_allclose(track.planning_center, center)
+
+
 def test_uncommitted_candidate_center_still_updates_before_commit():
     memory = GateMemory(
         association_radius=5.0,
