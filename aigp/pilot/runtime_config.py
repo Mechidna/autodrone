@@ -312,6 +312,18 @@ class PlannerSection:
     race_order_front_blocker_enabled: bool
     race_order_front_blocker_margin_m: float
     race_order_front_blocker_lateral_radius_m: float
+    provisional_next_gate_enabled: bool
+    provisional_next_gate_min_hits: int
+    provisional_next_gate_max_age_s: float
+    provisional_next_gate_min_keypoint_conf: float
+    provisional_next_gate_max_reprojection_error: float
+    provisional_next_gate_max_world_std_m: float
+    provisional_next_gate_max_distance_m: float
+    provisional_next_gate_max_lateral_m: float
+    provisional_next_gate_closer_margin_m: float
+    provisional_next_gate_max_duration_s: float
+    provisional_next_gate_replan_shift_m: float
+    provisional_next_gate_vmax_m_s: float
     replan_after_trajectory_s: float
     replan_min_interval_s: float
     max_detection_range_m: float
@@ -1270,6 +1282,65 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 planner_raw,
                 "race_order_front_blocker_lateral_radius_m",
                 6.0,
+            ),
+            provisional_next_gate_enabled=_bool(
+                planner_raw,
+                "provisional_next_gate_enabled",
+                True,
+            ),
+            provisional_next_gate_min_hits=max(
+                1,
+                _int(planner_raw, "provisional_next_gate_min_hits", 2),
+            ),
+            provisional_next_gate_max_age_s=_float(
+                planner_raw,
+                "provisional_next_gate_max_age_s",
+                1.0,
+            ),
+            provisional_next_gate_min_keypoint_conf=_float(
+                planner_raw,
+                "provisional_next_gate_min_keypoint_conf",
+                0.75,
+            ),
+            provisional_next_gate_max_reprojection_error=_float(
+                planner_raw,
+                "provisional_next_gate_max_reprojection_error",
+                1.25,
+            ),
+            provisional_next_gate_max_world_std_m=_float(
+                planner_raw,
+                "provisional_next_gate_max_world_std_m",
+                2.0,
+            ),
+            provisional_next_gate_max_distance_m=_float(
+                planner_raw,
+                "provisional_next_gate_max_distance_m",
+                120.0,
+            ),
+            provisional_next_gate_max_lateral_m=_float(
+                planner_raw,
+                "provisional_next_gate_max_lateral_m",
+                20.0,
+            ),
+            provisional_next_gate_closer_margin_m=_float(
+                planner_raw,
+                "provisional_next_gate_closer_margin_m",
+                3.0,
+            ),
+            provisional_next_gate_max_duration_s=_float(
+                planner_raw,
+                "provisional_next_gate_max_duration_s",
+                6.0,
+            ),
+            provisional_next_gate_replan_shift_m=_float(
+                planner_raw,
+                "provisional_next_gate_replan_shift_m",
+                0.75,
+            ),
+            provisional_next_gate_vmax_m_s=_float(
+                planner_raw,
+                "provisional_next_gate_vmax_m_s",
+                1.5,
             ),
             replan_after_trajectory_s=_float(planner_raw, "replan_after_trajectory_s", 0.25),
             replan_min_interval_s=_float(planner_raw, "replan_min_interval_s", 0.3),

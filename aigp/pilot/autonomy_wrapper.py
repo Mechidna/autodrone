@@ -117,6 +117,8 @@ class PyAIPilotAutonomyAPI:
         self.active_target_lost_grace_s = float(self.config.race.active_target_lost_grace_s)
         self.race_order_track_ids = []
         self.completed_track_ids = set()
+        self.completed_gate_positions = []
+        self.completed_gate_segments = []
         self.target_manager = TargetManager(
             race_gate_count=self.race_gate_count,
             active_target_lost_grace_s=self.active_target_lost_grace_s,
@@ -235,6 +237,53 @@ class PyAIPilotAutonomyAPI:
             0.0,
             float(self.config.planner.race_order_front_blocker_lateral_radius_m),
         )
+        self.provisional_next_gate_enabled = bool(
+            self.config.planner.provisional_next_gate_enabled
+        )
+        self.provisional_next_gate_min_hits = max(
+            1,
+            int(self.config.planner.provisional_next_gate_min_hits),
+        )
+        self.provisional_next_gate_max_age_s = max(
+            0.0,
+            float(self.config.planner.provisional_next_gate_max_age_s),
+        )
+        self.provisional_next_gate_min_keypoint_conf = float(
+            self.config.planner.provisional_next_gate_min_keypoint_conf
+        )
+        self.provisional_next_gate_max_reprojection_error = float(
+            self.config.planner.provisional_next_gate_max_reprojection_error
+        )
+        self.provisional_next_gate_max_world_std_m = float(
+            self.config.planner.provisional_next_gate_max_world_std_m
+        )
+        self.provisional_next_gate_max_distance_m = max(
+            0.0,
+            float(self.config.planner.provisional_next_gate_max_distance_m),
+        )
+        self.provisional_next_gate_max_lateral_m = max(
+            0.0,
+            float(self.config.planner.provisional_next_gate_max_lateral_m),
+        )
+        self.provisional_next_gate_closer_margin_m = max(
+            0.0,
+            float(self.config.planner.provisional_next_gate_closer_margin_m),
+        )
+        self.provisional_next_gate_max_duration_s = max(
+            0.0,
+            float(self.config.planner.provisional_next_gate_max_duration_s),
+        )
+        self.provisional_next_gate_replan_shift_m = max(
+            0.0,
+            float(self.config.planner.provisional_next_gate_replan_shift_m),
+        )
+        configured_provisional_vmax = float(
+            self.config.planner.provisional_next_gate_vmax_m_s
+        )
+        self.provisional_next_gate_vmax_m_s = max(
+            0.0,
+            configured_provisional_vmax,
+        )
         self.active_target_shift_frames = 0
         self.active_target_shift_track_id = None
         self.planner_vmax = float(self.config.planner.vmax)
@@ -322,6 +371,7 @@ class PyAIPilotAutonomyAPI:
         self._last_race_order_duplicate_signature = None
         self._last_race_order_front_blocker_signature = None
         self._last_race_order_closer_blocker_signature = None
+        self._last_target_reject_signature = None
         self._last_perception_reject_print_time = 0.0
         self._last_trace_print_time = 0.0
         self._trace_period_s = 0.5
@@ -337,6 +387,14 @@ class PyAIPilotAutonomyAPI:
         self.active_terminal_velocity_policy = "unset"
         self.post_gate_exit_until_s = 0.0
         self.post_gate_exit_reason = ""
+        self.provisional_target_active = False
+        self.provisional_target_track_id = None
+        self.provisional_target_gate_idx = None
+        self.provisional_target_center = None
+        self.provisional_target_start_time = 0.0
+        self.provisional_target_last_plan_time = 0.0
+        self.provisional_target_plan_count = 0
+        self._last_provisional_reject_signature = None
         self.last_gate_pass_preserved_plan = False
         print(
             "[GATE_SOURCE_CONFIG] "
@@ -511,8 +569,10 @@ class PyAIPilotAutonomyAPI:
 
         shift_replanned = self._maybe_apply_active_target_shift(pos, vel)
         advanced = self._advance_gate_if_needed(pos)
-        if not shift_replanned and self._should_plan(advanced):
+        if not shift_replanned and self._should_plan(advanced, pos, vel):
             planned = self._path_plan(pos, vel)
+            if not planned:
+                planned = self._path_plan_provisional_next_gate(pos, vel)
             if not planned and self._active_plan_expired():
                 self._clear_active_plan(reason="replan_failed_expired")
 
@@ -922,7 +982,8 @@ class PyAIPilotAutonomyAPI:
     def _sync_target_manager_state(self, clear_unlocked_current: bool = False) -> None:
         diag = self.target_manager.diagnostics()
         self.current_gate_idx = int(diag.gate_idx)
-        self.active_target_track_id = diag.active_track_id
+        if not self.provisional_target_active or diag.center_at_plan is not None:
+            self.active_target_track_id = diag.active_track_id
         self.completed_track_ids = set(self.target_manager.completed_track_ids)
         self.active_target_center_at_plan = (
             None if diag.center_at_plan is None else diag.center_at_plan.copy()
@@ -935,7 +996,7 @@ class PyAIPilotAutonomyAPI:
             self.current_gate_pos = diag.center_at_plan.copy()
             self.last_active_target_center = diag.center_at_plan.copy()
             self.active_target_lost_time = None
-        elif clear_unlocked_current:
+        elif clear_unlocked_current and not self.provisional_target_active:
             self.current_gate_pos = None
             self.last_active_target_center = None
             self.active_target_lost_time = None
@@ -992,6 +1053,279 @@ class PyAIPilotAutonomyAPI:
             and self.planner.total_time > 0.0
             and now <= float(self.post_gate_exit_until_s)
         )
+
+    def _completed_landmark_radius_m(self) -> float:
+        return max(
+            float(self.race_order_duplicate_radius_m),
+            float(self.pass_radius_m),
+            float(self.gate_pass_lateral_radius_m),
+        )
+
+    def _completed_segment_corridor_radius_m(self) -> float:
+        return max(
+            float(self.race_order_duplicate_radius_m),
+            float(self.gate_pass_lateral_radius_m),
+        )
+
+    def _is_near_completed_landmark(
+        self,
+        center,
+        *,
+        radius: float | None = None,
+    ) -> bool:
+        center = self._finite_vec3_or_none(center)
+        if center is None:
+            return False
+        radius = self._completed_landmark_radius_m() if radius is None else float(radius)
+        if radius <= 0.0:
+            return False
+        for completed in self.completed_gate_positions:
+            completed = self._finite_vec3_or_none(completed)
+            if completed is None:
+                continue
+            if float(np.linalg.norm(center - completed)) <= radius:
+                return True
+        return False
+
+    @staticmethod
+    def _point_in_segment_corridor(
+        point,
+        start,
+        end,
+        *,
+        radius: float,
+    ) -> bool:
+        point = np.asarray(point, dtype=float).reshape(3)
+        start = np.asarray(start, dtype=float).reshape(3)
+        end = np.asarray(end, dtype=float).reshape(3)
+        if not (
+            np.all(np.isfinite(point))
+            and np.all(np.isfinite(start))
+            and np.all(np.isfinite(end))
+        ):
+            return False
+        segment = end - start
+        denom = float(np.dot(segment, segment))
+        if denom < 1e-9:
+            return float(np.linalg.norm(point - start)) <= float(radius)
+        t = float(np.dot(point - start, segment) / denom)
+        if t < 0.0 or t > 1.0:
+            return False
+        closest = start + t * segment
+        return float(np.linalg.norm(point - closest)) <= float(radius)
+
+    def _is_inside_completed_segment_corridor(
+        self,
+        center,
+        *,
+        radius: float | None = None,
+    ) -> bool:
+        center = self._finite_vec3_or_none(center)
+        if center is None:
+            return False
+        radius = (
+            self._completed_segment_corridor_radius_m()
+            if radius is None
+            else float(radius)
+        )
+        if radius <= 0.0:
+            return False
+        for start, end in self.completed_gate_segments:
+            if self._point_in_segment_corridor(
+                center,
+                start,
+                end,
+                radius=radius,
+            ):
+                return True
+        return False
+
+    def _record_completed_landmark(self, track_id, center) -> None:
+        center = self._finite_vec3_or_none(center)
+        if center is None:
+            return
+        if track_id is not None:
+            try:
+                self.completed_track_ids.add(int(track_id))
+            except (TypeError, ValueError):
+                pass
+
+        if self._is_near_completed_landmark(center):
+            return
+
+        if self.completed_gate_positions:
+            previous = np.asarray(self.completed_gate_positions[-1], dtype=float).reshape(3)
+            if np.all(np.isfinite(previous)):
+                self.completed_gate_segments.append((previous.copy(), center.copy()))
+        self.completed_gate_positions.append(center.copy())
+
+    def _target_rejection_reason(self, center, track_id=None) -> str:
+        center = self._finite_vec3_or_none(center)
+        if center is None:
+            return "non_finite_target"
+        if track_id is not None:
+            try:
+                if int(track_id) in self.completed_track_ids:
+                    return "completed_track_id"
+            except (TypeError, ValueError):
+                pass
+        if self._is_near_completed_landmark(center):
+            return "duplicate_of_completed_landmark"
+        if self._is_inside_completed_segment_corridor(center):
+            return "completed_segment_corridor"
+        return ""
+
+    def _trace_target_rejection(
+        self,
+        *,
+        reason: str,
+        track_id,
+        center,
+        context: str,
+    ) -> None:
+        center = self._finite_vec3_or_none(center)
+        rounded_center = (
+            None
+            if center is None
+            else tuple(round(float(value), 2) for value in center)
+        )
+        signature = (
+            str(context),
+            str(reason),
+            None if track_id is None else int(track_id),
+            rounded_center,
+        )
+        if signature == self._last_target_reject_signature:
+            return
+        self._last_target_reject_signature = signature
+        print(
+            "target_validation_reject "
+            f"context={context} "
+            f"track={track_id if track_id is not None else 'none'} "
+            f"reason={reason} "
+            f"center={self._fmt_vec(center, precision=3) if center is not None else 'none'} "
+            f"completed_tracks={sorted(int(t) for t in self.completed_track_ids)} "
+            f"completed_landmarks={len(self.completed_gate_positions)} "
+            f"completed_segments={len(self.completed_gate_segments)}",
+            flush=True,
+        )
+
+    def _track_cluster_ids(
+        self,
+        track_id: int,
+        committed_by_id: dict[int, object] | None = None,
+        *,
+        radius: float | None = None,
+    ) -> list[int]:
+        try:
+            seed_id = int(track_id)
+        except (TypeError, ValueError):
+            return []
+        if seed_id < 0:
+            return [seed_id]
+
+        if committed_by_id is None:
+            committed_by_id = {
+                int(track.id): track for track in self.gate_memory.get_committed_tracks()
+            }
+        if seed_id not in committed_by_id:
+            track = self.gate_memory.get_track_by_id(seed_id)
+            if track is not None:
+                committed_by_id = dict(committed_by_id)
+                committed_by_id[seed_id] = track
+        if seed_id not in committed_by_id:
+            return []
+
+        radius = (
+            float(self.race_order_duplicate_radius_m)
+            if radius is None
+            else float(radius)
+        )
+        if radius <= 0.0:
+            return [seed_id]
+
+        cluster: list[int] = []
+        pending = [seed_id]
+        while pending:
+            current_id = int(pending.pop(0))
+            if current_id in cluster:
+                continue
+            cluster.append(current_id)
+            current_center = self._race_order_track_center(current_id, committed_by_id)
+            if current_center is None:
+                continue
+            for other_id in sorted(committed_by_id):
+                other_id = int(other_id)
+                if other_id in cluster or other_id in pending:
+                    continue
+                other_center = self._race_order_track_center(other_id, committed_by_id)
+                if other_center is None:
+                    continue
+                dist = float(np.linalg.norm(current_center - other_center))
+                if math.isfinite(dist) and dist <= radius:
+                    pending.append(other_id)
+        return cluster
+
+    def _best_duplicate_cluster_center(
+        self,
+        track_id,
+        committed_by_id: dict[int, object] | None = None,
+    ) -> tuple[np.ndarray | None, int | None, dict]:
+        try:
+            active_id = int(track_id)
+        except (TypeError, ValueError):
+            return None, None, {"ok": False, "reason": "invalid_track_id"}
+        if active_id < 0:
+            return None, active_id, {"ok": True, "reason": "ground_truth_track"}
+
+        if committed_by_id is None:
+            committed_by_id = {
+                int(track.id): track for track in self.gate_memory.get_committed_tracks()
+            }
+        cluster_ids = self._track_cluster_ids(active_id, committed_by_id)
+        best = None
+        for candidate_id in cluster_ids:
+            if candidate_id in self.completed_track_ids:
+                continue
+            track = committed_by_id.get(candidate_id)
+            if track is None:
+                track = self.gate_memory.get_track_by_id(candidate_id)
+            center, quality = self._track_filtered_center_for_navigation(track)
+            if center is None:
+                continue
+            score = self._race_order_track_score(candidate_id, committed_by_id)
+            key = (*score, -abs(candidate_id - active_id), -candidate_id)
+            if best is None or key > best[0]:
+                best = (key, center.copy(), int(candidate_id), dict(quality))
+
+        if best is not None:
+            quality = best[3]
+            quality["cluster_ids"] = tuple(cluster_ids)
+            quality["source_track_id"] = int(best[2])
+            return best[1], int(best[2]), quality
+
+        track = committed_by_id.get(active_id)
+        if track is None:
+            track = self.gate_memory.get_track_by_id(active_id)
+        center = self._track_navigation_center(track) if track is not None else None
+        return center, active_id, {
+            "ok": False,
+            "reason": "fallback_exact_track" if center is not None else "missing_cluster_center",
+            "cluster_ids": tuple(cluster_ids),
+            "source_track_id": active_id,
+        }
+
+    def _physical_navigation_center(
+        self,
+        track_id,
+        committed_by_id: dict[int, object] | None = None,
+        *,
+        require_fresh: bool = False,
+    ) -> np.ndarray | None:
+        center, _, quality = self._best_duplicate_cluster_center(track_id, committed_by_id)
+        if require_fresh and not bool(quality.get("ok", False)):
+            return None
+        return None if center is None else center.copy()
 
     def _active_plan_expired(self, now: float | None = None) -> bool:
         if self.active_waypoints is None or self.planner.total_time <= 0.0:
@@ -1170,9 +1504,8 @@ class PyAIPilotAutonomyAPI:
             self.active_target_shift_frames = 0
             self.active_target_shift_track_id = active_id
 
-        track = self.gate_memory.get_track_by_id(active_id)
-        latest, quality = self._track_filtered_center_for_navigation(track)
-        if latest is None:
+        latest, source_track_id, quality = self._best_duplicate_cluster_center(active_id)
+        if latest is None or not bool(quality.get("ok", False)):
             self.active_target_shift_frames = 0
             return False
 
@@ -1237,6 +1570,8 @@ class PyAIPilotAutonomyAPI:
             f"frames={self.active_target_shift_frames} "
             f"dist_to_target={dist_to_target:.2f} "
             f"alpha={self.active_target_shift_alpha:.2f} "
+            f"source_track={source_track_id if source_track_id is not None else 'none'} "
+            f"cluster={quality.get('cluster_ids', ())} "
             f"reproj={self._fmt_float(quality.get('reproj'), precision=2)} "
             f"kp_min={self._fmt_float(quality.get('kp_min'), precision=2)} "
             f"world_std={self._fmt_float(quality.get('world_std'), precision=2)} "
@@ -1284,6 +1619,16 @@ class PyAIPilotAutonomyAPI:
             track_id = self.gate_track_ids[idx] if idx < len(self.gate_track_ids) else None
             if track_id is not None and int(track_id) in self.completed_track_ids:
                 continue
+            if self.use_perception:
+                reject_reason = self._target_rejection_reason(center, track_id)
+                if reject_reason:
+                    self._trace_target_rejection(
+                        reason=reject_reason,
+                        track_id=track_id,
+                        center=center,
+                        context="planning_horizon",
+                    )
+                    continue
             if np.linalg.norm(center - targets[-1]) < 1e-3:
                 continue
             targets.append(center.copy())
@@ -1334,7 +1679,11 @@ class PyAIPilotAutonomyAPI:
         )
         if self._is_final_race_gate_index(last_gate_idx):
             return zero, "zero_final_gate"
-        if plan_mode not in ("gate_horizon", "single_gate_exit"):
+        if plan_mode not in (
+            "gate_horizon",
+            "single_gate_exit",
+            "provisional_next_gate",
+        ):
             return zero, f"zero_mode_{plan_mode}"
 
         direction = np.asarray(waypoints[-1] - waypoints[-2], dtype=float).reshape(3)
@@ -1476,6 +1825,132 @@ class PyAIPilotAutonomyAPI:
         )
         return True
 
+    def _path_plan_provisional_next_gate(
+        self,
+        pos: np.ndarray,
+        vel: np.ndarray,
+    ) -> bool:
+        if (
+            not self.provisional_next_gate_enabled
+            or not self.use_perception
+            or self.target_manager.locked
+            or 0 <= self.current_gate_idx < len(self.gate_centers_neu)
+        ):
+            return False
+
+        track, target, details = self._select_provisional_next_gate_candidate(pos, vel)
+        if track is None or target is None:
+            return False
+
+        pos = np.asarray(pos, dtype=float).reshape(3)
+        vel = np.asarray(vel, dtype=float).reshape(3)
+        target = self._apply_target_z_policy(target)
+        normal = unit_vector_from_to(pos, target)
+        if normal is None:
+            return False
+
+        track_id = int(track.id)
+        now = time.time()
+        previous_track_id = self.provisional_target_track_id
+        if (
+            not self.provisional_target_active
+            or previous_track_id is None
+            or int(previous_track_id) != track_id
+        ):
+            self.provisional_target_start_time = now
+            self.provisional_target_plan_count = 0
+
+        pass_through_target = target + normal * self.gate_pass_through_m
+        waypoints = np.vstack([pos, target, pass_through_target])
+        provisional_vmax = float(self.provisional_next_gate_vmax_m_s)
+        if provisional_vmax <= 0.0:
+            provisional_vmax = float(self.planner_vmax)
+        provisional_vmax = min(float(self.planner_vmax), provisional_vmax)
+        times = allocate_segment_times(
+            waypoints,
+            current_vel=vel,
+            vmax=provisional_vmax,
+            amax=self.planner_amax,
+            T_min=self.planner_t_min,
+        )
+        terminal_velocity, terminal_policy = self._terminal_velocity_for_plan(
+            waypoints=waypoints,
+            plan_mode="provisional_next_gate",
+            horizon_gate_indices=[int(self.current_gate_idx)],
+        )
+
+        self.planner = MultiSegmentMinimumSnapPlanner()
+        self.planner.update(
+            waypoints=waypoints,
+            times=times,
+            v_start=vel,
+            v_end=terminal_velocity,
+            a_start=np.zeros(3, dtype=float),
+            a_end=np.zeros(3, dtype=float),
+            j_start=np.zeros(3, dtype=float),
+            j_end=np.zeros(3, dtype=float),
+            waypoint_velocities=None,
+        )
+
+        self.provisional_target_active = True
+        self.provisional_target_track_id = track_id
+        self.provisional_target_gate_idx = int(self.current_gate_idx)
+        self.provisional_target_center = target.copy()
+        self.provisional_target_last_plan_time = now
+        self.provisional_target_plan_count += 1
+        self.current_gate_pos = target.copy()
+        self.active_target_track_id = track_id
+        self.last_active_target_center = target.copy()
+        self.active_waypoints = waypoints.copy()
+        self.active_times = np.asarray(times, dtype=float).copy()
+        self.active_horizon_gate_indices = [int(self.current_gate_idx)]
+        self.active_horizon_track_ids = [track_id]
+        self.active_horizon_targets = [target.copy()]
+        self.active_plan_mode = "provisional_next_gate"
+        self.active_terminal_velocity = terminal_velocity.copy()
+        self.active_terminal_velocity_policy = str(terminal_policy)
+        self.trajectory_start_time = now
+        self.last_plan_wall_time = now
+        self.last_planned_gate_idx = int(self.current_gate_idx)
+        self.post_gate_exit_until_s = 0.0
+        self.post_gate_exit_reason = ""
+        self._reset_gate_pass_state()
+
+        waypoints_txt = "[" + ";".join(
+            self._fmt_vec(waypoint, precision=3) for waypoint in waypoints
+        ) + "]"
+        times_txt = "(" + ",".join(f"{float(item):.3f}" for item in times) + ")"
+        nearest_stable = details.get("nearest_stable_distance", float("inf"))
+        print(
+            "plan_install "
+            f"gate_idx={self.current_gate_idx} "
+            f"track={track_id} "
+            "mode=provisional_next_gate "
+            f"horizon_tracks=({track_id}) "
+            f"horizon_gate_indices=({int(self.current_gate_idx)}) "
+            f"total_time={float(self.planner.total_time):.3f} "
+            f"segments={max(0, int(len(waypoints) - 1))} "
+            f"target_neu={self._fmt_vec(target, precision=3)} "
+            f"normal_neu={self._fmt_vec(normal, precision=3)} "
+            f"v_start_neu={self._fmt_vec(vel, precision=3)} "
+            f"v_end_neu={self._fmt_vec(terminal_velocity, precision=3)} "
+            f"terminal_policy={terminal_policy} "
+            f"times_s={times_txt} "
+            f"waypoints_neu={waypoints_txt} "
+            f"hits={self._fmt_float(details.get('hits'), precision=0)} "
+            f"age_s={self._fmt_float(details.get('age_s'), precision=2)} "
+            f"reproj={self._fmt_float(details.get('reproj'), precision=2)} "
+            f"kp_min={self._fmt_float(details.get('kp_min'), precision=2)} "
+            f"world_std={self._fmt_float(details.get('world_std'), precision=2)} "
+            f"distance={self._fmt_float(details.get('distance'), precision=2)} "
+            f"projection={self._fmt_float(details.get('projection'), precision=2)} "
+            f"lateral={self._fmt_float(details.get('lateral'), precision=2)} "
+            f"nearest_stable_distance={self._fmt_float(nearest_stable, precision=2)} "
+            "pass_enabled=0",
+            flush=True,
+        )
+        return True
+
     def _apply_target_z_policy(self, target) -> np.ndarray:
         out = np.asarray(target, dtype=float).reshape(3).copy()
         if self.target_z_mode in ("expected", "expected_altitude", "fixed_expected"):
@@ -1492,6 +1967,8 @@ class PyAIPilotAutonomyAPI:
 
     def _advance_gate_if_needed(self, pos: np.ndarray) -> bool:
         self.last_gate_pass_preserved_plan = False
+        if self.provisional_target_active:
+            return False
         if self.current_gate_pos is None and not self.gate_centers_neu:
             return False
         if (
@@ -1581,6 +2058,7 @@ class PyAIPilotAutonomyAPI:
             truth_pos_neu=truth_pos,
             truth_error_m=truth_error,
         )
+        self._record_completed_landmark(completed_track_id, target)
         continued = self._continue_plan_after_gate_pass(
             completed_gate_idx=completed_gate_idx,
             next_gate_idx=next_gate_idx,
@@ -1598,6 +2076,44 @@ class PyAIPilotAutonomyAPI:
             self.active_terminal_velocity = np.zeros(3, dtype=float)
             self.active_terminal_velocity_policy = "cleared_after_pass"
         return True
+
+    def _validated_horizon_continue_target(
+        self,
+        *,
+        track_id,
+        stored_target,
+        next_gate_idx: int,
+    ) -> tuple[bool, str, np.ndarray | None, int | None]:
+        target = self._finite_vec3_or_none(stored_target)
+        if target is None:
+            return False, "non_finite_stored_target", None, None
+
+        source_track_id = None
+        if self.use_perception and track_id is not None:
+            try:
+                candidate_track_id = int(track_id)
+            except (TypeError, ValueError):
+                return False, "invalid_track_id", None, None
+            if candidate_track_id >= 0:
+                target, source_track_id, quality = self._best_duplicate_cluster_center(
+                    candidate_track_id
+                )
+                if target is None or not bool(quality.get("ok", False)):
+                    return (
+                        False,
+                        str(quality.get("reason", "")) or "stale_horizon_track",
+                        None,
+                        source_track_id,
+                    )
+            else:
+                source_track_id = candidate_track_id
+
+        target = self._apply_target_z_policy(target)
+        reason = self._target_rejection_reason(target, track_id)
+        if reason:
+            return False, reason, None, source_track_id
+
+        return True, "ok", target.copy(), source_track_id
 
     def _continue_plan_after_gate_pass(
         self,
@@ -1630,6 +2146,23 @@ class PyAIPilotAutonomyAPI:
                     if horizon_idx < len(self.active_horizon_track_ids)
                     else None
                 )
+                valid, reject_reason, target, source_track_id = (
+                    self._validated_horizon_continue_target(
+                        track_id=track_id,
+                        stored_target=target,
+                        next_gate_idx=next_gate_idx,
+                    )
+                )
+                if not valid or target is None:
+                    self._trace_target_rejection(
+                        reason=reject_reason,
+                        track_id=track_id,
+                        center=self.active_horizon_targets[horizon_idx],
+                        context="horizon_continue",
+                    )
+                    return False
+                if source_track_id is not None:
+                    track_id = source_track_id
                 locked_target = self.target_manager.lock_target(
                     gate_idx=next_gate_idx,
                     track_id=track_id,
@@ -1706,11 +2239,26 @@ class PyAIPilotAutonomyAPI:
         )
         return False
 
-    def _should_plan(self, advanced: bool) -> bool:
+    def _should_plan(
+        self,
+        advanced: bool,
+        pos: np.ndarray,
+        vel: np.ndarray,
+    ) -> bool:
         if advanced:
             if self.last_gate_pass_preserved_plan:
                 return False
             return True
+        if self.provisional_target_active:
+            return self._should_replan_provisional_target(pos, vel)
+        if (
+            self._post_gate_exit_active()
+            and not self.target_manager.locked
+            and not (0 <= self.current_gate_idx < len(self.gate_centers_neu))
+        ):
+            track, center, _ = self._select_provisional_next_gate_candidate(pos, vel)
+            if track is not None and center is not None:
+                return True
         if self.active_waypoints is None or self.planner.total_time <= 0.0:
             return True
         now = time.time()
@@ -2403,6 +2951,355 @@ class PyAIPilotAutonomyAPI:
             return center
         return self._finite_vec3_or_none(getattr(track, "center", None))
 
+    def _provisional_track_center(self, track) -> np.ndarray | None:
+        center = self._finite_vec3_or_none(
+            getattr(track, "filtered_center_world", None)
+        )
+        if center is not None:
+            return center
+        center = self._finite_vec3_or_none(getattr(track, "planning_center", None))
+        if center is not None:
+            return center
+        return self._finite_vec3_or_none(getattr(track, "center", None))
+
+    def _provisional_forward_axis(
+        self,
+        pos: np.ndarray,
+        vel: np.ndarray,
+    ) -> np.ndarray | None:
+        pos = np.asarray(pos, dtype=float).reshape(3)
+        vel = np.asarray(vel, dtype=float).reshape(3)
+        speed = float(np.linalg.norm(vel))
+        if math.isfinite(speed) and speed >= 0.20:
+            return vel / speed
+
+        if self.completed_gate_positions:
+            previous = self._finite_vec3_or_none(self.completed_gate_positions[-1])
+            if previous is not None:
+                direction = pos - previous
+                norm = float(np.linalg.norm(direction))
+                if math.isfinite(norm) and norm >= 0.20:
+                    return direction / norm
+
+        if self.active_gate_normal is not None:
+            normal = self._finite_vec3_or_none(self.active_gate_normal)
+            if normal is not None:
+                norm = float(np.linalg.norm(normal))
+                if math.isfinite(norm) and norm >= 1e-6:
+                    return normal / norm
+
+        return None
+
+    def _provisional_track_quality(
+        self,
+        track,
+        now: float,
+    ) -> tuple[bool, str, dict[str, float]]:
+        details: dict[str, float] = {}
+        if track is None:
+            return False, "missing_track", details
+
+        hits = int(getattr(track, "hits", 0))
+        details["hits"] = float(hits)
+        if hits < int(self.provisional_next_gate_min_hits):
+            return False, "insufficient_hits", details
+
+        last_seen = self._finite_float(
+            getattr(track, "last_seen_time", 0.0),
+            0.0,
+        )
+        age_s = now - last_seen if last_seen > 0.0 else float("inf")
+        details["age_s"] = float(age_s)
+        max_age_s = float(self.provisional_next_gate_max_age_s)
+        if max_age_s > 0.0 and (last_seen <= 0.0 or age_s > max_age_s):
+            return False, "stale", details
+
+        obs_history = getattr(track, "obs_history", [])
+        if not obs_history:
+            return False, "missing_observation", details
+        last_obs = obs_history[-1]
+        if bool(getattr(last_obs, "is_outlier", False)):
+            return False, "last_observation_outlier", details
+        if not bool(getattr(last_obs, "quality_ok", True)):
+            return (
+                False,
+                str(getattr(last_obs, "quality_reason", "")) or "quality_bad",
+                details,
+            )
+
+        reproj = self._finite_float(
+            getattr(last_obs, "reprojection_error", float("nan")),
+            float("nan"),
+            allow_nan=True,
+        )
+        details["reproj"] = reproj
+        max_reproj = float(self.provisional_next_gate_max_reprojection_error)
+        if max_reproj <= 0.0:
+            max_reproj = float(self.max_reprojection_error_for_memory)
+        if max_reproj > 0.0 and (
+            not math.isfinite(reproj) or reproj > max_reproj
+        ):
+            return False, "reprojection_error_high", details
+
+        kp_min = self._finite_float(
+            getattr(last_obs, "keypoint_conf_min", float("nan")),
+            float("nan"),
+            allow_nan=True,
+        )
+        details["kp_min"] = kp_min
+        min_kp = float(self.provisional_next_gate_min_keypoint_conf)
+        if min_kp <= 0.0:
+            min_kp = float(self.min_keypoint_conf_for_memory)
+        if min_kp > 0.0 and (not math.isfinite(kp_min) or kp_min < min_kp):
+            return False, "keypoint_conf_low", details
+
+        world_std = self._finite_vec3_or_none(getattr(track, "center_world_std", None))
+        world_std_norm = (
+            float(np.linalg.norm(world_std))
+            if world_std is not None
+            else float("nan")
+        )
+        details["world_std"] = world_std_norm
+        max_world_std = float(self.provisional_next_gate_max_world_std_m)
+        if max_world_std > 0.0 and math.isfinite(world_std_norm):
+            if world_std_norm > max_world_std:
+                return False, "world_std_high", details
+
+        return True, "ok", details
+
+    def _nearest_committed_stable_forward_distance(
+        self,
+        *,
+        pos: np.ndarray,
+        direction: np.ndarray,
+        exclude_track_id: int | None = None,
+    ) -> float:
+        best = float("inf")
+        committed_by_id = {
+            int(track.id): track for track in self.gate_memory.get_committed_tracks()
+        }
+        for track in self.gate_memory.get_stable_tracks():
+            track_id = int(track.id)
+            if exclude_track_id is not None and track_id == int(exclude_track_id):
+                continue
+            if track_id in self.completed_track_ids:
+                continue
+            center, quality = self._track_filtered_center_for_navigation(
+                committed_by_id.get(track_id, track)
+            )
+            if center is None or not bool(quality.get("ok", False)):
+                continue
+            if self._target_rejection_reason(center, track_id):
+                continue
+            rel = center - pos
+            projection = float(np.dot(rel, direction))
+            if not math.isfinite(projection) or projection <= 0.25:
+                continue
+            distance = float(np.linalg.norm(rel))
+            if math.isfinite(distance) and distance < best:
+                best = distance
+        return best
+
+    def _trace_provisional_rejections(self, rejects: list[tuple]) -> None:
+        if not rejects:
+            self._last_provisional_reject_signature = None
+            return
+        signature = tuple(
+            (
+                int(track_id),
+                str(reason),
+                round(float(distance), 1) if math.isfinite(float(distance)) else "nan",
+            )
+            for track_id, reason, distance in rejects[:8]
+        )
+        if signature == self._last_provisional_reject_signature:
+            return
+        self._last_provisional_reject_signature = signature
+        entries = " ".join(
+            f"id={int(track_id)}:{reason}:dist={self._fmt_float(distance, precision=1)}"
+            for track_id, reason, distance in rejects[:8]
+        )
+        extra = "" if len(rejects) <= 8 else f" more={len(rejects) - 8}"
+        print(
+            "provisional_next_gate_reject "
+            f"gate_idx={int(self.current_gate_idx)} "
+            f"{entries}{extra}",
+            flush=True,
+        )
+
+    def _select_provisional_next_gate_candidate(
+        self,
+        pos: np.ndarray,
+        vel: np.ndarray,
+    ) -> tuple[object | None, np.ndarray | None, dict[str, float]]:
+        if (
+            not self.provisional_next_gate_enabled
+            or not self.use_perception
+            or self.target_manager.locked
+            or not self._has_future_race_gate(self.current_gate_idx)
+        ):
+            return None, None, {}
+
+        pos = np.asarray(pos, dtype=float).reshape(3)
+        direction = self._provisional_forward_axis(pos, vel)
+        if direction is None:
+            return None, None, {}
+
+        now = time.time()
+        best = None
+        rejects: list[tuple] = []
+        for track in sorted(self.gate_memory.tracks, key=lambda item: int(item.id)):
+            track_id = int(track.id)
+            distance_for_reject = float("nan")
+            if track_id in self.completed_track_ids:
+                rejects.append((track_id, "completed_track", distance_for_reject))
+                continue
+
+            center = self._provisional_track_center(track)
+            if center is None:
+                rejects.append((track_id, "missing_center", distance_for_reject))
+                continue
+            center = self._apply_target_z_policy(center)
+            rel = center - pos
+            distance = float(np.linalg.norm(rel))
+            distance_for_reject = distance
+
+            reject_reason = self._target_rejection_reason(center, track_id)
+            if reject_reason:
+                rejects.append((track_id, reject_reason, distance_for_reject))
+                continue
+
+            quality_ok, quality_reason, quality = self._provisional_track_quality(
+                track,
+                now,
+            )
+            if not quality_ok:
+                rejects.append((track_id, quality_reason, distance_for_reject))
+                continue
+
+            max_distance = float(self.provisional_next_gate_max_distance_m)
+            if max_distance > 0.0 and (
+                not math.isfinite(distance) or distance > max_distance
+            ):
+                rejects.append((track_id, "too_far", distance_for_reject))
+                continue
+
+            projection = float(np.dot(rel, direction))
+            if not math.isfinite(projection) or projection <= 0.50:
+                rejects.append((track_id, "not_in_front", distance_for_reject))
+                continue
+
+            lateral_vec = rel - projection * direction
+            lateral = float(np.linalg.norm(lateral_vec))
+            max_lateral = float(self.provisional_next_gate_max_lateral_m)
+            if max_lateral > 0.0 and (
+                not math.isfinite(lateral) or lateral > max_lateral
+            ):
+                rejects.append((track_id, "lateral_high", distance_for_reject))
+                continue
+
+            nearest_stable_dist = self._nearest_committed_stable_forward_distance(
+                pos=pos,
+                direction=direction,
+                exclude_track_id=track_id,
+            )
+            closer_margin = float(self.provisional_next_gate_closer_margin_m)
+            if math.isfinite(nearest_stable_dist):
+                if distance + closer_margin >= nearest_stable_dist:
+                    rejects.append(
+                        (track_id, "not_closer_than_stable", distance_for_reject)
+                    )
+                    continue
+
+            details = dict(quality)
+            details.update(
+                {
+                    "track_id": float(track_id),
+                    "distance": distance,
+                    "projection": projection,
+                    "lateral": lateral,
+                    "nearest_stable_distance": nearest_stable_dist,
+                }
+            )
+            key = (
+                projection,
+                distance,
+                -float(getattr(track, "hits", 0)),
+                float(track_id),
+            )
+            if best is None or key < best[0]:
+                best = (key, track, center.copy(), details)
+
+        if best is None:
+            self._trace_provisional_rejections(rejects)
+            return None, None, {}
+
+        self._last_provisional_reject_signature = None
+        return best[1], best[2], best[3]
+
+    def _clear_provisional_target(self, *, reason: str, clear_plan: bool = False) -> None:
+        if self.provisional_target_active:
+            print(
+                "provisional_next_gate_clear "
+                f"gate_idx={int(self.current_gate_idx)} "
+                f"track={self.provisional_target_track_id if self.provisional_target_track_id is not None else 'none'} "
+                f"reason={reason}",
+                flush=True,
+            )
+        self.provisional_target_active = False
+        self.provisional_target_track_id = None
+        self.provisional_target_gate_idx = None
+        self.provisional_target_center = None
+        self.provisional_target_start_time = 0.0
+        self.provisional_target_last_plan_time = 0.0
+        self.provisional_target_plan_count = 0
+        if clear_plan and self.active_plan_mode == "provisional_next_gate":
+            self._clear_active_plan(reason=f"provisional_{reason}")
+
+    def _provisional_target_timed_out(self) -> bool:
+        if not self.provisional_target_active:
+            return False
+        max_duration = float(self.provisional_next_gate_max_duration_s)
+        if max_duration <= 0.0:
+            return False
+        return time.time() - float(self.provisional_target_start_time) > max_duration
+
+    def _should_replan_provisional_target(
+        self,
+        pos: np.ndarray,
+        vel: np.ndarray,
+    ) -> bool:
+        if not self.provisional_target_active:
+            return False
+        if self._provisional_target_timed_out():
+            self._clear_provisional_target(reason="timeout", clear_plan=True)
+            return False
+        if self.active_waypoints is None or self.planner.total_time <= 0.0:
+            return True
+        if self._active_plan_expired():
+            return True
+        if time.time() - float(self.provisional_target_last_plan_time) < float(
+            self.replan_min_interval_s
+        ):
+            return False
+
+        track, center, _ = self._select_provisional_next_gate_candidate(pos, vel)
+        if track is None or center is None:
+            return False
+        track_id = int(track.id)
+        if self.provisional_target_track_id is None:
+            return True
+        if track_id != int(self.provisional_target_track_id):
+            return True
+        previous = self._finite_vec3_or_none(self.provisional_target_center)
+        if previous is None:
+            return True
+        shift = float(np.linalg.norm(center - previous))
+        return (
+            math.isfinite(shift)
+            and shift >= float(self.provisional_next_gate_replan_shift_m)
+        )
+
     def _closer_blocker_track_quality(
         self,
         track,
@@ -2762,12 +3659,20 @@ class PyAIPilotAutonomyAPI:
         track_ids = []
         now = time.time()
 
-        for track_id in self.race_order_track_ids:
+        current_idx = max(0, int(self.current_gate_idx))
+        for order_idx, track_id in enumerate(self.race_order_track_ids):
             track_id = int(track_id)
             center = None
             track = committed_by_id.get(track_id)
+            is_completed_prefix = order_idx < current_idx
             if track is not None:
-                center = self._track_navigation_center(track)
+                center = self._physical_navigation_center(
+                    track_id,
+                    committed_by_id,
+                    require_fresh=self.use_perception and not is_completed_prefix,
+                )
+                if center is None and is_completed_prefix:
+                    center = self._track_navigation_center(track)
                 if center is not None and track_id == self.active_target_track_id:
                     self.last_active_target_center = center.copy()
                     self.active_target_lost_time = None
@@ -2781,6 +3686,19 @@ class PyAIPilotAutonomyAPI:
                     center = self.last_active_target_center.copy()
 
             if center is None or not np.all(np.isfinite(center)):
+                continue
+            reject_reason = (
+                ""
+                if is_completed_prefix
+                else self._target_rejection_reason(center, track_id)
+            )
+            if reject_reason:
+                self._trace_target_rejection(
+                    reason=reject_reason,
+                    track_id=track_id,
+                    center=center,
+                    context="race_order",
+                )
                 continue
 
             gates.append(center)
@@ -3425,8 +4343,20 @@ class PyAIPilotAutonomyAPI:
             else None
         )
         self._last_gate_signature = signature
+        provisional_handoff = bool(
+            self.provisional_target_active and next_target is not None
+        )
 
         if next_target is None:
+            if self.provisional_target_active:
+                print(
+                    "provisional_next_gate_continue "
+                    f"gate_idx={int(self.current_gate_idx)} "
+                    f"track={self.provisional_target_track_id if self.provisional_target_track_id is not None else 'none'} "
+                    f"target_neu={self._fmt_vec(self.provisional_target_center, precision=3)}",
+                    flush=True,
+                )
+                return
             self.current_gate_pos = None
             self.active_target_track_id = None
             self.last_active_target_center = None
@@ -3452,6 +4382,16 @@ class PyAIPilotAutonomyAPI:
             self.last_planned_gate_idx = -1
             return
 
+        if provisional_handoff:
+            self._clear_provisional_target(reason="race_order_handoff")
+            print(
+                "provisional_next_gate_handoff "
+                f"gate_idx={int(self.current_gate_idx)} "
+                f"track={track_ids[self.current_gate_idx] if self.current_gate_idx < len(track_ids) else 'none'} "
+                f"target_neu={self._fmt_vec(next_target, precision=3)}",
+                flush=True,
+            )
+
         target_shift = (
             float(np.linalg.norm(next_target - previous_target))
             if previous_target is not None
@@ -3463,7 +4403,8 @@ class PyAIPilotAutonomyAPI:
             and self.last_planned_gate_idx == self.current_gate_idx
         )
         should_replan = (
-            not had_active_plan
+            provisional_handoff
+            or not had_active_plan
             or self.last_planned_gate_idx != self.current_gate_idx
             or (
                 not active_locked_same_gate

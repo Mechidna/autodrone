@@ -24,6 +24,8 @@ STRUCTURED_PREFIXES = (
     ("lateral_response_calibration ", "lateral_response_calibration"),
     ("plan_install ", "plan_install"),
     ("gate_pass ", "gate_pass"),
+    ("target_validation_reject ", "target_validation_reject"),
+    ("active_target_shift correction ", "active_target_shift"),
     ("target_manager lock ", "target_lock"),
     ("target_manager passed ", "target_passed"),
     ("target_manager active_lost ", "target_active_lost"),
