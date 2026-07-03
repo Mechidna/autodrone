@@ -139,12 +139,32 @@ class PyAIPilotAutonomyAPI:
         self.replan_min_interval_s = float(self.config.planner.replan_min_interval_s)
         self.last_plan_wall_time = 0.0
         self.planning_horizon_gates = max(1, int(self.config.planner.horizon_gates))
+        self.horizon_continuation_enabled = bool(
+            self.config.planner.horizon_continuation_enabled
+        )
+        self.post_gate_exit_continuation_enabled = bool(
+            self.config.planner.post_gate_exit_continuation_enabled
+        )
         self.passthrough_velocity_enabled = bool(
             self.config.planner.passthrough_velocity_enabled
         )
         self.passthrough_speed_m_s = max(
             0.0,
             float(self.config.planner.passthrough_speed_m_s),
+        )
+        self.terminal_velocity_enabled = bool(
+            self.config.planner.terminal_velocity_enabled
+        )
+        configured_terminal_speed = float(self.config.planner.terminal_speed_m_s)
+        if configured_terminal_speed <= 0.0:
+            configured_terminal_speed = self.passthrough_speed_m_s
+        self.terminal_speed_m_s = max(0.0, configured_terminal_speed)
+        self.yaw_reference_motion_near_gate_enabled = bool(
+            self.config.planner.yaw_reference_motion_near_gate_enabled
+        )
+        self.yaw_reference_motion_distance_m = max(
+            0.0,
+            float(self.config.planner.yaw_reference_motion_distance_m),
         )
         self.active_target_preempt_enabled = bool(
             self.config.planner.active_target_preempt_enabled
@@ -309,6 +329,15 @@ class PyAIPilotAutonomyAPI:
         self._shadow_trace_period_s = float(
             state_estimation_config.shadow_trace_period_s
         )
+        self.active_horizon_gate_indices = []
+        self.active_horizon_track_ids = []
+        self.active_horizon_targets = []
+        self.active_plan_mode = ""
+        self.active_terminal_velocity = np.zeros(3, dtype=float)
+        self.active_terminal_velocity_policy = "unset"
+        self.post_gate_exit_until_s = 0.0
+        self.post_gate_exit_reason = ""
+        self.last_gate_pass_preserved_plan = False
         print(
             "[GATE_SOURCE_CONFIG] "
             f"mode={self.gate_source_mode} "
@@ -483,7 +512,9 @@ class PyAIPilotAutonomyAPI:
         shift_replanned = self._maybe_apply_active_target_shift(pos, vel)
         advanced = self._advance_gate_if_needed(pos)
         if not shift_replanned and self._should_plan(advanced):
-            self._path_plan(pos, vel)
+            planned = self._path_plan(pos, vel)
+            if not planned and self._active_plan_expired():
+                self._clear_active_plan(reason="replan_failed_expired")
 
         if self.active_waypoints is None or self.planner.total_time <= 0.0:
             return None
@@ -917,6 +948,78 @@ class PyAIPilotAutonomyAPI:
         self.gate_progress_along_approach = float("nan")
         self.gate_lateral_error = float("nan")
 
+    def _initialize_gate_pass_tracking(
+        self,
+        *,
+        pos: np.ndarray,
+        target: np.ndarray,
+        fallback_normal: np.ndarray | None = None,
+    ) -> None:
+        pos = np.asarray(pos, dtype=float).reshape(3)
+        target = np.asarray(target, dtype=float).reshape(3)
+        normal = unit_vector_from_to(pos, target, fallback=fallback_normal)
+        self.active_gate_normal = None if normal is None else normal.copy()
+        self.previous_gate_pass_position = pos.copy()
+        self.gate_plane_crossed = False
+        self.near_gate_but_not_crossed = False
+        self.gate_lateral_error = float("nan")
+        self.gate_progress_along_approach = (
+            float(np.dot(pos - target, normal))
+            if normal is not None
+            else float("nan")
+        )
+
+    def _is_final_race_gate_index(self, gate_idx: int) -> bool:
+        if self.race_gate_count is None:
+            return False
+        return int(gate_idx) >= int(self.race_gate_count) - 1
+
+    def _has_future_race_gate(self, gate_idx: int) -> bool:
+        if self.race_gate_count is None:
+            return True
+        return int(gate_idx) < int(self.race_gate_count)
+
+    def _active_plan_remaining_s(self) -> float:
+        if self.active_waypoints is None or self.planner.total_time <= 0.0:
+            return 0.0
+        elapsed = time.time() - float(self.trajectory_start_time)
+        return max(0.0, float(self.planner.total_time) - elapsed)
+
+    def _post_gate_exit_active(self, now: float | None = None) -> bool:
+        now = time.time() if now is None else float(now)
+        return (
+            self.active_waypoints is not None
+            and self.planner.total_time > 0.0
+            and now <= float(self.post_gate_exit_until_s)
+        )
+
+    def _active_plan_expired(self, now: float | None = None) -> bool:
+        if self.active_waypoints is None or self.planner.total_time <= 0.0:
+            return False
+        now = time.time() if now is None else float(now)
+        elapsed = now - float(self.trajectory_start_time)
+        return elapsed > float(self.planner.total_time) + float(self.replan_after_trajectory_s)
+
+    def _clear_active_plan(self, *, reason: str) -> None:
+        print(
+            "active_plan_clear "
+            f"reason={reason} "
+            f"gate_idx={int(self.current_gate_idx)} "
+            f"active_plan_mode={self.active_plan_mode} "
+            f"terminal_policy={self.active_terminal_velocity_policy}",
+            flush=True,
+        )
+        self.active_waypoints = None
+        self.active_times = None
+        self.active_horizon_gate_indices = []
+        self.active_horizon_track_ids = []
+        self.active_horizon_targets = []
+        self.active_plan_mode = ""
+        self.active_terminal_velocity = np.zeros(3, dtype=float)
+        self.active_terminal_velocity_policy = f"cleared:{reason}"
+        self.post_gate_exit_until_s = 0.0
+        self.post_gate_exit_reason = ""
+
     @staticmethod
     def _finite_vec3_or_none(value) -> np.ndarray | None:
         try:
@@ -1150,6 +1253,12 @@ class PyAIPilotAutonomyAPI:
         self._reset_gate_pass_state()
         self.active_waypoints = None
         self.active_times = None
+        self.active_horizon_gate_indices = []
+        self.active_horizon_track_ids = []
+        self.active_horizon_targets = []
+        self.active_plan_mode = ""
+        self.active_terminal_velocity = np.zeros(3, dtype=float)
+        self.active_terminal_velocity_policy = "cleared_active_shift"
         self.last_planned_gate_idx = -1
         self._last_gate_signature = None
         self.active_target_shift_frames = 0
@@ -1160,9 +1269,10 @@ class PyAIPilotAutonomyAPI:
         target_idx: int,
         target: np.ndarray,
         target_track_id,
-    ) -> tuple[list[np.ndarray], list]:
+    ) -> tuple[list[np.ndarray], list, list[int]]:
         targets = [np.asarray(target, dtype=float).reshape(3).copy()]
         track_ids = [target_track_id]
+        gate_indices = [int(target_idx)]
         max_idx = min(
             len(self.gate_centers_neu),
             int(target_idx) + self.planning_horizon_gates,
@@ -1178,7 +1288,8 @@ class PyAIPilotAutonomyAPI:
                 continue
             targets.append(center.copy())
             track_ids.append(track_id)
-        return targets, track_ids
+            gate_indices.append(int(idx))
+        return targets, track_ids, gate_indices
 
     def _compute_passthrough_waypoint_velocities(
         self,
@@ -1200,6 +1311,40 @@ class PyAIPilotAutonomyAPI:
         if not np.any(np.isfinite(velocities[1:-1])):
             return None
         return velocities
+
+    def _terminal_velocity_for_plan(
+        self,
+        *,
+        waypoints: np.ndarray,
+        plan_mode: str,
+        horizon_gate_indices: list[int],
+    ) -> tuple[np.ndarray, str]:
+        zero = np.zeros(3, dtype=float)
+        if not self.terminal_velocity_enabled:
+            return zero, "zero_disabled"
+        if self.terminal_speed_m_s <= 0.0:
+            return zero, "zero_speed"
+        if waypoints.ndim != 2 or waypoints.shape[1] != 3 or len(waypoints) < 3:
+            return zero, "zero_no_terminal_segment"
+
+        last_gate_idx = (
+            int(horizon_gate_indices[-1])
+            if horizon_gate_indices
+            else int(self.current_gate_idx)
+        )
+        if self._is_final_race_gate_index(last_gate_idx):
+            return zero, "zero_final_gate"
+        if plan_mode not in ("gate_horizon", "single_gate_exit"):
+            return zero, f"zero_mode_{plan_mode}"
+
+        direction = np.asarray(waypoints[-1] - waypoints[-2], dtype=float).reshape(3)
+        norm = float(np.linalg.norm(direction))
+        if not math.isfinite(norm) or norm < 1e-6:
+            return zero, "zero_bad_terminal_direction"
+
+        speed = min(float(self.terminal_speed_m_s), float(self.planner_vmax))
+        velocity = speed * direction / norm
+        return velocity, f"continue_{plan_mode}"
 
     def _path_plan(self, pos: np.ndarray, vel: np.ndarray) -> bool:
         if not self.gate_centers_neu:
@@ -1223,22 +1368,19 @@ class PyAIPilotAutonomyAPI:
         )
         self._sync_target_manager_state()
 
-        normal = unit_vector_from_to(pos, target, fallback=self.active_gate_normal)
-        self.active_gate_normal = None if normal is None else normal.copy()
-        self.previous_gate_pass_position = np.asarray(pos, dtype=float).reshape(3).copy()
-        self.gate_plane_crossed = False
-        self.near_gate_but_not_crossed = False
-        self.gate_lateral_error = float("nan")
-        self.gate_progress_along_approach = (
-            float(np.dot(pos - target, normal))
-            if normal is not None
-            else float("nan")
+        self._initialize_gate_pass_tracking(
+            pos=pos,
+            target=target,
+            fallback_normal=self.active_gate_normal,
         )
+        normal = self.active_gate_normal
 
-        horizon_targets, horizon_track_ids = self._planning_horizon_targets(
-            target_idx,
-            target,
-            target_track_id,
+        horizon_targets, horizon_track_ids, horizon_gate_indices = (
+            self._planning_horizon_targets(
+                target_idx,
+                target,
+                target_track_id,
+            )
         )
         if len(horizon_targets) >= 2:
             waypoints = np.vstack([pos, *horizon_targets])
@@ -1260,13 +1402,18 @@ class PyAIPilotAutonomyAPI:
             amax=self.planner_amax,
             T_min=self.planner_t_min,
         )
+        terminal_velocity, terminal_policy = self._terminal_velocity_for_plan(
+            waypoints=waypoints,
+            plan_mode=plan_mode,
+            horizon_gate_indices=horizon_gate_indices,
+        )
 
         self.planner = MultiSegmentMinimumSnapPlanner()
         self.planner.update(
             waypoints=waypoints,
             times=times,
             v_start=vel,
-            v_end=np.zeros(3, dtype=float),
+            v_end=terminal_velocity,
             a_start=np.zeros(3, dtype=float),
             a_end=np.zeros(3, dtype=float),
             j_start=np.zeros(3, dtype=float),
@@ -1277,6 +1424,17 @@ class PyAIPilotAutonomyAPI:
         self.current_gate_pos = target.copy()
         self.active_waypoints = waypoints.copy()
         self.active_times = np.asarray(times, dtype=float).copy()
+        self.active_horizon_gate_indices = list(horizon_gate_indices)
+        self.active_horizon_track_ids = list(horizon_track_ids)
+        self.active_horizon_targets = [
+            np.asarray(item, dtype=float).reshape(3).copy()
+            for item in horizon_targets
+        ]
+        self.active_plan_mode = str(plan_mode)
+        self.active_terminal_velocity = terminal_velocity.copy()
+        self.active_terminal_velocity_policy = str(terminal_policy)
+        self.post_gate_exit_until_s = 0.0
+        self.post_gate_exit_reason = ""
         self.trajectory_start_time = time.time()
         self.last_plan_wall_time = self.trajectory_start_time
         self.last_planned_gate_idx = int(self.current_gate_idx)
@@ -1288,6 +1446,7 @@ class PyAIPilotAutonomyAPI:
             str(track_id) if track_id is not None else "none"
             for track_id in horizon_track_ids
         ) + ")"
+        horizon_indices_txt = "(" + ",".join(str(idx) for idx in horizon_gate_indices) + ")"
         waypoint_velocities_txt = "none"
         if waypoint_velocities is not None:
             waypoint_velocities_txt = "[" + ";".join(
@@ -1302,11 +1461,14 @@ class PyAIPilotAutonomyAPI:
             f"track={target_track_id if target_track_id is not None else 'none'} "
             f"mode={plan_mode} "
             f"horizon_tracks={horizon_tracks_txt} "
+            f"horizon_gate_indices={horizon_indices_txt} "
             f"total_time={float(self.planner.total_time):.3f} "
             f"segments={max(0, int(len(waypoints) - 1))} "
             f"target_neu={self._fmt_vec(target, precision=3)} "
             f"normal_neu={self._fmt_vec(normal, precision=3) if normal is not None else 'none'} "
             f"v_start_neu={self._fmt_vec(vel, precision=3)} "
+            f"v_end_neu={self._fmt_vec(terminal_velocity, precision=3)} "
+            f"terminal_policy={terminal_policy} "
             f"waypoint_velocities_neu={waypoint_velocities_txt} "
             f"times_s={times_txt} "
             f"waypoints_neu={waypoints_txt}",
@@ -1329,6 +1491,7 @@ class PyAIPilotAutonomyAPI:
         return out
 
     def _advance_gate_if_needed(self, pos: np.ndarray) -> bool:
+        self.last_gate_pass_preserved_plan = False
         if self.current_gate_pos is None and not self.gate_centers_neu:
             return False
         if (
@@ -1418,14 +1581,135 @@ class PyAIPilotAutonomyAPI:
             truth_pos_neu=truth_pos,
             truth_error_m=truth_error,
         )
-        self._sync_target_manager_state(clear_unlocked_current=True)
-        self._reset_gate_pass_state()
-        self.active_waypoints = None
-        self.active_times = None
+        continued = self._continue_plan_after_gate_pass(
+            completed_gate_idx=completed_gate_idx,
+            next_gate_idx=next_gate_idx,
+            pos=pos,
+        )
+        if not continued:
+            self._sync_target_manager_state(clear_unlocked_current=True)
+            self._reset_gate_pass_state()
+            self.active_waypoints = None
+            self.active_times = None
+            self.active_horizon_gate_indices = []
+            self.active_horizon_track_ids = []
+            self.active_horizon_targets = []
+            self.active_plan_mode = ""
+            self.active_terminal_velocity = np.zeros(3, dtype=float)
+            self.active_terminal_velocity_policy = "cleared_after_pass"
         return True
+
+    def _continue_plan_after_gate_pass(
+        self,
+        *,
+        completed_gate_idx: int,
+        next_gate_idx: int,
+        pos: np.ndarray,
+    ) -> bool:
+        if (
+            not self.horizon_continuation_enabled
+            or self.active_waypoints is None
+            or self.planner.total_time <= 0.0
+        ):
+            return False
+
+        pos = np.asarray(pos, dtype=float).reshape(3)
+        now = time.time()
+        remaining_s = self._active_plan_remaining_s()
+        next_gate_idx = int(next_gate_idx)
+        future_race_gate = self._has_future_race_gate(next_gate_idx)
+
+        if future_race_gate and next_gate_idx in self.active_horizon_gate_indices:
+            horizon_idx = self.active_horizon_gate_indices.index(next_gate_idx)
+            if 0 <= horizon_idx < len(self.active_horizon_targets):
+                target = self._apply_target_z_policy(
+                    self.active_horizon_targets[horizon_idx]
+                )
+                track_id = (
+                    self.active_horizon_track_ids[horizon_idx]
+                    if horizon_idx < len(self.active_horizon_track_ids)
+                    else None
+                )
+                locked_target = self.target_manager.lock_target(
+                    gate_idx=next_gate_idx,
+                    track_id=track_id,
+                    center_neu=target,
+                    reason="horizon_continue",
+                    now_s=now,
+                )
+                self._sync_target_manager_state()
+                self._initialize_gate_pass_tracking(
+                    pos=pos,
+                    target=locked_target,
+                    fallback_normal=None,
+                )
+                self.last_planned_gate_idx = next_gate_idx
+                self.post_gate_exit_until_s = 0.0
+                self.post_gate_exit_reason = ""
+                self.last_gate_pass_preserved_plan = True
+                print(
+                    "horizon_continue_after_pass "
+                    "mode=next_gate "
+                    f"completed_gate_idx={int(completed_gate_idx)} "
+                    f"next_gate_idx={next_gate_idx} "
+                    f"track={track_id if track_id is not None else 'none'} "
+                    f"horizon_idx={horizon_idx} "
+                    f"remaining_s={remaining_s:.3f} "
+                    f"target_neu={self._fmt_vec(locked_target, precision=3)} "
+                    f"active_plan_mode={self.active_plan_mode} "
+                    f"terminal_policy={self.active_terminal_velocity_policy}",
+                    flush=True,
+                )
+                return True
+
+        if (
+            self.post_gate_exit_continuation_enabled
+            and future_race_gate
+            and self.active_plan_mode == "single_gate_exit"
+            and remaining_s > 0.05
+        ):
+            self._sync_target_manager_state(clear_unlocked_current=True)
+            self._reset_gate_pass_state()
+            self.last_planned_gate_idx = next_gate_idx
+            self.post_gate_exit_until_s = min(
+                now + remaining_s + float(self.replan_after_trajectory_s),
+                float(self.trajectory_start_time)
+                + float(self.planner.total_time)
+                + float(self.replan_after_trajectory_s),
+            )
+            self.post_gate_exit_reason = "waiting_for_future_gate_after_pass"
+            self.last_gate_pass_preserved_plan = True
+            print(
+                "horizon_continue_after_pass "
+                "mode=post_gate_exit "
+                f"completed_gate_idx={int(completed_gate_idx)} "
+                f"next_gate_idx={next_gate_idx} "
+                f"remaining_s={remaining_s:.3f} "
+                f"until_s={self.post_gate_exit_until_s:.3f} "
+                f"active_plan_mode={self.active_plan_mode} "
+                f"terminal_policy={self.active_terminal_velocity_policy} "
+                f"reason={self.post_gate_exit_reason}",
+                flush=True,
+            )
+            return True
+
+        print(
+            "horizon_continue_after_pass "
+            "mode=none "
+            f"completed_gate_idx={int(completed_gate_idx)} "
+            f"next_gate_idx={next_gate_idx} "
+            f"future_race_gate={int(bool(future_race_gate))} "
+            f"remaining_s={remaining_s:.3f} "
+            f"active_plan_mode={self.active_plan_mode} "
+            f"horizon_gate_indices={self.active_horizon_gate_indices}",
+            flush=True,
+        )
+        return False
 
     def _should_plan(self, advanced: bool) -> bool:
         if advanced:
+            if self.last_gate_pass_preserved_plan:
+                return False
             return True
         if self.active_waypoints is None or self.planner.total_time <= 0.0:
             return True
@@ -1443,6 +1727,14 @@ class PyAIPilotAutonomyAPI:
         pos: np.ndarray,
         current_yaw: float,
     ) -> float:
+        if self._prefer_reference_motion_yaw_near_gate(pos):
+            desired = self._reference_motion_yaw(v_ref, a_ref, self.last_desired_yaw)
+            if np.isfinite(desired):
+                self.last_yaw_target = None
+                self.last_yaw_target_source = "reference_motion_near_horizon_gate"
+                self.last_desired_yaw = self._wrap_pi(desired)
+                return self.last_desired_yaw
+
         target, source = self._yaw_target_center()
         self.last_yaw_target = None if target is None else target.copy()
         self.last_yaw_target_source = source
@@ -1466,6 +1758,30 @@ class PyAIPilotAutonomyAPI:
             self.last_yaw_target_source = "current_yaw"
         self.last_desired_yaw = self._wrap_pi(desired)
         return self.last_desired_yaw
+
+    def _prefer_reference_motion_yaw_near_gate(self, pos: np.ndarray) -> bool:
+        if not self.yaw_reference_motion_near_gate_enabled:
+            return False
+        if self.yaw_reference_motion_distance_m <= 0.0:
+            return False
+        if self.active_waypoints is None or self.planner.total_time <= 0.0:
+            return False
+        if self._post_gate_exit_active():
+            return True
+        if len(self.active_horizon_gate_indices) < 2:
+            return False
+        if self.current_gate_pos is None:
+            return False
+        try:
+            pos = np.asarray(pos, dtype=float).reshape(3)
+            target = np.asarray(self.current_gate_pos, dtype=float).reshape(3)
+        except (TypeError, ValueError):
+            return False
+        distance = float(np.linalg.norm(pos - target))
+        return (
+            math.isfinite(distance)
+            and distance <= float(self.yaw_reference_motion_distance_m)
+        )
 
     def _yaw_target_center(self) -> tuple[np.ndarray | None, str]:
         if self.use_perception and self.active_target_track_id is not None:
@@ -3049,6 +3365,12 @@ class PyAIPilotAutonomyAPI:
         self._reset_gate_pass_state()
         self.active_waypoints = None
         self.active_times = None
+        self.active_horizon_gate_indices = []
+        self.active_horizon_track_ids = []
+        self.active_horizon_targets = []
+        self.active_plan_mode = ""
+        self.active_terminal_velocity = np.zeros(3, dtype=float)
+        self.active_terminal_velocity_policy = "cleared_preempt"
         self.last_planned_gate_idx = -1
         self.active_target_shift_frames = 0
         self.active_target_shift_track_id = None
@@ -3110,8 +3432,23 @@ class PyAIPilotAutonomyAPI:
             self.last_active_target_center = None
             self.active_target_lost_time = None
             self._reset_gate_pass_state()
+            if self._post_gate_exit_active():
+                print(
+                    "post_gate_exit_continue "
+                    f"current_gate_idx={int(self.current_gate_idx)} "
+                    f"until_s={self.post_gate_exit_until_s:.3f} "
+                    f"reason={self.post_gate_exit_reason or 'active'}",
+                    flush=True,
+                )
+                return
             self.active_waypoints = None
             self.active_times = None
+            self.active_horizon_gate_indices = []
+            self.active_horizon_track_ids = []
+            self.active_horizon_targets = []
+            self.active_plan_mode = ""
+            self.active_terminal_velocity = np.zeros(3, dtype=float)
+            self.active_terminal_velocity_policy = "cleared_no_target"
             self.last_planned_gate_idx = -1
             return
 
@@ -3146,6 +3483,12 @@ class PyAIPilotAutonomyAPI:
             self._reset_gate_pass_state()
             self.active_waypoints = None
             self.active_times = None
+            self.active_horizon_gate_indices = []
+            self.active_horizon_track_ids = []
+            self.active_horizon_targets = []
+            self.active_plan_mode = ""
+            self.active_terminal_velocity = np.zeros(3, dtype=float)
+            self.active_terminal_velocity_policy = "cleared_replan_needed"
             self.last_planned_gate_idx = -1
 
     @classmethod

@@ -182,7 +182,7 @@ max_keypoint_opposite_edge_ratio = 1.35
 max_pnp_size_depth_disagreement_m = 1.5
 max_pnp_size_depth_disagreement_ratio = 0.20
 min_depth_m_for_memory = 0.5
-max_depth_m_for_memory = 25.0
+max_depth_m_for_memory = 200.0
 reject_negative_depth = true
 
 [perception_geometry_audit]
@@ -200,12 +200,16 @@ gazebo_camera_mount_rpy = [0.0, -0.3490658503988659, 0.0]
 gazebo_rotation_mode = "transpose"
 gazebo_optical_mode = "physical_minus_y"
 known_gate_positions_neu = [
-  [-1.111371, 12.614718, 3.595973],
-  [0.221441, 24.070117, 2.163723],
-  [-0.050616, 35.213420, 1.501237],
-  [1.488134, 48.088183, 3.178262],
-  [2.058026, 58.992011, 7.154122],
-  [-0.962093, 71.786590, 6.997298],
+  [-0.061534, 29.665372, 4.113394],
+  [1.585332, 60.449254, 10.929463],
+  [-2.040347, 93.421399, 10.395199],
+  [-2.406968, 121.440150, 11.917446],
+  [2.647982, 153.000409, 20.743638],
+  [-0.774401, 181.070447, 19.334631],
+  [2.362300, 212.273024, 18.143769],
+  [-0.705327, 243.773001, 13.782656],
+  [-3.958353, 275.095294, 13.493975],
+  [-0.210331, 304.098806, 8.804799],
 ]
 gate_right_axis_neu = [1.0, 0.0, 0.0]
 gate_up_axis_neu = [0.0, 0.0, 1.0]
@@ -214,12 +218,16 @@ gate_up_axis_neu = [0.0, 0.0, 1.0]
 mode = "perception"               # perception | ground_truth
 allow_ground_truth = false         # debug/PX4 only; not competition-valid
 known_gate_positions_neu = [
-  [-1.111371, 12.614718, 3.595973],
-  [0.221441, 24.070117, 2.163723],
-  [-0.050616, 35.213420, 1.501237],
-  [1.488134, 48.088183, 3.178262],
-  [2.058026, 58.992011, 7.154122],
-  [-0.962093, 71.786590, 6.997298],
+  [-0.061534, 29.665372, 4.113394],
+  [1.585332, 60.449254, 10.929463],
+  [-2.040347, 93.421399, 10.395199],
+  [-2.406968, 121.440150, 11.917446],
+  [2.647982, 153.000409, 20.743638],
+  [-0.774401, 181.070447, 19.334631],
+  [2.362300, 212.273024, 18.143769],
+  [-0.705327, 243.773001, 13.782656],
+  [-3.958353, 275.095294, 13.493975],
+  [-0.210331, 304.098806, 8.804799],
 ]
 
 [gate_memory]
@@ -244,7 +252,7 @@ max_committed_match_distance = 0.60
 min_observation_time = 0.50
 
 [race]
-gate_count = 6
+gate_count = 10
 pass_radius_m = 1.25
 pass_lateral_radius_m = 0.75
 pass_plane_tolerance_m = 0.05
@@ -263,8 +271,14 @@ safe_max_target_z = inf
 target_z_mode = "observed_clamped" # observed_clamped | expected
 replan_target_shift_m = 1.0
 horizon_gates = 3
+horizon_continuation_enabled = true
+post_gate_exit_continuation_enabled = true
 passthrough_velocity_enabled = true
 passthrough_speed_m_s = 0.5
+terminal_velocity_enabled = true
+terminal_speed_m_s = 0.5
+yaw_reference_motion_near_gate_enabled = true
+yaw_reference_motion_distance_m = 2.0
 active_target_preempt_enabled = true
 active_target_preempt_min_active_distance_m = 6.0
 active_target_preempt_margin_m = 2.0
@@ -287,7 +301,7 @@ race_order_front_blocker_margin_m = 3.0
 race_order_front_blocker_lateral_radius_m = 6.0
 replan_after_trajectory_s = 0.25
 replan_min_interval_s = 0.3
-max_detection_range_m = 25.0
+max_detection_range_m = 200.0
 
 [controller]
 mass = 1.0

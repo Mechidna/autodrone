@@ -284,8 +284,14 @@ class PlannerSection:
     safe_max_target_z: float
     replan_target_shift_m: float
     horizon_gates: int
+    horizon_continuation_enabled: bool
+    post_gate_exit_continuation_enabled: bool
     passthrough_velocity_enabled: bool
     passthrough_speed_m_s: float
+    terminal_velocity_enabled: bool
+    terminal_speed_m_s: float
+    yaw_reference_motion_near_gate_enabled: bool
+    yaw_reference_motion_distance_m: float
     active_target_preempt_enabled: bool
     active_target_preempt_min_active_distance_m: float
     active_target_preempt_margin_m: float
@@ -1134,12 +1140,38 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             safe_max_target_z=_float(planner_raw, "safe_max_target_z", 3.0),
             replan_target_shift_m=_float(planner_raw, "replan_target_shift_m", 1.0),
             horizon_gates=max(1, _int(planner_raw, "horizon_gates", 3)),
+            horizon_continuation_enabled=_bool(
+                planner_raw,
+                "horizon_continuation_enabled",
+                True,
+            ),
+            post_gate_exit_continuation_enabled=_bool(
+                planner_raw,
+                "post_gate_exit_continuation_enabled",
+                True,
+            ),
             passthrough_velocity_enabled=_bool(
                 planner_raw,
                 "passthrough_velocity_enabled",
                 True,
             ),
             passthrough_speed_m_s=_float(planner_raw, "passthrough_speed_m_s", 2.5),
+            terminal_velocity_enabled=_bool(
+                planner_raw,
+                "terminal_velocity_enabled",
+                True,
+            ),
+            terminal_speed_m_s=_float(planner_raw, "terminal_speed_m_s", 0.0),
+            yaw_reference_motion_near_gate_enabled=_bool(
+                planner_raw,
+                "yaw_reference_motion_near_gate_enabled",
+                True,
+            ),
+            yaw_reference_motion_distance_m=_float(
+                planner_raw,
+                "yaw_reference_motion_distance_m",
+                2.0,
+            ),
             active_target_preempt_enabled=_bool(
                 planner_raw,
                 "active_target_preempt_enabled",
@@ -2096,6 +2128,14 @@ def _validate(config: PilotConfig) -> None:
         (
             "planner.race_order_front_blocker_lateral_radius_m",
             config.planner.race_order_front_blocker_lateral_radius_m,
+        ),
+        (
+            "planner.terminal_speed_m_s",
+            config.planner.terminal_speed_m_s,
+        ),
+        (
+            "planner.yaw_reference_motion_distance_m",
+            config.planner.yaw_reference_motion_distance_m,
         ),
         (
             "perception_geometry_audit.print_period_s",
