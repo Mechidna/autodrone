@@ -25,6 +25,49 @@ def test_inside_radius_before_plane_does_not_pass():
     assert result.lateral_error_m < 0.1
 
 
+def test_near_plane_aperture_pass_accepts_inside_opening_before_plane():
+    center = np.array([0.0, 10.0, 1.5])
+    normal = np.array([0.0, 1.0, 0.0])
+
+    result = check_gate_plane_pass(
+        previous_position=np.array([0.0, 9.45, 1.5]),
+        position=np.array([0.0, 9.72, 1.5]),
+        center=center,
+        normal=normal,
+        lateral_radius_m=0.75,
+        plane_tolerance_m=0.05,
+        near_plane_pass_distance_m=1.25,
+        near_plane_back_tolerance_m=0.35,
+        near_plane_forward_tolerance_m=0.15,
+    )
+
+    assert result.passed
+    assert result.reason == "near_plane_aperture"
+    assert not result.crossed_plane
+    np.testing.assert_allclose(result.signed_progress_m, -0.28)
+    np.testing.assert_allclose(result.lateral_error_m, 0.0)
+
+
+def test_near_plane_aperture_pass_rejects_if_moving_away_from_exit():
+    center = np.array([0.0, 10.0, 1.5])
+    normal = np.array([0.0, 1.0, 0.0])
+
+    result = check_gate_plane_pass(
+        previous_position=np.array([0.0, 9.75, 1.5]),
+        position=np.array([0.0, 9.72, 1.5]),
+        center=center,
+        normal=normal,
+        lateral_radius_m=0.75,
+        plane_tolerance_m=0.05,
+        near_plane_pass_distance_m=1.25,
+        near_plane_back_tolerance_m=0.35,
+        near_plane_forward_tolerance_m=0.15,
+    )
+
+    assert not result.passed
+    assert result.reason == "not_past_gate_plane"
+
+
 def test_crossing_plane_inside_opening_passes():
     center = np.array([0.0, 10.0, 1.5])
     normal = np.array([0.0, 1.0, 0.0])

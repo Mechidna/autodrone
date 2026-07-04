@@ -45,6 +45,9 @@ def check_gate_plane_pass(
     normal,
     lateral_radius_m: float,
     plane_tolerance_m: float,
+    near_plane_pass_distance_m: float | None = None,
+    near_plane_back_tolerance_m: float = 0.0,
+    near_plane_forward_tolerance_m: float = 0.0,
 ) -> GatePlanePassResult:
     prev = np.asarray(previous_position, dtype=float).reshape(3)
     pos = np.asarray(position, dtype=float).reshape(3)
@@ -100,9 +103,20 @@ def check_gate_plane_pass(
     previous_progress = float(np.dot(prev - gate_center, n))
     progress = float(np.dot(pos - gate_center, n))
     tolerance = max(0.0, float(plane_tolerance_m))
+    near_plane_distance = None
+    if near_plane_pass_distance_m is not None:
+        try:
+            candidate_distance = float(near_plane_pass_distance_m)
+        except (TypeError, ValueError):
+            candidate_distance = float("nan")
+        if np.isfinite(candidate_distance) and candidate_distance > 0.0:
+            near_plane_distance = candidate_distance
+    near_plane_back_tolerance = max(0.0, float(near_plane_back_tolerance_m))
+    near_plane_forward_tolerance = max(0.0, float(near_plane_forward_tolerance_m))
 
     crossed = previous_progress <= 0.0 <= progress
-    moving_toward_exit = progress >= previous_progress - 1e-6
+    progress_delta = progress - previous_progress
+    moving_toward_exit = progress_delta >= -1e-6
     on_plane = abs(progress) <= tolerance and moving_toward_exit
 
     crossing_point = None
@@ -124,6 +138,24 @@ def check_gate_plane_pass(
     lateral_error = float(np.linalg.norm(lateral_vec))
 
     if crossing_point is None:
+        near_plane_aperture = (
+            near_plane_distance is not None
+            and distance <= near_plane_distance
+            and lateral_error <= lateral_radius
+            and -near_plane_back_tolerance <= progress <= near_plane_forward_tolerance
+            and progress_delta > 1e-6
+        )
+        if near_plane_aperture:
+            return GatePlanePassResult(
+                passed=True,
+                reason="near_plane_aperture",
+                distance_m=distance,
+                signed_progress_m=progress,
+                previous_signed_progress_m=previous_progress,
+                lateral_error_m=lateral_error,
+                crossed_plane=False,
+                crossing_point=pos.copy(),
+            )
         return GatePlanePassResult(
             passed=False,
             reason="not_past_gate_plane",

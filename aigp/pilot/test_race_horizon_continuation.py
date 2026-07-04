@@ -110,6 +110,32 @@ def test_gate_pass_advances_inside_existing_horizon():
     np.testing.assert_allclose(api.current_gate_pos, np.array([0.0, 20.0, 1.5]))
 
 
+def test_near_plane_aperture_pass_advances_locked_gate_before_exact_plane():
+    api = PyAIPilotAutonomyAPI(use_perception=False, race_gate_count=1)
+    target = np.array([0.0, 10.0, 1.5])
+    api.near_plane_pass_enabled = True
+    api.near_plane_pass_back_tolerance_m = 0.35
+    api.near_plane_pass_forward_tolerance_m = 0.15
+    api.pass_radius_m = 1.25
+    api.gate_pass_lateral_radius_m = 0.75
+    api.gate_plane_tolerance_m = 0.05
+    api.target_manager.lock_target(
+        gate_idx=0,
+        track_id=-1,
+        center_neu=target,
+        reason="test",
+    )
+    api._sync_target_manager_state()
+    api.active_gate_normal = np.array([0.0, 1.0, 0.0])
+    api.previous_gate_pass_position = np.array([0.0, 9.45, 1.5])
+
+    advanced = api._advance_gate_if_needed(np.array([0.0, 9.72, 1.5]))
+
+    assert advanced
+    assert api.current_gate_idx == 1
+    assert -1 in api.completed_track_ids
+
+
 def test_duplicate_cluster_center_uses_best_sibling_track():
     api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=4)
     stale_active = _stable_track(19, np.array([-0.09, 28.06, 4.08]), hits=8, score=0.2)
@@ -226,6 +252,110 @@ def test_planning_horizon_skips_duplicate_future_waypoint():
     assert gate_indices == [0, 2]
     np.testing.assert_allclose(targets[0], target)
     np.testing.assert_allclose(targets[1], np.array([0.0, 30.0, 1.5]))
+
+
+def test_planning_horizon_appends_strong_uncommitted_future_track():
+    api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=4)
+    api.planning_horizon_gates = 3
+    api.provisional_next_gate_enabled = True
+    api.provisional_next_gate_max_age_s = 1.5
+    api.provisional_next_gate_max_lateral_m = 20.0
+    target = np.array([0.0, 10.0, 1.5])
+    future = _stable_track(
+        44,
+        np.array([0.0, 25.0, 1.5]),
+        hits=3,
+        committed=False,
+        stable=False,
+    )
+    api.gate_memory.tracks = [future]
+    api.gate_centers_neu = [target.copy()]
+    api.gate_track_ids = [10]
+    api.current_gate_idx = 0
+
+    targets, track_ids, gate_indices = api._planning_horizon_targets(
+        0,
+        target,
+        10,
+        pos=np.array([0.0, 0.0, 1.5]),
+        vel=np.array([0.0, 1.0, 0.0]),
+    )
+
+    assert track_ids == [10, 44]
+    assert gate_indices == [0, 1]
+    np.testing.assert_allclose(targets[0], target)
+    np.testing.assert_allclose(targets[1], future.filtered_center_world)
+
+
+def test_path_plan_uses_provisional_future_track_without_stealing_active_target():
+    api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=4)
+    api.planning_horizon_gates = 3
+    api.provisional_next_gate_enabled = True
+    api.provisional_next_gate_max_age_s = 1.5
+    target = np.array([0.0, 10.0, 1.5])
+    future = _stable_track(
+        44,
+        np.array([0.0, 25.0, 1.5]),
+        hits=3,
+        committed=False,
+        stable=False,
+    )
+    api.gate_memory.tracks = [future]
+    api.gate_centers_neu = [target.copy()]
+    api.gate_track_ids = [10]
+    api.current_gate_idx = 0
+
+    planned = api._path_plan(
+        pos=np.array([0.0, 0.0, 1.5]),
+        vel=np.zeros(3),
+    )
+
+    assert planned
+    assert api.active_plan_mode == "gate_horizon"
+    assert api.active_horizon_track_ids == [10, 44]
+    assert api.active_horizon_gate_indices == [0, 1]
+    assert api.active_target_track_id == 10
+    assert api.target_manager.locked
+    assert api.target_manager.active_target_track_id == 10
+    np.testing.assert_allclose(api.current_gate_pos, target)
+
+
+def test_plan_install_logs_boundary_continuity(capsys):
+    api = PyAIPilotAutonomyAPI(use_perception=False, race_gate_count=4)
+    api.gate_centers_neu = [
+        np.array([0.0, 10.0, 1.5]),
+        np.array([2.0, 20.0, 2.0]),
+        np.array([-1.0, 30.0, 1.2]),
+    ]
+    api.gate_track_ids = [-1, -2, -3]
+    api.current_gate_idx = 0
+
+    planned = api._path_plan(
+        pos=np.array([0.0, 0.0, 1.5]),
+        vel=np.zeros(3),
+    )
+
+    assert planned
+    output = capsys.readouterr().out
+    lines = [
+        line for line in output.splitlines()
+        if line.startswith("plan_boundary_continuity ")
+    ]
+    assert lines
+    first = lines[0]
+    assert "boundary_i=1" in first
+    assert "left_velocity_neu=" in first
+    assert "right_velocity_neu=" in first
+    assert "left_acceleration_neu=" in first
+    assert "right_acceleration_neu=" in first
+    assert "left_jerk_neu=" in first
+    assert "right_jerk_neu=" in first
+    assert "speed_at_waypoint=" in first
+    assert "turn_angle_in_deg=" in first
+    assert "turn_angle_out_deg=" in first
+    assert "velocity_delta=" in first
+    assert "acceleration_delta=" in first
+    assert "jerk_delta=" in first
 
 
 class _FakePlanner:

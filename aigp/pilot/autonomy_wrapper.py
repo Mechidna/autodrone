@@ -85,6 +85,17 @@ class PyAIPilotAutonomyAPI:
             0.0,
             float(self.config.race.pass_plane_tolerance_m),
         )
+        self.near_plane_pass_enabled = bool(
+            self.config.race.near_plane_pass_enabled
+        )
+        self.near_plane_pass_back_tolerance_m = max(
+            0.0,
+            float(self.config.race.near_plane_pass_back_tolerance_m),
+        )
+        self.near_plane_pass_forward_tolerance_m = max(
+            0.0,
+            float(self.config.race.near_plane_pass_forward_tolerance_m),
+        )
         self.gate_pass_through_m = max(
             float(VADR_TS_002.gate_depth_m),
             float(self.config.race.pass_through_m),
@@ -380,6 +391,7 @@ class PyAIPilotAutonomyAPI:
         self._last_race_order_suffix_filter_signature = None
         self._last_race_order_front_blocker_signature = None
         self._last_race_order_closer_blocker_signature = None
+        self._last_provisional_horizon_signature = None
         self._last_target_reject_signature = None
         self._last_plan_validation_reject_signature = None
         self._last_perception_reject_print_time = 0.0
@@ -1619,6 +1631,8 @@ class PyAIPilotAutonomyAPI:
         target_idx: int,
         target: np.ndarray,
         target_track_id,
+        pos: np.ndarray | None = None,
+        vel: np.ndarray | None = None,
     ) -> tuple[list[np.ndarray], list, list[int]]:
         targets = [np.asarray(target, dtype=float).reshape(3).copy()]
         track_ids = [target_track_id]
@@ -1665,7 +1679,247 @@ class PyAIPilotAutonomyAPI:
             targets.append(center.copy())
             track_ids.append(track_id)
             gate_indices.append(int(idx))
+        self._append_provisional_horizon_targets(
+            pos=pos,
+            vel=vel,
+            targets=targets,
+            track_ids=track_ids,
+            gate_indices=gate_indices,
+        )
         return targets, track_ids, gate_indices
+
+    def _append_provisional_horizon_targets(
+        self,
+        *,
+        pos: np.ndarray | None,
+        vel: np.ndarray | None,
+        targets: list[np.ndarray],
+        track_ids: list,
+        gate_indices: list[int],
+    ) -> None:
+        if (
+            not self.use_perception
+            or not self.provisional_next_gate_enabled
+            or pos is None
+            or vel is None
+            or not targets
+            or len(targets) >= int(self.planning_horizon_gates)
+            or not hasattr(self, "gate_memory")
+        ):
+            return
+
+        if self.race_gate_count is not None and gate_indices:
+            if int(gate_indices[-1]) >= int(self.race_gate_count) - 1:
+                return
+
+        pos = self._finite_vec3_or_none(pos)
+        vel = self._finite_vec3_or_none(vel)
+        if pos is None or vel is None:
+            return
+
+        accepted: list[tuple[int, int, float, float]] = []
+        rejected: list[tuple[int, str, float]] = []
+        now = time.time()
+
+        def track_id_set() -> set[int]:
+            out = set()
+            for track_id in track_ids:
+                if track_id is None:
+                    continue
+                try:
+                    out.add(int(track_id))
+                except (TypeError, ValueError):
+                    continue
+            return out
+
+        def horizon_direction() -> np.ndarray | None:
+            if len(targets) >= 2:
+                direction = targets[-1] - targets[-2]
+            else:
+                direction = targets[-1] - pos
+            norm = float(np.linalg.norm(direction))
+            if math.isfinite(norm) and norm >= 1e-6:
+                return direction / norm
+            return self._provisional_forward_axis(pos, vel)
+
+        while len(targets) < int(self.planning_horizon_gates):
+            direction = horizon_direction()
+            if direction is None:
+                break
+
+            anchor = np.asarray(targets[-1], dtype=float).reshape(3)
+            anchor_projection = float(np.dot(anchor - pos, direction))
+            existing_track_ids = track_id_set()
+            best = None
+
+            for track in sorted(self.gate_memory.tracks, key=lambda item: int(item.id)):
+                track_id = int(track.id)
+                distance_for_reject = float("nan")
+                if track_id in existing_track_ids:
+                    continue
+                if track_id in self.completed_track_ids:
+                    rejected.append((track_id, "completed_track", distance_for_reject))
+                    continue
+
+                center = self._provisional_track_center(track)
+                if center is None:
+                    rejected.append((track_id, "missing_center", distance_for_reject))
+                    continue
+                center = self._apply_target_z_policy(center)
+                rel = center - pos
+                distance = float(np.linalg.norm(rel))
+                distance_for_reject = distance
+
+                reject_reason = self._target_rejection_reason(center, track_id)
+                if reject_reason:
+                    rejected.append((track_id, reject_reason, distance_for_reject))
+                    continue
+
+                quality_ok, quality_reason, _ = self._provisional_track_quality(
+                    track,
+                    now,
+                )
+                if not quality_ok:
+                    rejected.append((track_id, quality_reason, distance_for_reject))
+                    continue
+
+                duplicate = self._duplicate_center_match(center, targets)
+                if duplicate is not None:
+                    duplicate_idx, dist = duplicate
+                    duplicate_track = (
+                        track_ids[duplicate_idx]
+                        if duplicate_idx < len(track_ids)
+                        else None
+                    )
+                    rejected.append(
+                        (
+                            track_id,
+                            "duplicate_horizon_target:"
+                            f"{duplicate_track if duplicate_track is not None else 'none'}",
+                            float(dist),
+                        )
+                    )
+                    continue
+
+                max_distance = float(self.provisional_next_gate_max_distance_m)
+                if max_distance > 0.0 and (
+                    not math.isfinite(distance) or distance > max_distance
+                ):
+                    rejected.append((track_id, "too_far", distance_for_reject))
+                    continue
+
+                projection = float(np.dot(rel, direction))
+                if not math.isfinite(projection) or projection <= 0.50:
+                    rejected.append((track_id, "not_in_front", distance_for_reject))
+                    continue
+
+                margin = max(0.50, float(self.provisional_next_gate_closer_margin_m))
+                if projection <= anchor_projection + margin:
+                    rejected.append((track_id, "not_beyond_horizon", distance_for_reject))
+                    continue
+
+                lateral_vec = rel - projection * direction
+                lateral = float(np.linalg.norm(lateral_vec))
+                max_lateral = float(self.provisional_next_gate_max_lateral_m)
+                if max_lateral > 0.0 and (
+                    not math.isfinite(lateral) or lateral > max_lateral
+                ):
+                    rejected.append((track_id, "lateral_high", distance_for_reject))
+                    continue
+
+                key = (
+                    projection,
+                    lateral,
+                    distance,
+                    -float(getattr(track, "hits", 0)),
+                    float(track_id),
+                )
+                if best is None or key < best[0]:
+                    best = (key, track_id, center.copy(), projection, lateral)
+
+            if best is None:
+                break
+
+            _, track_id, center, projection, lateral = best
+            next_gate_idx = (
+                int(gate_indices[-1]) + 1
+                if gate_indices
+                else int(self.current_gate_idx) + len(targets)
+            )
+            if self.race_gate_count is not None:
+                next_gate_idx = min(next_gate_idx, int(self.race_gate_count) - 1)
+            targets.append(center.copy())
+            track_ids.append(int(track_id))
+            gate_indices.append(int(next_gate_idx))
+            accepted.append((int(track_id), int(next_gate_idx), projection, lateral))
+
+            if (
+                self.race_gate_count is not None
+                and next_gate_idx >= int(self.race_gate_count) - 1
+            ):
+                break
+
+        self._trace_provisional_horizon_suffix(
+            accepted=accepted,
+            rejected=rejected,
+            gate_idx=int(gate_indices[0] if gate_indices else self.current_gate_idx),
+        )
+
+    def _trace_provisional_horizon_suffix(
+        self,
+        *,
+        accepted: list[tuple[int, int, float, float]],
+        rejected: list[tuple[int, str, float]],
+        gate_idx: int,
+    ) -> None:
+        if not accepted and not rejected:
+            self._last_provisional_horizon_signature = None
+            return
+
+        signature = (
+            tuple((track_id, gate_idx) for track_id, gate_idx, _, _ in accepted[:8]),
+            tuple(
+                (
+                    track_id,
+                    reason,
+                    round(float(distance), 1) if math.isfinite(float(distance)) else "nan",
+                )
+                for track_id, reason, distance in rejected[:8]
+            ),
+        )
+        if signature == self._last_provisional_horizon_signature:
+            return
+        self._last_provisional_horizon_signature = signature
+
+        accepted_txt = (
+            "none"
+            if not accepted
+            else "("
+            + ",".join(
+                f"{track_id}@{gate_idx}:proj={projection:.1f}:lat={lateral:.1f}"
+                for track_id, gate_idx, projection, lateral in accepted[:8]
+            )
+            + ")"
+        )
+        rejected_txt = (
+            "none"
+            if not rejected
+            else "("
+            + ",".join(
+                f"{track_id}:{reason}:dist={self._fmt_float(distance, precision=1)}"
+                for track_id, reason, distance in rejected[:8]
+            )
+            + ")"
+        )
+        extra_rejected = "" if len(rejected) <= 8 else f" rejected_more={len(rejected) - 8}"
+        print(
+            "planning_horizon_provisional_suffix "
+            f"gate_idx={int(gate_idx)} "
+            f"accepted={accepted_txt} "
+            f"rejected={rejected_txt}"
+            f"{extra_rejected}",
+            flush=True,
+        )
 
     def _compute_passthrough_waypoint_velocities(
         self,
@@ -1773,6 +2027,192 @@ class PyAIPilotAutonomyAPI:
                 return "none"
             samples.append(self._fmt_vec(point, precision=3))
         return "[" + ";".join(samples) + "]"
+
+    def _planner_segment_derivative(
+        self,
+        planner: MultiSegmentMinimumSnapPlanner,
+        *,
+        segment_idx: int,
+        tau: float,
+        order: int,
+    ) -> np.ndarray | None:
+        coeffs = getattr(planner, "coeffs", None)
+        if coeffs is None:
+            return None
+        try:
+            coeffs = np.asarray(coeffs, dtype=float)
+            segment_idx = int(segment_idx)
+            tau = float(tau)
+            order = int(order)
+        except (TypeError, ValueError):
+            return None
+        if (
+            coeffs.ndim != 3
+            or coeffs.shape[1] != 3
+            or segment_idx < 0
+            or segment_idx >= coeffs.shape[0]
+        ):
+            return None
+        values = np.zeros(3, dtype=float)
+        try:
+            for axis in range(3):
+                values[axis] = planner._eval_poly(
+                    coeffs[segment_idx, axis, :],
+                    tau,
+                    order=order,
+                )
+        except Exception:
+            return None
+        if not np.all(np.isfinite(values)):
+            return None
+        return values
+
+    def _angle_between_deg(self, a, b) -> float:
+        a = self._finite_vec3_or_none(a)
+        b = self._finite_vec3_or_none(b)
+        if a is None or b is None:
+            return float("nan")
+        a_norm = float(np.linalg.norm(a))
+        b_norm = float(np.linalg.norm(b))
+        if (
+            not math.isfinite(a_norm)
+            or not math.isfinite(b_norm)
+            or a_norm < 1e-6
+            or b_norm < 1e-6
+        ):
+            return float("nan")
+        dot = float(np.dot(a, b) / (a_norm * b_norm))
+        dot = float(np.clip(dot, -1.0, 1.0))
+        return float(math.degrees(math.acos(dot)))
+
+    def _trace_plan_boundary_continuity(
+        self,
+        *,
+        planner: MultiSegmentMinimumSnapPlanner,
+        waypoints: np.ndarray,
+        plan_mode: str,
+        horizon_track_ids,
+        horizon_gate_indices,
+    ) -> None:
+        times = getattr(planner, "times", None)
+        if times is None:
+            return
+        try:
+            times = np.asarray(times, dtype=float).reshape(-1)
+            waypoints = np.asarray(waypoints, dtype=float)
+        except (TypeError, ValueError):
+            return
+        if (
+            times.size < 2
+            or waypoints.ndim != 2
+            or waypoints.shape[1] != 3
+            or waypoints.shape[0] != times.size + 1
+        ):
+            return
+
+        for boundary_i in range(1, int(times.size)):
+            left_segment = boundary_i - 1
+            right_segment = boundary_i
+            tau_s = float(np.sum(times[:boundary_i]))
+            left_tau_s = float(times[left_segment])
+            right_tau_s = 0.0
+
+            left_velocity = self._planner_segment_derivative(
+                planner,
+                segment_idx=left_segment,
+                tau=left_tau_s,
+                order=1,
+            )
+            right_velocity = self._planner_segment_derivative(
+                planner,
+                segment_idx=right_segment,
+                tau=right_tau_s,
+                order=1,
+            )
+            left_acceleration = self._planner_segment_derivative(
+                planner,
+                segment_idx=left_segment,
+                tau=left_tau_s,
+                order=2,
+            )
+            right_acceleration = self._planner_segment_derivative(
+                planner,
+                segment_idx=right_segment,
+                tau=right_tau_s,
+                order=2,
+            )
+            left_jerk = self._planner_segment_derivative(
+                planner,
+                segment_idx=left_segment,
+                tau=left_tau_s,
+                order=3,
+            )
+            right_jerk = self._planner_segment_derivative(
+                planner,
+                segment_idx=right_segment,
+                tau=right_tau_s,
+                order=3,
+            )
+            if (
+                left_velocity is None
+                or right_velocity is None
+                or left_acceleration is None
+                or right_acceleration is None
+                or left_jerk is None
+                or right_jerk is None
+            ):
+                continue
+
+            incoming_chord = waypoints[boundary_i] - waypoints[boundary_i - 1]
+            outgoing_chord = waypoints[boundary_i + 1] - waypoints[boundary_i]
+            velocity_at_waypoint = 0.5 * (left_velocity + right_velocity)
+            speed_at_waypoint = float(np.linalg.norm(velocity_at_waypoint))
+            turn_angle_in = self._angle_between_deg(incoming_chord, left_velocity)
+            turn_angle_out = self._angle_between_deg(right_velocity, outgoing_chord)
+            turn_angle_chord = self._angle_between_deg(incoming_chord, outgoing_chord)
+            velocity_delta = float(np.linalg.norm(right_velocity - left_velocity))
+            acceleration_delta = float(
+                np.linalg.norm(right_acceleration - left_acceleration)
+            )
+            jerk_delta = float(np.linalg.norm(right_jerk - left_jerk))
+
+            horizon_idx = int(boundary_i) - 1
+            track_id = (
+                horizon_track_ids[horizon_idx]
+                if horizon_track_ids is not None and horizon_idx < len(horizon_track_ids)
+                else None
+            )
+            gate_idx = (
+                horizon_gate_indices[horizon_idx]
+                if horizon_gate_indices is not None
+                and horizon_idx < len(horizon_gate_indices)
+                else None
+            )
+            print(
+                "plan_boundary_continuity "
+                f"plan_mode={plan_mode} "
+                f"boundary_i={int(boundary_i)} "
+                f"left_segment={int(left_segment)} "
+                f"right_segment={int(right_segment)} "
+                f"tau_s={tau_s:.3f} "
+                f"gate_idx={gate_idx if gate_idx is not None else 'none'} "
+                f"track={track_id if track_id is not None else 'none'} "
+                f"waypoint_neu={self._fmt_vec(waypoints[boundary_i], precision=3)} "
+                f"left_velocity_neu={self._fmt_vec(left_velocity, precision=6)} "
+                f"right_velocity_neu={self._fmt_vec(right_velocity, precision=6)} "
+                f"left_acceleration_neu={self._fmt_vec(left_acceleration, precision=6)} "
+                f"right_acceleration_neu={self._fmt_vec(right_acceleration, precision=6)} "
+                f"left_jerk_neu={self._fmt_vec(left_jerk, precision=6)} "
+                f"right_jerk_neu={self._fmt_vec(right_jerk, precision=6)} "
+                f"speed_at_waypoint={speed_at_waypoint:.6f} "
+                f"turn_angle_in_deg={self._fmt_float(turn_angle_in, precision=3)} "
+                f"turn_angle_out_deg={self._fmt_float(turn_angle_out, precision=3)} "
+                f"turn_angle_chord_deg={self._fmt_float(turn_angle_chord, precision=3)} "
+                f"velocity_delta={velocity_delta:.6f} "
+                f"acceleration_delta={acceleration_delta:.6f} "
+                f"jerk_delta={jerk_delta:.6f}",
+                flush=True,
+            )
 
     def _validate_active_gate_plan_crossing(
         self,
@@ -2028,6 +2468,8 @@ class PyAIPilotAutonomyAPI:
                 target_idx,
                 target,
                 target_track_id,
+                pos=pos,
+                vel=vel,
             )
         )
 
@@ -2263,6 +2705,13 @@ class PyAIPilotAutonomyAPI:
             f"plan_samples_neu={plan_samples_txt}",
             flush=True,
         )
+        self._trace_plan_boundary_continuity(
+            planner=self.planner,
+            waypoints=waypoints,
+            plan_mode=str(plan_mode),
+            horizon_track_ids=horizon_track_ids,
+            horizon_gate_indices=horizon_gate_indices,
+        )
         return True
 
     def _path_plan_provisional_next_gate(
@@ -2461,6 +2910,13 @@ class PyAIPilotAutonomyAPI:
             "pass_enabled=0",
             flush=True,
         )
+        self._trace_plan_boundary_continuity(
+            planner=self.planner,
+            waypoints=waypoints,
+            plan_mode=str(plan_mode),
+            horizon_track_ids=[track_id],
+            horizon_gate_indices=[int(self.current_gate_idx)],
+        )
         return True
 
     def _apply_target_z_policy(self, target) -> np.ndarray:
@@ -2526,6 +2982,11 @@ class PyAIPilotAutonomyAPI:
             normal=normal,
             lateral_radius_m=self.gate_pass_lateral_radius_m,
             plane_tolerance_m=self.gate_plane_tolerance_m,
+            near_plane_pass_distance_m=(
+                self.pass_radius_m if self.near_plane_pass_enabled else None
+            ),
+            near_plane_back_tolerance_m=self.near_plane_pass_back_tolerance_m,
+            near_plane_forward_tolerance_m=self.near_plane_pass_forward_tolerance_m,
         )
         self.previous_gate_pass_position = pos.copy()
         self.gate_plane_crossed = bool(self.gate_plane_crossed or pass_result.crossed_plane)

@@ -268,6 +268,9 @@ class RaceSection:
     pass_radius_m: float
     pass_lateral_radius_m: float
     pass_plane_tolerance_m: float
+    near_plane_pass_enabled: bool
+    near_plane_pass_back_tolerance_m: float
+    near_plane_pass_forward_tolerance_m: float
     pass_through_m: float
     clear_radius_m: float
     debounce_s: float
@@ -1138,6 +1141,17 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             pass_radius_m=_float(race_raw, "pass_radius_m", _float(planner_raw, "pass_radius_m", 1.25)),
             pass_lateral_radius_m=_float(race_raw, "pass_lateral_radius_m", 0.75),
             pass_plane_tolerance_m=_float(race_raw, "pass_plane_tolerance_m", 0.05),
+            near_plane_pass_enabled=_bool(race_raw, "near_plane_pass_enabled", True),
+            near_plane_pass_back_tolerance_m=_float(
+                race_raw,
+                "near_plane_pass_back_tolerance_m",
+                0.35,
+            ),
+            near_plane_pass_forward_tolerance_m=_float(
+                race_raw,
+                "near_plane_pass_forward_tolerance_m",
+                0.15,
+            ),
             pass_through_m=_float(race_raw, "pass_through_m", 1.0),
             clear_radius_m=_float(race_raw, "clear_radius_m", 1.75),
             debounce_s=_float(race_raw, "debounce_s", 0.75),
@@ -1182,7 +1196,7 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             yaw_reference_motion_distance_m=_float(
                 planner_raw,
                 "yaw_reference_motion_distance_m",
-                2.0,
+                3.0,
             ),
             active_target_preempt_enabled=_bool(
                 planner_raw,
@@ -1295,7 +1309,7 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             provisional_next_gate_max_age_s=_float(
                 planner_raw,
                 "provisional_next_gate_max_age_s",
-                1.0,
+                1.5,
             ),
             provisional_next_gate_min_keypoint_conf=_float(
                 planner_raw,
