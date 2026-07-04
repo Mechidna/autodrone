@@ -283,6 +283,14 @@ class PlannerSection:
     vmax: float
     amax: float
     t_min: float
+    plan_validation_shape_enabled: bool
+    plan_validation_samples_per_segment: int
+    plan_validation_max_path_length_ratio: float
+    plan_validation_max_segment_path_length_ratio: float
+    plan_validation_max_corridor_m: float
+    plan_validation_max_polyline_backtrack_m: float
+    plan_validation_max_speed_m_s: float
+    plan_validation_max_accel_m_s2: float
     safe_min_target_z: float
     safe_max_target_z: float
     replan_target_shift_m: float
@@ -1165,6 +1173,45 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             vmax=_float(planner_raw, "vmax", 2.5),
             amax=_float(planner_raw, "amax", 2.0),
             t_min=_float(planner_raw, "t_min", 1.0),
+            plan_validation_shape_enabled=_bool(
+                planner_raw,
+                "plan_validation_shape_enabled",
+                True,
+            ),
+            plan_validation_samples_per_segment=max(
+                8,
+                _int(planner_raw, "plan_validation_samples_per_segment", 80),
+            ),
+            plan_validation_max_path_length_ratio=_float(
+                planner_raw,
+                "plan_validation_max_path_length_ratio",
+                1.45,
+            ),
+            plan_validation_max_segment_path_length_ratio=_float(
+                planner_raw,
+                "plan_validation_max_segment_path_length_ratio",
+                1.80,
+            ),
+            plan_validation_max_corridor_m=_float(
+                planner_raw,
+                "plan_validation_max_corridor_m",
+                4.0,
+            ),
+            plan_validation_max_polyline_backtrack_m=_float(
+                planner_raw,
+                "plan_validation_max_polyline_backtrack_m",
+                1.5,
+            ),
+            plan_validation_max_speed_m_s=_float(
+                planner_raw,
+                "plan_validation_max_speed_m_s",
+                5.0,
+            ),
+            plan_validation_max_accel_m_s2=_float(
+                planner_raw,
+                "plan_validation_max_accel_m_s2",
+                8.0,
+            ),
             safe_min_target_z=_float(planner_raw, "safe_min_target_z", 1.0),
             safe_max_target_z=_float(planner_raw, "safe_max_target_z", 3.0),
             replan_target_shift_m=_float(planner_raw, "replan_target_shift_m", 1.0),
@@ -2241,6 +2288,30 @@ def _validate(config: PilotConfig) -> None:
             config.planner.yaw_reference_motion_distance_m,
         ),
         (
+            "planner.plan_validation_max_path_length_ratio",
+            config.planner.plan_validation_max_path_length_ratio,
+        ),
+        (
+            "planner.plan_validation_max_segment_path_length_ratio",
+            config.planner.plan_validation_max_segment_path_length_ratio,
+        ),
+        (
+            "planner.plan_validation_max_corridor_m",
+            config.planner.plan_validation_max_corridor_m,
+        ),
+        (
+            "planner.plan_validation_max_polyline_backtrack_m",
+            config.planner.plan_validation_max_polyline_backtrack_m,
+        ),
+        (
+            "planner.plan_validation_max_speed_m_s",
+            config.planner.plan_validation_max_speed_m_s,
+        ),
+        (
+            "planner.plan_validation_max_accel_m_s2",
+            config.planner.plan_validation_max_accel_m_s2,
+        ),
+        (
             "perception_geometry_audit.print_period_s",
             config.perception_geometry_audit.print_period_s,
         ),
@@ -2253,6 +2324,8 @@ def _validate(config: PilotConfig) -> None:
             raise RuntimeError(f"{key} must be non-negative.")
     if config.perception_geometry_audit.max_prints < 0:
         raise RuntimeError("perception_geometry_audit.max_prints must be non-negative.")
+    if config.planner.plan_validation_samples_per_segment < 2:
+        raise RuntimeError("planner.plan_validation_samples_per_segment must be at least 2.")
     if (
         config.perception.max_depth_m_for_memory > 0.0
         and config.perception.min_depth_m_for_memory > config.perception.max_depth_m_for_memory

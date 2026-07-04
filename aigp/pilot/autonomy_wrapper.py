@@ -323,6 +323,37 @@ class PyAIPilotAutonomyAPI:
         self.planner_vmax = float(self.config.planner.vmax)
         self.planner_amax = float(self.config.planner.amax)
         self.planner_t_min = float(self.config.planner.t_min)
+        self.plan_validation_shape_enabled = bool(
+            self.config.planner.plan_validation_shape_enabled
+        )
+        self.plan_validation_samples_per_segment = max(
+            8,
+            int(self.config.planner.plan_validation_samples_per_segment),
+        )
+        self.plan_validation_max_path_length_ratio = max(
+            0.0,
+            float(self.config.planner.plan_validation_max_path_length_ratio),
+        )
+        self.plan_validation_max_segment_path_length_ratio = max(
+            0.0,
+            float(self.config.planner.plan_validation_max_segment_path_length_ratio),
+        )
+        self.plan_validation_max_corridor_m = max(
+            0.0,
+            float(self.config.planner.plan_validation_max_corridor_m),
+        )
+        self.plan_validation_max_polyline_backtrack_m = max(
+            0.0,
+            float(self.config.planner.plan_validation_max_polyline_backtrack_m),
+        )
+        self.plan_validation_max_speed_m_s = max(
+            0.0,
+            float(self.config.planner.plan_validation_max_speed_m_s),
+        )
+        self.plan_validation_max_accel_m_s2 = max(
+            0.0,
+            float(self.config.planner.plan_validation_max_accel_m_s2),
+        )
         self.safe_min_target_z = float(self.config.planner.safe_min_target_z)
         self.safe_max_target_z = float(self.config.planner.safe_max_target_z)
         self.target_z_mode = str(self.config.planner.target_z_mode).lower()
@@ -2085,6 +2116,337 @@ class PyAIPilotAutonomyAPI:
             samples.append(self._fmt_vec(point, precision=3))
         return "[" + ";".join(samples) + "]"
 
+    @staticmethod
+    def _project_point_to_waypoint_polyline(
+        point: np.ndarray,
+        waypoints: np.ndarray,
+    ) -> tuple[float, float, int]:
+        point = np.asarray(point, dtype=float).reshape(3)
+        waypoints = np.asarray(waypoints, dtype=float)
+        if waypoints.ndim != 2 or waypoints.shape[1] != 3 or len(waypoints) < 2:
+            return float("inf"), float("nan"), -1
+
+        best_distance = float("inf")
+        best_progress = 0.0
+        best_segment = -1
+        cumulative = 0.0
+        for idx in range(len(waypoints) - 1):
+            start = waypoints[idx]
+            end = waypoints[idx + 1]
+            delta = end - start
+            segment_length = float(np.linalg.norm(delta))
+            if not math.isfinite(segment_length):
+                return float("inf"), float("nan"), -1
+            if segment_length < 1e-6:
+                distance = float(np.linalg.norm(point - start))
+                progress = cumulative
+            else:
+                alpha = float(np.dot(point - start, delta) / (segment_length ** 2))
+                alpha = float(np.clip(alpha, 0.0, 1.0))
+                projection = start + alpha * delta
+                distance = float(np.linalg.norm(point - projection))
+                progress = cumulative + alpha * segment_length
+            if math.isfinite(distance) and distance < best_distance:
+                best_distance = distance
+                best_progress = progress
+                best_segment = idx
+            cumulative += max(0.0, segment_length)
+        return best_distance, best_progress, best_segment
+
+    def _validate_minimum_snap_plan_shape(
+        self,
+        *,
+        planner: MultiSegmentMinimumSnapPlanner,
+        plan_mode: str,
+        gate_idx: int,
+        track_id,
+    ) -> tuple[bool, dict]:
+        if not self.plan_validation_shape_enabled:
+            return True, {"reason": "shape_validation_disabled"}
+
+        waypoints = getattr(planner, "waypoints", None)
+        if waypoints is None:
+            return True, {"reason": "shape_validation_no_waypoints"}
+        try:
+            waypoints = np.asarray(waypoints, dtype=float)
+        except (TypeError, ValueError):
+            return False, {
+                "reason": "invalid_waypoints",
+                "plan_mode": str(plan_mode),
+                "gate_idx": int(gate_idx),
+                "track_id": track_id,
+            }
+        if (
+            waypoints.ndim != 2
+            or waypoints.shape[1] != 3
+            or len(waypoints) < 2
+            or not np.all(np.isfinite(waypoints))
+        ):
+            return False, {
+                "reason": "invalid_waypoints",
+                "plan_mode": str(plan_mode),
+                "gate_idx": int(gate_idx),
+                "track_id": track_id,
+            }
+
+        times = np.asarray(getattr(planner, "times", []), dtype=float).reshape(-1)
+        starts = np.asarray(
+            getattr(planner, "segment_starts", []),
+            dtype=float,
+        ).reshape(-1)
+        if (
+            len(times) <= 0
+            or len(starts) < len(times)
+            or len(times) != len(waypoints) - 1
+            or not np.all(np.isfinite(times))
+            or np.any(times <= 0.0)
+        ):
+            return False, {
+                "reason": "invalid_trajectory_times",
+                "plan_mode": str(plan_mode),
+                "gate_idx": int(gate_idx),
+                "track_id": track_id,
+            }
+
+        waypoint_segment_lengths = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
+        waypoint_cumulative_lengths = np.concatenate(
+            ([0.0], np.cumsum(waypoint_segment_lengths))
+        )
+        waypoint_path_length = float(np.sum(waypoint_segment_lengths))
+        if not math.isfinite(waypoint_path_length) or waypoint_path_length < 1e-6:
+            return False, {
+                "reason": "degenerate_waypoint_path",
+                "plan_mode": str(plan_mode),
+                "gate_idx": int(gate_idx),
+                "track_id": track_id,
+            }
+
+        max_speed = 0.0
+        max_accel = 0.0
+        max_corridor = 0.0
+        max_corridor_segment = -1
+        max_polyline_backtrack = 0.0
+        best_polyline_progress = 0.0
+        path_length = 0.0
+        previous_position = None
+        segment_path_lengths = np.zeros(len(times), dtype=float)
+        samples_per_segment = max(8, int(self.plan_validation_samples_per_segment))
+
+        for segment_idx, duration in enumerate(times):
+            duration = float(duration)
+            segment_start = float(starts[segment_idx])
+            segment_previous = None
+            for tau in np.linspace(0.0, duration, samples_per_segment):
+                sample_time = segment_start + float(tau)
+                try:
+                    position, velocity, acceleration = planner.sample(sample_time)
+                except Exception as exc:
+                    return False, {
+                        "reason": f"sample_failed:{type(exc).__name__}",
+                        "plan_mode": str(plan_mode),
+                        "gate_idx": int(gate_idx),
+                        "track_id": track_id,
+                        "segment_idx": int(segment_idx),
+                        "sample_time_s": float(sample_time),
+                    }
+                position = self._finite_vec3_or_none(position)
+                velocity = self._finite_vec3_or_none(velocity)
+                acceleration = self._finite_vec3_or_none(acceleration)
+                if position is None or velocity is None or acceleration is None:
+                    return False, {
+                        "reason": "non_finite_sample",
+                        "plan_mode": str(plan_mode),
+                        "gate_idx": int(gate_idx),
+                        "track_id": track_id,
+                        "segment_idx": int(segment_idx),
+                        "sample_time_s": float(sample_time),
+                    }
+
+                speed = float(np.linalg.norm(velocity))
+                accel = float(np.linalg.norm(acceleration))
+                max_speed = max(max_speed, speed)
+                max_accel = max(max_accel, accel)
+                if (
+                    self.plan_validation_max_speed_m_s > 0.0
+                    and speed > self.plan_validation_max_speed_m_s
+                ):
+                    return False, {
+                        "reason": "max_speed_too_large",
+                        "plan_mode": str(plan_mode),
+                        "gate_idx": int(gate_idx),
+                        "track_id": track_id,
+                        "segment_idx": int(segment_idx),
+                        "sample_time_s": float(sample_time),
+                        "speed_m_s": float(speed),
+                        "max_speed_m_s": float(self.plan_validation_max_speed_m_s),
+                        "position": position.copy(),
+                    }
+                if (
+                    self.plan_validation_max_accel_m_s2 > 0.0
+                    and accel > self.plan_validation_max_accel_m_s2
+                ):
+                    return False, {
+                        "reason": "max_accel_too_large",
+                        "plan_mode": str(plan_mode),
+                        "gate_idx": int(gate_idx),
+                        "track_id": track_id,
+                        "segment_idx": int(segment_idx),
+                        "sample_time_s": float(sample_time),
+                        "accel_m_s2": float(accel),
+                        "max_accel_m_s2": float(
+                            self.plan_validation_max_accel_m_s2
+                        ),
+                        "position": position.copy(),
+                    }
+
+                corridor, polyline_progress, nearest_segment = (
+                    self._project_point_to_waypoint_polyline(position, waypoints)
+                )
+                if 0 <= segment_idx < len(waypoints) - 1:
+                    segment_start_wp = waypoints[segment_idx]
+                    segment_delta_wp = waypoints[segment_idx + 1] - segment_start_wp
+                    segment_length_wp = float(waypoint_segment_lengths[segment_idx])
+                    if math.isfinite(segment_length_wp) and segment_length_wp >= 1e-6:
+                        segment_alpha = float(
+                            np.dot(position - segment_start_wp, segment_delta_wp)
+                            / (segment_length_wp ** 2)
+                        )
+                        segment_alpha = float(np.clip(segment_alpha, 0.0, 1.0))
+                        polyline_progress = (
+                            float(waypoint_cumulative_lengths[segment_idx])
+                            + segment_alpha * segment_length_wp
+                        )
+                if math.isfinite(corridor) and corridor > max_corridor:
+                    max_corridor = corridor
+                    max_corridor_segment = int(nearest_segment)
+                if (
+                    self.plan_validation_max_corridor_m > 0.0
+                    and math.isfinite(corridor)
+                    and corridor > self.plan_validation_max_corridor_m
+                ):
+                    return False, {
+                        "reason": "corridor_deviation_too_large",
+                        "plan_mode": str(plan_mode),
+                        "gate_idx": int(gate_idx),
+                        "track_id": track_id,
+                        "segment_idx": int(segment_idx),
+                        "nearest_waypoint_segment": int(nearest_segment),
+                        "sample_time_s": float(sample_time),
+                        "corridor_m": float(corridor),
+                        "max_corridor_m": float(self.plan_validation_max_corridor_m),
+                        "position": position.copy(),
+                    }
+
+                if math.isfinite(polyline_progress):
+                    polyline_backtrack = max(
+                        0.0,
+                        float(best_polyline_progress - polyline_progress),
+                    )
+                    max_polyline_backtrack = max(
+                        max_polyline_backtrack,
+                        polyline_backtrack,
+                    )
+                    if (
+                        self.plan_validation_max_polyline_backtrack_m > 0.0
+                        and polyline_backtrack
+                        > self.plan_validation_max_polyline_backtrack_m
+                    ):
+                        return False, {
+                            "reason": "polyline_backtrack_too_large",
+                            "plan_mode": str(plan_mode),
+                            "gate_idx": int(gate_idx),
+                            "track_id": track_id,
+                            "segment_idx": int(segment_idx),
+                            "sample_time_s": float(sample_time),
+                            "polyline_backtrack_m": float(polyline_backtrack),
+                            "max_polyline_backtrack_m": float(
+                                self.plan_validation_max_polyline_backtrack_m
+                            ),
+                            "polyline_progress_m": float(polyline_progress),
+                            "best_polyline_progress_m": float(best_polyline_progress),
+                            "position": position.copy(),
+                        }
+                    best_polyline_progress = max(
+                        best_polyline_progress,
+                        float(polyline_progress),
+                    )
+
+                if segment_previous is not None:
+                    segment_path_lengths[segment_idx] += float(
+                        np.linalg.norm(position - segment_previous)
+                    )
+                segment_previous = position.copy()
+                if previous_position is not None:
+                    path_length += float(np.linalg.norm(position - previous_position))
+                previous_position = position.copy()
+
+        path_length_ratio = path_length / waypoint_path_length
+        if (
+            self.plan_validation_max_path_length_ratio > 0.0
+            and math.isfinite(path_length_ratio)
+            and path_length_ratio > self.plan_validation_max_path_length_ratio
+        ):
+            return False, {
+                "reason": "path_length_ratio_too_large",
+                "plan_mode": str(plan_mode),
+                "gate_idx": int(gate_idx),
+                "track_id": track_id,
+                "path_length_ratio": float(path_length_ratio),
+                "max_path_length_ratio": float(
+                    self.plan_validation_max_path_length_ratio
+                ),
+                "path_length_m": float(path_length),
+                "waypoint_path_length_m": float(waypoint_path_length),
+                "corridor_m": float(max_corridor),
+                "speed_m_s": float(max_speed),
+                "accel_m_s2": float(max_accel),
+            }
+
+        if self.plan_validation_max_segment_path_length_ratio > 0.0:
+            for segment_idx, (sampled_length, chord_length) in enumerate(
+                zip(segment_path_lengths, waypoint_segment_lengths)
+            ):
+                chord_length = float(chord_length)
+                if chord_length < 1e-6:
+                    continue
+                segment_ratio = float(sampled_length / chord_length)
+                if (
+                    math.isfinite(segment_ratio)
+                    and segment_ratio
+                    > self.plan_validation_max_segment_path_length_ratio
+                ):
+                    return False, {
+                        "reason": "segment_path_length_ratio_too_large",
+                        "plan_mode": str(plan_mode),
+                        "gate_idx": int(gate_idx),
+                        "track_id": track_id,
+                        "segment_idx": int(segment_idx),
+                        "segment_path_length_ratio": float(segment_ratio),
+                        "max_segment_path_length_ratio": float(
+                            self.plan_validation_max_segment_path_length_ratio
+                        ),
+                        "segment_path_length_m": float(sampled_length),
+                        "segment_chord_length_m": float(chord_length),
+                        "corridor_m": float(max_corridor),
+                        "speed_m_s": float(max_speed),
+                        "accel_m_s2": float(max_accel),
+                    }
+
+        return True, {
+            "reason": "shape_validation_ok",
+            "plan_mode": str(plan_mode),
+            "gate_idx": int(gate_idx),
+            "track_id": track_id,
+            "path_length_ratio": float(path_length_ratio),
+            "path_length_m": float(path_length),
+            "waypoint_path_length_m": float(waypoint_path_length),
+            "corridor_m": float(max_corridor),
+            "nearest_waypoint_segment": int(max_corridor_segment),
+            "polyline_backtrack_m": float(max_polyline_backtrack),
+            "speed_m_s": float(max_speed),
+            "accel_m_s2": float(max_accel),
+        }
+
     def _planner_segment_derivative(
         self,
         planner: MultiSegmentMinimumSnapPlanner,
@@ -2290,6 +2652,14 @@ class PyAIPilotAutonomyAPI:
                 "gate_idx": int(gate_idx),
                 "track_id": track_id,
             }
+        shape_valid, shape_details = self._validate_minimum_snap_plan_shape(
+            planner=planner,
+            plan_mode=plan_mode,
+            gate_idx=gate_idx,
+            track_id=track_id,
+        )
+        if not shape_valid:
+            return False, shape_details
         if normal is None:
             return True, {"reason": "no_gate_normal"}
         normal_norm = float(np.linalg.norm(normal))
@@ -2463,6 +2833,12 @@ class PyAIPilotAutonomyAPI:
         sample_time = details.get("sample_time_s", details.get("closest_sample_time_s"))
         crossing = details.get("crossing_point", details.get("closest_position"))
         crossing = self._finite_vec3_or_none(crossing)
+        path_ratio = details.get("path_length_ratio")
+        segment_ratio = details.get("segment_path_length_ratio")
+        corridor = details.get("corridor_m")
+        polyline_backtrack = details.get("polyline_backtrack_m")
+        speed = details.get("speed_m_s")
+        accel = details.get("accel_m_s2")
         signature = (
             gate_idx,
             None if track_id is None else int(track_id),
@@ -2485,6 +2861,12 @@ class PyAIPilotAutonomyAPI:
             f"progress={self._fmt_float(progress, precision=2)} "
             f"sample_time={self._fmt_float(sample_time, precision=2)} "
             f"crossing={self._fmt_vec(crossing, precision=3) if crossing is not None else 'none'} "
+            f"path_ratio={self._fmt_float(path_ratio, precision=3)} "
+            f"segment_ratio={self._fmt_float(segment_ratio, precision=3)} "
+            f"corridor={self._fmt_float(corridor, precision=2)} "
+            f"polyline_backtrack={self._fmt_float(polyline_backtrack, precision=2)} "
+            f"speed={self._fmt_float(speed, precision=2)} "
+            f"accel={self._fmt_float(accel, precision=2)} "
             f"fallback={fallback}",
             flush=True,
         )

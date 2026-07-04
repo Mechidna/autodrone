@@ -437,6 +437,49 @@ class _BacktrackingPlanner:
         return p, v, a
 
 
+class _LoopingPlanner:
+    total_time = 4.0
+    times = np.array([4.0])
+    segment_starts = np.array([0.0, 4.0])
+    waypoints = np.array([[0.0, -1.0, 0.0], [0.0, 1.0, 0.0]])
+
+    def sample(self, t: float):
+        t = float(np.clip(t, 0.0, self.total_time))
+        omega = math.pi / self.total_time
+        x = 5.0 * math.sin(omega * t)
+        y = -1.0 + 2.0 * t / self.total_time
+        p = np.array([x, y, 0.0])
+        v = np.array([5.0 * omega * math.cos(omega * t), 2.0 / self.total_time, 0.0])
+        a = np.array([-5.0 * omega * omega * math.sin(omega * t), 0.0, 0.0])
+        return p, v, a
+
+
+class _PolylineUTurnPlanner:
+    total_time = 10.0
+    times = np.array([5.0, 5.0])
+    segment_starts = np.array([0.0, 5.0, 10.0])
+    waypoints = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [0.0, 10.0, 0.0],
+            [0.0, 5.0, 0.0],
+        ]
+    )
+
+    def sample(self, t: float):
+        t = float(np.clip(t, 0.0, self.total_time))
+        if t <= 5.0:
+            y = 2.0 * t
+            vy = 2.0
+        else:
+            y = 10.0 - (t - 5.0)
+            vy = -1.0
+        p = np.array([0.0, y, 0.0])
+        v = np.array([0.0, vy, 0.0])
+        a = np.zeros(3)
+        return p, v, a
+
+
 def test_active_gate_plan_validation_rejects_first_crossing_outside_corridor():
     api = PyAIPilotAutonomyAPI(use_perception=False, race_gate_count=1)
 
@@ -485,6 +528,38 @@ def test_active_gate_plan_validation_rejects_backward_progress_before_crossing()
     assert not valid
     assert details["reason"] == "backward_progress_before_crossing"
     assert details["backward_progress_m"] >= 0.5
+
+
+def test_plan_shape_validation_rejects_loop_far_from_waypoint_chain():
+    api = PyAIPilotAutonomyAPI(use_perception=False, race_gate_count=1)
+
+    valid, details = api._validate_active_gate_plan_crossing(
+        planner=_LoopingPlanner(),
+        target=np.array([0.0, 1.0, 0.0]),
+        normal=np.array([0.0, 1.0, 0.0]),
+        plan_mode="single_gate",
+        gate_idx=0,
+        track_id=1,
+    )
+
+    assert not valid
+    assert details["reason"] == "corridor_deviation_too_large"
+    assert details["corridor_m"] > api.plan_validation_max_corridor_m
+
+
+def test_plan_shape_validation_allows_course_level_u_turn_waypoint_chain():
+    api = PyAIPilotAutonomyAPI(use_perception=False, race_gate_count=1)
+
+    valid, details = api._validate_minimum_snap_plan_shape(
+        planner=_PolylineUTurnPlanner(),
+        plan_mode="gate_horizon",
+        gate_idx=0,
+        track_id=1,
+    )
+
+    assert valid
+    assert details["reason"] == "shape_validation_ok"
+    assert details["polyline_backtrack_m"] == 0.0
 
 
 def test_horizon_continue_rejects_target_inside_completed_segment_corridor():

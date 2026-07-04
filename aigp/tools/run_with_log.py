@@ -24,6 +24,7 @@ STRUCTURED_PREFIXES = (
     ("lateral_response_calibration ", "lateral_response_calibration"),
     ("plan_install ", "plan_install"),
     ("plan_boundary_continuity ", "plan_boundary_continuity"),
+    ("plan_validation_reject ", "plan_validation_reject"),
     ("gate_pass ", "gate_pass"),
     ("target_validation_reject ", "target_validation_reject"),
     ("planning_horizon_provisional_suffix ", "planning_horizon_provisional_suffix"),
