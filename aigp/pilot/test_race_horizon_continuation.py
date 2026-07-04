@@ -358,6 +358,50 @@ def test_plan_install_logs_boundary_continuity(capsys):
     assert "jerk_delta=" in first
 
 
+def test_adaptive_passthrough_velocity_uses_rounded_tangent_and_speed_cap():
+    api = PyAIPilotAutonomyAPI(use_perception=False, race_gate_count=3)
+    api.passthrough_velocity_enabled = True
+    api.passthrough_velocity_mode = "adaptive"
+    api.passthrough_speed_m_s = 0.5
+    api.passthrough_speed_max_m_s = 1.2
+    api.passthrough_turn_slowdown = 0.5
+    waypoints = np.array(
+        [
+            [0.0, 0.0, 1.5],
+            [0.0, 10.0, 1.5],
+            [10.0, 10.0, 1.5],
+        ]
+    )
+
+    velocities = api._compute_passthrough_waypoint_velocities(waypoints)
+
+    assert velocities is not None
+    expected_dir = np.array([1.0, 1.0, 0.0]) / math.sqrt(2.0)
+    speed = float(np.linalg.norm(velocities[1]))
+    np.testing.assert_allclose(velocities[1] / speed, expected_dir)
+    np.testing.assert_allclose(speed, 0.9)
+
+
+def test_fixed_passthrough_velocity_keeps_configured_speed():
+    api = PyAIPilotAutonomyAPI(use_perception=False, race_gate_count=3)
+    api.passthrough_velocity_enabled = True
+    api.passthrough_velocity_mode = "fixed"
+    api.passthrough_speed_m_s = 0.5
+    api.passthrough_speed_max_m_s = 1.2
+    waypoints = np.array(
+        [
+            [0.0, 0.0, 1.5],
+            [0.0, 10.0, 1.5],
+            [10.0, 10.0, 1.5],
+        ]
+    )
+
+    velocities = api._compute_passthrough_waypoint_velocities(waypoints)
+
+    assert velocities is not None
+    np.testing.assert_allclose(np.linalg.norm(velocities[1]), 0.5)
+
+
 class _FakePlanner:
     total_time = 1.0
     times = np.array([1.0])

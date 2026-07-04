@@ -290,7 +290,10 @@ class PlannerSection:
     horizon_continuation_enabled: bool
     post_gate_exit_continuation_enabled: bool
     passthrough_velocity_enabled: bool
+    passthrough_velocity_mode: str
     passthrough_speed_m_s: float
+    passthrough_speed_max_m_s: float
+    passthrough_turn_slowdown: float
     terminal_velocity_enabled: bool
     terminal_speed_m_s: float
     yaw_reference_motion_near_gate_enabled: bool
@@ -1181,7 +1184,22 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 "passthrough_velocity_enabled",
                 True,
             ),
+            passthrough_velocity_mode=_str(
+                planner_raw,
+                "passthrough_velocity_mode",
+                "adaptive",
+            ).lower(),
             passthrough_speed_m_s=_float(planner_raw, "passthrough_speed_m_s", 2.5),
+            passthrough_speed_max_m_s=_float(
+                planner_raw,
+                "passthrough_speed_max_m_s",
+                1.2,
+            ),
+            passthrough_turn_slowdown=_float(
+                planner_raw,
+                "passthrough_turn_slowdown",
+                0.5,
+            ),
             terminal_velocity_enabled=_bool(
                 planner_raw,
                 "terminal_velocity_enabled",

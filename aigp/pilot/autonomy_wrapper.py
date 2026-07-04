@@ -169,9 +169,24 @@ class PyAIPilotAutonomyAPI:
         self.passthrough_velocity_enabled = bool(
             self.config.planner.passthrough_velocity_enabled
         )
+        self.passthrough_velocity_mode = str(
+            self.config.planner.passthrough_velocity_mode or "fixed"
+        ).lower()
         self.passthrough_speed_m_s = max(
             0.0,
             float(self.config.planner.passthrough_speed_m_s),
+        )
+        configured_passthrough_max_speed = float(
+            self.config.planner.passthrough_speed_max_m_s
+        )
+        if configured_passthrough_max_speed <= 0.0:
+            configured_passthrough_max_speed = self.passthrough_speed_m_s
+        self.passthrough_speed_max_m_s = max(
+            self.passthrough_speed_m_s,
+            configured_passthrough_max_speed,
+        )
+        self.passthrough_turn_slowdown = float(
+            np.clip(float(self.config.planner.passthrough_turn_slowdown), 0.0, 1.0)
         )
         self.terminal_velocity_enabled = bool(
             self.config.planner.terminal_velocity_enabled
@@ -1933,14 +1948,56 @@ class PyAIPilotAutonomyAPI:
 
         velocities = np.full_like(waypoints, np.nan, dtype=float)
         for idx in range(1, len(waypoints) - 1):
-            direction = waypoints[idx + 1] - waypoints[idx - 1]
-            norm = float(np.linalg.norm(direction))
-            if not math.isfinite(norm) or norm < 1e-6:
+            incoming = waypoints[idx] - waypoints[idx - 1]
+            outgoing = waypoints[idx + 1] - waypoints[idx]
+            incoming_norm = float(np.linalg.norm(incoming))
+            outgoing_norm = float(np.linalg.norm(outgoing))
+            if (
+                not math.isfinite(incoming_norm)
+                or not math.isfinite(outgoing_norm)
+                or incoming_norm < 1e-6
+                or outgoing_norm < 1e-6
+            ):
                 continue
-            velocities[idx] = self.passthrough_speed_m_s * (direction / norm)
+            incoming_dir = incoming / incoming_norm
+            outgoing_dir = outgoing / outgoing_norm
+            tangent = incoming_dir + outgoing_dir
+            tangent_norm = float(np.linalg.norm(tangent))
+            if not math.isfinite(tangent_norm) or tangent_norm < 1e-6:
+                tangent = outgoing_dir
+                tangent_norm = float(np.linalg.norm(tangent))
+            if not math.isfinite(tangent_norm) or tangent_norm < 1e-6:
+                continue
+            direction = tangent / tangent_norm
+
+            speed = self.passthrough_speed_m_s
+            if self.passthrough_velocity_mode == "adaptive":
+                dot = float(np.clip(np.dot(incoming_dir, outgoing_dir), -1.0, 1.0))
+                turn_angle = float(math.acos(dot))
+                turn_ratio = turn_angle / math.pi
+                adaptive_speed = self.passthrough_speed_max_m_s * (
+                    1.0 - self.passthrough_turn_slowdown * turn_ratio
+                )
+                speed = max(self.passthrough_speed_m_s, adaptive_speed)
+                speed = min(
+                    speed,
+                    self.passthrough_speed_max_m_s,
+                    float(self.planner_vmax),
+                )
+            velocities[idx] = speed * direction
         if not np.any(np.isfinite(velocities[1:-1])):
             return None
         return velocities
+
+    def _passthrough_velocity_policy_text(self) -> str:
+        if not self.passthrough_velocity_enabled or self.passthrough_speed_m_s <= 0.0:
+            return "disabled"
+        return (
+            f"{self.passthrough_velocity_mode}:"
+            f"base={self.passthrough_speed_m_s:.2f}:"
+            f"max={self.passthrough_speed_max_m_s:.2f}:"
+            f"slowdown={self.passthrough_turn_slowdown:.2f}"
+        )
 
     def _terminal_velocity_for_plan(
         self,
@@ -2699,6 +2756,7 @@ class PyAIPilotAutonomyAPI:
             f"v_start_neu={self._fmt_vec(vel, precision=3)} "
             f"v_end_neu={self._fmt_vec(terminal_velocity, precision=3)} "
             f"terminal_policy={terminal_policy} "
+            f"passthrough_policy={self._passthrough_velocity_policy_text()} "
             f"waypoint_velocities_neu={waypoint_velocities_txt} "
             f"times_s={times_txt} "
             f"waypoints_neu={waypoints_txt} "
