@@ -144,6 +144,8 @@ class PyAIPilotAutonomyAPI:
         )
         self.active_waypoints = None
         self.active_times = None
+        self.active_waypoint_roles = []
+        self.active_plan_generation = 0
         self.active_gate_normal = None
         self.previous_gate_pass_position = None
         self.gate_plane_crossed = False
@@ -152,6 +154,20 @@ class PyAIPilotAutonomyAPI:
         self.gate_lateral_error = float("nan")
         self.last_planned_gate_idx = -1
         self.trajectory_start_time = 0.0
+        self.reference_tau_floor = 0.0
+        self.reference_tau_raw = 0.0
+        self.reference_tau_reason = "raw"
+        self.reference_tau_vehicle = float("nan")
+        self.reference_path_lag_m = 0.0
+        self.reference_path_distance_m = float("nan")
+        self.reference_progress_m = float("nan")
+        self.reference_vehicle_progress_m = float("nan")
+        self.reference_progress_clamp_tolerance_m = 0.10
+        self.reference_progress_clamp_max_error_m = max(
+            1.5,
+            2.0 * float(self.gate_pass_lateral_radius_m),
+        )
+        self.reference_progress_clamp_max_tau_step_s = 1.0
         self.last_desired_yaw = 0.0
         self.last_yaw_target_source = "init"
         self.last_yaw_target = None
@@ -165,6 +181,15 @@ class PyAIPilotAutonomyAPI:
         )
         self.post_gate_exit_continuation_enabled = bool(
             self.config.planner.post_gate_exit_continuation_enabled
+        )
+        self.gate_corridor_enabled = bool(self.config.planner.gate_corridor_enabled)
+        self.gate_corridor_length_m = max(
+            0.0,
+            float(self.config.planner.gate_corridor_length_m),
+        )
+        self.reference_progress_clamp_max_error_m = max(
+            float(self.reference_progress_clamp_max_error_m),
+            0.75 * float(self.gate_corridor_length_m),
         )
         self.passthrough_velocity_enabled = bool(
             self.config.planner.passthrough_velocity_enabled
@@ -260,6 +285,29 @@ class PyAIPilotAutonomyAPI:
         self.active_target_shift_max_near_gate_z_m = float(
             self.config.planner.active_target_shift_max_near_gate_z_m
         )
+        self.active_target_shift_defer_longitudinal_enabled = bool(
+            self.config.planner.active_target_shift_defer_longitudinal_enabled
+        )
+        self.active_target_shift_longitudinal_min_m = max(
+            0.0,
+            float(self.config.planner.active_target_shift_longitudinal_min_m),
+        )
+        self.active_target_shift_longitudinal_lateral_max_m = max(
+            0.0,
+            float(self.config.planner.active_target_shift_longitudinal_lateral_max_m),
+        )
+        self.active_target_shift_longitudinal_filter_size = max(
+            1,
+            int(self.config.planner.active_target_shift_longitudinal_filter_size),
+        )
+        self.active_target_shift_longitudinal_exit_shift_max_m = max(
+            0.0,
+            float(self.config.planner.active_target_shift_longitudinal_exit_shift_max_m),
+        )
+        self.active_target_shift_longitudinal_enter_radius_m = max(
+            0.0,
+            float(self.config.planner.active_target_shift_longitudinal_enter_radius_m),
+        )
         self.race_order_front_blocker_enabled = bool(
             self.config.planner.race_order_front_blocker_enabled
         )
@@ -320,6 +368,13 @@ class PyAIPilotAutonomyAPI:
         )
         self.active_target_shift_frames = 0
         self.active_target_shift_track_id = None
+        self.active_target_shift_pending_kind = None
+        self.deferred_longitudinal_shift_gate_idx = None
+        self.deferred_longitudinal_shift_track_id = None
+        self.deferred_longitudinal_shift_axis = None
+        self.deferred_longitudinal_shift_samples = []
+        self.deferred_longitudinal_shift_applied_generation = -1
+        self.deferred_longitudinal_shift_pending_signature = None
         self.planner_vmax = float(self.config.planner.vmax)
         self.planner_amax = float(self.config.planner.amax)
         self.planner_t_min = float(self.config.planner.t_min)
@@ -648,8 +703,9 @@ class PyAIPilotAutonomyAPI:
         if self.active_waypoints is None or self.planner.total_time <= 0.0:
             return None
 
-        tau = max(0.0, time.time() - self.trajectory_start_time)
-        tau = min(tau, float(self.planner.total_time))
+        tau_raw = max(0.0, time.time() - self.trajectory_start_time)
+        tau_raw = min(tau_raw, float(self.planner.total_time))
+        tau = self._reference_progress_clamped_tau(tau_raw, pos)
         p_ref, v_ref, a_ref = self.planner.sample(tau)
         desired_yaw = self._desired_yaw(p_ref, v_ref, a_ref, pos, yaw_rad)
 
@@ -1027,6 +1083,11 @@ class PyAIPilotAutonomyAPI:
             f"truth_pos_neu={truth_pos_txt} "
             f"corr={correction_txt} "
             f"tau={tau:.2f}/{float(self.planner.total_time):.2f} "
+            f"tau_raw={float(self.reference_tau_raw):.2f} "
+            f"tau_mode={self.reference_tau_reason} "
+            f"tau_vehicle={self._fmt_float(self.reference_tau_vehicle, precision=2)} "
+            f"path_lag={self._fmt_float(self.reference_path_lag_m, precision=2)} "
+            f"path_dist={self._fmt_float(self.reference_path_distance_m, precision=2)} "
             f"dist={dist_txt} "
             f"pos_neu={fmt_vec(pos)} "
             f"target_neu={target_txt} "
@@ -1121,6 +1182,215 @@ class PyAIPilotAutonomyAPI:
             self.active_waypoints is not None
             and self.planner.total_time > 0.0
             and now <= float(self.post_gate_exit_until_s)
+        )
+
+    def _active_gate_exit_waypoint(self) -> tuple[np.ndarray | None, str]:
+        if self.active_waypoints is None:
+            return None, "none"
+        roles = list(self.active_waypoint_roles or [])
+        if not roles or len(roles) != len(self.active_waypoints):
+            return None, "missing_roles"
+
+        try:
+            horizon_idx = self.active_horizon_gate_indices.index(
+                int(self.current_gate_idx)
+            )
+        except ValueError:
+            horizon_idx = 0
+        if horizon_idx < 0:
+            horizon_idx = 0
+
+        seen_gate_centers = 0
+        for idx, role in enumerate(roles):
+            if role != "gate_center":
+                continue
+            if seen_gate_centers != horizon_idx:
+                seen_gate_centers += 1
+                continue
+
+            for exit_idx in range(idx + 1, len(roles)):
+                exit_role = roles[exit_idx]
+                if exit_role == "gate_center":
+                    break
+                if exit_role in ("gate_exit", "gate_exit_shifted"):
+                    return (
+                        np.asarray(
+                            self.active_waypoints[exit_idx],
+                            dtype=float,
+                        ).reshape(3).copy(),
+                        str(exit_role),
+                    )
+            return None, "missing_exit_after_center"
+
+        return None, "missing_gate_center"
+
+    def _reset_reference_progress_state(self) -> None:
+        self.reference_tau_floor = 0.0
+        self.reference_tau_raw = 0.0
+        self.reference_tau_reason = "raw"
+        self.reference_tau_vehicle = float("nan")
+        self.reference_path_lag_m = 0.0
+        self.reference_path_distance_m = float("nan")
+        self.reference_progress_m = float("nan")
+        self.reference_vehicle_progress_m = float("nan")
+
+    def _reference_progress_clamped_tau(self, raw_tau: float, pos: np.ndarray) -> float:
+        try:
+            total_time = float(self.planner.total_time)
+        except (TypeError, ValueError):
+            total_time = 0.0
+        if not math.isfinite(total_time) or total_time <= 0.0:
+            self._reset_reference_progress_state()
+            return 0.0
+
+        raw_tau = float(np.clip(float(raw_tau), 0.0, total_time))
+        tau = raw_tau
+        reason = "raw"
+        self.reference_tau_raw = raw_tau
+        self.reference_tau_vehicle = float("nan")
+        self.reference_path_lag_m = 0.0
+        self.reference_path_distance_m = float("nan")
+        self.reference_progress_m = float("nan")
+        self.reference_vehicle_progress_m = float("nan")
+
+        if (
+            math.isfinite(float(self.reference_tau_floor))
+            and self.reference_tau_floor > tau + 1e-6
+        ):
+            tau = min(total_time, float(self.reference_tau_floor))
+            reason = "floor"
+
+        projection = self._project_position_to_planner_path(pos)
+        if projection is not None:
+            vehicle_tau = float(projection["tau"])
+            vehicle_progress = float(projection["progress_m"])
+            path_distance = float(projection["distance_m"])
+            reference_progress = self._planner_path_progress_at_tau(
+                raw_tau,
+                projection["taus"],
+                projection["cumulative_m"],
+            )
+            path_lag = vehicle_progress - reference_progress
+            self.reference_tau_vehicle = vehicle_tau
+            self.reference_path_lag_m = path_lag
+            self.reference_path_distance_m = path_distance
+            self.reference_progress_m = reference_progress
+            self.reference_vehicle_progress_m = vehicle_progress
+
+            if (
+                math.isfinite(path_lag)
+                and math.isfinite(path_distance)
+                and path_distance <= float(self.reference_progress_clamp_max_error_m)
+                and path_lag > float(self.reference_progress_clamp_tolerance_m)
+                and vehicle_tau > tau + 1e-6
+            ):
+                max_tau = min(
+                    total_time,
+                    raw_tau + float(self.reference_progress_clamp_max_tau_step_s),
+                )
+                clamped_tau = min(vehicle_tau, max_tau)
+                if clamped_tau > tau + 1e-6:
+                    tau = clamped_tau
+                    reason = "path_progress"
+
+        self.reference_tau_floor = max(
+            float(self.reference_tau_floor),
+            float(tau),
+        )
+        self.reference_tau_reason = reason
+        return float(tau)
+
+    def _project_position_to_planner_path(self, point: np.ndarray) -> dict | None:
+        try:
+            total_time = float(self.planner.total_time)
+            point = np.asarray(point, dtype=float).reshape(3)
+        except (TypeError, ValueError):
+            return None
+        if (
+            not math.isfinite(total_time)
+            or total_time <= 0.0
+            or not np.all(np.isfinite(point))
+        ):
+            return None
+
+        count = max(24, min(160, int(math.ceil(total_time * 8.0)) + 1))
+        taus = np.linspace(0.0, total_time, count)
+        positions = np.zeros((count, 3), dtype=float)
+        cumulative = np.zeros(count, dtype=float)
+        for idx, tau in enumerate(taus):
+            try:
+                sample_pos, _, _ = self.planner.sample(float(tau))
+            except Exception:
+                return None
+            positions[idx] = np.asarray(sample_pos, dtype=float).reshape(3)
+            if not np.all(np.isfinite(positions[idx])):
+                return None
+            if idx > 0:
+                segment_length = float(np.linalg.norm(positions[idx] - positions[idx - 1]))
+                if not math.isfinite(segment_length):
+                    return None
+                cumulative[idx] = cumulative[idx - 1] + max(0.0, segment_length)
+
+        best_distance = float("inf")
+        best_progress = 0.0
+        best_tau = 0.0
+        best_segment = -1
+        for idx in range(count - 1):
+            start = positions[idx]
+            end = positions[idx + 1]
+            delta = end - start
+            segment_length_sq = float(np.dot(delta, delta))
+            if segment_length_sq <= 1e-12:
+                alpha = 0.0
+                projection = start
+            else:
+                alpha = float(np.dot(point - start, delta) / segment_length_sq)
+                alpha = float(np.clip(alpha, 0.0, 1.0))
+                projection = start + alpha * delta
+            distance = float(np.linalg.norm(point - projection))
+            if not math.isfinite(distance) or distance >= best_distance:
+                continue
+            segment_progress = cumulative[idx + 1] - cumulative[idx]
+            best_distance = distance
+            best_progress = cumulative[idx] + alpha * segment_progress
+            best_tau = float(taus[idx] + alpha * (taus[idx + 1] - taus[idx]))
+            best_segment = idx
+
+        if best_segment < 0:
+            return None
+        return {
+            "distance_m": float(best_distance),
+            "progress_m": float(best_progress),
+            "tau": float(best_tau),
+            "segment": int(best_segment),
+            "taus": taus,
+            "cumulative_m": cumulative,
+        }
+
+    @staticmethod
+    def _planner_path_progress_at_tau(
+        tau: float,
+        taus: np.ndarray,
+        cumulative_m: np.ndarray,
+    ) -> float:
+        if len(taus) == 0 or len(taus) != len(cumulative_m):
+            return float("nan")
+        tau = float(tau)
+        if not math.isfinite(tau):
+            return float("nan")
+        if tau <= float(taus[0]):
+            return float(cumulative_m[0])
+        if tau >= float(taus[-1]):
+            return float(cumulative_m[-1])
+        idx = int(np.searchsorted(taus, tau, side="right") - 1)
+        idx = max(0, min(idx, len(taus) - 2))
+        dt = float(taus[idx + 1] - taus[idx])
+        if abs(dt) <= 1e-12:
+            return float(cumulative_m[idx])
+        alpha = float(np.clip((tau - float(taus[idx])) / dt, 0.0, 1.0))
+        return float(
+            cumulative_m[idx]
+            + alpha * (float(cumulative_m[idx + 1]) - float(cumulative_m[idx]))
         )
 
     def _completed_landmark_radius_m(self) -> float:
@@ -1414,6 +1684,7 @@ class PyAIPilotAutonomyAPI:
         )
         self.active_waypoints = None
         self.active_times = None
+        self.active_waypoint_roles = []
         self.active_horizon_gate_indices = []
         self.active_horizon_track_ids = []
         self.active_horizon_targets = []
@@ -1422,6 +1693,7 @@ class PyAIPilotAutonomyAPI:
         self.active_terminal_velocity_policy = f"cleared:{reason}"
         self.post_gate_exit_until_s = 0.0
         self.post_gate_exit_reason = ""
+        self._reset_reference_progress_state()
 
     @staticmethod
     def _finite_vec3_or_none(value) -> np.ndarray | None:
@@ -1559,6 +1831,7 @@ class PyAIPilotAutonomyAPI:
         diag = self.target_manager.diagnostics()
         if not diag.locked or diag.active_track_id is None or diag.center_at_plan is None:
             self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = None
             self.active_target_shift_track_id = None
             return False
 
@@ -1566,25 +1839,31 @@ class PyAIPilotAutonomyAPI:
             active_id = int(diag.active_track_id)
         except (TypeError, ValueError):
             self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = None
             self.active_target_shift_track_id = None
             return False
         if active_id < 0:
             self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = None
             self.active_target_shift_track_id = None
             return False
 
         if self.active_target_shift_track_id != active_id:
             self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = None
             self.active_target_shift_track_id = active_id
+            self._reset_deferred_longitudinal_shift()
 
         latest, source_track_id, quality = self._best_duplicate_cluster_center(active_id)
         if latest is None or not bool(quality.get("ok", False)):
             self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = None
             return False
 
         planned = self._finite_vec3_or_none(diag.center_at_plan)
         if planned is None:
             self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = None
             return False
 
         planned = self._apply_target_z_policy(planned)
@@ -1595,17 +1874,92 @@ class PyAIPilotAutonomyAPI:
         shift_z_m = float(abs(shift_vec[2]))
         if not math.isfinite(shift_m) or shift_m < self.active_target_shift_threshold_m:
             self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = None
+            if self._maybe_apply_deferred_longitudinal_exit_shift(
+                pos=pos,
+                vel=vel,
+                gate_idx=int(self.current_gate_idx),
+                track_id=active_id,
+                target=planned,
+            ):
+                return True
             return False
         max_total_m = float(self.active_target_shift_max_total_m)
         if max_total_m > 0.0 and shift_m > max_total_m:
             self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = None
             return False
 
         dist_to_target = float(np.linalg.norm(np.asarray(pos, dtype=float).reshape(3) - planned))
+
+        longitudinal_axis = self._gate_corridor_axis(
+            center=planned,
+            reference=np.asarray(pos, dtype=float).reshape(3),
+            preferred_normal=self.active_gate_normal,
+        )
+        longitudinal_m = float("nan")
+        lateral_m = float("nan")
+        mostly_longitudinal = False
+        if longitudinal_axis is not None:
+            longitudinal_m = float(np.dot(shift_vec, longitudinal_axis))
+            lateral_vec = shift_vec - longitudinal_m * longitudinal_axis
+            lateral_m = float(np.linalg.norm(lateral_vec))
+            mostly_longitudinal = (
+                self.active_target_shift_defer_longitudinal_enabled
+                and abs(longitudinal_m)
+                >= float(self.active_target_shift_longitudinal_min_m)
+                and math.isfinite(lateral_m)
+                and lateral_m
+                < float(self.active_target_shift_longitudinal_lateral_max_m)
+            )
+
+        if mostly_longitudinal:
+            if self.active_target_shift_pending_kind != "longitudinal_deferred":
+                self.active_target_shift_frames = 0
+                self.active_target_shift_pending_kind = "longitudinal_deferred"
+            self.active_target_shift_frames += 1
+            if self.active_target_shift_frames < self.active_target_shift_required_frames:
+                return False
+            self._record_deferred_longitudinal_shift(
+                gate_idx=int(self.current_gate_idx),
+                track_id=active_id,
+                axis=longitudinal_axis,
+                longitudinal_m=longitudinal_m,
+                lateral_m=lateral_m,
+                shift_m=shift_m,
+                shift_z_m=shift_z_m,
+                planned=planned,
+                latest=latest,
+                source_track_id=source_track_id,
+                quality=quality,
+            )
+            self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = None
+            return self._maybe_apply_deferred_longitudinal_exit_shift(
+                pos=pos,
+                vel=vel,
+                gate_idx=int(self.current_gate_idx),
+                track_id=active_id,
+                target=planned,
+            )
+
+        if self._maybe_apply_deferred_longitudinal_exit_shift(
+            pos=pos,
+            vel=vel,
+            gate_idx=int(self.current_gate_idx),
+            track_id=active_id,
+            target=planned,
+        ):
+            return True
+
         if dist_to_target <= self.active_target_shift_near_gate_distance_m:
             self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = None
             return False
 
+        if self.active_target_shift_pending_kind != "active_correction":
+            self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = "active_correction"
         self.active_target_shift_frames += 1
         if self.active_target_shift_frames < self.active_target_shift_required_frames:
             return False
@@ -1616,6 +1970,7 @@ class PyAIPilotAutonomyAPI:
 
         if self.active_target_shift_alpha <= 0.0:
             self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = None
             return False
 
         correction_vec = self.active_target_shift_alpha * shift_vec
@@ -1630,6 +1985,7 @@ class PyAIPilotAutonomyAPI:
         target_idx = int(self.current_gate_idx)
         if target_idx < 0 or target_idx >= len(self.gate_centers_neu):
             self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = None
             return False
 
         print(
@@ -1639,6 +1995,8 @@ class PyAIPilotAutonomyAPI:
             f"shift={shift_m:.2f} "
             f"shift_xy={shift_xy_m:.2f} "
             f"shift_z={shift_z_m:.2f} "
+            f"shift_longitudinal_lateral=({self._fmt_float(longitudinal_m, precision=2)},"
+            f"{self._fmt_float(lateral_m, precision=2)}) "
             f"step={correction_m:.2f} "
             f"frames={self.active_target_shift_frames} "
             f"dist_to_target={dist_to_target:.2f} "
@@ -1661,6 +2019,7 @@ class PyAIPilotAutonomyAPI:
         self._reset_gate_pass_state()
         self.active_waypoints = None
         self.active_times = None
+        self.active_waypoint_roles = []
         self.active_horizon_gate_indices = []
         self.active_horizon_track_ids = []
         self.active_horizon_targets = []
@@ -1670,6 +2029,7 @@ class PyAIPilotAutonomyAPI:
         self.last_planned_gate_idx = -1
         self._last_gate_signature = None
         self.active_target_shift_frames = 0
+        self.active_target_shift_pending_kind = None
         return self._path_plan(pos, vel)
 
     def _planning_horizon_targets(
@@ -1967,6 +2327,291 @@ class PyAIPilotAutonomyAPI:
             flush=True,
         )
 
+    def _gate_corridor_axis(
+        self,
+        *,
+        center: np.ndarray,
+        reference: np.ndarray,
+        preferred_normal: np.ndarray | None = None,
+    ) -> np.ndarray | None:
+        center = self._finite_vec3_or_none(center)
+        reference = self._finite_vec3_or_none(reference)
+        if center is None or reference is None:
+            return None
+
+        axis = self._finite_vec3_or_none(preferred_normal)
+        if axis is not None:
+            norm = float(np.linalg.norm(axis))
+            if math.isfinite(norm) and norm > 1e-6:
+                axis = axis / norm
+            else:
+                axis = None
+
+        if axis is None:
+            axis = unit_vector_from_to(reference, center)
+        if axis is None:
+            return None
+
+        rel = center - reference
+        rel_norm = float(np.linalg.norm(rel))
+        if math.isfinite(rel_norm) and rel_norm > 1e-6 and float(np.dot(rel, axis)) < 0.0:
+            axis = -axis
+        return axis
+
+    def _build_gate_corridor_waypoints(
+        self,
+        *,
+        start: np.ndarray,
+        targets,
+        preferred_normals=None,
+        exit_shift_by_target=None,
+    ) -> tuple[np.ndarray, list[str]]:
+        start = np.asarray(start, dtype=float).reshape(3)
+        waypoints = [start.copy()]
+        roles = ["start"]
+        reference = start.copy()
+
+        half_length = 0.5 * max(0.0, float(self.gate_corridor_length_m))
+        use_corridor = bool(self.gate_corridor_enabled) and half_length > 1e-6
+        preferred_normals = list(preferred_normals or [])
+        exit_shift_by_target = list(exit_shift_by_target or [])
+
+        for idx, raw_target in enumerate(targets):
+            center = np.asarray(raw_target, dtype=float).reshape(3)
+            normal = preferred_normals[idx] if idx < len(preferred_normals) else None
+            axis = (
+                self._gate_corridor_axis(
+                    center=center,
+                    reference=reference,
+                    preferred_normal=normal,
+                )
+                if use_corridor
+                else None
+            )
+            if axis is None:
+                waypoints.append(center.copy())
+                roles.append("gate_center")
+                reference = center.copy()
+                continue
+
+            enter = center - axis * half_length
+            exit_shift_m = (
+                float(exit_shift_by_target[idx])
+                if idx < len(exit_shift_by_target)
+                else 0.0
+            )
+            if not math.isfinite(exit_shift_m):
+                exit_shift_m = 0.0
+            min_exit_after_center_m = max(float(VADR_TS_002.gate_depth_m), 0.25)
+            exit_after_center_m = max(
+                min_exit_after_center_m,
+                half_length + exit_shift_m,
+            )
+            exit_point = center + axis * exit_after_center_m
+
+            # If the current/reference point has already crossed the enter point,
+            # do not send the vehicle backward just to line up.
+            enter_progress = float(np.dot(enter - reference, axis))
+            if math.isfinite(enter_progress) and enter_progress > 0.25:
+                waypoints.append(enter)
+                roles.append("gate_enter")
+
+            waypoints.append(center.copy())
+            roles.append("gate_center")
+            waypoints.append(exit_point)
+            roles.append("gate_exit")
+            reference = exit_point
+
+        return np.vstack(waypoints), roles
+
+    def _reset_deferred_longitudinal_shift(self) -> None:
+        self.deferred_longitudinal_shift_gate_idx = None
+        self.deferred_longitudinal_shift_track_id = None
+        self.deferred_longitudinal_shift_axis = None
+        self.deferred_longitudinal_shift_samples = []
+        self.deferred_longitudinal_shift_applied_generation = -1
+        self.deferred_longitudinal_shift_pending_signature = None
+
+    def _record_deferred_longitudinal_shift(
+        self,
+        *,
+        gate_idx: int,
+        track_id: int,
+        axis: np.ndarray,
+        longitudinal_m: float,
+        lateral_m: float,
+        shift_m: float,
+        shift_z_m: float,
+        planned: np.ndarray,
+        latest: np.ndarray,
+        source_track_id,
+        quality: dict,
+    ) -> float:
+        if (
+            self.deferred_longitudinal_shift_gate_idx != int(gate_idx)
+            or self.deferred_longitudinal_shift_track_id != int(track_id)
+        ):
+            self.deferred_longitudinal_shift_gate_idx = int(gate_idx)
+            self.deferred_longitudinal_shift_track_id = int(track_id)
+            self.deferred_longitudinal_shift_samples = []
+            self.deferred_longitudinal_shift_applied_generation = -1
+
+        axis = np.asarray(axis, dtype=float).reshape(3)
+        axis_norm = float(np.linalg.norm(axis))
+        if math.isfinite(axis_norm) and axis_norm > 1e-6:
+            self.deferred_longitudinal_shift_axis = axis / axis_norm
+
+        self.deferred_longitudinal_shift_samples.append(float(longitudinal_m))
+        self.deferred_longitudinal_shift_pending_signature = None
+        max_samples = int(self.active_target_shift_longitudinal_filter_size)
+        if len(self.deferred_longitudinal_shift_samples) > max_samples:
+            self.deferred_longitudinal_shift_samples = (
+                self.deferred_longitudinal_shift_samples[-max_samples:]
+            )
+
+        mean_m = float(np.mean(self.deferred_longitudinal_shift_samples))
+        print(
+            "active_target_shift_longitudinal_deferred "
+            f"gate_idx={int(gate_idx)} "
+            f"track={int(track_id)} "
+            f"shift={float(shift_m):.2f} "
+            f"longitudinal={float(longitudinal_m):.2f} "
+            f"lateral={float(lateral_m):.2f} "
+            f"shift_z={float(shift_z_m):.2f} "
+            f"samples={len(self.deferred_longitudinal_shift_samples)} "
+            f"mean={mean_m:.2f} "
+            f"source_track={source_track_id if source_track_id is not None else 'none'} "
+            f"reproj={self._fmt_float(quality.get('reproj'), precision=2)} "
+            f"kp_min={self._fmt_float(quality.get('kp_min'), precision=2)} "
+            f"world_std={self._fmt_float(quality.get('world_std'), precision=2)} "
+            f"planned={self._fmt_vec(planned, precision=3)} "
+            f"latest={self._fmt_vec(latest, precision=3)} "
+            f"axis={self._fmt_vec(self.deferred_longitudinal_shift_axis, precision=3)}",
+            flush=True,
+        )
+        return mean_m
+
+    def _active_corridor_enter_status(
+        self,
+        pos: np.ndarray,
+    ) -> tuple[bool, str, np.ndarray | None, float, float]:
+        if self.active_waypoints is None or self.planner.total_time <= 0.0:
+            return False, "no_active_plan", None, float("nan"), float("nan")
+        roles = list(self.active_waypoint_roles or [])
+        if not roles or len(roles) != len(self.active_waypoints):
+            return False, "missing_roles", None, float("nan"), float("nan")
+        if "gate_enter" not in roles:
+            if "gate_center" in roles and "gate_exit" in roles:
+                return True, "enter_absent_already_past", None, float("nan"), float("nan")
+            return False, "no_corridor_enter", None, float("nan"), float("nan")
+
+        enter_idx = roles.index("gate_enter")
+        if enter_idx < 0 or enter_idx >= len(self.active_waypoints):
+            return False, "bad_enter_idx", None, float("nan"), float("nan")
+
+        enter = np.asarray(self.active_waypoints[enter_idx], dtype=float).reshape(3)
+        axis = None
+        if "gate_center" in roles[enter_idx + 1 :]:
+            center_idx = enter_idx + 1 + roles[enter_idx + 1 :].index("gate_center")
+            center = np.asarray(self.active_waypoints[center_idx], dtype=float).reshape(3)
+            direction = center - enter
+            direction_norm = float(np.linalg.norm(direction))
+            if math.isfinite(direction_norm) and direction_norm > 1e-6:
+                axis = direction / direction_norm
+        if axis is None:
+            axis = self._finite_vec3_or_none(self.active_gate_normal)
+        if axis is None:
+            return False, "missing_axis", enter, float("nan"), float("nan")
+
+        pos = np.asarray(pos, dtype=float).reshape(3)
+        distance_m = float(np.linalg.norm(pos - enter))
+        progress_m = float(np.dot(pos - enter, axis))
+        entered = (
+            math.isfinite(distance_m)
+            and distance_m <= float(self.active_target_shift_longitudinal_enter_radius_m)
+        ) or (
+            math.isfinite(progress_m)
+            and progress_m >= -float(self.active_target_shift_longitudinal_enter_radius_m)
+        )
+        return entered, "entered" if entered else "not_entered", enter, distance_m, progress_m
+
+    def _maybe_apply_deferred_longitudinal_exit_shift(
+        self,
+        *,
+        pos: np.ndarray,
+        vel: np.ndarray,
+        gate_idx: int,
+        track_id: int,
+        target: np.ndarray,
+    ) -> bool:
+        if (
+            self.deferred_longitudinal_shift_gate_idx != int(gate_idx)
+            or self.deferred_longitudinal_shift_track_id != int(track_id)
+            or not self.deferred_longitudinal_shift_samples
+            or self.deferred_longitudinal_shift_applied_generation
+            == self.active_plan_generation
+        ):
+            return False
+
+        entered, reason, enter, enter_dist_m, enter_progress_m = (
+            self._active_corridor_enter_status(pos)
+        )
+        if not entered:
+            mean_m = float(np.mean(self.deferred_longitudinal_shift_samples))
+            signature = (
+                int(gate_idx),
+                int(track_id),
+                len(self.deferred_longitudinal_shift_samples),
+                round(mean_m, 2),
+                str(reason),
+            )
+            if signature != self.deferred_longitudinal_shift_pending_signature:
+                self.deferred_longitudinal_shift_pending_signature = signature
+                print(
+                    "active_target_shift_longitudinal_pending "
+                    f"gate_idx={int(gate_idx)} "
+                    f"track={int(track_id)} "
+                    f"samples={len(self.deferred_longitudinal_shift_samples)} "
+                    f"mean={mean_m:.2f} "
+                    f"reason={reason} "
+                    f"enter={self._fmt_vec(enter, precision=3) if enter is not None else 'none'} "
+                    f"enter_dist={self._fmt_float(enter_dist_m, precision=2)} "
+                    f"enter_progress={self._fmt_float(enter_progress_m, precision=2)}",
+                    flush=True,
+                )
+            return False
+
+        mean_m = float(np.mean(self.deferred_longitudinal_shift_samples))
+        max_shift = float(self.active_target_shift_longitudinal_exit_shift_max_m)
+        clamped_m = float(np.clip(mean_m, -max_shift, max_shift)) if max_shift > 0.0 else 0.0
+        if abs(clamped_m) < 1e-6:
+            return False
+
+        axis = self._finite_vec3_or_none(self.deferred_longitudinal_shift_axis)
+        if axis is None:
+            axis = self._finite_vec3_or_none(self.active_gate_normal)
+        if axis is None:
+            return False
+        axis_norm = float(np.linalg.norm(axis))
+        if not math.isfinite(axis_norm) or axis_norm < 1e-6:
+            return False
+        axis = axis / axis_norm
+
+        return self._path_plan_deferred_corridor_exit_shift(
+            pos=np.asarray(pos, dtype=float).reshape(3),
+            vel=np.asarray(vel, dtype=float).reshape(3),
+            target=np.asarray(target, dtype=float).reshape(3),
+            axis=axis,
+            exit_shift_m=clamped_m,
+            raw_mean_m=mean_m,
+            gate_idx=int(gate_idx),
+            track_id=int(track_id),
+            enter_reason=reason,
+            enter=enter,
+            enter_dist_m=enter_dist_m,
+            enter_progress_m=enter_progress_m,
+        )
+
     def _compute_passthrough_waypoint_velocities(
         self,
         waypoints: np.ndarray,
@@ -2054,6 +2699,8 @@ class PyAIPilotAutonomyAPI:
             return zero, "zero_final_gate"
         if plan_mode not in (
             "gate_horizon",
+            "single_gate_corridor",
+            "single_gate_corridor_exit_shift",
             "single_gate_exit",
             "provisional_next_gate",
         ):
@@ -2871,6 +3518,168 @@ class PyAIPilotAutonomyAPI:
             flush=True,
         )
 
+    def _path_plan_deferred_corridor_exit_shift(
+        self,
+        *,
+        pos: np.ndarray,
+        vel: np.ndarray,
+        target: np.ndarray,
+        axis: np.ndarray,
+        exit_shift_m: float,
+        raw_mean_m: float,
+        gate_idx: int,
+        track_id: int,
+        enter_reason: str,
+        enter: np.ndarray | None,
+        enter_dist_m: float,
+        enter_progress_m: float,
+    ) -> bool:
+        half_length = 0.5 * max(0.0, float(self.gate_corridor_length_m))
+        min_exit_after_center_m = max(float(VADR_TS_002.gate_depth_m), 0.25)
+        exit_after_center_m = max(
+            min_exit_after_center_m,
+            half_length + float(exit_shift_m),
+        )
+        shifted_exit = target + axis * exit_after_center_m
+        waypoints = np.vstack([pos, target, shifted_exit])
+        waypoint_roles = ["start", "gate_center", "gate_exit_shifted"]
+        waypoint_velocities = self._compute_passthrough_waypoint_velocities(waypoints)
+        times = allocate_segment_times(
+            waypoints,
+            current_vel=vel,
+            vmax=self.planner_vmax,
+            amax=self.planner_amax,
+            T_min=self.planner_t_min,
+        )
+        plan_mode = "single_gate_corridor_exit_shift"
+        terminal_velocity, terminal_policy = self._terminal_velocity_for_plan(
+            waypoints=waypoints,
+            plan_mode=plan_mode,
+            horizon_gate_indices=[int(gate_idx)],
+        )
+        planner = self._build_minimum_snap_plan(
+            waypoints=waypoints,
+            times=times,
+            v_start=vel,
+            v_end=terminal_velocity,
+            waypoint_velocities=waypoint_velocities,
+        )
+        valid_plan, validation_details = self._validate_active_gate_plan_crossing(
+            planner=planner,
+            target=target,
+            normal=axis,
+            plan_mode=plan_mode,
+            gate_idx=int(gate_idx),
+            track_id=int(track_id),
+        )
+        if not valid_plan:
+            self._trace_plan_validation_reject(
+                validation_details,
+                fallback="deferred_exit_shift_hold_current_plan",
+            )
+            print(
+                "active_target_shift_longitudinal_exit_replan_reject "
+                f"gate_idx={int(gate_idx)} "
+                f"track={int(track_id)} "
+                f"mean={float(raw_mean_m):.2f} "
+                f"clamped={float(exit_shift_m):.2f} "
+                f"reason={validation_details.get('reason', 'unknown')}",
+                flush=True,
+            )
+            return False
+
+        self.planner = planner
+        self.current_gate_pos = target.copy()
+        self.active_waypoints = waypoints.copy()
+        self.active_times = np.asarray(times, dtype=float).copy()
+        self.active_waypoint_roles = list(waypoint_roles)
+        self.active_horizon_gate_indices = [int(gate_idx)]
+        self.active_horizon_track_ids = [int(track_id)]
+        self.active_horizon_targets = [target.copy()]
+        self.active_plan_mode = plan_mode
+        self.active_terminal_velocity = terminal_velocity.copy()
+        self.active_terminal_velocity_policy = str(terminal_policy)
+        self.post_gate_exit_until_s = 0.0
+        self.post_gate_exit_reason = ""
+        self.trajectory_start_time = time.time()
+        self.last_plan_wall_time = self.trajectory_start_time
+        self.last_planned_gate_idx = int(gate_idx)
+        self.active_plan_generation += 1
+        self._reset_reference_progress_state()
+        self.deferred_longitudinal_shift_applied_generation = self.active_plan_generation
+        self.deferred_longitudinal_shift_samples = []
+        self.deferred_longitudinal_shift_pending_signature = None
+        self._reset_gate_pass_state()
+        self._initialize_gate_pass_tracking(
+            pos=pos,
+            target=target,
+            fallback_normal=axis,
+        )
+
+        waypoints_txt = "[" + ";".join(
+            self._fmt_vec(waypoint, precision=3) for waypoint in waypoints
+        ) + "]"
+        times_txt = "(" + ",".join(f"{float(item):.3f}" for item in times) + ")"
+        waypoint_roles_txt = "(" + ",".join(str(role) for role in waypoint_roles) + ")"
+        waypoint_velocities_txt = "none"
+        if waypoint_velocities is not None:
+            waypoint_velocities_txt = "[" + ";".join(
+                self._fmt_vec(velocity, precision=3)
+                if np.all(np.isfinite(velocity))
+                else "nan"
+                for velocity in waypoint_velocities
+            ) + "]"
+        print(
+            "active_target_shift_longitudinal_exit_replan "
+            f"gate_idx={int(gate_idx)} "
+            f"track={int(track_id)} "
+            f"mean={float(raw_mean_m):.2f} "
+            f"clamped={float(exit_shift_m):.2f} "
+            f"exit_after_center={float(exit_after_center_m):.2f} "
+            f"enter_reason={enter_reason} "
+            f"enter={self._fmt_vec(enter, precision=3) if enter is not None else 'none'} "
+            f"enter_dist={self._fmt_float(enter_dist_m, precision=2)} "
+            f"enter_progress={self._fmt_float(enter_progress_m, precision=2)} "
+            f"target_neu={self._fmt_vec(target, precision=3)} "
+            f"axis={self._fmt_vec(axis, precision=3)} "
+            f"shifted_exit={self._fmt_vec(shifted_exit, precision=3)}",
+            flush=True,
+        )
+        plan_samples_txt = self._sample_planner_path_text(self.planner)
+        print(
+            "plan_install "
+            f"gate_idx={int(gate_idx)} "
+            f"track={int(track_id)} "
+            f"mode={plan_mode} "
+            f"horizon_tracks=({int(track_id)}) "
+            f"horizon_gate_indices=({int(gate_idx)}) "
+            f"total_time={float(self.planner.total_time):.3f} "
+            f"segments={max(0, int(len(waypoints) - 1))} "
+            f"target_neu={self._fmt_vec(target, precision=3)} "
+            f"normal_neu={self._fmt_vec(axis, precision=3)} "
+            f"v_start_neu={self._fmt_vec(vel, precision=3)} "
+            f"v_end_neu={self._fmt_vec(terminal_velocity, precision=3)} "
+            f"terminal_policy={terminal_policy} "
+            f"passthrough_policy={self._passthrough_velocity_policy_text()} "
+            f"waypoint_velocities_neu={waypoint_velocities_txt} "
+            f"times_s={times_txt} "
+            f"waypoint_roles={waypoint_roles_txt} "
+            f"gate_corridor={int(self.gate_corridor_enabled)}:"
+            f"{float(self.gate_corridor_length_m):.2f} "
+            f"exit_shift_m={float(exit_shift_m):.2f} "
+            f"waypoints_neu={waypoints_txt} "
+            f"plan_samples_neu={plan_samples_txt}",
+            flush=True,
+        )
+        self._trace_plan_boundary_continuity(
+            planner=self.planner,
+            waypoints=waypoints,
+            plan_mode=plan_mode,
+            horizon_track_ids=[int(track_id)],
+            horizon_gate_indices=[int(gate_idx)],
+        )
+        return True
+
     def _path_plan(self, pos: np.ndarray, vel: np.ndarray) -> bool:
         if not self.gate_centers_neu:
             return False
@@ -2914,18 +3723,43 @@ class PyAIPilotAutonomyAPI:
 
         def build_candidate(targets, track_ids, gate_indices, *, allow_exit: bool = True):
             if len(targets) >= 2:
-                candidate_waypoints = np.vstack([pos, *targets])
+                preferred_normals = [normal] + [None] * max(0, len(targets) - 1)
+                candidate_waypoints, candidate_waypoint_roles = (
+                    self._build_gate_corridor_waypoints(
+                        start=pos,
+                        targets=targets,
+                        preferred_normals=preferred_normals,
+                    )
+                )
                 candidate_waypoint_velocities = (
                     self._compute_passthrough_waypoint_velocities(candidate_waypoints)
                 )
                 candidate_mode = "gate_horizon"
             elif normal is None or not allow_exit:
                 candidate_waypoints = np.vstack([pos, target])
+                candidate_waypoint_roles = ["start", "gate_center"]
                 candidate_waypoint_velocities = None
                 candidate_mode = "single_gate"
+            elif self.gate_corridor_enabled and self.gate_corridor_length_m > 0.0:
+                candidate_waypoints, candidate_waypoint_roles = (
+                    self._build_gate_corridor_waypoints(
+                        start=pos,
+                        targets=[target],
+                        preferred_normals=[normal],
+                    )
+                )
+                candidate_waypoint_velocities = (
+                    self._compute_passthrough_waypoint_velocities(candidate_waypoints)
+                )
+                candidate_mode = (
+                    "single_gate_corridor"
+                    if len(candidate_waypoints) >= 3
+                    else "single_gate"
+                )
             else:
                 pass_through_target = target + normal * self.gate_pass_through_m
                 candidate_waypoints = np.vstack([pos, target, pass_through_target])
+                candidate_waypoint_roles = ["start", "gate_center", "gate_exit"]
                 candidate_waypoint_velocities = None
                 candidate_mode = "single_gate_exit"
             candidate_times = allocate_segment_times(
@@ -2957,6 +3791,7 @@ class PyAIPilotAutonomyAPI:
                 "terminal_policy": candidate_terminal_policy,
                 "waypoint_velocities": candidate_waypoint_velocities,
                 "mode": candidate_mode,
+                "waypoint_roles": list(candidate_waypoint_roles),
                 "horizon_targets": [
                     np.asarray(item, dtype=float).reshape(3).copy()
                     for item in targets
@@ -2996,7 +3831,10 @@ class PyAIPilotAutonomyAPI:
                 gate_idx=target_idx,
                 track_id=target_track_id,
             )
-            if not fallback_valid and fallback_candidate["mode"] == "single_gate_exit":
+            if not fallback_valid and fallback_candidate["mode"] in (
+                "single_gate_corridor",
+                "single_gate_exit",
+            ):
                 self._trace_plan_validation_reject(
                     fallback_details,
                     fallback="single_gate",
@@ -3036,7 +3874,10 @@ class PyAIPilotAutonomyAPI:
                 flush=True,
             )
             candidate = fallback_candidate
-        elif not valid_plan and candidate["mode"] == "single_gate_exit":
+        elif not valid_plan and candidate["mode"] in (
+            "single_gate_corridor",
+            "single_gate_exit",
+        ):
             self._trace_plan_validation_reject(
                 validation_details,
                 fallback="single_gate",
@@ -3085,6 +3926,7 @@ class PyAIPilotAutonomyAPI:
         terminal_policy = candidate["terminal_policy"]
         waypoint_velocities = candidate["waypoint_velocities"]
         plan_mode = candidate["mode"]
+        waypoint_roles = candidate["waypoint_roles"]
         horizon_targets = candidate["horizon_targets"]
         horizon_track_ids = candidate["horizon_track_ids"]
         horizon_gate_indices = candidate["horizon_gate_indices"]
@@ -3092,6 +3934,7 @@ class PyAIPilotAutonomyAPI:
         self.current_gate_pos = target.copy()
         self.active_waypoints = waypoints.copy()
         self.active_times = np.asarray(times, dtype=float).copy()
+        self.active_waypoint_roles = list(waypoint_roles)
         self.active_horizon_gate_indices = list(horizon_gate_indices)
         self.active_horizon_track_ids = list(horizon_track_ids)
         self.active_horizon_targets = [
@@ -3106,10 +3949,13 @@ class PyAIPilotAutonomyAPI:
         self.trajectory_start_time = time.time()
         self.last_plan_wall_time = self.trajectory_start_time
         self.last_planned_gate_idx = int(self.current_gate_idx)
+        self.active_plan_generation += 1
+        self._reset_reference_progress_state()
         waypoints_txt = "[" + ";".join(
             self._fmt_vec(waypoint, precision=3) for waypoint in waypoints
         ) + "]"
         times_txt = "(" + ",".join(f"{float(item):.3f}" for item in times) + ")"
+        waypoint_roles_txt = "(" + ",".join(str(role) for role in waypoint_roles) + ")"
         plan_samples_txt = self._sample_planner_path_text(self.planner)
         horizon_tracks_txt = "(" + ",".join(
             str(track_id) if track_id is not None else "none"
@@ -3141,6 +3987,9 @@ class PyAIPilotAutonomyAPI:
             f"passthrough_policy={self._passthrough_velocity_policy_text()} "
             f"waypoint_velocities_neu={waypoint_velocities_txt} "
             f"times_s={times_txt} "
+            f"waypoint_roles={waypoint_roles_txt} "
+            f"gate_corridor={int(self.gate_corridor_enabled)}:"
+            f"{float(self.gate_corridor_length_m):.2f} "
             f"waypoints_neu={waypoints_txt} "
             f"plan_samples_neu={plan_samples_txt}",
             flush=True,
@@ -3195,11 +4044,25 @@ class PyAIPilotAutonomyAPI:
         provisional_vmax = min(float(self.planner_vmax), provisional_vmax)
 
         def build_provisional_candidate(*, allow_exit: bool) -> dict:
-            if allow_exit:
+            if (
+                allow_exit
+                and self.gate_corridor_enabled
+                and self.gate_corridor_length_m > 0.0
+            ):
+                candidate_waypoints, candidate_waypoint_roles = (
+                    self._build_gate_corridor_waypoints(
+                        start=pos,
+                        targets=[target],
+                        preferred_normals=[normal],
+                    )
+                )
+            elif allow_exit:
                 pass_through_target = target + normal * self.gate_pass_through_m
                 candidate_waypoints = np.vstack([pos, target, pass_through_target])
+                candidate_waypoint_roles = ["start", "gate_center", "gate_exit"]
             else:
                 candidate_waypoints = np.vstack([pos, target])
+                candidate_waypoint_roles = ["start", "gate_center"]
             candidate_times = allocate_segment_times(
                 candidate_waypoints,
                 current_vel=vel,
@@ -3232,6 +4095,7 @@ class PyAIPilotAutonomyAPI:
                 "times": candidate_times,
                 "terminal_velocity": candidate_terminal_velocity,
                 "terminal_policy": candidate_terminal_policy,
+                "waypoint_roles": list(candidate_waypoint_roles),
                 "mode": (
                     "provisional_next_gate"
                     if allow_exit
@@ -3284,6 +4148,7 @@ class PyAIPilotAutonomyAPI:
         times = candidate["times"]
         terminal_velocity = candidate["terminal_velocity"]
         terminal_policy = candidate["terminal_policy"]
+        waypoint_roles = candidate["waypoint_roles"]
         plan_mode = candidate["mode"]
 
         self.planner = candidate_planner
@@ -3298,6 +4163,7 @@ class PyAIPilotAutonomyAPI:
         self.last_active_target_center = target.copy()
         self.active_waypoints = waypoints.copy()
         self.active_times = np.asarray(times, dtype=float).copy()
+        self.active_waypoint_roles = list(waypoint_roles)
         self.active_horizon_gate_indices = [int(self.current_gate_idx)]
         self.active_horizon_track_ids = [track_id]
         self.active_horizon_targets = [target.copy()]
@@ -3307,6 +4173,8 @@ class PyAIPilotAutonomyAPI:
         self.trajectory_start_time = now
         self.last_plan_wall_time = now
         self.last_planned_gate_idx = int(self.current_gate_idx)
+        self.active_plan_generation += 1
+        self._reset_reference_progress_state()
         self.post_gate_exit_until_s = 0.0
         self.post_gate_exit_reason = ""
         self._reset_gate_pass_state()
@@ -3315,6 +4183,7 @@ class PyAIPilotAutonomyAPI:
             self._fmt_vec(waypoint, precision=3) for waypoint in waypoints
         ) + "]"
         times_txt = "(" + ",".join(f"{float(item):.3f}" for item in times) + ")"
+        waypoint_roles_txt = "(" + ",".join(str(role) for role in waypoint_roles) + ")"
         plan_samples_txt = self._sample_planner_path_text(self.planner)
         nearest_plausible = details.get(
             "nearest_plausible_distance",
@@ -3335,6 +4204,9 @@ class PyAIPilotAutonomyAPI:
             f"v_end_neu={self._fmt_vec(terminal_velocity, precision=3)} "
             f"terminal_policy={terminal_policy} "
             f"times_s={times_txt} "
+            f"waypoint_roles={waypoint_roles_txt} "
+            f"gate_corridor={int(self.gate_corridor_enabled)}:"
+            f"{float(self.gate_corridor_length_m):.2f} "
             f"waypoints_neu={waypoints_txt} "
             f"plan_samples_neu={plan_samples_txt} "
             f"hits={self._fmt_float(details.get('hits'), precision=0)} "
@@ -3395,6 +4267,8 @@ class PyAIPilotAutonomyAPI:
         pos = np.asarray(pos, dtype=float).reshape(3)
         target = np.asarray(target, dtype=float).reshape(3)
         distance = float(np.linalg.norm(pos - target))
+        pass_target, pass_target_role = self._active_gate_exit_waypoint()
+        use_exit_pass_target = pass_target is not None
         normal = self.active_gate_normal
         if normal is None:
             start = (
@@ -3415,7 +4289,7 @@ class PyAIPilotAutonomyAPI:
             self.gate_progress_along_approach = float(np.dot(pos - target, normal))
             return False
 
-        pass_result = check_gate_plane_pass(
+        center_pass_result = check_gate_plane_pass(
             previous_position=previous_pos,
             position=pos,
             center=target,
@@ -3428,14 +4302,49 @@ class PyAIPilotAutonomyAPI:
             near_plane_back_tolerance_m=self.near_plane_pass_back_tolerance_m,
             near_plane_forward_tolerance_m=self.near_plane_pass_forward_tolerance_m,
         )
+        pass_result = center_pass_result
+        pass_distance = distance
+        if use_exit_pass_target:
+            pass_result = check_gate_plane_pass(
+                previous_position=previous_pos,
+                position=pos,
+                center=pass_target,
+                normal=normal,
+                lateral_radius_m=self.gate_pass_lateral_radius_m,
+                plane_tolerance_m=self.gate_plane_tolerance_m,
+                near_plane_pass_distance_m=None,
+            )
+            pass_distance = float(np.linalg.norm(pos - pass_target))
         self.previous_gate_pass_position = pos.copy()
-        self.gate_plane_crossed = bool(self.gate_plane_crossed or pass_result.crossed_plane)
+        self.gate_plane_crossed = bool(
+            self.gate_plane_crossed
+            or center_pass_result.crossed_plane
+            or (
+                use_exit_pass_target
+                and center_pass_result.passed
+            )
+        )
         self.near_gate_but_not_crossed = bool(
             not pass_result.passed and distance <= self.pass_radius_m
         )
-        self.gate_progress_along_approach = float(pass_result.signed_progress_m)
-        self.gate_lateral_error = float(pass_result.lateral_error_m)
+        self.gate_progress_along_approach = float(center_pass_result.signed_progress_m)
+        self.gate_lateral_error = float(center_pass_result.lateral_error_m)
         if not pass_result.passed:
+            if use_exit_pass_target and center_pass_result.passed:
+                print(
+                    "gate_center_pass_hold_exit "
+                    f"gate_idx={int(self.current_gate_idx)} "
+                    f"track={self.active_target_track_id if self.active_target_track_id is not None else 'none'} "
+                    f"center_reason={center_pass_result.reason} "
+                    f"center_distance={distance:.3f} "
+                    f"center_plane_progress={float(center_pass_result.signed_progress_m):.3f} "
+                    f"center_lateral_error={float(center_pass_result.lateral_error_m):.3f} "
+                    f"pass_target_role={pass_target_role} "
+                    f"pass_target_distance={pass_distance:.3f} "
+                    f"pass_target_progress={float(pass_result.signed_progress_m):.3f} "
+                    f"pass_target_neu={self._fmt_vec(pass_target, precision=3)}",
+                    flush=True,
+                )
             return False
 
         truth_pos = None
@@ -3453,10 +4362,15 @@ class PyAIPilotAutonomyAPI:
             f"gate_idx={completed_gate_idx} "
             f"track={completed_track_id if completed_track_id is not None else 'none'} "
             f"next_gate_idx={next_gate_idx} "
-            f"reason={pass_result.reason} "
+            f"reason={pass_target_role + '_' if use_exit_pass_target else ''}{pass_result.reason} "
             f"distance={distance:.3f} "
             f"plane_progress={float(pass_result.signed_progress_m):.3f} "
             f"lateral_error={float(pass_result.lateral_error_m):.3f} "
+            f"center_plane_progress={float(center_pass_result.signed_progress_m):.3f} "
+            f"center_lateral_error={float(center_pass_result.lateral_error_m):.3f} "
+            f"pass_target_role={pass_target_role if use_exit_pass_target else 'gate_center'} "
+            f"pass_target_distance={pass_distance:.3f} "
+            f"pass_target_neu={self._fmt_vec(pass_target, precision=3) if use_exit_pass_target else self._fmt_vec(target, precision=3)} "
             f"pos_neu={self._fmt_vec(pos, precision=3)} "
             f"target_neu={self._fmt_vec(target, precision=3)} "
             f"truth_err={self._fmt_float(truth_error, precision=3)}",
@@ -3464,8 +4378,12 @@ class PyAIPilotAutonomyAPI:
         )
         self.target_manager.mark_passed(
             pos_neu=pos,
-            distance_m=distance,
-            pass_reason=pass_result.reason,
+            distance_m=pass_distance,
+            pass_reason=(
+                f"{pass_target_role}_{pass_result.reason}"
+                if use_exit_pass_target
+                else pass_result.reason
+            ),
             plane_progress_m=pass_result.signed_progress_m,
             lateral_error_m=pass_result.lateral_error_m,
             truth_pos_neu=truth_pos,
@@ -3482,6 +4400,7 @@ class PyAIPilotAutonomyAPI:
             self._reset_gate_pass_state()
             self.active_waypoints = None
             self.active_times = None
+            self.active_waypoint_roles = []
             self.active_horizon_gate_indices = []
             self.active_horizon_track_ids = []
             self.active_horizon_targets = []
@@ -3611,7 +4530,12 @@ class PyAIPilotAutonomyAPI:
         if (
             self.post_gate_exit_continuation_enabled
             and future_race_gate
-            and self.active_plan_mode == "single_gate_exit"
+            and self.active_plan_mode
+            in (
+                "single_gate_exit",
+                "single_gate_corridor",
+                "single_gate_corridor_exit_shift",
+            )
             and remaining_s > 0.05
         ):
             self._sync_target_manager_state(clear_unlocked_current=True)
@@ -3688,11 +4612,12 @@ class PyAIPilotAutonomyAPI:
         pos: np.ndarray,
         current_yaw: float,
     ) -> float:
-        if self._prefer_reference_motion_yaw_near_gate(pos):
+        reference_motion_source = self._reference_motion_yaw_preference_source(pos)
+        if reference_motion_source is not None:
             desired = self._reference_motion_yaw(v_ref, a_ref, self.last_desired_yaw)
             if np.isfinite(desired):
                 self.last_yaw_target = None
-                self.last_yaw_target_source = "reference_motion_near_horizon_gate"
+                self.last_yaw_target_source = reference_motion_source
                 self.last_desired_yaw = self._wrap_pi(desired)
                 return self.last_desired_yaw
 
@@ -3721,28 +4646,37 @@ class PyAIPilotAutonomyAPI:
         return self.last_desired_yaw
 
     def _prefer_reference_motion_yaw_near_gate(self, pos: np.ndarray) -> bool:
-        if not self.yaw_reference_motion_near_gate_enabled:
-            return False
-        if self.yaw_reference_motion_distance_m <= 0.0:
-            return False
+        return self._reference_motion_yaw_preference_source(pos) is not None
+
+    def _reference_motion_yaw_preference_source(self, pos: np.ndarray) -> str | None:
         if self.active_waypoints is None or self.planner.total_time <= 0.0:
-            return False
+            return None
+        if self.gate_plane_crossed:
+            exit_target, _ = self._active_gate_exit_waypoint()
+            if exit_target is not None:
+                return "reference_motion_after_center_crossing"
+        if not self.yaw_reference_motion_near_gate_enabled:
+            return None
+        if self.yaw_reference_motion_distance_m <= 0.0:
+            return None
         if self._post_gate_exit_active():
-            return True
+            return "reference_motion_post_gate_exit"
         if len(self.active_horizon_gate_indices) < 2:
-            return False
+            return None
         if self.current_gate_pos is None:
-            return False
+            return None
         try:
             pos = np.asarray(pos, dtype=float).reshape(3)
             target = np.asarray(self.current_gate_pos, dtype=float).reshape(3)
         except (TypeError, ValueError):
-            return False
+            return None
         distance = float(np.linalg.norm(pos - target))
-        return (
+        if (
             math.isfinite(distance)
             and distance <= float(self.yaw_reference_motion_distance_m)
-        )
+        ):
+            return "reference_motion_near_horizon_gate"
+        return None
 
     def _yaw_target_center(self) -> tuple[np.ndarray | None, str]:
         if self.use_perception and self.active_target_track_id is not None:
@@ -6087,6 +7021,7 @@ class PyAIPilotAutonomyAPI:
         self._reset_gate_pass_state()
         self.active_waypoints = None
         self.active_times = None
+        self.active_waypoint_roles = []
         self.active_horizon_gate_indices = []
         self.active_horizon_track_ids = []
         self.active_horizon_targets = []
@@ -6095,7 +7030,9 @@ class PyAIPilotAutonomyAPI:
         self.active_terminal_velocity_policy = "cleared_preempt"
         self.last_planned_gate_idx = -1
         self.active_target_shift_frames = 0
+        self.active_target_shift_pending_kind = None
         self.active_target_shift_track_id = None
+        self._reset_deferred_longitudinal_shift()
         self._last_gate_signature = None
         return True
 
@@ -6177,6 +7114,7 @@ class PyAIPilotAutonomyAPI:
                 return
             self.active_waypoints = None
             self.active_times = None
+            self.active_waypoint_roles = []
             self.active_horizon_gate_indices = []
             self.active_horizon_track_ids = []
             self.active_horizon_targets = []
@@ -6184,6 +7122,26 @@ class PyAIPilotAutonomyAPI:
             self.active_terminal_velocity = np.zeros(3, dtype=float)
             self.active_terminal_velocity_policy = "cleared_no_target"
             self.last_planned_gate_idx = -1
+            return
+
+        if self._post_gate_exit_active() and had_active_plan and not provisional_handoff:
+            self.current_gate_pos = next_target.copy()
+            self.active_target_track_id = (
+                self.gate_track_ids[self.current_gate_idx]
+                if self.current_gate_idx < len(self.gate_track_ids)
+                else None
+            )
+            if self.active_target_track_id is not None:
+                self.last_active_target_center = next_target.copy()
+            print(
+                "post_gate_exit_continue "
+                f"current_gate_idx={int(self.current_gate_idx)} "
+                f"track={self.active_target_track_id if self.active_target_track_id is not None else 'none'} "
+                f"target_neu={self._fmt_vec(next_target, precision=3)} "
+                f"until_s={self.post_gate_exit_until_s:.3f} "
+                f"reason={self.post_gate_exit_reason or 'active'}",
+                flush=True,
+            )
             return
 
         if provisional_handoff:
@@ -6228,6 +7186,7 @@ class PyAIPilotAutonomyAPI:
             self._reset_gate_pass_state()
             self.active_waypoints = None
             self.active_times = None
+            self.active_waypoint_roles = []
             self.active_horizon_gate_indices = []
             self.active_horizon_track_ids = []
             self.active_horizon_targets = []

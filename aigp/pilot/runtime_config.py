@@ -297,6 +297,8 @@ class PlannerSection:
     horizon_gates: int
     horizon_continuation_enabled: bool
     post_gate_exit_continuation_enabled: bool
+    gate_corridor_enabled: bool
+    gate_corridor_length_m: float
     passthrough_velocity_enabled: bool
     passthrough_velocity_mode: str
     passthrough_speed_m_s: float
@@ -323,6 +325,12 @@ class PlannerSection:
     active_target_shift_near_gate_distance_m: float
     active_target_shift_max_near_gate_xy_m: float
     active_target_shift_max_near_gate_z_m: float
+    active_target_shift_defer_longitudinal_enabled: bool
+    active_target_shift_longitudinal_min_m: float
+    active_target_shift_longitudinal_lateral_max_m: float
+    active_target_shift_longitudinal_filter_size: int
+    active_target_shift_longitudinal_exit_shift_max_m: float
+    active_target_shift_longitudinal_enter_radius_m: float
     race_order_front_blocker_enabled: bool
     race_order_front_blocker_margin_m: float
     race_order_front_blocker_lateral_radius_m: float
@@ -1226,6 +1234,16 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 "post_gate_exit_continuation_enabled",
                 True,
             ),
+            gate_corridor_enabled=_bool(
+                planner_raw,
+                "gate_corridor_enabled",
+                True,
+            ),
+            gate_corridor_length_m=_float(
+                planner_raw,
+                "gate_corridor_length_m",
+                3.0,
+            ),
             passthrough_velocity_enabled=_bool(
                 planner_raw,
                 "passthrough_velocity_enabled",
@@ -1346,6 +1364,35 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 planner_raw,
                 "active_target_shift_max_near_gate_z_m",
                 0.25,
+            ),
+            active_target_shift_defer_longitudinal_enabled=_bool(
+                planner_raw,
+                "active_target_shift_defer_longitudinal_enabled",
+                True,
+            ),
+            active_target_shift_longitudinal_min_m=_float(
+                planner_raw,
+                "active_target_shift_longitudinal_min_m",
+                0.5,
+            ),
+            active_target_shift_longitudinal_lateral_max_m=_float(
+                planner_raw,
+                "active_target_shift_longitudinal_lateral_max_m",
+                0.5,
+            ),
+            active_target_shift_longitudinal_filter_size=max(
+                1,
+                _int(planner_raw, "active_target_shift_longitudinal_filter_size", 8),
+            ),
+            active_target_shift_longitudinal_exit_shift_max_m=_float(
+                planner_raw,
+                "active_target_shift_longitudinal_exit_shift_max_m",
+                3.0,
+            ),
+            active_target_shift_longitudinal_enter_radius_m=_float(
+                planner_raw,
+                "active_target_shift_longitudinal_enter_radius_m",
+                0.75,
             ),
             race_order_front_blocker_enabled=_bool(
                 planner_raw,

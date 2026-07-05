@@ -215,8 +215,8 @@ gate_right_axis_neu = [1.0, 0.0, 0.0]
 gate_up_axis_neu = [0.0, 0.0, 1.0]
 
 [gate_source]
-mode = "perception"               # perception | ground_truth
-allow_ground_truth = false         # debug/PX4 only; not competition-valid
+mode = "ground_truth"               # perception | ground_truth
+allow_ground_truth = true         # debug/PX4 only; not competition-valid
 known_gate_positions_neu = [
   [0.042238, 13.172596, 2.669784],
   [1.492108, 23.982963, 3.793709],
@@ -284,6 +284,8 @@ replan_target_shift_m = 1.0
 horizon_gates = 3
 horizon_continuation_enabled = true
 post_gate_exit_continuation_enabled = true
+gate_corridor_enabled = true
+gate_corridor_length_m = 3.0
 passthrough_velocity_enabled = true
 passthrough_velocity_mode = "adaptive" # fixed | adaptive
 passthrough_speed_m_s = 0.5
@@ -310,6 +312,12 @@ active_target_shift_max_total_m = 3.00
 active_target_shift_near_gate_distance_m = 2.0
 active_target_shift_max_near_gate_xy_m = 0.35
 active_target_shift_max_near_gate_z_m = 0.25
+active_target_shift_defer_longitudinal_enabled = true
+active_target_shift_longitudinal_min_m = 0.5
+active_target_shift_longitudinal_lateral_max_m = 0.5
+active_target_shift_longitudinal_filter_size = 8
+active_target_shift_longitudinal_exit_shift_max_m = 3.0
+active_target_shift_longitudinal_enter_radius_m = 0.75
 race_order_front_blocker_enabled = true
 race_order_front_blocker_margin_m = 3.0
 race_order_front_blocker_lateral_radius_m = 6.0

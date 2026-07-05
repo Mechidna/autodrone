@@ -26,9 +26,27 @@ STRUCTURED_PREFIXES = (
     ("plan_boundary_continuity ", "plan_boundary_continuity"),
     ("plan_validation_reject ", "plan_validation_reject"),
     ("gate_pass ", "gate_pass"),
+    ("gate_center_pass_hold_exit ", "gate_center_pass_hold_exit"),
+    ("post_gate_exit_continue ", "post_gate_exit_continue"),
     ("target_validation_reject ", "target_validation_reject"),
     ("planning_horizon_provisional_suffix ", "planning_horizon_provisional_suffix"),
     ("active_target_shift correction ", "active_target_shift"),
+    (
+        "active_target_shift_longitudinal_deferred ",
+        "active_target_shift_longitudinal_deferred",
+    ),
+    (
+        "active_target_shift_longitudinal_pending ",
+        "active_target_shift_longitudinal_pending",
+    ),
+    (
+        "active_target_shift_longitudinal_exit_replan ",
+        "active_target_shift_longitudinal_exit_replan",
+    ),
+    (
+        "active_target_shift_longitudinal_exit_replan_reject ",
+        "active_target_shift_longitudinal_exit_replan_reject",
+    ),
     ("target_manager lock ", "target_lock"),
     ("target_manager passed ", "target_passed"),
     ("target_manager active_lost ", "target_active_lost"),
