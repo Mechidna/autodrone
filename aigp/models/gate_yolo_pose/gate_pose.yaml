@@ -1,0 +1,7 @@
+path: /home/paolo/datasets/gazebo_gate_yolo_pose_racer
+train: images/train
+val: images/val
+kpt_shape: [4, 3]
+flip_idx: [1, 0, 3, 2]
+names:
+  0: gate

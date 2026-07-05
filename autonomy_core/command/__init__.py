@@ -1,0 +1,2 @@
+"""Competition command boundary helpers."""
+

@@ -9,6 +9,12 @@ class GetTelemetry:
         self.last_vel_time = 0
         self.last_vel_time = 0
         self.last_rpy_time = 0
+        self.position_sample_time = float("nan")
+        self.velocity_sample_time = float("nan")
+        self.attitude_sample_time = float("nan")
+        self.perception_yaw_correction_rad = 0.0
+        self.yaw_rad_raw = 0.0
+        self.yaw_rad_perception = 0.0
         init_position = (0.0, 0.0, 0.0)
         init_velocity = (0.0, 0.0, 0.0)
         init_orientation = (0.0, 0.0, 0.0)
@@ -27,6 +33,7 @@ class GetTelemetry:
             "y": float(position[1]),
             "z": float(position[2]),
         }
+        self.position_sample_time = time.time()
         if start_position is not None:
             self.p0 = {
                 "x": float(start_position[0]),
@@ -47,6 +54,7 @@ class GetTelemetry:
             "vy": velocity[1],
             "vz": velocity[2]
         }
+        self.velocity_sample_time = current_time
         # Priority: If start_velocity is provided, we print it (Initial snapshot)
         # Otherwise, check if 1.0 second has passed for live updates
         if start_velocity is not None:
@@ -57,16 +65,31 @@ class GetTelemetry:
 
     def telemetry_rpy(self, orientation, start_orientation):
         current_time = time.time()
+        self.yaw_rad_raw = float(orientation[2])
+        self.yaw_rad_perception = self.wrap_pi(
+            self.yaw_rad_raw + self.perception_yaw_correction_rad
+        )
         self.rpy = {
             "roll": orientation[0],
             "pitch": orientation[1],
-            "yaw": orientation[2]
+            "yaw": self.yaw_rad_raw,
         }
+        self.attitude_sample_time = current_time
         if start_orientation is not None:
             self._print_rpy(start_orientation, prefix="Initial RPY")
         elif current_time - self.last_rpy_time >= 1.0:
             self._print_rpy(orientation, prefix="Live RPY")
             self.last_rpy_time = current_time
+
+    @staticmethod
+    def wrap_pi(angle):
+        return (float(angle) + np.pi) % (2.0 * np.pi) - np.pi
+
+    def set_perception_yaw_correction(self, correction_rad):
+        self.perception_yaw_correction_rad = self.wrap_pi(correction_rad)
+        self.yaw_rad_perception = self.wrap_pi(
+            self.yaw_rad_raw + self.perception_yaw_correction_rad
+        )
 
     # Helper methods to keep the logic clean
     def _print_pos(self, data, prefix):

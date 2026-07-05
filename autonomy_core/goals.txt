@@ -1,4 +1,0 @@
-perception under bad lighting / blur
-mode switching under noisy detections
-repeated replans
-recovery after losing a gate

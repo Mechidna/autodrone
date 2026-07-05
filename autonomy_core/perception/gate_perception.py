@@ -7,7 +7,7 @@ from collections import deque
 class GatePerception:
 
     def __init__(self,
-                 gate_size=2.0,
+                 gate_size=1.5,
                  smoothing_window=5,
                  max_failures=10):
 
@@ -15,8 +15,14 @@ class GatePerception:
         self.pose_history = deque(maxlen=smoothing_window)
         self.max_failures = max_failures
         self.failure_counter = 0
+        self.last_debug = {}
+        self.live_solver_name = "SOLVEPNP_ITERATIVE"
+        print("[LIVE PNP] using SOLVEPNP_ITERATIVE")
 
-        # Exact 1m square model
+        # Square model matching the detected OUTER colored frame.
+        # The SDF gate has a 1.5 m inner opening, 0.6 m frame width,
+        # so the outer colored square is 2.7 m wide/high.
+        # If you later detect the inner opening corners instead, use gate_size=1.5.
         s = gate_size / 2.0
         self.model_points = np.array([
             [-s,  s, 0],
@@ -44,23 +50,10 @@ class GatePerception:
 
         ordered = self.order_corners(corners)
 
-        pose = self.estimate_pose(
-            ordered,
-            camera_matrix,
-            dist_coeffs
-        )
-
-        if pose is None:
+        result = self._estimate_detection_result(corners, ordered, camera_matrix, dist_coeffs)
+        if result is None:
             return None
-
-        R_mat, tvec = pose
-
-        confidence = self.compute_confidence(ordered)
-
-        R_smooth, t_smooth = self.smooth_pose(
-            R_mat,
-            tvec
-        )
+        self.last_debug = result["debug"].copy()
 
         # -------- DEBUG DRAW --------
 
@@ -96,41 +89,135 @@ class GatePerception:
         print("\n------ Pose ------")
 
         print("t (meters):")
-        print(t_smooth.flatten())
+        print(result["t"].flatten())
 
-        print("confidence:", confidence)
+        print("confidence:", result["confidence"])
+        print("reprojection_error:", result["debug"]["reprojection_error"])
 
+        return result
+
+    def process_all(self, frame, camera_matrix, dist_coeffs):
+        corners_list = self.detect_gate_candidates(frame)
+        if len(corners_list) == 0:
+            self.handle_failure()
+            return []
+
+        self.failure_counter = 0
+        detections = []
+        for corners in corners_list:
+            ordered = self.order_corners(corners)
+            result = self._estimate_detection_result(corners, ordered, camera_matrix, dist_coeffs)
+            if result is not None:
+                detections.append(result)
+
+        detections.sort(
+            key=lambda det: (
+                -float(det.get("confidence", 0.0)),
+                float(det.get("debug", {}).get("reprojection_error", np.inf)),
+            )
+        )
+        if detections:
+            self.last_debug = detections[0]["debug"].copy()
+        return detections
+
+    def _estimate_detection_result(self, corners, ordered, camera_matrix, dist_coeffs):
+        pose = self.estimate_pose(
+            ordered,
+            camera_matrix,
+            dist_coeffs
+        )
+
+        if pose is None:
+            return None
+
+        R_mat, tvec, pnp_debug = pose
+        confidence = self.compute_confidence(ordered)
+
+        # Do not smooth camera-frame pose while the camera is moving. Averaging
+        # tvec across frames from different drone poses creates a biased world
+        # landmark after the current drone pose is applied.
+        R_out, t_out = R_mat, tvec
+        reprojection_error = self.compute_reprojection_error(
+            R_out,
+            t_out,
+            camera_matrix,
+            dist_coeffs,
+            ordered,
+        )
+        reprojected_corners = self.project_model_points(
+            R_out,
+            t_out,
+            camera_matrix,
+            dist_coeffs,
+        )
+        gate_normal_camera = R_out[:, 2].astype(float)
+        gate_normal_camera /= np.linalg.norm(gate_normal_camera) + 1e-12
+        debug = {
+            "raw_corners": np.asarray(corners, dtype=float).reshape(-1, 2).copy(),
+            "ordered_corners": ordered.copy(),
+            "reprojected_corners": reprojected_corners.copy(),
+            "rvec": pnp_debug["rvec"].copy(),
+            "tvec": np.asarray(t_out, dtype=float).reshape(3).copy(),
+            "reprojection_error": float(reprojection_error),
+            "corner_reprojection_error_px": float(reprojection_error),
+            "gate_normal_camera": gate_normal_camera.copy(),
+            "pnp_candidates": pnp_debug["candidates"],
+            "chosen_candidate": int(pnp_debug["chosen_candidate"]),
+            "live_solver_name": pnp_debug.get("live_solver_name", "SOLVEPNP_ITERATIVE"),
+            "pnp_fallback_reason": pnp_debug.get("fallback_reason", ""),
+            "gate_size_sweep": self.solve_pnp_gate_size_sweep(
+                ordered,
+                camera_matrix,
+                dist_coeffs,
+                sizes=(2.60, 2.70, 2.80),
+            ),
+            "pnp_formulation_debug": self.solve_pnp_formulation_debug(
+                ordered,
+                camera_matrix,
+                dist_coeffs,
+            ),
+        }
         return {
-            "R": R_smooth,
-            "t": t_smooth,
-            "confidence": confidence
+            "R": R_out,
+            "t": t_out,
+            "confidence": confidence,
+            "debug": debug,
         }
 
     # -------------------------------------------------
     # Look for holes algorithm
     # -------------------------------------------------
     def detect_gate(self, frame):
+        candidates = self.detect_gate_candidates(frame)
+        if len(candidates) == 0:
+            return None
+        return candidates[0]
+
+    def detect_gate_candidates(self, frame):
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-        # --- Orange mask (tune these) ---
-        lower_orange = np.array([5, 80, 80])
-        upper_orange = np.array([30, 255, 255])
-        mask = cv2.inRange(hsv, lower_orange, upper_orange)
+        # --- Blue gate mask for SDF color #0000B3 ---
+        # #0000B3 is RGB(0, 0, 179). In OpenCV HSV this is approximately
+        # H=120, S=255, V=179. The range below allows lighting/shadow variation.
+        lower_blue = np.array([105, 50, 35], dtype=np.uint8)
+        upper_blue = np.array([130, 255, 255], dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower_blue, upper_blue)
 
         # Clean up mask: fill small gaps / remove noise
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         mask_closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
         mask_opened = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, k, iterations=1)
 
-        # cv2.imshow("Full_Orange_Mask", mask_opened)
+        # cv2.imshow("Full_Blue_Mask", mask_opened)
 
-        # Find contours on the COLOR mask (not grayscale edges)
-        contours, _ = cv2.findContours(mask_opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Find all blue contour candidates. RETR_EXTERNAL misses future
+        # gates visible through the current gate because those contours can be
+        # nested inside the foreground gate contour in the mask hierarchy.
+        contours, _ = cv2.findContours(mask_opened, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            return None
+            return []
 
-        best_box = None
-        best_area = 0.0
+        candidates = []
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
@@ -148,12 +235,27 @@ class GatePerception:
             if aspect > 1.8:
                 continue
 
-            if area > best_area:
-                best_area = area
-                box = cv2.boxPoints(rect)
-                best_box = box.astype(np.float32)
+            box = cv2.boxPoints(rect)
+            candidates.append((float(area), box.astype(np.float32)))
 
-        return best_box
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        deduped = []
+        for area, box in candidates:
+            center = np.mean(box, axis=0)
+            size = np.ptp(box, axis=0)
+            duplicate = False
+            for kept_area, kept_box in deduped:
+                kept_center = np.mean(kept_box, axis=0)
+                kept_size = np.ptp(kept_box, axis=0)
+                center_close = np.linalg.norm(center - kept_center) < 12.0
+                size_close = np.linalg.norm(size - kept_size) < 20.0
+                if center_close and size_close:
+                    duplicate = True
+                    break
+            if not duplicate:
+                deduped.append((area, box))
+
+        return [box for _, box in deduped]
         #     # --- GEOMETRY ---
         #     peri = cv2.arcLength(cnt, True)
         #     approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
@@ -211,19 +313,66 @@ class GatePerception:
     def estimate_pose(self, image_points, camera_matrix, dist_coeffs):
         image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 1, 2)
 
+        print("\n------ Perception ------")
+        fallback_reason = ""
+        try:
+            ok, rvec, tvec = cv2.solvePnP(
+                self.model_points,
+                image_points,
+                camera_matrix,
+                dist_coeffs,
+                flags=cv2.SOLVEPNP_ITERATIVE,
+            )
+        except Exception as exc:
+            ok = False
+            fallback_reason = f"iterative_exception:{exc}"
+
+        if ok:
+            R_mat, _ = cv2.Rodrigues(rvec)
+            reprojection_error = self.compute_reprojection_error(
+                R_mat,
+                tvec,
+                camera_matrix,
+                dist_coeffs,
+                image_points,
+            )
+            normal = R_mat[:, 2].astype(float)
+            normal /= np.linalg.norm(normal) + 1e-12
+            print("[LIVE PNP] solver=SOLVEPNP_ITERATIVE")
+            print("  iterative t:", np.asarray(tvec, dtype=float).reshape(3))
+            print("  iterative reprojection_error:", reprojection_error)
+            candidate = {
+                "index": 0,
+                "rvec": np.asarray(rvec, dtype=float).reshape(3),
+                "tvec": np.asarray(tvec, dtype=float).reshape(3),
+                "normal": normal,
+                "error": float(reprojection_error),
+            }
+            return R_mat, tvec, {
+                "rvec": np.asarray(rvec, dtype=float).reshape(3),
+                "tvec": np.asarray(tvec, dtype=float).reshape(3),
+                "chosen_candidate": 0,
+                "candidates": [candidate],
+                "live_solver_name": "SOLVEPNP_ITERATIVE",
+                "fallback_reason": "",
+            }
+
+        if not fallback_reason:
+            fallback_reason = "iterative_failed"
+        print(f"[LIVE PNP] ITERATIVE failed; falling back to SOLVEPNP_IPPE_SQUARE reason={fallback_reason}")
+
         ok, rvecs, tvecs, reprojErrs = cv2.solvePnPGeneric(
             self.model_points,
             image_points,
             camera_matrix,
             dist_coeffs,
-            flags=cv2.SOLVEPNP_IPPE_SQUARE
+            flags=cv2.SOLVEPNP_IPPE_SQUARE,
         )
-        print("\n------ Perception ------")
         if not ok or rvecs is None or len(rvecs) == 0:
-            print("solvePnPGeneric returned no solutions")
+            print("fallback solvePnPGeneric returned no solutions")
             return None
 
-        print(f"solvePnPGeneric returned {len(rvecs)} solutions")
+        print(f"fallback solvePnPGeneric returned {len(rvecs)} solutions")
 
         def err_scalar(e):
             if e is None:
@@ -257,7 +406,222 @@ class GatePerception:
         rvec = rvecs[best_i]
         tvec = tvecs[best_i]
         R_mat, _ = cv2.Rodrigues(rvec)
-        return R_mat, tvec
+        candidates = []
+        for i, (cand_rvec, cand_tvec) in enumerate(zip(rvecs, tvecs)):
+            cand_R, _ = cv2.Rodrigues(cand_rvec)
+            cand_normal = cand_R[:, 2].astype(float)
+            cand_normal /= np.linalg.norm(cand_normal) + 1e-12
+            candidates.append({
+                "index": int(i),
+                "rvec": np.asarray(cand_rvec, dtype=float).reshape(3),
+                "tvec": np.asarray(cand_tvec, dtype=float).reshape(3),
+                "normal": cand_normal,
+                "error": err_scalar(reprojErrs[i]) if reprojErrs is not None and len(reprojErrs) > i else float("nan"),
+            })
+        return R_mat, tvec, {
+            "rvec": np.asarray(rvec, dtype=float).reshape(3),
+            "tvec": np.asarray(tvec, dtype=float).reshape(3),
+            "chosen_candidate": best_i,
+            "candidates": candidates,
+            "live_solver_name": "SOLVEPNP_IPPE_SQUARE_FALLBACK",
+            "fallback_reason": fallback_reason,
+        }
+
+    @staticmethod
+    def model_points_for_size(gate_size: float):
+        s = float(gate_size) / 2.0
+        return np.array([
+            [-s,  s, 0],
+            [ s,  s, 0],
+            [ s, -s, 0],
+            [-s, -s, 0],
+        ], dtype=np.float32)
+
+    def solve_pnp_gate_size_sweep(self, image_points, camera_matrix, dist_coeffs, sizes=(1.90, 2.00, 2.10)):
+        image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 1, 2)
+        out = {}
+
+        def err_scalar(e):
+            if e is None:
+                return float("nan")
+            return float(np.asarray(e).reshape(-1)[0])
+
+        for size in sizes:
+            key = f"{int(round(float(size) * 100)):03d}"
+            model_points = self.model_points_for_size(size)
+            ok, rvecs, tvecs, reprojErrs = cv2.solvePnPGeneric(
+                model_points,
+                image_points,
+                camera_matrix,
+                dist_coeffs,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE,
+            )
+            if not ok or rvecs is None or len(rvecs) == 0:
+                out[key] = {
+                    "rvec": np.full(3, np.nan, dtype=float),
+                    "tvec": np.full(3, np.nan, dtype=float),
+                    "reprojection_error": float("nan"),
+                    "chosen_candidate": None,
+                    "candidate_count": 0,
+                }
+                continue
+
+            best_i = 0
+            best_score = -1e18
+            for i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
+                R_mat, _ = cv2.Rodrigues(rvec)
+                n = R_mat[:, 2].astype(float)
+                n /= np.linalg.norm(n) + 1e-12
+                e = err_scalar(reprojErrs[i]) if reprojErrs is not None and len(reprojErrs) > i else 0.0
+                tz = float(np.asarray(tvec).reshape(-1)[2])
+                score = (10.0 * n[2]) - e
+                if tz <= 0:
+                    score -= 1e6
+                if score > best_score:
+                    best_score = score
+                    best_i = i
+
+            out[key] = {
+                "rvec": np.asarray(rvecs[best_i], dtype=float).reshape(3),
+                "tvec": np.asarray(tvecs[best_i], dtype=float).reshape(3),
+                "reprojection_error": err_scalar(reprojErrs[best_i]) if reprojErrs is not None and len(reprojErrs) > best_i else float("nan"),
+                "chosen_candidate": int(best_i),
+                "candidate_count": int(len(rvecs)),
+            }
+
+        return out
+
+    def solve_pnp_formulation_debug(self, ordered_points, camera_matrix, dist_coeffs):
+        ordered_points = np.asarray(ordered_points, dtype=np.float32).reshape(4, 2)
+        out = []
+
+        solvers = [
+            ("IPPE_SQUARE", cv2.SOLVEPNP_IPPE_SQUARE),
+            ("IPPE", cv2.SOLVEPNP_IPPE),
+            ("ITERATIVE", cv2.SOLVEPNP_ITERATIVE),
+        ]
+        if hasattr(cv2, "SOLVEPNP_SQPNP"):
+            solvers.append(("SQPNP", cv2.SOLVEPNP_SQPNP))
+
+        for solver_name, flag in solvers:
+            result = self.solve_pnp_debug_variant(
+                ordered_points,
+                camera_matrix,
+                dist_coeffs,
+                flag=flag,
+                solver_name=solver_name,
+                order_name="tl_tr_br_bl",
+            )
+            if result is not None:
+                out.append(result)
+
+        permutations = [
+            ("tl_tr_br_bl", [0, 1, 2, 3]),
+            ("tr_br_bl_tl", [1, 2, 3, 0]),
+            ("br_bl_tl_tr", [2, 3, 0, 1]),
+            ("bl_tl_tr_br", [3, 0, 1, 2]),
+            ("tl_bl_br_tr", [0, 3, 2, 1]),
+            ("tr_tl_bl_br", [1, 0, 3, 2]),
+        ]
+        for order_name, idx in permutations:
+            pts = ordered_points[idx]
+            result = self.solve_pnp_debug_variant(
+                pts,
+                camera_matrix,
+                dist_coeffs,
+                flag=cv2.SOLVEPNP_IPPE_SQUARE,
+                solver_name="IPPE_SQUARE",
+                order_name=order_name,
+            )
+            if result is not None:
+                out.append(result)
+
+        return out
+
+    def solve_pnp_debug_variant(self, image_points, camera_matrix, dist_coeffs, flag, solver_name, order_name):
+        image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 1, 2)
+        try:
+            ok, rvecs, tvecs, reprojErrs = cv2.solvePnPGeneric(
+                self.model_points,
+                image_points,
+                camera_matrix,
+                dist_coeffs,
+                flags=flag,
+            )
+        except Exception:
+            return None
+
+        if not ok or rvecs is None or len(rvecs) == 0:
+            return None
+
+        def err_scalar(e):
+            if e is None:
+                return float("nan")
+            return float(np.asarray(e).reshape(-1)[0])
+
+        candidates = []
+        best_i = 0
+        best_score = -1e18
+        for i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
+            R_mat, _ = cv2.Rodrigues(rvec)
+            normal = R_mat[:, 2].astype(float)
+            normal /= np.linalg.norm(normal) + 1e-12
+            err = err_scalar(reprojErrs[i]) if reprojErrs is not None and len(reprojErrs) > i else self.compute_reprojection_error(
+                R_mat,
+                tvec,
+                camera_matrix,
+                dist_coeffs,
+                image_points,
+            )
+            tz = float(np.asarray(tvec).reshape(-1)[2])
+            score = (10.0 * normal[2]) - err
+            if tz <= 0:
+                score -= 1e6
+            if score > best_score:
+                best_score = score
+                best_i = i
+            candidates.append({
+                "index": int(i),
+                "rvec": np.asarray(rvec, dtype=float).reshape(3),
+                "tvec": np.asarray(tvec, dtype=float).reshape(3),
+                "normal": normal.copy(),
+                "error": float(err),
+                "projected_corners": self.project_model_points(
+                    R_mat,
+                    tvec,
+                    camera_matrix,
+                    dist_coeffs,
+                ),
+            })
+
+        chosen = candidates[best_i]
+        return {
+            "solver": solver_name,
+            "order": order_name,
+            "chosen_candidate": int(best_i),
+            "candidate_count": int(len(candidates)),
+            "rvec": chosen["rvec"].copy(),
+            "tvec": chosen["tvec"].copy(),
+            "normal": chosen["normal"].copy(),
+            "reprojection_error": float(chosen["error"]),
+            "candidates": candidates,
+        }
+
+    def compute_reprojection_error(self, R_mat, tvec, camera_matrix, dist_coeffs, image_points):
+        projected = self.project_model_points(R_mat, tvec, camera_matrix, dist_coeffs)
+        image_points = np.asarray(image_points, dtype=float).reshape(-1, 2)
+        return float(np.sqrt(np.mean(np.sum((projected - image_points) ** 2, axis=1))))
+
+    def project_model_points(self, R_mat, tvec, camera_matrix, dist_coeffs):
+        rvec, _ = cv2.Rodrigues(R_mat)
+        projected, _ = cv2.projectPoints(
+            self.model_points,
+            rvec,
+            tvec,
+            camera_matrix,
+            dist_coeffs,
+        )
+        return projected.reshape(-1, 2).astype(float)
 
 
     # -------------------------------------------------
