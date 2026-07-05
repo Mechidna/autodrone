@@ -436,6 +436,45 @@ def _downsample(items: list[dict[str, Any]], max_items: int) -> list[dict[str, A
     return out
 
 
+def _load_camera_frames(run_dir: Path, start: float) -> list[dict[str, Any]]:
+    index_path = run_dir / "camera_frames" / "index.jsonl"
+    if not index_path.exists():
+        return []
+
+    frames: list[dict[str, Any]] = []
+    try:
+        with index_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                try:
+                    raw = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                wall_time = _finite_float(raw.get("wall_time"))
+                rel_path = str(raw.get("path") or "").strip()
+                if wall_time is None or not rel_path:
+                    continue
+                path = index_path.parent / rel_path
+                frames.append(
+                    {
+                        "t": max(0.0, float(wall_time) - start),
+                        "frame_id": raw.get("frame_id"),
+                        "source": raw.get("source"),
+                        "path": str(Path("camera_frames") / rel_path),
+                        "width": raw.get("width"),
+                        "height": raw.get("height"),
+                        "sim_time_ns": raw.get("sim_time_ns"),
+                        "ros_stamp_sec": raw.get("ros_stamp_sec"),
+                        "ros_stamp_nanosec": raw.get("ros_stamp_nanosec"),
+                        "exists": path.exists(),
+                    }
+                )
+    except OSError:
+        return []
+    return sorted(frames, key=lambda item: float(item.get("t") or 0.0))
+
+
 def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
     events = []
     with path.open("r", encoding="utf-8", errors="replace") as f:
@@ -509,6 +548,7 @@ def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
     if isinstance(run_start, dict):
         env = run_start.get("env") or {}
         runtime_config = run_start.get("runtime_config")
+    camera_frames = _load_camera_frames(path.parent, start)
 
     return {
         "run_id": path.parent.name,
@@ -526,6 +566,7 @@ def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
         "shifts": shifts,
         "maps": maps,
         "canonical_gate_poses": canonical_gate_poses,
+        "camera_frames": camera_frames,
         "alerts": alerts[-20:],
         "counts": {
             "frames": len(frames),
@@ -535,6 +576,7 @@ def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
             "shifts": len(shifts),
             "maps": len(maps),
             "canonical_gate_poses": len(canonical_gate_poses),
+            "camera_frames": len(camera_frames),
             "alerts": len(alerts),
         },
     }
@@ -601,9 +643,11 @@ canvas {
 }
 #mapCanvas { height: 620px; }
 #altCanvas { height: 180px; border-top: 1px solid #29333d; }
+#cameraCanvas { width: 100%; height: 202px; border-radius: 6px; background: #080c10; }
+#recordCanvas { display: none; }
 .toolbar {
   display: grid;
-  grid-template-columns: auto auto 1fr auto auto;
+  grid-template-columns: auto auto auto 1fr auto auto;
   gap: 10px;
   align-items: center;
   padding: 10px;
@@ -658,6 +702,11 @@ aside {
   color: #d5dde5;
   white-space: pre-wrap;
 }
+.record-status {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 8px;
+}
 .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
 @media (max-width: 1000px) {
   main { grid-template-columns: 1fr; }
@@ -675,10 +724,11 @@ aside {
   <section class="panel">
     <div class="toolbar">
       <button id="playBtn">Play</button>
+      <button id="saveVideoBtn">Save video</button>
       <select id="viewMode">
-        <option value="xy" selected>Top-down x/y</option>
+        <option value="xy">Top-down x/y</option>
         <option value="yz">Side y/z</option>
-        <option value="3d">3D orbit</option>
+        <option value="3d" selected>3D orbit</option>
       </select>
       <input id="slider" type="range" min="0" max="0" value="0">
       <select id="speed">
@@ -698,7 +748,7 @@ aside {
       <label><input type="checkbox" id="showStable" checked> stable map</label>
       <label><input type="checkbox" id="showGt" checked> ground truth</label>
       <label><input type="checkbox" id="showLabels" checked> labels</label>
-      <label><input type="checkbox" id="followDrone"> follow drone</label>
+      <label><input type="checkbox" id="followDrone" checked> follow drone</label>
     </div>
     <div class="canvas-wrap">
       <canvas id="mapCanvas"></canvas>
@@ -706,6 +756,11 @@ aside {
     </div>
   </section>
   <aside>
+    <section class="panel side-section">
+      <h2 style="margin:0 0 10px;font-size:15px;">Camera</h2>
+      <canvas id="cameraCanvas"></canvas>
+      <div class="record-status" id="videoStatus"></div>
+    </section>
     <section class="panel side-section">
       <h2 style="margin:0 0 10px;font-size:15px;">Current Frame</h2>
       <div class="kv" id="frameInfo"></div>
@@ -729,31 +784,38 @@ aside {
     </section>
   </aside>
 </main>
+<canvas id="recordCanvas"></canvas>
 <script>
 const DATA = __DATA__;
 
 const mapCanvas = document.getElementById('mapCanvas');
 const altCanvas = document.getElementById('altCanvas');
+const cameraCanvas = document.getElementById('cameraCanvas');
+const recordCanvas = document.getElementById('recordCanvas');
 const slider = document.getElementById('slider');
 const playBtn = document.getElementById('playBtn');
+const saveVideoBtn = document.getElementById('saveVideoBtn');
 const viewMode = document.getElementById('viewMode');
 const speedSel = document.getElementById('speed');
 const timeLabel = document.getElementById('timeLabel');
 const frameInfo = document.getElementById('frameInfo');
 const eventsBox = document.getElementById('events');
 const subtitle = document.getElementById('subtitle');
+const videoStatus = document.getElementById('videoStatus');
 const checks = ['showTruth','showRef','showPlan','showRace','showStable','showGt','showLabels','followDrone']
   .reduce((acc, id) => { acc[id] = document.getElementById(id); return acc; }, {});
 
 const frames = DATA.frames || [];
+const cameraFrames = DATA.camera_frames || [];
 slider.max = Math.max(0, frames.length - 1);
-subtitle.textContent = `${DATA.debug_path} | frames=${DATA.counts.frames}, plans=${DATA.counts.plans}, passes=${DATA.counts.passes}, shifts=${DATA.counts.shifts}, return=${DATA.returncode}`;
+subtitle.textContent = `${DATA.debug_path} | frames=${DATA.counts.frames}, camera=${DATA.counts.camera_frames || 0}, plans=${DATA.counts.plans}, passes=${DATA.counts.passes}, shifts=${DATA.counts.shifts}, return=${DATA.returncode}`;
 const gateSizeM = Number(DATA.gate_size_m || 1.5);
 
 let frameIndex = 0;
 let playing = false;
 let lastTick = performance.now();
 let playTime = frames.length ? Number(frames[0].t || 0) : 0;
+let recording = false;
 
 function finite(v) { return Number.isFinite(v); }
 function pxy(p) { return p && finite(p[0]) && finite(p[1]); }
@@ -814,6 +876,109 @@ function frameIndexForTime(t) {
     else hi = mid - 1;
   }
   return lo;
+}
+
+function cameraFrameIndexForTime(t) {
+  if (!cameraFrames.length) return -1;
+  if (t <= cameraFrames[0].t) return 0;
+  let lo = 0;
+  let hi = cameraFrames.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (cameraFrames[mid].t <= t) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
+}
+
+function cameraFrameForTime(t) {
+  const idx = cameraFrameIndexForTime(t);
+  return idx >= 0 ? cameraFrames[idx] : null;
+}
+
+const imageCache = new Map();
+
+function loadCameraImage(item) {
+  if (!item || !item.path) return Promise.resolve(null);
+  const key = item.path;
+  const cached = imageCache.get(key);
+  if (cached) {
+    if (cached.loaded) return Promise.resolve(cached.img);
+    if (cached.failed) return Promise.resolve(null);
+    return cached.promise;
+  }
+  const img = new Image();
+  const entry = {
+    img,
+    loaded: false,
+    failed: false,
+    promise: null,
+  };
+  entry.promise = new Promise(resolve => {
+    img.onload = () => {
+      entry.loaded = true;
+      resolve(img);
+    };
+    img.onerror = () => {
+      entry.failed = true;
+      resolve(null);
+    };
+  });
+  imageCache.set(key, entry);
+  img.src = key;
+  return entry.promise;
+}
+
+function drawCenteredImage(ctx, img, x, y, w, h) {
+  const iw = img.naturalWidth || img.width || 1;
+  const ih = img.naturalHeight || img.height || 1;
+  const scale = Math.min(w / iw, h / ih);
+  const dw = iw * scale;
+  const dh = ih * scale;
+  ctx.drawImage(img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+}
+
+function drawCamera() {
+  const { ctx, w, h } = resizeCanvas(cameraCanvas);
+  ctx.fillStyle = '#080c10';
+  ctx.fillRect(0, 0, w, h);
+  ctx.fillStyle = '#9aa7b3';
+  ctx.font = '12px ui-monospace, monospace';
+
+  if (!cameraFrames.length) {
+    ctx.fillText('No camera frames captured for this run.', 12, 24);
+    if (videoStatus) {
+      videoStatus.textContent = 'Run with --capture-camera-frames to include /camera images.';
+    }
+    return;
+  }
+
+  const t = frames[frameIndex] ? Number(frames[frameIndex].t || 0) : 0;
+  const item = cameraFrameForTime(t);
+  if (!item) {
+    ctx.fillText('Waiting for camera frame...', 12, 24);
+    return;
+  }
+
+  const cached = imageCache.get(item.path);
+  if (cached && cached.loaded) {
+    drawCenteredImage(ctx, cached.img, 0, 0, w, h);
+  } else {
+    ctx.fillText('Loading camera frame...', 12, 24);
+    loadCameraImage(item).then(() => {
+      const current = cameraFrameForTime(frames[frameIndex] ? Number(frames[frameIndex].t || 0) : 0);
+      if (current && current.path === item.path) drawCamera();
+    });
+  }
+
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.62)';
+  ctx.fillRect(0, h - 24, w, 24);
+  ctx.fillStyle = '#eef4f8';
+  ctx.fillText(
+    `camera t=${fmt(item.t, 2)}s frame=${item.frame_id ?? 'n/a'} source=${item.source ?? 'n/a'}`,
+    10,
+    h - 8,
+  );
 }
 
 function allPoints() {
@@ -1051,9 +1216,11 @@ function makeProjector3D(w, h, frame) {
   ];
   const cam = add3(target, offset);
   const forward = norm3(sub3(target, cam), [0, 1, 0]);
-  let right = norm3(cross3(forward, [0, 0, 1]), [1, 0, 0]);
+  // Match onboard camera imagery: screen-right follows MAVLink/OpenCV
+  // body-right, not the opposite-handed external orbit convention.
+  let right = norm3(cross3([0, 0, 1], forward), [1, 0, 0]);
   if (len3(right) < 1e-6) right = [1, 0, 0];
-  const up = norm3(cross3(right, forward), [0, 0, 1]);
+  const up = norm3(cross3(forward, right), [0, 0, 1]);
   const focal = Math.min(w, h) * 0.92;
   return {
     cam,
@@ -1498,6 +1665,7 @@ function updateInfo() {
   const planCurve = planCurvePoints(plan);
   const race = latestAt(DATA.maps, t, m => m.kind === 'race_order_gates');
   const stable = latestAt(DATA.maps, t, m => m.kind === 'stable_perception_gates');
+  const cameraFrame = cameraFrameForTime(t);
   const viewText = viewMode.value === '3d'
     ? '3D orbit'
     : (viewMode.value === 'yz' ? 'side y/z' : 'top-down x/y');
@@ -1515,6 +1683,7 @@ function updateInfo() {
     ['cmd_deg', fmtVec(f.cmd_deg)],
     ['plan', plan ? `${plan.mode} g=${plan.gate_idx} tracks=(${(plan.horizon_tracks||[]).join(',')})` : 'none'],
     ['plan samples', plan ? `${planCurve.length} curve / ${(plan.waypoints || []).length} waypoints` : 'none'],
+    ['camera frame', cameraFrame ? `${cameraFrame.frame_id ?? 'n/a'} @ ${fmt(cameraFrame.t, 2)}s` : 'none'],
     ['race gates', race ? race.gates.length : 0],
     ['stable gates', stable ? stable.gates.length : 0],
   ];
@@ -1536,6 +1705,7 @@ function updateInfo() {
 function draw() {
   drawMap();
   drawAlt();
+  drawCamera();
   updateInfo();
   slider.value = String(frameIndex);
 }
@@ -1556,6 +1726,149 @@ function tick(now) {
   }
   lastTick = now;
   requestAnimationFrame(tick);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function mediaRecorderMimeType() {
+  const candidates = [
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8',
+    'video/webm',
+  ];
+  for (const item of candidates) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(item)) return item;
+  }
+  return '';
+}
+
+function composeRecordFrame(ctx, t) {
+  const w = recordCanvas.width;
+  const h = recordCanvas.height;
+  ctx.fillStyle = '#101418';
+  ctx.fillRect(0, 0, w, h);
+
+  const leftW = 1280;
+  const mapH = 840;
+  const altH = h - mapH;
+  const rightX = leftW;
+  const rightW = w - leftW;
+
+  ctx.drawImage(mapCanvas, 0, 0, leftW, mapH);
+  ctx.drawImage(altCanvas, 0, mapH, leftW, altH);
+
+  ctx.fillStyle = '#080c10';
+  ctx.fillRect(rightX, 0, rightW, h);
+  ctx.drawImage(cameraCanvas, rightX, 0, rightW, 360);
+
+  const f = frames[frameIndex] || {};
+  const cam = cameraFrameForTime(t);
+  ctx.fillStyle = '#eef4f8';
+  ctx.font = '24px ui-monospace, monospace';
+  ctx.fillText(`AIGP replay ${DATA.run_id}`, rightX + 24, 420);
+  ctx.font = '20px ui-monospace, monospace';
+  ctx.fillText(`t ${fmt(t, 2)} s`, rightX + 24, 462);
+  ctx.fillText(`gate ${f.gate_idx ?? 'n/a'} track ${f.active_track ?? 'n/a'}`, rightX + 24, 500);
+  ctx.fillText(`pos ${fmtVec(f.pos)}`, rightX + 24, 538);
+  ctx.fillText(`target ${fmtVec(f.target)}`, rightX + 24, 576);
+  ctx.fillText(`camera ${cam ? `${cam.frame_id ?? 'n/a'} @ ${fmt(cam.t, 2)}s` : 'none'}`, rightX + 24, 614);
+
+  ctx.fillStyle = '#9aa7b3';
+  ctx.font = '16px ui-monospace, monospace';
+  ctx.fillText('3D orbit + follow drone, encoded at 30 fps real-time playback', rightX + 24, h - 36);
+}
+
+async function recordReplayVideo() {
+  if (recording || !frames.length) return;
+  if (!window.MediaRecorder || !recordCanvas.captureStream) {
+    videoStatus.textContent = 'MediaRecorder/canvas capture is not supported in this browser.';
+    return;
+  }
+
+  recording = true;
+  saveVideoBtn.disabled = true;
+  const previous = {
+    frameIndex,
+    playTime,
+    playing,
+    viewMode: viewMode.value,
+    followDrone: checks.followDrone.checked,
+  };
+
+  playing = false;
+  playBtn.textContent = 'Play';
+  viewMode.value = '3d';
+  checks.followDrone.checked = true;
+
+  const fps = 30;
+  const startT = Number(frames[0].t || 0);
+  const endT = Math.max(startT, Number(DATA.duration || frames[frames.length - 1].t || startT));
+  const totalFrames = Math.max(1, Math.ceil((endT - startT) * fps));
+  recordCanvas.width = 1920;
+  recordCanvas.height = 1080;
+  const recordCtx = recordCanvas.getContext('2d');
+  const mimeType = mediaRecorderMimeType();
+  const stream = recordCanvas.captureStream(fps);
+  const chunks = [];
+  let recorder;
+
+  try {
+    recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+  } catch (err) {
+    videoStatus.textContent = `Could not start recorder: ${err}`;
+    saveVideoBtn.disabled = false;
+    recording = false;
+    return;
+  }
+
+  const stopped = new Promise(resolve => {
+    recorder.onstop = resolve;
+  });
+  recorder.ondataavailable = event => {
+    if (event.data && event.data.size > 0) chunks.push(event.data);
+  };
+
+  try {
+    recorder.start();
+    for (let i = 0; i <= totalFrames; i++) {
+      const t = Math.min(endT, startT + i / fps);
+      frameIndex = frameIndexForTime(t);
+      playTime = t;
+      const cam = cameraFrameForTime(t);
+      await loadCameraImage(cam);
+      draw();
+      composeRecordFrame(recordCtx, t);
+      videoStatus.textContent = `recording ${i}/${totalFrames} frames (${fmt((i / Math.max(1, totalFrames)) * 100, 0)}%)`;
+      await sleep(1000 / fps);
+    }
+  } finally {
+    if (recorder.state !== 'inactive') recorder.stop();
+    await stopped;
+    for (const track of stream.getTracks()) track.stop();
+  }
+
+  const blob = new Blob(chunks, { type: mimeType || 'video/webm' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `${DATA.run_id || 'aigp_replay'}_replay.webm`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+
+  frameIndex = previous.frameIndex;
+  playTime = previous.playTime;
+  playing = previous.playing;
+  viewMode.value = previous.viewMode;
+  checks.followDrone.checked = previous.followDrone;
+  playBtn.textContent = playing ? 'Pause' : 'Play';
+  videoStatus.textContent = `saved ${link.download}`;
+  saveVideoBtn.disabled = false;
+  recording = false;
+  draw();
 }
 
 mapCanvas.addEventListener('pointerdown', event => {
@@ -1606,6 +1919,7 @@ playBtn.addEventListener('click', () => {
   playBtn.textContent = playing ? 'Pause' : 'Play';
   lastTick = performance.now();
 });
+saveVideoBtn.addEventListener('click', recordReplayVideo);
 slider.addEventListener('input', () => {
   frameIndex = Number(slider.value);
   playTime = Number((frames[frameIndex] && frames[frameIndex].t) || 0);

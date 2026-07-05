@@ -295,6 +295,26 @@ def _parse_args() -> argparse.Namespace:
         help="Run folder name. Defaults to UTC timestamp.",
     )
     parser.add_argument(
+        "--capture-camera-frames",
+        action="store_true",
+        help=(
+            "Save decoded camera frames under the run directory for replay_debug_map.py. "
+            "This can create many JPEG files."
+        ),
+    )
+    parser.add_argument(
+        "--camera-capture-hz",
+        type=float,
+        default=30.0,
+        help="Maximum camera frame capture rate when --capture-camera-frames is set.",
+    )
+    parser.add_argument(
+        "--camera-jpeg-quality",
+        type=int,
+        default=80,
+        help="JPEG quality for captured replay camera frames.",
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="Optional command to run after '--'. Defaults to the pilot main.py.",
@@ -321,9 +341,25 @@ def main() -> int:
     debug_path = run_dir / "debug.jsonl"
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
+    if bool(args.capture_camera_frames):
+        camera_dir = run_dir / "camera_frames"
+        camera_dir.mkdir(parents=True, exist_ok=True)
+        env["AIGP_CAMERA_CAPTURE_DIR"] = str(camera_dir)
+        env["AIGP_CAMERA_CAPTURE_HZ"] = str(max(0.1, float(args.camera_capture_hz)))
+        env["AIGP_CAMERA_CAPTURE_JPEG_QUALITY"] = str(
+            max(1, min(100, int(args.camera_jpeg_quality)))
+        )
 
     print(f"logging run to {run_dir}", flush=True)
     print(f"command: {' '.join(shlex.quote(part) for part in command)}", flush=True)
+    if bool(args.capture_camera_frames):
+        print(
+            "camera frame capture: "
+            f"{run_dir / 'camera_frames'} "
+            f"hz={max(0.1, float(args.camera_capture_hz)):.1f} "
+            f"jpeg_quality={max(1, min(100, int(args.camera_jpeg_quality)))}",
+            flush=True,
+        )
 
     start = time.time()
     proc: subprocess.Popen[str] | None = None

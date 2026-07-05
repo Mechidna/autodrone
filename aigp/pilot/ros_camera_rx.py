@@ -12,6 +12,7 @@ from sensor_msgs.msg import Image, CameraInfo
 from tf2_msgs.msg import TFMessage
 from cv_bridge import CvBridge
 
+from frame_capture import CameraFrameCapture
 from runtime_config import load_runtime_config
 
 
@@ -93,6 +94,7 @@ class RosCameraNode(Node):
         self.data = data
         self.bridge = CvBridge()
         self.frame_id_counter = 0
+        self.frame_capture = CameraFrameCapture(source="ros2_camera")
         self.gazebo_pose_lock = threading.Lock()
         self.latest_gazebo_pose = None
 
@@ -243,6 +245,7 @@ class RosCameraNode(Node):
         }
 
         self._store_frame(frame_data)
+        self.frame_capture.maybe_capture(frame_data, img)
 
     def gazebo_pose_callback(self, msg: TFMessage):
         if len(msg.transforms) == 0:

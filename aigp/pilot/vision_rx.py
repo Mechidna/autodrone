@@ -6,6 +6,7 @@ import time
 import cv2
 import numpy as np
 
+from frame_capture import CameraFrameCapture
 from runtime_config import load_runtime_config
 
 class VisionRX:
@@ -60,6 +61,7 @@ class VisionRX:
         self.expected_height = int(
             config.camera.height if expected_height is None else expected_height
         )
+        self.frame_capture = CameraFrameCapture(source="udp_vision")
         self.thread = threading.Thread(
             target=self._vision_loop,
             daemon=False
@@ -220,6 +222,7 @@ class VisionRX:
             "sim_time_ns": sim_time_ns,
             "wall_time": time.time(),
         }
+        self.frame_capture.maybe_capture(frame_data, img)
 
         lock = self.data.get("lock") if isinstance(self.data, dict) else None
 
