@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 from dataclasses import dataclass
 
@@ -77,6 +79,12 @@ class RPGHighLevelTracker:
         thrust_max=0.80,
         thrust_from_acc_gain=None,
         lateral_accel_gain_xy=(1.0, 1.0),
+        max_acc_z_slew_m_s3=0.0,
+        max_acc_z_slew_reset_s=0.5,
+        near_reference_z_error_m=0.0,
+        near_reference_vz_error_max_m_s=0.0,
+        near_reference_max_acc_z_up=0.0,
+        near_reference_max_acc_z_down=0.0,
     ):
         self.m = float(mass)
         self.g = float(gravity)
@@ -102,8 +110,29 @@ class RPGHighLevelTracker:
             lateral_accel_gain_xy,
             dtype=float,
         ).reshape(2)
+        self.max_acc_z_slew_m_s3 = max(0.0, float(max_acc_z_slew_m_s3))
+        self.max_acc_z_slew_reset_s = max(0.0, float(max_acc_z_slew_reset_s))
+        self.near_reference_z_error_m = max(0.0, float(near_reference_z_error_m))
+        self.near_reference_vz_error_max_m_s = max(
+            0.0,
+            float(near_reference_vz_error_max_m_s),
+        )
+        self.near_reference_max_acc_z_up = max(
+            0.0,
+            float(near_reference_max_acc_z_up),
+        )
+        self.near_reference_max_acc_z_down = max(
+            0.0,
+            float(near_reference_max_acc_z_down),
+        )
+        self._last_acc_z_cmd = None
+        self._last_update_time = None
 
-    def _limit_acceleration(self, a_cmd_no_g):
+    def reset_vertical_limiter(self):
+        self._last_acc_z_cmd = None
+        self._last_update_time = None
+
+    def _limit_acceleration(self, a_cmd_no_g, *, near_reference=False):
         """
         Limit commanded translational acceleration before gravity is added.
         This is more practical than limiting total a_des directly.
@@ -117,12 +146,45 @@ class RPGHighLevelTracker:
             a[:2] = a_xy * (self.max_acc_xy / n_xy)
 
         # Vertical limit
-        if a[2] > self.max_acc_z_up:
-            a[2] = self.max_acc_z_up
-        if a[2] < -self.max_acc_z_down:
-            a[2] = -self.max_acc_z_down
+        max_acc_z_up = self.max_acc_z_up
+        max_acc_z_down = self.max_acc_z_down
+        if near_reference:
+            if self.near_reference_max_acc_z_up > 0.0:
+                max_acc_z_up = min(max_acc_z_up, self.near_reference_max_acc_z_up)
+            if self.near_reference_max_acc_z_down > 0.0:
+                max_acc_z_down = min(max_acc_z_down, self.near_reference_max_acc_z_down)
+        if a[2] > max_acc_z_up:
+            a[2] = max_acc_z_up
+        if a[2] < -max_acc_z_down:
+            a[2] = -max_acc_z_down
 
         return a
+
+    def _slew_limit_vertical_acceleration(self, a_cmd_no_g):
+        a = a_cmd_no_g.copy()
+        now = time.monotonic()
+        previous = self._last_acc_z_cmd
+        previous_time = self._last_update_time
+        limited = False
+
+        if (
+            previous is not None
+            and previous_time is not None
+            and self.max_acc_z_slew_m_s3 > 0.0
+        ):
+            dt = now - previous_time
+            if dt > 0.0 and (
+                self.max_acc_z_slew_reset_s <= 0.0
+                or dt <= self.max_acc_z_slew_reset_s
+            ):
+                max_delta = self.max_acc_z_slew_m_s3 * dt
+                before = float(a[2])
+                a[2] = clamp(a[2], previous - max_delta, previous + max_delta)
+                limited = abs(float(a[2]) - before) > 1e-9
+
+        self._last_acc_z_cmd = float(a[2])
+        self._last_update_time = now
+        return a, limited
 
     def _construct_R_des(self, z_b_des, yaw_des):
         """
@@ -150,13 +212,37 @@ class RPGHighLevelTracker:
         e_p = ref.pos - state.pos
         e_v = ref.vel - state.vel
 
+        near_reference_vertical = (
+            self.near_reference_z_error_m > 0.0
+            and abs(float(e_p[2])) <= self.near_reference_z_error_m
+        )
+        e_v_for_control = e_v.copy()
+        vertical_velocity_error_limited = False
+        if (
+            near_reference_vertical
+            and self.near_reference_vz_error_max_m_s > 0.0
+        ):
+            before = float(e_v_for_control[2])
+            e_v_for_control[2] = clamp(
+                before,
+                -self.near_reference_vz_error_max_m_s,
+                self.near_reference_vz_error_max_m_s,
+            )
+            vertical_velocity_error_limited = abs(float(e_v_for_control[2]) - before) > 1e-9
+
         # RPG-style high-level acceleration command:
         # a_fb + a_ref + gravity compensation. :contentReference[oaicite:2]{index=2}
-        a_fb = self.Kp * e_p + self.Kv * e_v
+        a_fb = self.Kp * e_p + self.Kv * e_v_for_control
         a_cmd_raw_no_g = ref.acc + a_fb
 
         # Saturate translational demand to something your drone can actually do
-        a_cmd_no_g = self._limit_acceleration(a_cmd_raw_no_g)
+        a_cmd_accel_limited_no_g = self._limit_acceleration(
+            a_cmd_raw_no_g,
+            near_reference=near_reference_vertical,
+        )
+        a_cmd_no_g, vertical_accel_slew_limited = (
+            self._slew_limit_vertical_acceleration(a_cmd_accel_limited_no_g)
+        )
 
         # Calibrate lateral acceleration demand into the attitude command path.
         a_cmd_attitude_no_g = a_cmd_no_g.copy()
@@ -200,9 +286,11 @@ class RPGHighLevelTracker:
         debug = {
             "e_p": e_p,
             "e_v": e_v,
+            "e_v_for_control": e_v_for_control,
             "a_ref": ref.acc,
             "a_fb": a_fb,
             "a_cmd_raw_no_g": a_cmd_raw_no_g,
+            "a_cmd_accel_limited_no_g": a_cmd_accel_limited_no_g,
             "a_cmd_no_g": a_cmd_no_g,
             "a_cmd_attitude_no_g": a_cmd_attitude_no_g,
             "a_des": a_des,
@@ -214,6 +302,9 @@ class RPGHighLevelTracker:
             "thrust_limited": bool(thrust_cmd != thrust_raw_before_clamp),
             "hover_thrust": self.thrust_hover,
             "lateral_accel_gain_xy": self.lateral_accel_gain_xy.copy(),
+            "near_reference_vertical": bool(near_reference_vertical),
+            "vertical_velocity_error_limited": bool(vertical_velocity_error_limited),
+            "vertical_accel_slew_limited": bool(vertical_accel_slew_limited),
         }
 
         return roll_des, pitch_des, yaw_cmd, thrust_cmd, debug

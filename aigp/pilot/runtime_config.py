@@ -362,6 +362,12 @@ class ControllerSection:
     max_acc_xy: float
     max_acc_z_up: float
     max_acc_z_down: float
+    max_acc_z_slew_m_s3: float
+    max_acc_z_slew_reset_s: float
+    near_reference_z_error_m: float
+    near_reference_vz_error_max_m_s: float
+    near_reference_max_acc_z_up: float
+    near_reference_max_acc_z_down: float
     lateral_accel_gain_xy: tuple[float, float]
     thrust_hover: float
     thrust_min: float
@@ -1476,12 +1482,42 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
         controller=ControllerSection(
             mass=_float(controller_raw, "mass", 1.0),
             gravity=_float(controller_raw, "gravity", 9.81),
-            kp=_float_tuple(controller_raw.get("kp"), (2.5, 2.5, 3.5), 3),
-            kv=_float_tuple(controller_raw.get("kv"), (2.0, 2.0, 2.6), 3),
+            kp=_float_tuple(controller_raw.get("kp"), (2.5, 2.5, 1.6), 3),
+            kv=_float_tuple(controller_raw.get("kv"), (2.0, 2.0, 1.1), 3),
             max_tilt_deg=_float(controller_raw, "max_tilt_deg", 20.0),
             max_acc_xy=_float(controller_raw, "max_acc_xy", 2.0),
-            max_acc_z_up=_float(controller_raw, "max_acc_z_up", 2.5),
-            max_acc_z_down=_float(controller_raw, "max_acc_z_down", 2.0),
+            max_acc_z_up=_float(controller_raw, "max_acc_z_up", 1.2),
+            max_acc_z_down=_float(controller_raw, "max_acc_z_down", 1.0),
+            max_acc_z_slew_m_s3=_float(
+                controller_raw,
+                "max_acc_z_slew_m_s3",
+                6.0,
+            ),
+            max_acc_z_slew_reset_s=_float(
+                controller_raw,
+                "max_acc_z_slew_reset_s",
+                0.5,
+            ),
+            near_reference_z_error_m=_float(
+                controller_raw,
+                "near_reference_z_error_m",
+                0.4,
+            ),
+            near_reference_vz_error_max_m_s=_float(
+                controller_raw,
+                "near_reference_vz_error_max_m_s",
+                0.7,
+            ),
+            near_reference_max_acc_z_up=_float(
+                controller_raw,
+                "near_reference_max_acc_z_up",
+                0.8,
+            ),
+            near_reference_max_acc_z_down=_float(
+                controller_raw,
+                "near_reference_max_acc_z_down",
+                0.8,
+            ),
             lateral_accel_gain_xy=_float_tuple(
                 controller_raw.get("lateral_accel_gain_xy"),
                 (1.0, 1.0),
@@ -2174,6 +2210,25 @@ def _validate(config: PilotConfig) -> None:
         raise RuntimeError("controller fallback_thrust must stay within [0.0, 1.0].")
     if any(float(value) <= 0.0 for value in config.controller.lateral_accel_gain_xy):
         raise RuntimeError("controller.lateral_accel_gain_xy values must be positive.")
+    for key, value in (
+        ("max_acc_z_slew_m_s3", config.controller.max_acc_z_slew_m_s3),
+        ("max_acc_z_slew_reset_s", config.controller.max_acc_z_slew_reset_s),
+        ("near_reference_z_error_m", config.controller.near_reference_z_error_m),
+        (
+            "near_reference_vz_error_max_m_s",
+            config.controller.near_reference_vz_error_max_m_s,
+        ),
+        (
+            "near_reference_max_acc_z_up",
+            config.controller.near_reference_max_acc_z_up,
+        ),
+        (
+            "near_reference_max_acc_z_down",
+            config.controller.near_reference_max_acc_z_down,
+        ),
+    ):
+        if float(value) < 0.0:
+            raise RuntimeError(f"controller.{key} must be non-negative.")
     for key, value in (
         ("vision_correction_alpha", config.state_estimation.vision_correction_alpha),
         ("vision_correction_alpha_xy", config.state_estimation.vision_correction_alpha_xy),

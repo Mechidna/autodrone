@@ -215,8 +215,8 @@ gate_right_axis_neu = [1.0, 0.0, 0.0]
 gate_up_axis_neu = [0.0, 0.0, 1.0]
 
 [gate_source]
-mode = "ground_truth"               # perception | ground_truth
-allow_ground_truth = true         # debug/PX4 only; not competition-valid
+mode = "perception"               # perception | ground_truth
+allow_ground_truth = false         # debug/PX4 only; not competition-valid
 known_gate_positions_neu = [
   [0.042238, 13.172596, 2.669784],
   [1.492108, 23.982963, 3.793709],
@@ -288,8 +288,8 @@ gate_corridor_enabled = true
 gate_corridor_length_m = 3.0
 passthrough_velocity_enabled = true
 passthrough_velocity_mode = "adaptive" # fixed | adaptive
-passthrough_speed_m_s = 0.5
-passthrough_speed_max_m_s = 1.2
+passthrough_speed_m_s = 2.5
+passthrough_speed_max_m_s = 3.0
 passthrough_turn_slowdown = 0.5
 terminal_velocity_enabled = true
 terminal_speed_m_s = 0.5
@@ -340,11 +340,17 @@ max_detection_range_m = 200.0
 [controller]
 mass = 1.0
 gravity = 9.81
-kp = [2.5, 2.5, 3.5]
-kv = [2.0, 2.0, 2.6]
+kp = [2.5, 2.5, 1.6]
+kv = [2.0, 2.0, 1.1]
 max_acc_xy = 2.0
-max_acc_z_up = 2.5
-max_acc_z_down = 2.0
+max_acc_z_up = 1.2
+max_acc_z_down = 1.0
+max_acc_z_slew_m_s3 = 6.0
+max_acc_z_slew_reset_s = 0.5
+near_reference_z_error_m = 0.4
+near_reference_vz_error_max_m_s = 0.7
+near_reference_max_acc_z_up = 0.8
+near_reference_max_acc_z_down = 0.8
 lateral_accel_gain_xy = [1.0, 1.0]
 thrust_hover_initial = 0.5
 fallback_thrust_initial = 0.5       # last-resort initial guess only

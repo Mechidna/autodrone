@@ -50,6 +50,7 @@ STRUCTURED_PREFIXES = (
     ("target_manager lock ", "target_lock"),
     ("target_manager passed ", "target_passed"),
     ("target_manager active_lost ", "target_active_lost"),
+    ("spline_memory ", "spline_memory"),
     ("[PERCEPTION_CHAIN] ", "perception_chain"),
     ("[PERCEPTION_DEBUG] ", "perception_debug"),
 )
