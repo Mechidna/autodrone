@@ -28,6 +28,7 @@ STRUCTURED_PREFIXES = (
     ("gate_pass ", "gate_pass"),
     ("gate_center_pass_hold_exit ", "gate_center_pass_hold_exit"),
     ("post_gate_exit_continue ", "post_gate_exit_continue"),
+    ("post_gate_fallback_plan ", "post_gate_fallback_plan"),
     ("target_validation_reject ", "target_validation_reject"),
     ("planning_horizon_provisional_suffix ", "planning_horizon_provisional_suffix"),
     ("active_target_shift correction ", "active_target_shift"),
@@ -315,6 +316,15 @@ def _parse_args() -> argparse.Namespace:
         help="JPEG quality for captured replay camera frames.",
     )
     parser.add_argument(
+        "--camera-capture-queue-size",
+        type=int,
+        default=4,
+        help=(
+            "Maximum pending JPEG writes for camera frame capture. "
+            "Frames are dropped when this queue is full so flight callbacks do not block."
+        ),
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="Optional command to run after '--'. Defaults to the pilot main.py.",
@@ -349,6 +359,9 @@ def main() -> int:
         env["AIGP_CAMERA_CAPTURE_JPEG_QUALITY"] = str(
             max(1, min(100, int(args.camera_jpeg_quality)))
         )
+        env["AIGP_CAMERA_CAPTURE_QUEUE_SIZE"] = str(
+            max(1, min(512, int(args.camera_capture_queue_size)))
+        )
 
     print(f"logging run to {run_dir}", flush=True)
     print(f"command: {' '.join(shlex.quote(part) for part in command)}", flush=True)
@@ -357,7 +370,8 @@ def main() -> int:
             "camera frame capture: "
             f"{run_dir / 'camera_frames'} "
             f"hz={max(0.1, float(args.camera_capture_hz)):.1f} "
-            f"jpeg_quality={max(1, min(100, int(args.camera_jpeg_quality)))}",
+            f"jpeg_quality={max(1, min(100, int(args.camera_jpeg_quality)))} "
+            f"queue_size={max(1, min(512, int(args.camera_capture_queue_size)))}",
             flush=True,
         )
 

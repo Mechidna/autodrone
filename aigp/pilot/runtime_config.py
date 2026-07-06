@@ -291,6 +291,12 @@ class PlannerSection:
     plan_validation_max_polyline_backtrack_m: float
     plan_validation_max_speed_m_s: float
     plan_validation_max_accel_m_s2: float
+    plan_validation_max_acc_xy_m_s2: float
+    plan_validation_max_lateral_accel_m_s2: float
+    plan_validation_max_acc_z_up_m_s2: float
+    plan_validation_max_acc_z_down_m_s2: float
+    plan_validation_max_z_overshoot_m: float
+    plan_v_start_z_max_m_s: float
     safe_min_target_z: float
     safe_max_target_z: float
     replan_target_shift_m: float
@@ -346,6 +352,7 @@ class PlannerSection:
     provisional_next_gate_max_duration_s: float
     provisional_next_gate_replan_shift_m: float
     provisional_next_gate_vmax_m_s: float
+    spline_memory_live_override_m: float
     replan_after_trajectory_s: float
     replan_min_interval_s: float
     max_detection_range_m: float
@@ -1219,12 +1226,42 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             plan_validation_max_speed_m_s=_float(
                 planner_raw,
                 "plan_validation_max_speed_m_s",
-                5.0,
+                0.0,
             ),
             plan_validation_max_accel_m_s2=_float(
                 planner_raw,
                 "plan_validation_max_accel_m_s2",
                 8.0,
+            ),
+            plan_validation_max_acc_xy_m_s2=_float(
+                planner_raw,
+                "plan_validation_max_acc_xy_m_s2",
+                3.0 * _float(controller_raw, "max_acc_xy", 2.0),
+            ),
+            plan_validation_max_lateral_accel_m_s2=_float(
+                planner_raw,
+                "plan_validation_max_lateral_accel_m_s2",
+                _float(controller_raw, "max_acc_xy", 2.0),
+            ),
+            plan_validation_max_acc_z_up_m_s2=_float(
+                planner_raw,
+                "plan_validation_max_acc_z_up_m_s2",
+                _float(controller_raw, "max_acc_z_up", 1.2),
+            ),
+            plan_validation_max_acc_z_down_m_s2=_float(
+                planner_raw,
+                "plan_validation_max_acc_z_down_m_s2",
+                _float(controller_raw, "max_acc_z_down", 1.0),
+            ),
+            plan_validation_max_z_overshoot_m=_float(
+                planner_raw,
+                "plan_validation_max_z_overshoot_m",
+                0.50,
+            ),
+            plan_v_start_z_max_m_s=_float(
+                planner_raw,
+                "plan_v_start_z_max_m_s",
+                0.40,
             ),
             safe_min_target_z=_float(planner_raw, "safe_min_target_z", 1.0),
             safe_max_target_z=_float(planner_raw, "safe_max_target_z", 3.0),
@@ -1473,6 +1510,11 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 planner_raw,
                 "provisional_next_gate_vmax_m_s",
                 1.5,
+            ),
+            spline_memory_live_override_m=_float(
+                planner_raw,
+                "spline_memory_live_override_m",
+                4.0,
             ),
             replan_after_trajectory_s=_float(planner_raw, "replan_after_trajectory_s", 0.25),
             replan_min_interval_s=_float(planner_raw, "replan_min_interval_s", 0.3),
@@ -2412,6 +2454,30 @@ def _validate(config: PilotConfig) -> None:
         (
             "planner.plan_validation_max_accel_m_s2",
             config.planner.plan_validation_max_accel_m_s2,
+        ),
+        (
+            "planner.plan_validation_max_acc_xy_m_s2",
+            config.planner.plan_validation_max_acc_xy_m_s2,
+        ),
+        (
+            "planner.plan_validation_max_lateral_accel_m_s2",
+            config.planner.plan_validation_max_lateral_accel_m_s2,
+        ),
+        (
+            "planner.plan_validation_max_acc_z_up_m_s2",
+            config.planner.plan_validation_max_acc_z_up_m_s2,
+        ),
+        (
+            "planner.plan_validation_max_acc_z_down_m_s2",
+            config.planner.plan_validation_max_acc_z_down_m_s2,
+        ),
+        (
+            "planner.plan_validation_max_z_overshoot_m",
+            config.planner.plan_validation_max_z_overshoot_m,
+        ),
+        (
+            "planner.plan_v_start_z_max_m_s",
+            config.planner.plan_v_start_z_max_m_s,
         ),
         (
             "perception_geometry_audit.print_period_s",

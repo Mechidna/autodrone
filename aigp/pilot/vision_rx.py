@@ -222,7 +222,6 @@ class VisionRX:
             "sim_time_ns": sim_time_ns,
             "wall_time": time.time(),
         }
-        self.frame_capture.maybe_capture(frame_data, img)
 
         lock = self.data.get("lock") if isinstance(self.data, dict) else None
 
@@ -233,3 +232,5 @@ class VisionRX:
         else:
             self.data["latest_frame"] = frame_data
             self.data["vision_frame_count"] = self.data.get("vision_frame_count", 0) + 1
+
+        self.frame_capture.maybe_capture(frame_data, img)

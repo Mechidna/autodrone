@@ -627,6 +627,24 @@ class PerceptionWrapper:
         gate_world = None if gate_world is None else self._vec3(gate_world, default=None)
         gate_world_ned = detection.get("gate_center_world_ned")
         gate_world_ned = None if gate_world_ned is None else self._vec3(gate_world_ned, default=None)
+        gate_normal_camera = self._vec3(detection.get("gate_normal_camera"), default=None)
+        gate_normal_body = self._vec3(detection.get("gate_normal_body"), default=None)
+        if gate_normal_body is None and gate_normal_camera is not None:
+            gate_normal_body = self.camera_to_body @ gate_normal_camera
+        gate_normal_body_frd = self._vec3(
+            detection.get("gate_normal_body_frd"),
+            default=gate_normal_body,
+        )
+        gate_normal_world = detection.get("gate_normal_world")
+        gate_normal_world = (
+            None if gate_normal_world is None else self._vec3(gate_normal_world, default=None)
+        )
+        gate_normal_world_ned = detection.get("gate_normal_world_ned")
+        gate_normal_world_ned = (
+            None
+            if gate_normal_world_ned is None
+            else self._vec3(gate_normal_world_ned, default=None)
+        )
         area_confidence = self._float_or_default(detection.get("confidence"), 0.0)
         yolo_confidence = self._float_or_default(
             detection.get("yolo_confidence"),
@@ -653,6 +671,11 @@ class PerceptionWrapper:
             ),
             "gate_center_world": gate_world,
             "gate_center_world_ned": gate_world_ned,
+            "gate_normal_camera": gate_normal_camera,
+            "gate_normal_body": gate_normal_body,
+            "gate_normal_body_frd": gate_normal_body_frd,
+            "gate_normal_world": gate_normal_world,
+            "gate_normal_world_ned": gate_normal_world_ned,
             "confidence": area_confidence,
             "memory_confidence": memory_confidence,
             "yolo_confidence": yolo_confidence,
