@@ -337,6 +337,8 @@ class PlannerSection:
     active_target_shift_longitudinal_filter_size: int
     active_target_shift_longitudinal_exit_shift_max_m: float
     active_target_shift_longitudinal_enter_radius_m: float
+    active_target_shift_horizon_lateral_replan_min_m: float
+    active_target_shift_horizon_total_replan_min_m: float
     race_order_front_blocker_enabled: bool
     race_order_front_blocker_margin_m: float
     race_order_front_blocker_lateral_radius_m: float
@@ -1436,6 +1438,16 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 planner_raw,
                 "active_target_shift_longitudinal_enter_radius_m",
                 0.75,
+            ),
+            active_target_shift_horizon_lateral_replan_min_m=_float(
+                planner_raw,
+                "active_target_shift_horizon_lateral_replan_min_m",
+                0.75,
+            ),
+            active_target_shift_horizon_total_replan_min_m=_float(
+                planner_raw,
+                "active_target_shift_horizon_total_replan_min_m",
+                1.25,
             ),
             race_order_front_blocker_enabled=_bool(
                 planner_raw,
