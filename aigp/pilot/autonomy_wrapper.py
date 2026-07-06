@@ -1328,6 +1328,14 @@ class PyAIPilotAutonomyAPI:
 
         return None, "missing_gate_center"
 
+    def _centerline_gate_exit_distance_m(self, exit_shift_m: float = 0.0) -> float:
+        return max(
+            float(VADR_TS_002.gate_depth_m),
+            float(self.gate_pass_through_m),
+            0.5 * float(self.gate_corridor_length_m) + float(exit_shift_m),
+            0.25,
+        )
+
     def _synthetic_centerline_gate_exit(
         self,
         horizon_idx: int,
@@ -1373,11 +1381,7 @@ class PyAIPilotAutonomyAPI:
                     else 0.0
                 )
 
-        exit_after_center_m = max(
-            float(VADR_TS_002.gate_depth_m),
-            0.5 * float(self.gate_corridor_length_m) + exit_shift_m,
-            0.25,
-        )
+        exit_after_center_m = self._centerline_gate_exit_distance_m(exit_shift_m)
         return center + normal * exit_after_center_m
 
     def _reset_reference_progress_state(self) -> None:
@@ -2003,15 +2007,113 @@ class PyAIPilotAutonomyAPI:
         is_current_target: bool = False,
     ) -> tuple[bool, str]:
         source = str(source)
-        if source == "planning_horizon_candidate" or (
-            source == "gate_horizon" and not bool(is_current_target)
-        ):
+        if source == "planning_horizon_candidate":
             return self._spline_memory_track_quality_ok(
                 track_id,
                 require_stable=True,
                 require_fresh=True,
             )
+        if source == "gate_horizon" and not bool(is_current_target):
+            return self._spline_memory_track_quality_ok(
+                track_id,
+                require_stable=False,
+                require_fresh=False,
+            )
         return True, "installed_plan"
+
+    def _shift_spline_memory_after_live_override(
+        self,
+        *,
+        gate_idx: int,
+        track_id,
+        center,
+        context: str,
+    ) -> bool:
+        try:
+            gate_idx = int(gate_idx)
+        except (TypeError, ValueError):
+            return False
+        record = self.spline_memory_by_gate_idx.pop(gate_idx, None)
+        if record is None or bool(record.get("completed", False)):
+            return False
+
+        center = self._finite_vec3_or_none(center)
+        if center is None:
+            return False
+        try:
+            memory_track_id = None if track_id is None else int(track_id)
+        except (TypeError, ValueError):
+            memory_track_id = None
+
+        max_idx = gate_idx + max(2, int(self.planning_horizon_gates) + 2)
+        if self.race_gate_count is not None:
+            max_idx = max(gate_idx + 1, int(self.race_gate_count) - 1)
+
+        for idx in range(gate_idx + 1, max_idx + 1):
+            existing = self.spline_memory_by_gate_idx.get(idx)
+            if existing is None:
+                continue
+            existing_track = existing.get("track_id")
+            try:
+                existing_track = (
+                    None if existing_track is None else int(existing_track)
+                )
+            except (TypeError, ValueError):
+                existing_track = None
+            existing_center = self._finite_vec3_or_none(existing.get("center"))
+            same_track = (
+                memory_track_id is not None
+                and existing_track is not None
+                and int(memory_track_id) == int(existing_track)
+            )
+            same_center = (
+                existing_center is not None
+                and float(np.linalg.norm(existing_center - center))
+                <= float(self.race_order_duplicate_radius_m)
+            )
+            if same_track or same_center:
+                existing["center"] = center.copy()
+                existing["track_id"] = memory_track_id
+                existing["last_used_time"] = float(time.time())
+                self._trace_spline_memory(
+                    action="shift_merge",
+                    gate_idx=int(idx),
+                    track_id=memory_track_id,
+                    center=center,
+                    context=str(context),
+                    from_gate_idx=int(gate_idx),
+                )
+                return True
+
+        carry = dict(record)
+        carry["center"] = center.copy()
+        carry["track_id"] = memory_track_id
+        carry["last_used_time"] = float(time.time())
+        for idx in range(gate_idx + 1, max_idx + 1):
+            next_record = self.spline_memory_by_gate_idx.get(idx)
+            shifted = dict(carry)
+            shifted["gate_idx"] = int(idx)
+            self.spline_memory_by_gate_idx[int(idx)] = shifted
+            self._trace_spline_memory(
+                action="shift",
+                gate_idx=int(idx),
+                track_id=shifted.get("track_id"),
+                center=shifted.get("center"),
+                context=str(context),
+                from_gate_idx=int(carry.get("gate_idx", gate_idx)),
+            )
+            if next_record is None:
+                return True
+            carry = dict(next_record)
+
+        self._trace_spline_memory(
+            action="drop_shift",
+            gate_idx=int(gate_idx),
+            track_id=memory_track_id,
+            center=center,
+            context=f"{context}:no_future_slot",
+        )
+        return False
 
     def _spline_memory_live_override(
         self,
@@ -2061,11 +2163,18 @@ class PyAIPilotAutonomyAPI:
             selected_neu=selected,
             selected_dist_m=distance,
         )
-        self._clear_spline_memory_for_gate(
-            int(gate_idx),
-            reason=f"{context}_live_override",
+        shifted = self._shift_spline_memory_after_live_override(
+            gate_idx=int(gate_idx),
             track_id=memory_track_id,
+            center=memory_target,
+            context=f"{context}:live_insert",
         )
+        if not shifted:
+            self._clear_spline_memory_for_gate(
+                int(gate_idx),
+                reason=f"{context}_live_override",
+                track_id=memory_track_id,
+            )
         return True, selected.copy(), distance
 
     def _record_spline_memory_from_active_plan(self, *, source: str) -> None:
@@ -3317,6 +3426,7 @@ class PyAIPilotAutonomyAPI:
         *,
         start: np.ndarray,
         targets,
+        gate_indices=None,
     ) -> tuple[np.ndarray, list[str]]:
         start = np.asarray(start, dtype=float).reshape(3)
         waypoints = [start.copy()]
@@ -3325,7 +3435,55 @@ class PyAIPilotAutonomyAPI:
             center = np.asarray(target, dtype=float).reshape(3)
             waypoints.append(center.copy())
             roles.append("gate_center")
+        final_exit = self._final_centerline_horizon_exit_waypoint(
+            waypoints,
+            gate_indices=gate_indices,
+        )
+        if final_exit is not None:
+            waypoints.append(final_exit)
+            roles.append("gate_exit")
         return np.vstack(waypoints), roles
+
+    def _final_centerline_horizon_exit_waypoint(
+        self,
+        waypoints: list[np.ndarray],
+        *,
+        gate_indices,
+    ) -> np.ndarray | None:
+        if not gate_indices:
+            return None
+        try:
+            last_gate_idx = int(gate_indices[-1])
+        except (TypeError, ValueError):
+            return None
+        if not self._is_final_race_gate_index(last_gate_idx):
+            return None
+        if len(waypoints) < 3:
+            return None
+
+        final_center = self._finite_vec3_or_none(waypoints[-1])
+        previous_center = self._finite_vec3_or_none(waypoints[-2])
+        if final_center is None or previous_center is None:
+            return None
+
+        axis = self._gate_corridor_axis(
+            center=final_center,
+            reference=previous_center,
+            preferred_normal=(
+                self.active_gate_normal
+                if last_gate_idx == int(self.current_gate_idx)
+                else None
+            ),
+        )
+        if axis is None:
+            return None
+        exit_after_center_m = self._centerline_gate_exit_distance_m()
+        return final_center + axis * exit_after_center_m
+
+    def _clear_rejected_path_plan_lock(self, *, reason: str) -> None:
+        self.target_manager.clear_active(reason=str(reason))
+        self._sync_target_manager_state(clear_unlocked_current=True)
+        self._reset_gate_pass_state()
 
     def _reset_deferred_longitudinal_shift(self) -> None:
         self.deferred_longitudinal_shift_gate_idx = None
@@ -3404,8 +3562,6 @@ class PyAIPilotAutonomyAPI:
         if not roles or len(roles) != len(self.active_waypoints):
             return False, "missing_roles", None, float("nan"), float("nan")
         if "gate_enter" not in roles:
-            if "gate_center" in roles and "gate_exit" in roles:
-                return True, "enter_absent_already_past", None, float("nan"), float("nan")
             if "gate_center" in roles:
                 center_idx = roles.index("gate_center")
                 if 0 <= center_idx < len(self.active_waypoints):
@@ -3425,10 +3581,20 @@ class PyAIPilotAutonomyAPI:
                         float(self.active_target_shift_longitudinal_enter_radius_m),
                         float(self.active_target_shift_near_gate_distance_m),
                     )
-                    if math.isfinite(distance_m) and distance_m <= close_radius_m:
+                    if (
+                        bool(self.gate_plane_crossed)
+                        or (
+                            math.isfinite(progress_m)
+                            and progress_m >= -float(close_radius_m)
+                        )
+                        or (
+                            math.isfinite(distance_m)
+                            and distance_m <= close_radius_m
+                        )
+                    ):
                         return (
                             True,
-                            "single_gate_close_to_center",
+                            "no_enter_near_or_past_center",
                             center,
                             distance_m,
                             progress_m,
@@ -5048,6 +5214,15 @@ class PyAIPilotAutonomyAPI:
         if target is None:
             return False
         target = self._apply_target_z_policy(target)
+        reject_reason = self._target_rejection_reason(target, target_track_id)
+        if reject_reason:
+            self._trace_target_rejection(
+                reason=reject_reason,
+                track_id=target_track_id,
+                center=target,
+                context="path_plan_selected_target",
+            )
+            return False
         target = self.target_manager.lock_target(
             gate_idx=target_idx,
             track_id=target_track_id,
@@ -5086,18 +5261,19 @@ class PyAIPilotAutonomyAPI:
                     self._build_gate_centerline_waypoints(
                         start=pos,
                         targets=targets,
+                        gate_indices=gate_indices,
                     )
                 )
                 candidate_waypoint_velocities = (
                     self._compute_passthrough_waypoint_velocities(candidate_waypoints)
                 )
                 candidate_mode = "gate_horizon"
-            elif normal is None or not allow_exit:
+            elif not allow_exit:
                 candidate_waypoints = np.vstack([pos, target])
                 candidate_waypoint_roles = ["start", "gate_center"]
                 candidate_waypoint_velocities = None
                 candidate_mode = "single_gate"
-            elif self.gate_corridor_enabled and self.gate_corridor_length_m > 0.0:
+            else:
                 candidate_waypoints, candidate_waypoint_roles = (
                     self._build_gate_corridor_waypoints(
                         start=pos,
@@ -5105,23 +5281,8 @@ class PyAIPilotAutonomyAPI:
                         preferred_normals=[normal],
                     )
                 )
-                candidate_waypoint_velocities = (
-                    self._compute_role_aware_waypoint_velocities(
-                        candidate_waypoints,
-                        candidate_waypoint_roles,
-                    )
-                )
-                candidate_mode = (
-                    "single_gate_corridor"
-                    if len(candidate_waypoints) >= 3
-                    else "single_gate"
-                )
-            else:
-                pass_through_target = target + normal * self.gate_pass_through_m
-                candidate_waypoints = np.vstack([pos, target, pass_through_target])
-                candidate_waypoint_roles = ["start", "gate_center", "gate_exit"]
                 candidate_waypoint_velocities = None
-                candidate_mode = "single_gate_exit"
+                candidate_mode = "single_gate_corridor"
             candidate_times = allocate_segment_times(
                 candidate_waypoints,
                 current_vel=vel,
@@ -5158,6 +5319,7 @@ class PyAIPilotAutonomyAPI:
                 ],
                 "horizon_track_ids": list(track_ids),
                 "horizon_gate_indices": list(gate_indices),
+                "prevalidation_details": None,
             }
 
         candidate = build_candidate(
@@ -5165,14 +5327,18 @@ class PyAIPilotAutonomyAPI:
             horizon_track_ids,
             horizon_gate_indices,
         )
-        valid_plan, validation_details = self._validate_active_gate_plan_crossing(
-            planner=candidate["planner"],
-            target=target,
-            normal=normal,
-            plan_mode=candidate["mode"],
-            gate_idx=target_idx,
-            track_id=target_track_id,
-        )
+        if candidate.get("prevalidation_details") is not None:
+            valid_plan = False
+            validation_details = candidate["prevalidation_details"]
+        else:
+            valid_plan, validation_details = self._validate_active_gate_plan_crossing(
+                planner=candidate["planner"],
+                target=target,
+                normal=normal,
+                plan_mode=candidate["mode"],
+                gate_idx=target_idx,
+                track_id=target_track_id,
+            )
 
         def retry_candidate_with_slower_timing(candidate, validation_details):
             initial_scale = self._plan_validation_retry_scale(validation_details)
@@ -5239,14 +5405,20 @@ class PyAIPilotAutonomyAPI:
                 [target_track_id],
                 [target_idx],
             )
-            fallback_valid, fallback_details = self._validate_active_gate_plan_crossing(
-                planner=fallback_candidate["planner"],
-                target=target,
-                normal=normal,
-                plan_mode=fallback_candidate["mode"],
-                gate_idx=target_idx,
-                track_id=target_track_id,
-            )
+            if fallback_candidate.get("prevalidation_details") is not None:
+                fallback_valid = False
+                fallback_details = fallback_candidate["prevalidation_details"]
+            else:
+                fallback_valid, fallback_details = (
+                    self._validate_active_gate_plan_crossing(
+                        planner=fallback_candidate["planner"],
+                        target=target,
+                        normal=normal,
+                        plan_mode=fallback_candidate["mode"],
+                        gate_idx=target_idx,
+                        track_id=target_track_id,
+                    )
+                )
             if not fallback_valid:
                 fallback_candidate, fallback_valid, fallback_details = (
                     retry_candidate_with_slower_timing(
