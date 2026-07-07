@@ -37,6 +37,29 @@ GATE_YAWS_RAD_GAZEBO = (
 )
 INNER_OPENING_M = 1.5
 OUTER_GATE_M = 2.7
+GATE_DEPTH_M = 0.260
+GATE_EXIT_FACE_OFFSET_M = GATE_DEPTH_M * 0.5
+SELF_OCCLUSION_ENDPOINT_CLEARANCE_M = 0.02
+KEYPOINT_LAYOUT_INNER4 = "inner4"
+KEYPOINT_LAYOUT_INNER4_OUTER4 = "inner4_outer4"
+KEYPOINT_LAYOUT_CHOICES = (KEYPOINT_LAYOUT_INNER4, KEYPOINT_LAYOUT_INNER4_OUTER4)
+KEYPOINT_LAYOUT_FLIP_IDX = {
+    KEYPOINT_LAYOUT_INNER4: (1, 0, 3, 2),
+    KEYPOINT_LAYOUT_INNER4_OUTER4: (1, 0, 3, 2, 5, 4, 7, 6),
+}
+KEYPOINT_LAYOUT_NAMES = {
+    KEYPOINT_LAYOUT_INNER4: ("TL", "TR", "BR", "BL"),
+    KEYPOINT_LAYOUT_INNER4_OUTER4: (
+        "I-TL",
+        "I-TR",
+        "I-BR",
+        "I-BL",
+        "O-TL",
+        "O-TR",
+        "O-BR",
+        "O-BL",
+    ),
+}
 GATE_CENTER_Z_OFFSET_M = 1.35
 SDF_GATE_YAW_OFFSET_RAD = np.pi / 2.0
 MIN_PARTIAL_BBOX_AREA_PX2 = 64.0
@@ -303,19 +326,30 @@ def quaternion_to_rotmat(quat_xyzw) -> np.ndarray:
     ], dtype=float)
 
 
+def gate_axes_world(gate_yaw_rad: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return right, up, and exit-normal axes for the SDF gate model."""
+    right = np.array([np.cos(gate_yaw_rad), np.sin(gate_yaw_rad), 0.0], dtype=float)
+    up = np.array([0.0, 0.0, 1.0], dtype=float)
+    # The SDF gate boxes use local X as the 0.260 m depth and local +Y as the
+    # opening-width axis. gate_yaw_rad is the world yaw of local +Y, so local +X
+    # is right x up. In the generated race worlds, local +X is the exit face.
+    exit_normal = np.cross(right, up)
+    exit_normal /= np.linalg.norm(exit_normal) + 1e-12
+    return right, up, exit_normal
+
+
 def gate_inner_corners_world(center_world: np.ndarray, gate_yaw_rad: float) -> np.ndarray:
     center_world = np.asarray(center_world, dtype=float).reshape(3)
     half = INNER_OPENING_M / 2.0
 
-    # yaw=0 means the gate plane is vertical with normal along +world Y.
-    right = np.array([np.cos(gate_yaw_rad), np.sin(gate_yaw_rad), 0.0], dtype=float)
-    up = np.array([0.0, 0.0, 1.0], dtype=float)
+    right, up, exit_normal = gate_axes_world(gate_yaw_rad)
+    face_center_world = center_world + GATE_EXIT_FACE_OFFSET_M * exit_normal
 
     return np.array([
-        center_world - half * right + half * up,  # TL
-        center_world + half * right + half * up,  # TR
-        center_world + half * right - half * up,  # BR
-        center_world - half * right - half * up,  # BL
+        face_center_world - half * right + half * up,  # TL
+        face_center_world + half * right + half * up,  # TR
+        face_center_world + half * right - half * up,  # BR
+        face_center_world - half * right - half * up,  # BL
     ], dtype=float)
 
 
@@ -323,14 +357,16 @@ def gate_outer_corners_world(center_world: np.ndarray, gate_yaw_rad: float) -> n
     center_world = np.asarray(center_world, dtype=float).reshape(3)
     half = OUTER_GATE_M / 2.0
 
-    right = np.array([np.cos(gate_yaw_rad), np.sin(gate_yaw_rad), 0.0], dtype=float)
-    up = np.array([0.0, 0.0, 1.0], dtype=float)
+    right, up, exit_normal = gate_axes_world(gate_yaw_rad)
+    # Outer exit-face corners are usually hidden from the drone by the near
+    # frame, so label the visible entry face for the outer silhouette.
+    face_center_world = center_world - GATE_EXIT_FACE_OFFSET_M * exit_normal
 
     return np.array([
-        center_world - half * right + half * up,  # TL
-        center_world + half * right + half * up,  # TR
-        center_world + half * right - half * up,  # BR
-        center_world - half * right - half * up,  # BL
+        face_center_world - half * right + half * up,  # TL
+        face_center_world + half * right + half * up,  # TR
+        face_center_world + half * right - half * up,  # BR
+        face_center_world - half * right - half * up,  # BL
     ], dtype=float)
 
 
@@ -569,6 +605,73 @@ def keypoint_gate_occlusion(
     return occluded, occluder_names
 
 
+def keypoint_same_gate_occlusion(
+    camera_pos_world,
+    keypoints_world,
+    *,
+    target_gate_idx: int,
+    gate_occluders,
+    padding_m: float = GATE_OCCLUSION_PADDING_M,
+    endpoint_clearance_m: float = SELF_OCCLUSION_ENDPOINT_CLEARANCE_M,
+) -> tuple[np.ndarray, list[str]]:
+    keypoints_world = np.asarray(keypoints_world, dtype=float).reshape(-1, 3)
+    camera_pos_world = np.asarray(camera_pos_world, dtype=float).reshape(3)
+    occluded = np.zeros(len(keypoints_world), dtype=bool)
+    occluder_names = [""] * len(keypoints_world)
+
+    gate_occluders = tuple(gate_occluders or ())
+    target_gate_idx = int(target_gate_idx)
+    if target_gate_idx < 0 or target_gate_idx >= len(gate_occluders):
+        return occluded, occluder_names
+
+    boxes = tuple(gate_occluders[target_gate_idx])
+    endpoint_clearance_m = max(0.0, float(endpoint_clearance_m))
+    for point_idx, keypoint_world in enumerate(keypoints_world):
+        segment_length = float(np.linalg.norm(keypoint_world - camera_pos_world))
+        if segment_length <= endpoint_clearance_m:
+            continue
+        t_max = 1.0 - endpoint_clearance_m / segment_length
+        t_max = min(1.0 - 1e-5, max(0.0, t_max))
+        for box in boxes:
+            if segment_intersects_obb(
+                camera_pos_world,
+                keypoint_world,
+                box,
+                padding_m=padding_m,
+                t_max=t_max,
+            ):
+                occluded[point_idx] = True
+                box_name = str(box.get("name", f"gate_{target_gate_idx}"))
+                occluder_names[point_idx] = f"self:{box_name}"
+                break
+
+    return occluded, occluder_names
+
+
+def merge_keypoint_occlusions(
+    primary_occluded,
+    primary_occluder_names,
+    secondary_occluded,
+    secondary_occluder_names,
+) -> tuple[np.ndarray, list[str]]:
+    primary_occluded = np.asarray(primary_occluded, dtype=bool).reshape(-1)
+    secondary_occluded = np.asarray(secondary_occluded, dtype=bool).reshape(-1)
+    if primary_occluded.shape != secondary_occluded.shape:
+        raise ValueError(
+            "Occlusion masks must have the same shape: "
+            f"{primary_occluded.shape} != {secondary_occluded.shape}"
+        )
+
+    occluded = primary_occluded | secondary_occluded
+    occluder_names = list(primary_occluder_names)
+    if len(occluder_names) != len(occluded):
+        occluder_names = [""] * len(occluded)
+    for idx, is_secondary_only in enumerate(secondary_occluded & ~primary_occluded):
+        if is_secondary_only:
+            occluder_names[idx] = str(secondary_occluder_names[idx])
+    return occluded, occluder_names
+
+
 def project_camera_points(points_camera, camera_matrix, dist_coeffs):
     points_camera = np.asarray(points_camera, dtype=float).reshape(-1, 3)
     camera_matrix = np.asarray(camera_matrix, dtype=float).reshape(3, 3)
@@ -668,6 +771,19 @@ def bbox_corners_from_points(points_image):
     )
 
 
+def normalize_keypoint_layout(value):
+    layout = str(value or KEYPOINT_LAYOUT_INNER4).strip().lower()
+    if layout not in KEYPOINT_LAYOUT_CHOICES:
+        raise ValueError(
+            f"Unsupported keypoint layout {value!r}; use one of {KEYPOINT_LAYOUT_CHOICES}."
+        )
+    return layout
+
+
+def keypoint_layout_count(keypoint_layout):
+    return len(KEYPOINT_LAYOUT_FLIP_IDX[normalize_keypoint_layout(keypoint_layout)])
+
+
 def yolo_pose_line(
     bbox_points_image,
     keypoints_image,
@@ -677,8 +793,13 @@ def yolo_pose_line(
     class_id=0,
 ):
     bbox_points_image = np.asarray(bbox_points_image, dtype=float).reshape(-1, 2)
-    keypoints_image = np.asarray(keypoints_image, dtype=float).reshape(4, 2)
-    raw_visibility = np.asarray(keypoint_visibility).reshape(4)
+    keypoints_image = np.asarray(keypoints_image, dtype=float).reshape(-1, 2)
+    raw_visibility = np.asarray(keypoint_visibility).reshape(-1)
+    if raw_visibility.shape[0] != keypoints_image.shape[0]:
+        raise ValueError(
+            "keypoint_visibility count must match keypoints_image count: "
+            f"{raw_visibility.shape[0]} != {keypoints_image.shape[0]}"
+        )
     if raw_visibility.dtype == np.bool_:
         keypoint_visibility = np.where(raw_visibility, 2, 0).astype(int)
     else:
@@ -743,7 +864,6 @@ def draw_preview(image, labels):
     preview = image.copy()
     outer_colors = ((0, 180, 255), (255, 128, 0), (0, 128, 255))
     inner_colors = ((0, 255, 0), (255, 0, 0), (0, 255, 255))
-    names = ("TL", "TR", "BR", "BL")
 
     for label in labels:
         gate_idx = label["gate_idx"]
@@ -751,7 +871,7 @@ def draw_preview(image, labels):
         keypoints = label["keypoints_image"]
         raw_visibility = np.asarray(
             label.get("keypoint_yolo_visibility", label["keypoint_visibility"])
-        ).reshape(4)
+        ).reshape(-1)
         if raw_visibility.dtype == np.bool_:
             keypoint_visibility = np.where(raw_visibility, 2, 0).astype(int)
         else:
@@ -763,15 +883,22 @@ def draw_preview(image, labels):
         keypoint_pts = np.round(keypoints).astype(int).reshape(-1, 2)
 
         cv2.polylines(preview, [bbox_pts], isClosed=True, color=outer_color, thickness=2)
-        visible_points = keypoint_pts[keypoint_visibility == 2]
-        if len(visible_points) == 4:
-            cv2.polylines(preview, [visible_points], isClosed=True, color=inner_color, thickness=2)
+        if len(keypoint_pts) >= 4 and np.all(keypoint_visibility[:4] == 2):
+            cv2.polylines(preview, [keypoint_pts[:4]], isClosed=True, color=inner_color, thickness=2)
+        if len(keypoint_pts) >= 8 and np.all(keypoint_visibility[4:8] == 2):
+            cv2.polylines(preview, [keypoint_pts[4:8]], isClosed=True, color=outer_color, thickness=2)
+        names = KEYPOINT_LAYOUT_NAMES.get(
+            KEYPOINT_LAYOUT_INNER4_OUTER4 if len(keypoint_pts) >= 8 else KEYPOINT_LAYOUT_INNER4,
+            tuple(f"KP{idx}" for idx in range(len(keypoint_pts))),
+        )
         for point_idx, (x, y) in enumerate(keypoint_pts):
+            point_color = inner_color if point_idx < 4 else outer_color
+            point_name = names[point_idx] if point_idx < len(names) else f"KP{point_idx}"
             if keypoint_visibility[point_idx] == 2:
-                cv2.circle(preview, (int(x), int(y)), 4, inner_color, -1)
+                cv2.circle(preview, (int(x), int(y)), 4, point_color, -1)
                 marker = ""
                 text_origin = (int(x) + 4, int(y) - 4)
-                text_color = inner_color
+                text_color = point_color
             elif keypoint_visibility[point_idx] == 1:
                 cv2.drawMarker(
                     preview,
@@ -799,7 +926,7 @@ def draw_preview(image, labels):
                 text_color = (0, 0, 255)
             cv2.putText(
                 preview,
-                f"g{gate_idx}:{names[point_idx]}{marker}",
+                f"g{gate_idx}:{point_name}{marker}",
                 text_origin,
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.4,
@@ -874,14 +1001,17 @@ def ensure_output_dirs(output_root, draw_preview_enabled):
         (output_root / "previews").mkdir(parents=True, exist_ok=True)
 
 
-def write_yaml(output_root):
+def write_yaml(output_root, keypoint_layout=KEYPOINT_LAYOUT_INNER4):
+    keypoint_layout = normalize_keypoint_layout(keypoint_layout)
+    keypoint_count = keypoint_layout_count(keypoint_layout)
+    flip_idx = ", ".join(str(index) for index in KEYPOINT_LAYOUT_FLIP_IDX[keypoint_layout])
     yaml_path = output_root / "gate_pose.yaml"
     with open(yaml_path, "w", encoding="utf-8") as f:
         f.write(f"path: {output_root}\n")
         f.write("train: images/train\n")
         f.write("val: images/val\n")
-        f.write("kpt_shape: [4, 3]\n")
-        f.write("flip_idx: [1, 0, 3, 2]\n")
+        f.write(f"kpt_shape: [{keypoint_count}, 3]\n")
+        f.write(f"flip_idx: [{flip_idx}]\n")
         f.write("names:\n")
         f.write("  0: gate\n")
     return yaml_path
@@ -1020,6 +1150,7 @@ def build_labels(
     label_all_visible_gates=False,
     allow_partial_gates=False,
     min_partial_bbox_area_px2=MIN_PARTIAL_BBOX_AREA_PX2,
+    keypoint_layout=KEYPOINT_LAYOUT_INNER4,
     order_image_corners=True,
     gazebo_rotation_mode="direct",
     gazebo_optical_mode="current",
@@ -1029,6 +1160,8 @@ def build_labels(
     max_gate_label_distance_m=DEFAULT_MAX_GATE_LABEL_DISTANCE_M,
     debug=False,
 ):
+    keypoint_layout = normalize_keypoint_layout(keypoint_layout)
+    keypoint_count = keypoint_layout_count(keypoint_layout)
     width = int(metadata["image_width"])
     height = int(metadata["image_height"])
     labels = []
@@ -1056,6 +1189,7 @@ def build_labels(
         inner_corners_world = gate_inner_corners_world(center_world, yaw)
         outer_corners_world = gate_outer_corners_world(center_world, yaw)
         points_body = None
+        outer_points_body = None
         if metadata_has_gazebo_pose(metadata):
             points_body = gazebo_world_to_camera_body(
                 inner_corners_world,
@@ -1094,11 +1228,11 @@ def build_labels(
         accepted = True
         reason = ""
         rejected_partial_reason = ""
-        keypoints_image = np.full((4, 2), np.nan, dtype=float)
-        projected_keypoints_clipped = np.full((4, 2), np.nan, dtype=float)
-        keypoint_yolo_visibility = np.zeros(4, dtype=int)
-        keypoint_occluded = np.zeros(4, dtype=bool)
-        keypoint_occluders = [""] * 4
+        keypoints_image = np.full((keypoint_count, 2), np.nan, dtype=float)
+        projected_keypoints_clipped = np.full((keypoint_count, 2), np.nan, dtype=float)
+        keypoint_yolo_visibility = np.zeros(keypoint_count, dtype=int)
+        keypoint_occluded = np.zeros(keypoint_count, dtype=bool)
+        keypoint_occluders = [""] * keypoint_count
         labeled_keypoint_count = 0
         visible_keypoint_count = 0
         occluded_keypoint_count = 0
@@ -1116,7 +1250,7 @@ def build_labels(
             accepted = False
             reason = "outer_corner_behind_camera"
         else:
-            keypoints_image = project_camera_points(
+            inner_keypoints_image = project_camera_points(
                 inner_corners_camera,
                 metadata["camera_matrix"],
                 metadata["dist_coeffs"],
@@ -1126,44 +1260,115 @@ def build_labels(
                 metadata["camera_matrix"],
                 metadata["dist_coeffs"],
             )
+            outer_keypoints_image = bbox_points_image.copy()
             if order_image_corners:
-                corner_order = order_points_tl_tr_br_bl_indices(keypoints_image)
-                keypoints_image = keypoints_image[corner_order]
+                corner_order = order_points_tl_tr_br_bl_indices(inner_keypoints_image)
+                inner_keypoints_image = inner_keypoints_image[corner_order]
                 inner_corners_world = inner_corners_world[corner_order]
                 inner_corners_camera = inner_corners_camera[corner_order]
                 if points_body is not None:
                     points_body = points_body[corner_order]
                 outer_corner_order = order_points_tl_tr_br_bl_indices(bbox_points_image)
                 bbox_points_image = bbox_points_image[outer_corner_order]
+                outer_keypoints_image = outer_keypoints_image[outer_corner_order]
+                outer_corners_world = outer_corners_world[outer_corner_order]
                 outer_corners_camera = outer_corners_camera[outer_corner_order]
+                if outer_points_body is not None:
+                    outer_points_body = outer_points_body[outer_corner_order]
 
-            keypoint_labeled = points_inside_image(keypoints_image, width, height)
-            keypoint_labeled &= np.asarray(inner_corners_camera[:, 2] > 0.0, dtype=bool)
-            projected_keypoints_clipped = np.column_stack(
+            inner_keypoint_labeled = points_inside_image(inner_keypoints_image, width, height)
+            inner_keypoint_labeled &= np.asarray(inner_corners_camera[:, 2] > 0.0, dtype=bool)
+            outer_keypoint_labeled = points_inside_image(outer_keypoints_image, width, height)
+            outer_keypoint_labeled &= np.asarray(outer_corners_camera[:, 2] > 0.0, dtype=bool)
+
+            inner_projected_clipped = np.column_stack(
                 [
-                    np.clip(keypoints_image[:, 0], 0.0, float(width - 1)),
-                    np.clip(keypoints_image[:, 1], 0.0, float(height - 1)),
+                    np.clip(inner_keypoints_image[:, 0], 0.0, float(width - 1)),
+                    np.clip(inner_keypoints_image[:, 1], 0.0, float(height - 1)),
                 ]
             )
+            outer_projected_clipped = np.column_stack(
+                [
+                    np.clip(outer_keypoints_image[:, 0], 0.0, float(width - 1)),
+                    np.clip(outer_keypoints_image[:, 1], 0.0, float(height - 1)),
+                ]
+            )
+            inner_keypoint_occluded = np.zeros(4, dtype=bool)
+            outer_keypoint_occluded = np.zeros(4, dtype=bool)
+            inner_keypoint_occluders = [""] * 4
+            outer_keypoint_occluders = [""] * 4
             if use_gate_occlusion and camera_pos_world is not None:
-                keypoint_occluded, keypoint_occluders = keypoint_gate_occlusion(
+                inner_other_occluded, inner_other_occluders = keypoint_gate_occlusion(
                     camera_pos_world,
                     inner_corners_world,
                     target_gate_idx=gate_idx,
                     gate_occluders=gate_occluders,
                     padding_m=gate_occlusion_padding_m,
                 )
-                keypoint_occluded &= keypoint_labeled
+                inner_self_occluded, inner_self_occluders = keypoint_same_gate_occlusion(
+                    camera_pos_world,
+                    inner_corners_world,
+                    target_gate_idx=gate_idx,
+                    gate_occluders=gate_occluders,
+                    padding_m=gate_occlusion_padding_m,
+                )
+                inner_keypoint_occluded, inner_keypoint_occluders = merge_keypoint_occlusions(
+                    inner_other_occluded,
+                    inner_other_occluders,
+                    inner_self_occluded,
+                    inner_self_occluders,
+                )
+                inner_keypoint_occluded &= inner_keypoint_labeled
+                outer_other_occluded, outer_other_occluders = keypoint_gate_occlusion(
+                    camera_pos_world,
+                    outer_corners_world,
+                    target_gate_idx=gate_idx,
+                    gate_occluders=gate_occluders,
+                    padding_m=gate_occlusion_padding_m,
+                )
+                outer_self_occluded, outer_self_occluders = keypoint_same_gate_occlusion(
+                    camera_pos_world,
+                    outer_corners_world,
+                    target_gate_idx=gate_idx,
+                    gate_occluders=gate_occluders,
+                    padding_m=gate_occlusion_padding_m,
+                )
+                outer_keypoint_occluded, outer_keypoint_occluders = merge_keypoint_occlusions(
+                    outer_other_occluded,
+                    outer_other_occluders,
+                    outer_self_occluded,
+                    outer_self_occluders,
+                )
+                outer_keypoint_occluded &= outer_keypoint_labeled
 
-            keypoint_yolo_visibility = np.zeros(4, dtype=int)
-            keypoint_yolo_visibility[keypoint_labeled & keypoint_occluded] = 1
-            keypoint_yolo_visibility[keypoint_labeled & ~keypoint_occluded] = 2
+            inner_visibility = np.zeros(4, dtype=int)
+            inner_visibility[inner_keypoint_labeled & inner_keypoint_occluded] = 1
+            inner_visibility[inner_keypoint_labeled & ~inner_keypoint_occluded] = 2
+            outer_visibility = np.zeros(4, dtype=int)
+            outer_visibility[outer_keypoint_labeled & outer_keypoint_occluded] = 1
+            outer_visibility[outer_keypoint_labeled & ~outer_keypoint_occluded] = 2
+            if keypoint_layout == KEYPOINT_LAYOUT_INNER4:
+                keypoints_image = inner_keypoints_image
+                projected_keypoints_clipped = inner_projected_clipped
+                keypoint_yolo_visibility = inner_visibility
+                keypoint_occluded = inner_keypoint_occluded
+                keypoint_occluders = inner_keypoint_occluders
+            else:
+                keypoints_image = np.vstack([inner_keypoints_image, outer_keypoints_image])
+                projected_keypoints_clipped = np.vstack(
+                    [inner_projected_clipped, outer_projected_clipped]
+                )
+                keypoint_yolo_visibility = np.concatenate([inner_visibility, outer_visibility])
+                keypoint_occluded = np.concatenate(
+                    [inner_keypoint_occluded, outer_keypoint_occluded]
+                )
+                keypoint_occluders = inner_keypoint_occluders + outer_keypoint_occluders
             labeled_keypoint_count = int(np.sum(keypoint_yolo_visibility > 0))
             visible_keypoint_count = int(np.sum(keypoint_yolo_visibility == 2))
             occluded_keypoint_count = int(np.sum(keypoint_yolo_visibility == 1))
 
             if allow_partial_gates:
-                partial_gate_label = labeled_keypoint_count < 4
+                partial_gate_label = labeled_keypoint_count < keypoint_count
                 if labeled_keypoint_count < 2:
                     accepted = False
                     reason = "fewer_than_2_labeled_keypoints"
@@ -1203,6 +1408,7 @@ def build_labels(
                     bbox_clipped = np.array([x_min, y_min, x_max, y_max], dtype=float)
 
         candidate = {
+            "keypoint_layout": keypoint_layout,
             "gate_idx": gate_idx,
             "gate_id": gate_idx,
             "race_order": gate_idx,
@@ -1234,6 +1440,7 @@ def build_labels(
 
         if accepted:
             labels.append({
+                "keypoint_layout": keypoint_layout,
                 "gate_idx": gate_idx,
                 "gate_id": gate_idx,
                 "race_order": gate_idx,
@@ -1296,6 +1503,7 @@ def diagnostic_row(
         "image_filename": frame_name,
         "source_image_filename": source_image_filename or frame_name,
         "gate_geometry_source": gate_geometry_source,
+        "keypoint_layout": candidate.get("keypoint_layout", KEYPOINT_LAYOUT_INNER4),
         "gate_id": candidate["gate_id"],
         "race_order": candidate["race_order"],
         "accepted": bool(candidate["accepted"]),
@@ -1421,7 +1629,7 @@ def process_dataset(args):
 
     if not args.preview_only:
         ensure_output_dirs(output_root, args.draw_preview)
-        yaml_path = write_yaml(output_root)
+        yaml_path = write_yaml(output_root, keypoint_layout=args.keypoint_layout)
     elif args.draw_preview:
         (output_root / "previews").mkdir(parents=True, exist_ok=True)
         yaml_path = None
@@ -1475,6 +1683,7 @@ def process_dataset(args):
                 label_all_visible_gates=args.label_all_visible_gates,
                 allow_partial_gates=args.allow_partial_gates,
                 min_partial_bbox_area_px2=args.min_partial_bbox_area_px2,
+                keypoint_layout=args.keypoint_layout,
                 order_image_corners=not args.no_image_order_corners,
                 gazebo_rotation_mode=args.gazebo_rotation_mode,
                 gazebo_optical_mode=args.gazebo_optical_mode,
@@ -1563,6 +1772,7 @@ def process_dataset(args):
         "image_filename",
         "source_image_filename",
         "gate_geometry_source",
+        "keypoint_layout",
         "gate_id",
         "race_order",
         "accepted",
@@ -1647,9 +1857,19 @@ def parse_args():
     parser.add_argument("--max-preview", type=int, default=50)
     parser.add_argument("--label-all-visible-gates", action="store_true")
     parser.add_argument(
+        "--keypoint-layout",
+        choices=KEYPOINT_LAYOUT_CHOICES,
+        default=KEYPOINT_LAYOUT_INNER4,
+        help=(
+            "YOLO pose keypoint layout. inner4 keeps the existing inner-opening "
+            "TL/TR/BR/BL labels. inner4_outer4 appends outer-frame TL/TR/BR/BL "
+            "for 8-keypoint training."
+        ),
+    )
+    parser.add_argument(
         "--allow-partial-gates",
         action="store_true",
-        help="Label gates with at least two labeled inner keypoints using 0 0 0 for missing points.",
+        help="Label gates with at least two labeled layout keypoints using 0 0 0 for missing points.",
     )
     parser.add_argument(
         "--min-partial-bbox-area-px2",
@@ -1668,13 +1888,16 @@ def parse_args():
     parser.add_argument(
         "--disable-gate-occlusion",
         action="store_true",
-        help="Do not mark keypoints occluded by other gate frame boxes.",
+        help="Do not mark keypoints occluded by same-gate or other-gate frame boxes.",
     )
     parser.add_argument(
         "--gate-occlusion-padding-m",
         type=float,
         default=GATE_OCCLUSION_PADDING_M,
-        help="Optional padding added to gate frame boxes during occlusion ray tests.",
+        help=(
+            "Optional padding added to gate frame boxes during same-gate and "
+            "other-gate occlusion ray tests."
+        ),
     )
     parser.add_argument("--no-image-order-corners", action="store_true")
     parser.add_argument(

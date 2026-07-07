@@ -441,17 +441,41 @@ python3 ./aigp/tools/capture_gazebo_yolo_pose.py \
   --allow-pose-fallback
 ```
 
-Autolabel captures:
+Autolabel captures for the 8-keypoint training dataset:
 
 ```bash
 python3 ./autonomy_core/tools/autolabel_gazebo_yolo_pose.py \
   --capture-root ~/datasets/gazebo_gate_capture_racer \
-  --output-root ~/datasets/gazebo_gate_yolo_pose_racer \
+  --output-root ~/datasets/gazebo_gate_yolo_pose_racer_8k \
+  --keypoint-layout inner4_outer4 \
   --allow-partial-gates \
   --label-all-visible-gates \
   --draw-preview \
   --gazebo-rotation-mode transpose \
   --gazebo-optical-mode physical_minus_y
+```
+
+The generated `gate_pose.yaml` will use `kpt_shape: [8, 3]` with keypoints
+ordered as inner TL/TR/BR/BL followed by outer TL/TR/BR/BL. The inner keypoints
+are projected on the gate exit face, 0.130 m downstream from the SDF gate center
+plane. The outer keypoints are projected on the entry/visible face, 0.130 m
+upstream, so they stay on the visible frame silhouette. Omit
+`--keypoint-layout inner4_outer4` to keep generating the existing 4-keypoint
+inner-corner dataset, also on the exit face. Keypoints hidden by the same gate's
+own frame or by another gate frame are kept labeled with YOLO visibility `1`.
+
+Train the 8-keypoint model:
+
+```bash
+yolo pose train \
+  model=/home/paolo/datasets/drone-racing-dataset/yolo11n-pose.pt \
+  data=/home/paolo/datasets/gazebo_gate_yolo_pose_racer_8k/gate_pose.yaml \
+  epochs=100 \
+  batch=16 \
+  imgsz=640 \
+  device=0 \
+  project=/home/paolo/datasets/gazebo_gate_yolo_pose_racer_8k_runs \
+  name=inner4_outer4
 ```
 
 Randomize a world:
