@@ -478,6 +478,12 @@ yolo pose train \
   name=inner4_outer4
 ```
 
+To run the 8-keypoint perception/PnP path after training, set
+`perception.yolo_model_path` in `aigp/config/runtime.toml` to the new
+`.../weights/best.pt` and set `perception.yolo_keypoint_layout =
+"inner4_outer4"`. Use `yolo_keypoint_layout = "inner4"` with the existing
+4-keypoint model.
+
 Randomize a world:
 
 ```bash

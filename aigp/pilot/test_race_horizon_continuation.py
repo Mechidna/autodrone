@@ -1,5 +1,6 @@
 import math
 import time
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -15,6 +16,7 @@ def _stable_track(
     score: float = 0.8,
     committed: bool = True,
     stable: bool = True,
+    last_observation_outlier: bool = False,
 ):
     center = np.asarray(center, dtype=float)
     now = time.time()
@@ -44,6 +46,7 @@ def _stable_track(
             keypoint_conf_min=1.0,
             keypoint_conf_mean=1.0,
             quality_ok=True,
+            is_outlier=bool(last_observation_outlier),
         )
     ]
     return track
@@ -113,6 +116,53 @@ def test_gate_pass_advances_inside_existing_horizon():
     assert api.target_manager.locked
     assert api.active_target_track_id == -2
     np.testing.assert_allclose(api.current_gate_pos, np.array([0.0, 20.0, 1.5]))
+
+
+def test_gate_pass_replans_stale_horizon_suffix_to_live_target(capsys):
+    api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=3)
+    api.horizon_continuation_enabled = True
+    api.gate_corridor_enabled = True
+    api.gate_corridor_length_m = 3.0
+    api.replan_target_shift_m = 1.0
+    api.gate_centers_neu = [
+        np.array([0.0, 10.0, 1.5]),
+        np.array([0.0, 30.0, 1.5]),
+    ]
+    api.gate_track_ids = [10, 20]
+    api.gate_memory.tracks = [
+        _stable_track(20, np.array([0.0, 20.0, 1.5]), hits=20),
+    ]
+    api.current_gate_idx = 0
+
+    planned = api._path_plan(
+        pos=np.array([0.0, 0.0, 1.5]),
+        vel=np.zeros(3),
+    )
+
+    assert planned
+    assert api.active_plan_mode == "gate_horizon"
+    assert api.active_horizon_gate_indices == [0, 1]
+    np.testing.assert_allclose(api.active_horizon_targets[1], [0.0, 30.0, 1.5])
+    old_generation = api.active_plan_generation
+
+    advanced = api._advance_gate_if_needed(
+        np.array([0.0, 11.6, 1.5]),
+        vel=np.array([0.0, 2.0, 0.0]),
+    )
+
+    assert advanced
+    assert api.current_gate_idx == 1
+    assert api.active_plan_generation > old_generation
+    assert api.active_plan_mode == "single_gate_corridor"
+    assert api.active_horizon_gate_indices == [1]
+    assert api.active_horizon_track_ids == [20]
+    np.testing.assert_allclose(api.current_gate_pos, [0.0, 20.0, 1.5])
+    np.testing.assert_allclose(api.active_waypoints[0], [0.0, 11.6, 1.5])
+    assert np.max(api.active_waypoints[:, 1]) < 25.0
+
+    output = capsys.readouterr().out
+    assert "horizon_continue_after_pass mode=replan_suffix" in output
+    assert "post_gate_fallback_plan" in output
 
 
 def test_single_gate_corridor_preserves_exit_segment_after_pass():
@@ -188,7 +238,7 @@ def test_expired_exit_tail_soft_passes_after_center_crossing_near_exit():
     assert -1 in api.completed_track_ids
 
 
-def test_expired_exit_tail_blocks_same_gate_replan_until_exit_is_reached():
+def test_expired_exit_tail_center_clearance_advances_gate():
     api = PyAIPilotAutonomyAPI(use_perception=False, race_gate_count=2)
     api.replan_after_trajectory_s = 0.0
     api.replan_min_interval_s = 0.0
@@ -220,8 +270,45 @@ def test_expired_exit_tail_blocks_same_gate_replan_until_exit_is_reached():
         np.array([0.0, 0.3, 0.0]),
     )
 
+    assert advanced
+    assert should_plan
+    assert api.current_gate_idx == 1
+
+
+def test_expired_exit_tail_allows_replan_when_not_clear_enough_to_pass():
+    api = PyAIPilotAutonomyAPI(use_perception=False, race_gate_count=2)
+    api.replan_after_trajectory_s = 0.0
+    api.replan_min_interval_s = 0.0
+    api.current_gate_idx = 0
+    api.current_gate_pos = np.array([0.0, 10.0, 1.5])
+    api.active_target_track_id = -1
+    api.active_gate_normal = np.array([0.0, 1.0, 0.0])
+    api.previous_gate_pass_position = np.array([0.0, 10.2, 1.5])
+    api.gate_plane_crossed = True
+    api.active_waypoints = np.vstack(
+        [
+            np.array([0.0, 0.0, 1.5]),
+            np.array([0.0, 10.0, 1.5]),
+            np.array([0.0, 13.0, 1.5]),
+        ]
+    )
+    api.active_waypoint_roles = ["start", "gate_center", "gate_exit"]
+    api.active_horizon_gate_indices = [0]
+    api.active_plan_mode = "single_gate_corridor"
+    api.last_planned_gate_idx = 0
+    api.planner.total_time = 1.0
+    api.trajectory_start_time = time.time() - 2.0
+    pos = np.array([0.0, 10.4, 1.5])
+
+    advanced = api._advance_gate_if_needed(pos)
+    should_plan = api._should_plan(
+        advanced,
+        pos,
+        np.array([0.0, 0.3, 0.0]),
+    )
+
     assert not advanced
-    assert not should_plan
+    assert should_plan
     assert api.current_gate_idx == 0
     assert api._last_exit_tail_hold_signature is not None
 
@@ -433,6 +520,54 @@ def test_race_order_prunes_stale_duplicate_suffix_before_gate_count_cap():
     gates, track_ids = api._ordered_perception_gates(committed_by_id)
     assert track_ids[api.current_gate_idx + 1] == 225
     np.testing.assert_allclose(gates[api.current_gate_idx + 1], final_gate.filtered_center_world)
+
+
+def test_race_order_rescues_stale_suffix_with_fresh_duplicate_track():
+    api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=4)
+    completed_a = _stable_track(10, np.array([0.0, 15.0, 2.0]))
+    completed_b = _stable_track(11, np.array([0.0, 30.0, 2.0]))
+    stale_owner = _stable_track(
+        4,
+        np.array([-1.25, 60.6, 2.75]),
+        hits=40,
+        score=0.95,
+    )
+    fresh_duplicate = _stable_track(
+        14,
+        np.array([-1.20, 60.8, 2.80]),
+        hits=4,
+        score=0.40,
+    )
+    stale_time = time.time() - float(api.gate_memory.stale_time) - 1.0
+    stale_owner.last_seen_time = stale_time
+    stale_owner.obs_history[-1].timestamp = stale_time
+    api.gate_memory.tracks = [
+        completed_a,
+        completed_b,
+        stale_owner,
+        fresh_duplicate,
+    ]
+    api.current_gate_idx = 2
+    api.completed_track_ids = {10, 11}
+    api.race_order_track_ids = [10, 11, 4]
+
+    committed_by_id = {
+        int(track.id): track for track in api.gate_memory.get_committed_tracks()
+    }
+    api._refresh_perception_race_order(
+        stable_tracks=api.gate_memory.get_stable_tracks(),
+        committed_by_id=committed_by_id,
+        current_pos=np.array([0.0, 45.0, 2.0]),
+    )
+
+    assert api.race_order_track_ids[api.current_gate_idx] == 14
+    assert 4 not in api.race_order_track_ids[api.current_gate_idx:]
+    gates, track_ids = api._ordered_perception_gates(committed_by_id)
+    assert track_ids[api.current_gate_idx] == 14
+    np.testing.assert_allclose(
+        gates[api.current_gate_idx],
+        fresh_duplicate.filtered_center_world,
+    )
 
 
 def test_planning_horizon_skips_duplicate_future_waypoint():
@@ -874,14 +1009,14 @@ def test_path_plan_rejects_selected_target_duplicate_of_completed_landmark():
     assert api.active_waypoints is None
 
 
-def test_longitudinal_active_shift_is_deferred_before_gate_enter():
+def test_longitudinal_active_shift_is_ignored_before_gate_enter():
     api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=2)
     api.gate_corridor_enabled = True
     api.gate_corridor_length_m = 3.0
     api.active_target_shift_enabled = True
     api.active_target_shift_required_frames = 1
     api.active_target_shift_threshold_m = 0.45
-    api.active_target_shift_defer_longitudinal_enabled = True
+    api.active_target_shift_defer_longitudinal_enabled = False
     api.active_target_shift_longitudinal_min_m = 0.5
     api.active_target_shift_longitudinal_lateral_max_m = 0.5
     api.gate_centers_neu = [np.array([0.0, 10.0, 1.5])]
@@ -901,7 +1036,7 @@ def test_longitudinal_active_shift_is_deferred_before_gate_enter():
     assert not replanned
     assert api.active_plan_generation == original_generation
     np.testing.assert_allclose(api.active_waypoints, original_waypoints)
-    assert api.deferred_longitudinal_shift_samples == [2.0]
+    assert api.deferred_longitudinal_shift_samples == []
     np.testing.assert_allclose(api.gate_centers_neu[0], np.array([0.0, 10.0, 1.5]))
 
 
@@ -912,7 +1047,7 @@ def test_centerline_horizon_shift_preserves_active_plan_for_small_longitudinal_u
     api.active_target_shift_enabled = True
     api.active_target_shift_required_frames = 1
     api.active_target_shift_threshold_m = 0.45
-    api.active_target_shift_defer_longitudinal_enabled = True
+    api.active_target_shift_defer_longitudinal_enabled = False
     api.active_target_shift_longitudinal_min_m = 0.5
     api.active_target_shift_longitudinal_lateral_max_m = 0.5
     api.active_target_shift_horizon_lateral_replan_min_m = 0.75
@@ -938,13 +1073,41 @@ def test_centerline_horizon_shift_preserves_active_plan_for_small_longitudinal_u
     assert not replanned
     assert api.active_plan_generation == original_generation
     np.testing.assert_allclose(api.active_waypoints, original_waypoints)
-    np.testing.assert_allclose(api.deferred_longitudinal_shift_samples, [0.47])
+    assert api.deferred_longitudinal_shift_samples == []
     exit_target, exit_role = api._active_gate_exit_waypoint()
     assert exit_role == "synthetic_gate_exit"
-    np.testing.assert_allclose(exit_target, np.array([0.0, 11.97, 1.5]))
+    np.testing.assert_allclose(exit_target, np.array([0.0, 11.5, 1.5]))
 
 
-def test_deferred_longitudinal_shift_moves_only_exit_after_gate_enter():
+def test_synthetic_exit_uses_live_current_gate_center_over_stale_horizon_target():
+    api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=6)
+    api.gate_corridor_enabled = True
+    api.gate_corridor_length_m = 3.0
+    api.current_gate_idx = 3
+    api.current_gate_pos = np.array([-1.268, 60.710, 2.766])
+    api.active_gate_normal = np.array([0.0, 1.0, 0.0])
+    api.active_plan_mode = "gate_horizon"
+    api.active_horizon_gate_indices = [2, 3]
+    api.active_horizon_targets = [
+        np.array([-1.487, 45.185, 1.950]),
+        np.array([-1.258, 62.571, 2.786]),
+    ]
+    api.active_waypoints = np.vstack(
+        [
+            np.array([0.659, 30.807, 1.741]),
+            np.array([-1.487, 45.185, 1.950]),
+            np.array([-1.258, 62.571, 2.786]),
+        ]
+    )
+    api.active_waypoint_roles = ["start", "gate_center", "gate_center"]
+
+    exit_target, exit_role = api._active_gate_exit_waypoint()
+
+    assert exit_role == "synthetic_gate_exit"
+    np.testing.assert_allclose(exit_target, np.array([-1.268, 62.210, 2.766]))
+
+
+def test_longitudinal_shift_does_not_install_exit_shift_plan_near_gate():
     api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=2)
     api.gate_corridor_enabled = True
     api.gate_corridor_length_m = 3.0
@@ -960,6 +1123,9 @@ def test_deferred_longitudinal_shift_moves_only_exit_after_gate_enter():
     api.current_gate_idx = 0
 
     assert api._path_plan(pos=np.array([0.0, 0.0, 1.5]), vel=np.zeros(3))
+    original_generation = api.active_plan_generation
+    original_mode = api.active_plan_mode
+    original_waypoints = api.active_waypoints.copy()
     api.gate_memory.tracks = [_stable_track(10, np.array([0.0, 12.0, 1.5]))]
 
     replanned = api._maybe_apply_active_target_shift(
@@ -967,12 +1133,12 @@ def test_deferred_longitudinal_shift_moves_only_exit_after_gate_enter():
         vel=np.array([0.0, 1.0, 0.0]),
     )
 
-    assert replanned
-    assert api.active_plan_mode == "single_gate_corridor_exit_shift"
-    assert api.active_waypoint_roles == ["start", "gate_center", "gate_exit_shifted"]
-    np.testing.assert_allclose(api.active_waypoints[1], np.array([0.0, 10.0, 1.5]))
-    np.testing.assert_allclose(api.active_waypoints[2], np.array([0.0, 13.5, 1.5]))
+    assert not replanned
+    assert api.active_plan_generation == original_generation
+    assert api.active_plan_mode == original_mode
+    np.testing.assert_allclose(api.active_waypoints, original_waypoints)
     np.testing.assert_allclose(api.gate_centers_neu[0], np.array([0.0, 10.0, 1.5]))
+    assert api.deferred_longitudinal_shift_samples == []
 
     advanced = api._advance_gate_if_needed(np.array([0.0, 9.72, 1.5]))
 
@@ -983,58 +1149,6 @@ def test_deferred_longitudinal_shift_moves_only_exit_after_gate_enter():
 
     assert advanced
     assert api.current_gate_idx == 1
-
-
-def test_deferred_longitudinal_shift_applies_near_single_gate_without_enter():
-    api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=2)
-    api.gate_corridor_enabled = True
-    api.gate_corridor_length_m = 3.0
-    api.active_target_shift_longitudinal_exit_shift_max_m = 3.0
-    api.active_target_shift_longitudinal_enter_radius_m = 0.75
-    api.active_target_shift_near_gate_distance_m = 2.0
-    api.current_gate_idx = 0
-    api.active_target_track_id = 10
-    api.active_gate_normal = np.array([0.0, 1.0, 0.0])
-    api.active_plan_mode = "single_gate"
-    api.active_plan_generation = 4
-    api.current_gate_pos = np.array([0.0, 10.0, 1.5])
-    api.active_waypoints = np.array(
-        [
-            [0.0, 0.0, 1.5],
-            [0.0, 10.0, 1.5],
-        ],
-        dtype=float,
-    )
-    api.active_waypoint_roles = ["start", "gate_center"]
-    api.planner.update(
-        waypoints=api.active_waypoints,
-        times=[5.0],
-        v_start=np.zeros(3),
-        v_end=np.zeros(3),
-        a_start=np.zeros(3),
-        a_end=np.zeros(3),
-        j_start=np.zeros(3),
-        j_end=np.zeros(3),
-    )
-    api.deferred_longitudinal_shift_gate_idx = 0
-    api.deferred_longitudinal_shift_track_id = 10
-    api.deferred_longitudinal_shift_samples = [1.0, 1.4]
-    api.deferred_longitudinal_shift_axis = np.array([0.0, 1.0, 0.0])
-    api.deferred_longitudinal_shift_applied_generation = None
-
-    replanned = api._maybe_apply_deferred_longitudinal_exit_shift(
-        pos=np.array([0.0, 8.6, 1.5]),
-        vel=np.array([0.0, 0.6, 0.0]),
-        gate_idx=0,
-        track_id=10,
-        target=np.array([0.0, 10.0, 1.5]),
-    )
-
-    assert replanned
-    assert api.active_plan_mode == "single_gate_corridor_exit_shift"
-    assert api.active_waypoint_roles == ["start", "gate_center", "gate_exit_shifted"]
-    np.testing.assert_allclose(api.active_waypoints[1], np.array([0.0, 10.0, 1.5]))
-    np.testing.assert_allclose(api.active_waypoints[2], np.array([0.0, 12.7, 1.5]))
 
 
 class _FakePlanner:
@@ -1438,6 +1552,105 @@ def test_install_gate_centers_yields_stale_memory_to_stable_live_slot():
     assert out_track_ids[2] == 63
     assert 2 not in api.spline_memory_by_gate_idx
     np.testing.assert_allclose(out_gates[2], live_target)
+
+
+def test_duplicate_live_track_beats_stale_spline_memory_current_slot():
+    api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=6)
+    api.spline_memory_live_override_m = 4.0
+    api.race_order_duplicate_radius_m = 5.0
+    memory_target = np.array([-1.430, 43.636, 2.010])
+    live_target = np.array([-1.543, 44.901, 1.975])
+    memory_track = _stable_track(
+        11,
+        memory_target,
+        hits=3,
+        committed=True,
+        stable=False,
+    )
+    live_track = _stable_track(
+        12,
+        live_target,
+        hits=12,
+        committed=True,
+        stable=True,
+    )
+    api.gate_memory.tracks = [memory_track, live_track]
+    api.current_gate_idx = 2
+    api.spline_memory_by_gate_idx[2] = {
+        "gate_idx": 2,
+        "track_id": 11,
+        "center": memory_target.copy(),
+        "plan_generation": 4,
+        "plan_mode": "gate_horizon",
+        "source": "gate_horizon",
+        "created_time": time.time(),
+        "last_used_time": time.time(),
+        "completed": False,
+    }
+
+    gates = [
+        np.array([0.0, 20.0, 1.5]),
+        np.array([0.0, 40.0, 1.5]),
+        live_target,
+    ]
+    track_ids = [10, 11, 12]
+
+    out_gates, out_track_ids = api._apply_spline_memory_to_gate_entries(
+        gates,
+        track_ids,
+    )
+
+    assert out_track_ids[2] == 12
+    assert api.spline_memory_by_gate_idx == {}
+    np.testing.assert_allclose(out_gates[2], live_target)
+
+
+def test_install_gate_centers_yields_memory_to_closer_stable_outlier_slot():
+    api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=5)
+    api.spline_memory_live_override_m = 4.0
+    api.last_state_estimate = SimpleNamespace(
+        pos_neu=np.array([0.0, 50.0, 2.6])
+    )
+    memory_target = np.array([0.0, 63.0, 2.6])
+    live_target = np.array([0.0, 60.0, 2.6])
+    live_track = _stable_track(
+        63,
+        live_target,
+        hits=8,
+        committed=True,
+        stable=True,
+        last_observation_outlier=True,
+    )
+    api.gate_memory.tracks = [live_track]
+    api.current_gate_idx = 2
+    api.spline_memory_by_gate_idx[2] = {
+        "gate_idx": 2,
+        "track_id": 49,
+        "center": memory_target.copy(),
+        "plan_generation": 4,
+        "plan_mode": "gate_horizon",
+        "source": "gate_horizon",
+        "created_time": time.time(),
+        "last_used_time": time.time(),
+        "completed": False,
+    }
+
+    gates = [
+        np.array([0.0, 20.0, 1.5]),
+        np.array([0.0, 40.0, 1.5]),
+        live_target,
+    ]
+    track_ids = [10, 11, 63]
+
+    out_gates, out_track_ids = api._apply_spline_memory_to_gate_entries(
+        gates,
+        track_ids,
+    )
+
+    assert out_track_ids[2] == 63
+    np.testing.assert_allclose(out_gates[2], live_target)
+    assert 3 in api.spline_memory_by_gate_idx
+    assert api.spline_memory_by_gate_idx[3]["track_id"] == 49
 
 
 def test_final_gate_pass_defers_completion_for_strong_forward_candidate():

@@ -26,6 +26,56 @@ def normalize_keypoint_order(value) -> str:
     )
 
 
+KEYPOINT_LAYOUT_INNER4 = "inner4"
+KEYPOINT_LAYOUT_INNER4_OUTER4 = "inner4_outer4"
+KEYPOINT_LAYOUT_CHOICES = (KEYPOINT_LAYOUT_INNER4, KEYPOINT_LAYOUT_INNER4_OUTER4)
+
+
+def normalize_keypoint_layout(value) -> str:
+    layout = str(value or KEYPOINT_LAYOUT_INNER4).strip().lower()
+    aliases = {
+        "4": KEYPOINT_LAYOUT_INNER4,
+        "4k": KEYPOINT_LAYOUT_INNER4,
+        "inner": KEYPOINT_LAYOUT_INNER4,
+        "inner_4": KEYPOINT_LAYOUT_INNER4,
+        "8": KEYPOINT_LAYOUT_INNER4_OUTER4,
+        "8k": KEYPOINT_LAYOUT_INNER4_OUTER4,
+        "inner_outer": KEYPOINT_LAYOUT_INNER4_OUTER4,
+        "inner4+outer4": KEYPOINT_LAYOUT_INNER4_OUTER4,
+    }
+    layout = aliases.get(layout, layout)
+    if layout not in KEYPOINT_LAYOUT_CHOICES:
+        raise ValueError(
+            f"Unsupported YOLO keypoint layout {value!r}; use one of {KEYPOINT_LAYOUT_CHOICES}."
+        )
+    return layout
+
+
+def square_object_points_m(square_size_m: float, z_m: float = 0.0) -> np.ndarray:
+    points = np.asarray(planar_square_object_points_m(square_size_m), dtype=np.float32)
+    points[:, 2] = float(z_m)
+    return points
+
+
+def object_points_for_keypoint_layout(
+    keypoint_layout,
+    *,
+    inner_gate_size_m: float = VADR_TS_002.gate_inner_square_m,
+    outer_gate_size_m: float = VADR_TS_002.gate_outer_square_m,
+    gate_depth_m: float = VADR_TS_002.gate_depth_m,
+) -> np.ndarray:
+    layout = normalize_keypoint_layout(keypoint_layout)
+    if layout == KEYPOINT_LAYOUT_INNER4:
+        # Preserve the current deployed 4-keypoint model/PnP behavior: inner
+        # square object points are planar on the gate center plane.
+        return square_object_points_m(inner_gate_size_m, z_m=0.0)
+
+    half_depth = 0.5 * float(gate_depth_m)
+    inner_exit = square_object_points_m(inner_gate_size_m, z_m=half_depth)
+    outer_entry = square_object_points_m(outer_gate_size_m, z_m=-half_depth)
+    return np.vstack([inner_exit, outer_entry]).astype(np.float32)
+
+
 class GatePerception:
 
     def __init__(self,
@@ -37,7 +87,8 @@ class GatePerception:
                  yolo_imgsz=640,
                  yolo_device=None,
                  preprocess_mode="distinctive",
-                 keypoint_order="semantic"):
+                 keypoint_order="semantic",
+                 keypoint_layout=KEYPOINT_LAYOUT_INNER4):
 
         self.gate_size = gate_size
         self.pose_history = deque(maxlen=smoothing_window)
@@ -67,6 +118,14 @@ class GatePerception:
         self.yolo_device = yolo_device
         self.preprocess_mode = preprocess_mode
         self.keypoint_order = normalize_keypoint_order(keypoint_order)
+        self.keypoint_layout = normalize_keypoint_layout(keypoint_layout)
+        self.model_points = object_points_for_keypoint_layout(
+            self.keypoint_layout,
+            inner_gate_size_m=float(gate_size),
+            outer_gate_size_m=VADR_TS_002.gate_outer_square_m,
+            gate_depth_m=VADR_TS_002.gate_depth_m,
+        )
+        self.keypoint_count = int(self.model_points.shape[0])
         # semantic: keypoint IDs are fixed physical gate corners.
         # image: keypoint IDs are image-space TL/TR/BR/BL and PnP must try corner permutations.
         self.corners_are_semantic = self.keypoint_order == "semantic"
@@ -77,16 +136,9 @@ class GatePerception:
         print(f"[YOLO PERCEPTION] model={self.yolo_model_path}")
         print(f"[YOLO PERCEPTION] preprocess_mode={self.preprocess_mode}, conf={self.yolo_conf}, imgsz={self.yolo_imgsz}")
         print(f"[YOLO PERCEPTION] keypoint_order={self.keypoint_order}")
-        print("[LIVE PNP] using IPPE_SQUARE candidate sweep")
+        print(f"[YOLO PERCEPTION] keypoint_layout={self.keypoint_layout}, keypoint_count={self.keypoint_count}")
+        print("[LIVE PNP] using layout-aware candidate sweep")
         print(f"[LIVE PNP] allow_pnp_corner_reordering={self.allow_pnp_corner_reordering}")
-
-        # TII keypoint labels are inner opening corners, so use the inner opening size.
-        # Competition/spec gate: inner opening = 1.5 m x 1.5 m.
-        # If you switch back to HSV outer-frame contour detection, use gate_size=2.7 instead.
-        self.model_points = np.array(
-            planar_square_object_points_m(gate_size),
-            dtype=np.float32,
-        )
 
         print("Model points:")
         print(self.model_points)
@@ -131,13 +183,22 @@ class GatePerception:
                 -1
             )
 
-        cv2.polylines(
-            debug,
-            [ordered.astype(int)],
-            True,
-            (0,255,0),
-            2
-        )
+        if ordered.shape[0] >= 4:
+            cv2.polylines(
+                debug,
+                [ordered[:4].astype(int)],
+                True,
+                (0,255,0),
+                2
+            )
+        if ordered.shape[0] >= 8:
+            cv2.polylines(
+                debug,
+                [ordered[4:8].astype(int)],
+                True,
+                (0,180,255),
+                2
+            )
 
         # cv2.imshow("Detection", debug)
         # cv2.waitKey(1)
@@ -189,7 +250,7 @@ class GatePerception:
                     meta.get("box_confidence", result.get("confidence", np.nan))
                 )
                 result["debug"]["yolo_keypoints"] = np.asarray(
-                    meta.get("keypoints", np.full((4, 3), np.nan)),
+                    meta.get("keypoints", np.full((self.keypoint_count, 3), np.nan)),
                     dtype=float,
                 ).reshape(-1, 3).copy()
                 result["debug"]["quad_area_px2"] = quad_area_px2
@@ -225,7 +286,8 @@ class GatePerception:
         selected_ordered = np.asarray(
             pnp_debug.get("ordered_points", ordered),
             dtype=np.float32,
-        ).reshape(4, 2)
+        ).reshape(-1, 2)
+        selected_primary = self.primary_image_points(selected_ordered)
         confidence = self.compute_confidence(ordered)
 
         # Do not smooth camera-frame pose while the camera is moving. Averaging
@@ -253,7 +315,7 @@ class GatePerception:
             "pnp_debug_best_ordered_corners": np.asarray(
                 pnp_debug.get("debug_best_ordered_points", selected_ordered),
                 dtype=float,
-            ).reshape(4, 2).copy(),
+            ).reshape(-1, 2).copy(),
             "reprojected_corners": reprojected_corners.copy(),
             "rvec": pnp_debug["rvec"].copy(),
             "tvec": np.asarray(t_out, dtype=float).reshape(3).copy(),
@@ -306,13 +368,13 @@ class GatePerception:
             ),
             "raw_keypoint_polygon_winding": pnp_debug.get("raw_keypoint_polygon_winding", ""),
             "gate_size_sweep": self.solve_pnp_gate_size_sweep(
-                selected_ordered,
+                selected_primary,
                 camera_matrix,
                 dist_coeffs,
                 sizes=(1.40, 1.50, 1.60),
             ),
             "pnp_formulation_debug": self.solve_pnp_formulation_debug(
-                selected_ordered,
+                selected_primary,
                 camera_matrix,
                 dist_coeffs,
             ),
@@ -408,11 +470,11 @@ class GatePerception:
 
     def detect_gate_candidates(self, frame):
         """
-        Returns a list of 4-point arrays.
+        Returns a list of keypoint arrays for the configured layout.
 
         In semantic mode, indices are fixed physical gate corners. In image mode,
-        indices are image-space TL/TR/BR/BL and PnP is allowed to remap them to
-        the physical model points.
+        each 4-point group is image-space TL/TR/BR/BL and PnP is allowed to
+        remap groups to the physical model points.
         """
         if frame is None:
             return []
@@ -490,13 +552,17 @@ class GatePerception:
                 "keypoints": np.asarray(keypoints[i], dtype=float).copy(),
                 "rejection_reason": "",
             }
-            if keypoints.shape[1] < 4:
-                meta["rejection_reason"] = "fewer_than_4_keypoints"
+            if keypoints.shape[1] < self.keypoint_count:
+                meta["rejection_reason"] = f"fewer_than_{self.keypoint_count}_keypoints"
                 candidates.append((-np.inf, float(boxes_conf[i]), 0.0, None, meta))
                 continue
 
-            pts = keypoints[i, :4, :2].astype(np.float32)
-            kconf = keypoints[i, :4, 2].astype(float) if keypoints.shape[2] >= 3 else np.ones(4)
+            pts = keypoints[i, :self.keypoint_count, :2].astype(np.float32)
+            kconf = (
+                keypoints[i, :self.keypoint_count, 2].astype(float)
+                if keypoints.shape[2] >= 3
+                else np.ones(self.keypoint_count)
+            )
 
             # Reject broken keypoint sets.
             if not np.isfinite(pts).all():
@@ -519,7 +585,7 @@ class GatePerception:
                 candidates.append((-np.inf, float(boxes_conf[i]), mean_kconf, None, meta))
                 continue
 
-            area = abs(cv2.contourArea(pts))
+            area = abs(cv2.contourArea(self.primary_image_points(pts)))
             if area < 50:
                 meta["rejection_reason"] = "keypoint_area_low"
                 candidates.append((-np.inf, float(boxes_conf[i]), mean_kconf, None, meta))
@@ -564,6 +630,19 @@ class GatePerception:
     # -------------------------------------------------
     # Correct Corner Ordering
     # -------------------------------------------------
+    @staticmethod
+    def order_quad_tl_tr_br_bl(pts):
+        pts = np.asarray(pts, dtype=np.float32).reshape(4, 2)
+        s = pts.sum(axis=1)  # x+y
+        d = (pts[:, 0] - pts[:, 1])  # x-y
+
+        tl = pts[np.argmin(s)]
+        br = pts[np.argmax(s)]
+        tr = pts[np.argmax(d)]
+        bl = pts[np.argmin(d)]
+
+        return np.array([tl, tr, br, bl], dtype=np.float32)
+
     def order_corners(self, corners):
         pts = np.asarray(corners, dtype=np.float32)
         if pts.shape[0] < 4:
@@ -571,8 +650,16 @@ class GatePerception:
 
         # Semantic labels already provide fixed physical gate-corner IDs. Do not
         # reorder by image location because that would scramble the physical ID.
-        if getattr(self, "corners_are_semantic", False) and pts.shape[0] == 4:
+        expected_count = int(getattr(self, "keypoint_count", 4))
+        if getattr(self, "corners_are_semantic", False) and pts.shape[0] == expected_count:
             return pts.astype(np.float32)
+
+        if pts.shape[0] == expected_count:
+            ordered_groups = [
+                self.order_quad_tl_tr_br_bl(pts[start:start + 4])
+                for start in range(0, expected_count, 4)
+            ]
+            return np.vstack(ordered_groups).astype(np.float32)
 
         # If more than 4 points, take convex hull then approximate to 4
         if pts.shape[0] > 4:
@@ -584,17 +671,7 @@ class GatePerception:
         if pts.shape[0] != 4:
             return None
 
-        # Classic TL/TR/BR/BL ordering using sum and diff
-        s = pts.sum(axis=1)  # x+y
-        d = (pts[:, 0] - pts[:, 1])  # x-y
-
-        tl = pts[np.argmin(s)]
-        br = pts[np.argmax(s)]
-        tr = pts[np.argmax(d)]
-        bl = pts[np.argmin(d)]
-
-        ordered = np.array([tl, tr, br, bl], dtype=np.float32)
-        return ordered
+        return self.order_quad_tl_tr_br_bl(pts)
 
 
     # -------------------------------------------------
@@ -617,8 +694,129 @@ class GatePerception:
             return float("nan")
         return float(np.asarray(err).reshape(-1)[0])
 
+    @staticmethod
+    def primary_image_points(image_points):
+        return np.asarray(image_points, dtype=np.float32).reshape(-1, 2)[:4]
+
+    def apply_pnp_order(self, image_points, idx):
+        pts = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
+        idx = list(idx)
+        if pts.shape[0] == 4:
+            return pts[idx].astype(np.float32)
+        if pts.shape[0] == 8:
+            return np.vstack([pts[:4][idx], pts[4:8][idx]]).astype(np.float32)
+        return pts.astype(np.float32)
+
+    @staticmethod
+    def _solve_pnp_single(object_points, image_points_ordered, camera_matrix, dist_coeffs, flag):
+        try:
+            ok, rvec, tvec = cv2.solvePnP(
+                object_points,
+                image_points_ordered,
+                camera_matrix,
+                dist_coeffs,
+                flags=flag,
+            )
+        except Exception:
+            return []
+        if not ok:
+            return []
+        return [(
+            np.asarray(rvec, dtype=float).reshape(3, 1),
+            np.asarray(tvec, dtype=float).reshape(3, 1),
+            None,
+        )]
+
+    def _general_pnp_solvers(self):
+        solvers = []
+        if hasattr(cv2, "SOLVEPNP_SQPNP"):
+            solvers.append(("SQPNP", cv2.SOLVEPNP_SQPNP))
+        solvers.append(("ITERATIVE", cv2.SOLVEPNP_ITERATIVE))
+        if self.model_points.shape[0] >= 4:
+            solvers.append(("EPNP", cv2.SOLVEPNP_EPNP))
+        return solvers
+
+    def append_general_pnp_candidates(
+        self,
+        candidates,
+        *,
+        pts,
+        order_name,
+        order_indices,
+        camera_matrix,
+        dist_coeffs,
+    ):
+        pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+        image_points_ordered = pts.reshape(-1, 1, 2)
+        size_depth = self.estimate_size_depth(pts, camera_matrix)
+        image_center_offset = self.image_center_offset_normalized(pts, camera_matrix)
+
+        for solver_name, flag in self._general_pnp_solvers():
+            solved = self._solve_pnp_single(
+                self.model_points,
+                image_points_ordered,
+                camera_matrix,
+                dist_coeffs,
+                flag,
+            )
+            for candidate_index, (rvec, tvec, _solver_err) in enumerate(solved):
+                R_mat, _ = cv2.Rodrigues(rvec)
+                normal = R_mat[:, 2].astype(float)
+                normal /= np.linalg.norm(normal) + 1e-12
+                err = self.compute_reprojection_error(
+                    R_mat,
+                    tvec,
+                    camera_matrix,
+                    dist_coeffs,
+                    image_points_ordered,
+                )
+                (
+                    score,
+                    reason,
+                    depth,
+                    normal_score,
+                    scored_size_depth,
+                    depth_disagreement,
+                    lateral_angle,
+                    scored_image_center_offset,
+                    lateral_offset_disagreement,
+                ) = self.score_pnp_candidate(
+                    err,
+                    tvec,
+                    normal,
+                    size_depth,
+                    image_center_offset,
+                )
+                candidates.append({
+                    "index": len(candidates),
+                    "solver": solver_name,
+                    "order": order_name,
+                    "order_indices": list(order_indices),
+                    "solver_candidate_index": int(candidate_index),
+                    "rvec": np.asarray(rvec, dtype=float).reshape(3),
+                    "tvec": np.asarray(tvec, dtype=float).reshape(3),
+                    "normal": normal.copy(),
+                    "error": float(err),
+                    "score": float(score),
+                    "selected_reason": reason,
+                    "depth": float(depth),
+                    "normal_score": float(normal_score),
+                    "size_depth": float(scored_size_depth),
+                    "depth_disagreement": float(depth_disagreement),
+                    "lateral_angle": float(lateral_angle),
+                    "image_center_offset_normalized": float(scored_image_center_offset),
+                    "lateral_offset_disagreement": float(lateral_offset_disagreement),
+                    "ordered_points": pts.copy(),
+                    "projected_corners": self.project_model_points(
+                        R_mat,
+                        tvec,
+                        camera_matrix,
+                        dist_coeffs,
+                    ),
+                })
+
     def estimate_size_depth(self, image_points, camera_matrix):
-        pts = np.asarray(image_points, dtype=float).reshape(4, 2)
+        pts = self.primary_image_points(image_points).astype(float).reshape(4, 2)
         k = np.asarray(camera_matrix, dtype=float).reshape(3, 3)
         fx = float(k[0, 0])
         fy = float(k[1, 1])
@@ -640,7 +838,7 @@ class GatePerception:
         return float(np.mean(depths))
 
     def image_center_offset_normalized(self, image_points, camera_matrix):
-        pts = np.asarray(image_points, dtype=float).reshape(4, 2)
+        pts = self.primary_image_points(image_points).astype(float).reshape(4, 2)
         k = np.asarray(camera_matrix, dtype=float).reshape(3, 3)
         fx = float(k[0, 0])
         cx = float(k[0, 2])
@@ -729,16 +927,34 @@ class GatePerception:
         )
 
     def estimate_pose(self, image_points, camera_matrix, dist_coeffs):
-        ordered_points = np.asarray(image_points, dtype=np.float32).reshape(4, 2)
+        ordered_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 2)
+        expected_count = int(getattr(self, "keypoint_count", self.model_points.shape[0]))
+        if ordered_points.shape[0] != expected_count:
+            print(
+                "[LIVE PNP] rejected keypoint count "
+                f"{ordered_points.shape[0]} for layout={getattr(self, 'keypoint_layout', 'unknown')} "
+                f"expected={expected_count}"
+            )
+            return None
 
         print("\n------ Perception ------")
         candidates = []
 
         for order_name, idx in self.pnp_order_permutations():
-            pts = ordered_points[idx].astype(np.float32)
+            pts = self.apply_pnp_order(ordered_points, idx)
             image_points_ordered = pts.reshape(-1, 1, 2)
             size_depth = self.estimate_size_depth(pts, camera_matrix)
             image_center_offset = self.image_center_offset_normalized(pts, camera_matrix)
+            if self.model_points.shape[0] != 4:
+                self.append_general_pnp_candidates(
+                    candidates,
+                    pts=pts,
+                    order_name=order_name,
+                    order_indices=idx,
+                    camera_matrix=camera_matrix,
+                    dist_coeffs=dist_coeffs,
+                )
+                continue
             try:
                 ok, rvecs, tvecs, reprojErrs = cv2.solvePnPGeneric(
                     self.model_points,
@@ -807,68 +1023,78 @@ class GatePerception:
                     ),
                 })
 
-        image_points_default = ordered_points.reshape(-1, 1, 2)
-        size_depth_default = self.estimate_size_depth(ordered_points, camera_matrix)
-        image_center_offset_default = self.image_center_offset_normalized(ordered_points, camera_matrix)
-        try:
-            ok, rvec, tvec = cv2.solvePnP(
-                self.model_points,
-                image_points_default,
+        if self.model_points.shape[0] == 4:
+            image_points_default = ordered_points.reshape(-1, 1, 2)
+            size_depth_default = self.estimate_size_depth(ordered_points, camera_matrix)
+            image_center_offset_default = self.image_center_offset_normalized(
+                ordered_points,
                 camera_matrix,
-                dist_coeffs,
-                flags=cv2.SOLVEPNP_ITERATIVE,
             )
-        except Exception:
-            ok = False
-        if ok:
-            R_mat, _ = cv2.Rodrigues(rvec)
-            normal = R_mat[:, 2].astype(float)
-            normal /= np.linalg.norm(normal) + 1e-12
-            err = self.compute_reprojection_error(
-                R_mat,
-                tvec,
-                camera_matrix,
-                dist_coeffs,
-                image_points_default,
-            )
-            (
-                score,
-                reason,
-                depth,
-                normal_score,
-                size_depth,
-                depth_disagreement,
-                lateral_angle,
-                image_center_offset,
-                lateral_offset_disagreement,
-            ) = self.score_pnp_candidate(err, tvec, normal, size_depth_default, image_center_offset_default)
-            candidates.append({
-                "index": len(candidates),
-                "solver": "ITERATIVE",
-                "order": "tl_tr_br_bl",
-                "order_indices": [0, 1, 2, 3],
-                "solver_candidate_index": 0,
-                "rvec": np.asarray(rvec, dtype=float).reshape(3),
-                "tvec": np.asarray(tvec, dtype=float).reshape(3),
-                "normal": normal.copy(),
-                "error": float(err),
-                "score": float(score),
-                "selected_reason": reason,
-                "depth": float(depth),
-                "normal_score": float(normal_score),
-                "size_depth": float(size_depth),
-                "depth_disagreement": float(depth_disagreement),
-                "lateral_angle": float(lateral_angle),
-                "image_center_offset_normalized": float(image_center_offset),
-                "lateral_offset_disagreement": float(lateral_offset_disagreement),
-                "ordered_points": ordered_points.copy(),
-                "projected_corners": self.project_model_points(
+            try:
+                ok, rvec, tvec = cv2.solvePnP(
+                    self.model_points,
+                    image_points_default,
+                    camera_matrix,
+                    dist_coeffs,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+            except Exception:
+                ok = False
+            if ok:
+                R_mat, _ = cv2.Rodrigues(rvec)
+                normal = R_mat[:, 2].astype(float)
+                normal /= np.linalg.norm(normal) + 1e-12
+                err = self.compute_reprojection_error(
                     R_mat,
                     tvec,
                     camera_matrix,
                     dist_coeffs,
-                ),
-            })
+                    image_points_default,
+                )
+                (
+                    score,
+                    reason,
+                    depth,
+                    normal_score,
+                    size_depth,
+                    depth_disagreement,
+                    lateral_angle,
+                    image_center_offset,
+                    lateral_offset_disagreement,
+                ) = self.score_pnp_candidate(
+                    err,
+                    tvec,
+                    normal,
+                    size_depth_default,
+                    image_center_offset_default,
+                )
+                candidates.append({
+                    "index": len(candidates),
+                    "solver": "ITERATIVE",
+                    "order": "tl_tr_br_bl",
+                    "order_indices": [0, 1, 2, 3],
+                    "solver_candidate_index": 0,
+                    "rvec": np.asarray(rvec, dtype=float).reshape(3),
+                    "tvec": np.asarray(tvec, dtype=float).reshape(3),
+                    "normal": normal.copy(),
+                    "error": float(err),
+                    "score": float(score),
+                    "selected_reason": reason,
+                    "depth": float(depth),
+                    "normal_score": float(normal_score),
+                    "size_depth": float(size_depth),
+                    "depth_disagreement": float(depth_disagreement),
+                    "lateral_angle": float(lateral_angle),
+                    "image_center_offset_normalized": float(image_center_offset),
+                    "lateral_offset_disagreement": float(lateral_offset_disagreement),
+                    "ordered_points": ordered_points.copy(),
+                    "projected_corners": self.project_model_points(
+                        R_mat,
+                        tvec,
+                        camera_matrix,
+                        dist_coeffs,
+                    ),
+                })
 
         if len(candidates) == 0:
             print("[LIVE PNP] candidate sweep returned no solutions")
@@ -891,8 +1117,10 @@ class GatePerception:
         debug_best = max(candidates, key=lambda item: item["score"])
         best = max(live_candidates, key=lambda item: item["score"])
         live_vs_debug_best_order_mismatch = best["order"] != debug_best["order"]
-        selected_geometry = self.keypoint_geometry(best["ordered_points"])
-        raw_geometry = self.keypoint_geometry(ordered_points)
+        selected_geometry = self.keypoint_geometry(
+            self.primary_image_points(best["ordered_points"])
+        )
+        raw_geometry = self.keypoint_geometry(self.primary_image_points(ordered_points))
         R_mat, _ = cv2.Rodrigues(best["rvec"])
         tvec = best["tvec"].reshape(3, 1)
         candidate_summary = ";".join(
@@ -1056,9 +1284,12 @@ class GatePerception:
 
     def solve_pnp_debug_variant(self, image_points, camera_matrix, dist_coeffs, flag, solver_name, order_name):
         image_points = np.asarray(image_points, dtype=np.float32).reshape(-1, 1, 2)
+        model_points = self.model_points
+        if model_points.shape[0] != image_points.shape[0]:
+            model_points = self.model_points_for_size(self.gate_size)
         try:
             ok, rvecs, tvecs, reprojErrs = cv2.solvePnPGeneric(
-                self.model_points,
+                model_points,
                 image_points,
                 camera_matrix,
                 dist_coeffs,
@@ -1082,13 +1313,18 @@ class GatePerception:
             R_mat, _ = cv2.Rodrigues(rvec)
             normal = R_mat[:, 2].astype(float)
             normal /= np.linalg.norm(normal) + 1e-12
-            err = err_scalar(reprojErrs[i]) if reprojErrs is not None and len(reprojErrs) > i else self.compute_reprojection_error(
-                R_mat,
-                tvec,
-                camera_matrix,
-                dist_coeffs,
-                image_points,
-            )
+            if reprojErrs is not None and len(reprojErrs) > i:
+                err = err_scalar(reprojErrs[i])
+            else:
+                projected = self.project_points(
+                    model_points,
+                    R_mat,
+                    tvec,
+                    camera_matrix,
+                    dist_coeffs,
+                )
+                observed = np.asarray(image_points, dtype=float).reshape(-1, 2)
+                err = float(np.sqrt(np.mean(np.sum((projected - observed) ** 2, axis=1))))
             tz = float(np.asarray(tvec).reshape(-1)[2])
             score = (10.0 * normal[2]) - err
             if tz <= 0:
@@ -1102,7 +1338,8 @@ class GatePerception:
                 "tvec": np.asarray(tvec, dtype=float).reshape(3),
                 "normal": normal.copy(),
                 "error": float(err),
-                "projected_corners": self.project_model_points(
+                "projected_corners": self.project_points(
+                    model_points,
                     R_mat,
                     tvec,
                     camera_matrix,
@@ -1128,10 +1365,11 @@ class GatePerception:
         image_points = np.asarray(image_points, dtype=float).reshape(-1, 2)
         return float(np.sqrt(np.mean(np.sum((projected - image_points) ** 2, axis=1))))
 
-    def project_model_points(self, R_mat, tvec, camera_matrix, dist_coeffs):
+    @staticmethod
+    def project_points(model_points, R_mat, tvec, camera_matrix, dist_coeffs):
         rvec, _ = cv2.Rodrigues(R_mat)
         projected, _ = cv2.projectPoints(
-            self.model_points,
+            np.asarray(model_points, dtype=np.float32).reshape(-1, 3),
             rvec,
             tvec,
             camera_matrix,
@@ -1139,13 +1377,22 @@ class GatePerception:
         )
         return projected.reshape(-1, 2).astype(float)
 
+    def project_model_points(self, R_mat, tvec, camera_matrix, dist_coeffs):
+        return self.project_points(
+            self.model_points,
+            R_mat,
+            tvec,
+            camera_matrix,
+            dist_coeffs,
+        )
+
 
     # -------------------------------------------------
     # Confidence
     # -------------------------------------------------
     def compute_confidence(self, pts):
 
-        area = cv2.contourArea(pts)
+        area = cv2.contourArea(self.primary_image_points(pts))
 
         return min(area/40000.0,1.0)
 

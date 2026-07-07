@@ -59,6 +59,7 @@ class PerceptionWrapper:
                 preprocess_mode=preprocess_mode
                 or perception_config.preprocess_mode,
                 yolo_keypoint_order=perception_config.yolo_keypoint_order,
+                yolo_keypoint_layout=perception_config.yolo_keypoint_layout,
                 gate_size_m=perception_config.gate_size_m,
             )
 
@@ -78,7 +79,8 @@ class PerceptionWrapper:
         self.object_points_m = np.asarray(
             getattr(self.gate_perception, "model_points", VADR_TS_002.gate_inner_object_points_m),
             dtype=float,
-        ).reshape(4, 3)
+        ).reshape(-1, 3)
+        self.audit_object_points_m = self.object_points_m[:4].copy()
         audit_config = self.config.perception_geometry_audit
         self.gazebo_rotation_mode = str(
             getattr(audit_config, "gazebo_rotation_mode", "transpose")
@@ -97,6 +99,7 @@ class PerceptionWrapper:
             f"transform_mode={self.transform_mode} "
             f"world_pose_source={self.world_pose_source} "
             f"yolo_keypoint_order={perception_config.yolo_keypoint_order} "
+            f"yolo_keypoint_layout={perception_config.yolo_keypoint_layout} "
             f"camera_mount_profile={self.config.camera.mount_profile} "
             f"perception_yaw_correction_deg={self.perception_yaw_correction_deg:.3f} "
             f"K={self._fmt_array(self.camera_matrix, precision=3)} "
@@ -128,6 +131,7 @@ class PerceptionWrapper:
         yolo_device: Optional[int | str],
         preprocess_mode: str,
         yolo_keypoint_order: str,
+        yolo_keypoint_layout: str,
         gate_size_m: float,
     ):
         if self.backend in ("yolo", "pose", "yolo_pose"):
@@ -141,6 +145,7 @@ class PerceptionWrapper:
                 yolo_device=yolo_device,
                 preprocess_mode=str(preprocess_mode),
                 keypoint_order=str(yolo_keypoint_order),
+                keypoint_layout=str(yolo_keypoint_layout),
             )
 
         if self.backend in ("orange", "hsv_orange"):
@@ -431,7 +436,7 @@ class PerceptionWrapper:
                     camera_matrix=self.camera_matrix,
                     camera_to_body=self.camera_to_body,
                     camera_translation_body=self.camera_translation_body,
-                    object_points_m=self.object_points_m,
+                    object_points_m=self.audit_object_points_m,
                     frame_id=frame_id,
                     gazebo_pose=gazebo_pose,
                     image_wall_time=image_wall_time,
@@ -544,7 +549,7 @@ class PerceptionWrapper:
                 camera_matrix=self.camera_matrix,
                 camera_to_body=self.camera_to_body,
                 camera_translation_body=self.camera_translation_body,
-                object_points_m=self.object_points_m,
+                object_points_m=self.audit_object_points_m,
                 frame_id=frame_id,
                 gazebo_pose=gazebo_pose,
                 image_wall_time=image_wall_time,
@@ -770,16 +775,26 @@ class PerceptionWrapper:
         return int(index)
 
     def _keypoints_from_detection(self, detection: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+        expected_count = int(max(4, self.object_points_m.shape[0]))
         yolo_keypoints = detection.get("yolo_keypoints")
         if yolo_keypoints is not None:
             keypoints = np.asarray(yolo_keypoints, dtype=float)
-            if keypoints.ndim == 2 and keypoints.shape[0] >= 4 and keypoints.shape[1] >= 2:
-                keypoints = keypoints[:4]
-                keypoints_px = np.asarray(keypoints[:, :2], dtype=float).reshape(4, 2)
+            if (
+                keypoints.ndim == 2
+                and keypoints.shape[0] >= expected_count
+                and keypoints.shape[1] >= 2
+            ):
+                keypoints = keypoints[:expected_count]
+                keypoints_px = np.asarray(keypoints[:, :2], dtype=float).reshape(
+                    expected_count,
+                    2,
+                )
                 if keypoints.shape[1] >= 3:
-                    keypoint_conf = np.asarray(keypoints[:, 2], dtype=float).reshape(4)
+                    keypoint_conf = np.asarray(keypoints[:, 2], dtype=float).reshape(
+                        expected_count
+                    )
                 else:
-                    keypoint_conf = np.ones(4, dtype=float)
+                    keypoint_conf = np.ones(expected_count, dtype=float)
                 return keypoints_px, keypoint_conf
 
         for key in ("ordered_corners", "raw_corners"):
@@ -787,10 +802,16 @@ class PerceptionWrapper:
             if corners is None:
                 continue
             arr = np.asarray(corners, dtype=float)
-            if arr.ndim >= 2 and arr.shape[0] >= 4 and arr.shape[1] >= 2:
-                return arr[:4, :2].reshape(4, 2).copy(), np.ones(4, dtype=float)
+            if arr.ndim >= 2 and arr.shape[0] >= expected_count and arr.shape[1] >= 2:
+                return (
+                    arr[:expected_count, :2].reshape(expected_count, 2).copy(),
+                    np.ones(expected_count, dtype=float),
+                )
 
-        return np.full((4, 2), np.nan, dtype=float), np.zeros(4, dtype=float)
+        return (
+            np.full((expected_count, 2), np.nan, dtype=float),
+            np.zeros(expected_count, dtype=float),
+        )
 
     @staticmethod
     def _vec3(value, default=None):

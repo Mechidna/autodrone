@@ -1352,36 +1352,15 @@ class PyAIPilotAutonomyAPI:
             return None
         normal = normal / normal_norm
 
-        center = None
-        if 0 <= int(horizon_idx) < len(self.active_horizon_targets):
+        center = self._finite_vec3_or_none(self.current_gate_pos)
+        if center is None and 0 <= int(horizon_idx) < len(self.active_horizon_targets):
             center = self._finite_vec3_or_none(
                 self.active_horizon_targets[int(horizon_idx)]
             )
-        if center is None and self.current_gate_pos is not None:
-            center = self._finite_vec3_or_none(self.current_gate_pos)
         if center is None:
             return None
 
-        exit_shift_m = 0.0
-        if (
-            self.deferred_longitudinal_shift_gate_idx == int(self.current_gate_idx)
-            and self.deferred_longitudinal_shift_samples
-        ):
-            if (
-                self.deferred_longitudinal_shift_track_id is None
-                or self.active_target_track_id is None
-                or int(self.deferred_longitudinal_shift_track_id)
-                == int(self.active_target_track_id)
-            ):
-                raw_shift_m = float(np.mean(self.deferred_longitudinal_shift_samples))
-                max_shift_m = float(self.active_target_shift_longitudinal_exit_shift_max_m)
-                exit_shift_m = (
-                    float(np.clip(raw_shift_m, -max_shift_m, max_shift_m))
-                    if max_shift_m > 0.0
-                    else 0.0
-                )
-
-        exit_after_center_m = self._centerline_gate_exit_distance_m(exit_shift_m)
+        exit_after_center_m = self._centerline_gate_exit_distance_m()
         return center + normal * exit_after_center_m
 
     def _reset_reference_progress_state(self) -> None:
@@ -1999,6 +1978,154 @@ class PyAIPilotAutonomyAPI:
 
         return True, "ok"
 
+    def _current_vehicle_position_neu(self) -> np.ndarray | None:
+        estimate = getattr(self, "last_state_estimate", None)
+        if estimate is None:
+            return None
+        return self._finite_vec3_or_none(getattr(estimate, "pos_neu", None))
+
+    def _closer_stable_live_spline_override_ok(
+        self,
+        *,
+        selected_target,
+        selected_track_id,
+        memory_target,
+    ) -> tuple[bool, str, float, float]:
+        selected = self._finite_vec3_or_none(selected_target)
+        memory = self._finite_vec3_or_none(memory_target)
+        pos = self._current_vehicle_position_neu()
+        if selected is None or memory is None:
+            return False, "non_finite_target", float("nan"), float("nan")
+        if pos is None:
+            return False, "missing_vehicle_position", float("nan"), float("nan")
+
+        selected_dist = float(np.linalg.norm(selected - pos))
+        memory_dist = float(np.linalg.norm(memory - pos))
+        if not math.isfinite(selected_dist) or not math.isfinite(memory_dist):
+            return False, "non_finite_distance", selected_dist, memory_dist
+        if selected_dist + 1e-6 >= memory_dist:
+            return False, "not_closer", selected_dist, memory_dist
+
+        try:
+            track_id = None if selected_track_id is None else int(selected_track_id)
+        except (TypeError, ValueError):
+            return False, "invalid_track_id", selected_dist, memory_dist
+        if track_id is None:
+            return False, "missing_track_id", selected_dist, memory_dist
+        if track_id < 0:
+            return True, "synthetic_closer", selected_dist, memory_dist
+        if not hasattr(self, "gate_memory"):
+            return False, "missing_gate_memory", selected_dist, memory_dist
+
+        track = self.gate_memory.get_track_by_id(track_id)
+        nav_center, quality = self._track_filtered_center_for_navigation(track)
+        if nav_center is None or not bool(quality.get("ok", False)):
+            return (
+                False,
+                str(quality.get("reason", "")) or "navigation_center_not_stable",
+                selected_dist,
+                memory_dist,
+            )
+
+        reject_reason = self._target_rejection_reason(selected, track_id)
+        if reject_reason:
+            return False, reject_reason, selected_dist, memory_dist
+
+        return (
+            True,
+            str(quality.get("reason", "")) or "stable_navigation_center",
+            selected_dist,
+            memory_dist,
+        )
+
+    def _spline_memory_live_duplicate_override_ok(
+        self,
+        *,
+        memory_target,
+        memory_track_id,
+        selected_target,
+        selected_track_id,
+    ) -> tuple[bool, str, float]:
+        selected = self._finite_vec3_or_none(selected_target)
+        memory = self._finite_vec3_or_none(memory_target)
+        if selected is None or memory is None:
+            return False, "non_finite_target", float("nan")
+
+        distance = float(np.linalg.norm(memory - selected))
+        if not math.isfinite(distance):
+            return False, "non_finite_distance", distance
+
+        try:
+            selected_id = (
+                None if selected_track_id is None else int(selected_track_id)
+            )
+        except (TypeError, ValueError):
+            return False, "invalid_selected_track_id", distance
+        try:
+            memory_id = None if memory_track_id is None else int(memory_track_id)
+        except (TypeError, ValueError):
+            return False, "invalid_memory_track_id", distance
+
+        if selected_id is None or memory_id is None:
+            return False, "missing_track_id", distance
+        if selected_id < 0 or memory_id < 0:
+            return False, "synthetic_track", distance
+        if selected_id == memory_id:
+            return False, "same_track", distance
+
+        radius = self._finite_float(
+            getattr(self, "race_order_duplicate_radius_m", 0.0),
+            0.0,
+        )
+        if radius <= 0.0:
+            return False, "duplicate_radius_disabled", distance
+
+        duplicate_distance = distance
+        duplicate_match = None
+        if hasattr(self, "gate_memory"):
+            committed_by_id = {}
+            for track in self.gate_memory.get_committed_tracks():
+                try:
+                    committed_by_id[int(track.id)] = track
+                except (TypeError, ValueError, AttributeError):
+                    continue
+            for track_id in (selected_id, memory_id):
+                if track_id in committed_by_id:
+                    continue
+                track = self.gate_memory.get_track_by_id(track_id)
+                if track is not None:
+                    committed_by_id[int(track_id)] = track
+            duplicate_match = self._race_order_duplicate_match_against_ids(
+                selected_id,
+                [memory_id],
+                committed_by_id,
+                radius=radius,
+            )
+            if duplicate_match is not None:
+                duplicate_distance = float(duplicate_match[2])
+
+        if duplicate_match is None and distance > radius:
+            return False, "outside_duplicate_radius", distance
+
+        ok, reason = self._spline_memory_track_quality_ok(
+            selected_id,
+            require_stable=True,
+            require_fresh=True,
+        )
+        if not ok:
+            return False, reason, duplicate_distance
+
+        reject_reason = self._target_rejection_reason(selected, selected_id)
+        if reject_reason:
+            return False, reject_reason, duplicate_distance
+
+        reason = (
+            "duplicate_live_track"
+            if duplicate_match is not None
+            else "duplicate_live_center"
+        )
+        return True, reason, duplicate_distance
+
     def _spline_memory_record_allowed(
         self,
         *,
@@ -2129,6 +2256,76 @@ class PyAIPilotAutonomyAPI:
         if selected is None:
             return False, None, float("inf")
         distance = float(np.linalg.norm(memory_target - selected))
+        (
+            closer_ok,
+            closer_reason,
+            selected_vehicle_dist,
+            memory_vehicle_dist,
+        ) = self._closer_stable_live_spline_override_ok(
+            selected_target=selected,
+            selected_track_id=selected_track_id,
+            memory_target=memory_target,
+        )
+        if closer_ok:
+            self._trace_spline_memory(
+                action="yield",
+                gate_idx=int(gate_idx),
+                track_id=memory_track_id,
+                center=memory_target,
+                context=f"{context}:closer_live_override",
+                selected_track=("none" if selected_track_id is None else str(selected_track_id)),
+                selected_neu=selected,
+                selected_dist_m=distance,
+                selected_vehicle_dist_m=selected_vehicle_dist,
+                memory_vehicle_dist_m=memory_vehicle_dist,
+                override_reason=closer_reason,
+            )
+            shifted = self._shift_spline_memory_after_live_override(
+                gate_idx=int(gate_idx),
+                track_id=memory_track_id,
+                center=memory_target,
+                context=f"{context}:closer_live_insert",
+            )
+            if not shifted:
+                self._clear_spline_memory_for_gate(
+                    int(gate_idx),
+                    reason=f"{context}_closer_live_override",
+                    track_id=memory_track_id,
+                )
+            return True, selected.copy(), distance
+
+        (
+            duplicate_ok,
+            duplicate_reason,
+            duplicate_distance,
+        ) = self._spline_memory_live_duplicate_override_ok(
+            memory_target=memory_target,
+            memory_track_id=memory_track_id,
+            selected_target=selected,
+            selected_track_id=selected_track_id,
+        )
+        if duplicate_ok:
+            self._trace_spline_memory(
+                action="yield",
+                gate_idx=int(gate_idx),
+                track_id=memory_track_id,
+                center=memory_target,
+                context=f"{context}:duplicate_live_override",
+                selected_track=(
+                    "none" if selected_track_id is None else str(selected_track_id)
+                ),
+                selected_neu=selected,
+                selected_dist_m=distance,
+                duplicate_dist_m=duplicate_distance,
+                override_reason=duplicate_reason,
+            )
+            self._clear_spline_memory_for_gate(
+                int(gate_idx),
+                reason=f"{context}_duplicate_live_override",
+                track_id=memory_track_id,
+            )
+            return True, selected.copy(), distance
+
         threshold = float(self.spline_memory_live_override_m)
         if threshold <= 0.0 or not math.isfinite(distance) or distance <= threshold:
             return False, selected, distance
@@ -2760,14 +2957,6 @@ class PyAIPilotAutonomyAPI:
         if latest is None or not bool(quality.get("ok", False)):
             self.active_target_shift_frames = 0
             self.active_target_shift_pending_kind = None
-            if self._maybe_apply_deferred_longitudinal_exit_shift(
-                pos=pos,
-                vel=vel,
-                gate_idx=int(self.current_gate_idx),
-                track_id=active_id,
-                target=planned,
-            ):
-                return True
             return False
 
         latest = self._apply_target_z_policy(latest)
@@ -2778,14 +2967,6 @@ class PyAIPilotAutonomyAPI:
         if not math.isfinite(shift_m) or shift_m < self.active_target_shift_threshold_m:
             self.active_target_shift_frames = 0
             self.active_target_shift_pending_kind = None
-            if self._maybe_apply_deferred_longitudinal_exit_shift(
-                pos=pos,
-                vel=vel,
-                gate_idx=int(self.current_gate_idx),
-                track_id=active_id,
-                target=planned,
-            ):
-                return True
             return False
         max_total_m = float(self.active_target_shift_max_total_m)
         if max_total_m > 0.0 and shift_m > max_total_m:
@@ -2807,15 +2988,12 @@ class PyAIPilotAutonomyAPI:
             longitudinal_m = float(np.dot(shift_vec, longitudinal_axis))
             lateral_vec = shift_vec - longitudinal_m * longitudinal_axis
             lateral_m = float(np.linalg.norm(lateral_vec))
-            longitudinal_min_m = float(self.active_target_shift_longitudinal_min_m)
-            if self._active_horizon_protects_current_segment():
-                longitudinal_min_m = min(
-                    longitudinal_min_m,
-                    float(self.active_target_shift_threshold_m),
-                )
+            longitudinal_min_m = min(
+                float(self.active_target_shift_longitudinal_min_m),
+                float(self.active_target_shift_threshold_m),
+            )
             mostly_longitudinal = (
-                self.active_target_shift_defer_longitudinal_enabled
-                and abs(longitudinal_m)
+                abs(longitudinal_m)
                 >= longitudinal_min_m
                 and math.isfinite(lateral_m)
                 and lateral_m
@@ -2823,43 +3001,10 @@ class PyAIPilotAutonomyAPI:
             )
 
         if mostly_longitudinal:
-            if self.active_target_shift_pending_kind != "longitudinal_deferred":
-                self.active_target_shift_frames = 0
-                self.active_target_shift_pending_kind = "longitudinal_deferred"
-            self.active_target_shift_frames += 1
-            if self.active_target_shift_frames < self.active_target_shift_required_frames:
-                return False
-            self._record_deferred_longitudinal_shift(
-                gate_idx=int(self.current_gate_idx),
-                track_id=active_id,
-                axis=longitudinal_axis,
-                longitudinal_m=longitudinal_m,
-                lateral_m=lateral_m,
-                shift_m=shift_m,
-                shift_z_m=shift_z_m,
-                planned=planned,
-                latest=latest,
-                source_track_id=source_track_id,
-                quality=quality,
-            )
             self.active_target_shift_frames = 0
             self.active_target_shift_pending_kind = None
-            return self._maybe_apply_deferred_longitudinal_exit_shift(
-                pos=pos,
-                vel=vel,
-                gate_idx=int(self.current_gate_idx),
-                track_id=active_id,
-                target=planned,
-            )
-
-        if self._maybe_apply_deferred_longitudinal_exit_shift(
-            pos=pos,
-            vel=vel,
-            gate_idx=int(self.current_gate_idx),
-            track_id=active_id,
-            target=planned,
-        ):
-            return True
+            self._reset_deferred_longitudinal_shift()
+            return False
 
         if self._should_preserve_active_horizon_for_shift(
             shift_m=shift_m,
@@ -3493,245 +3638,6 @@ class PyAIPilotAutonomyAPI:
         self.deferred_longitudinal_shift_applied_generation = -1
         self.deferred_longitudinal_shift_pending_signature = None
 
-    def _record_deferred_longitudinal_shift(
-        self,
-        *,
-        gate_idx: int,
-        track_id: int,
-        axis: np.ndarray,
-        longitudinal_m: float,
-        lateral_m: float,
-        shift_m: float,
-        shift_z_m: float,
-        planned: np.ndarray,
-        latest: np.ndarray,
-        source_track_id,
-        quality: dict,
-    ) -> float:
-        if (
-            self.deferred_longitudinal_shift_gate_idx != int(gate_idx)
-            or self.deferred_longitudinal_shift_track_id != int(track_id)
-        ):
-            self.deferred_longitudinal_shift_gate_idx = int(gate_idx)
-            self.deferred_longitudinal_shift_track_id = int(track_id)
-            self.deferred_longitudinal_shift_samples = []
-            self.deferred_longitudinal_shift_applied_generation = -1
-
-        axis = np.asarray(axis, dtype=float).reshape(3)
-        axis_norm = float(np.linalg.norm(axis))
-        if math.isfinite(axis_norm) and axis_norm > 1e-6:
-            self.deferred_longitudinal_shift_axis = axis / axis_norm
-
-        self.deferred_longitudinal_shift_samples.append(float(longitudinal_m))
-        self.deferred_longitudinal_shift_pending_signature = None
-        max_samples = int(self.active_target_shift_longitudinal_filter_size)
-        if len(self.deferred_longitudinal_shift_samples) > max_samples:
-            self.deferred_longitudinal_shift_samples = (
-                self.deferred_longitudinal_shift_samples[-max_samples:]
-            )
-
-        mean_m = float(np.mean(self.deferred_longitudinal_shift_samples))
-        print(
-            "active_target_shift_longitudinal_deferred "
-            f"gate_idx={int(gate_idx)} "
-            f"track={int(track_id)} "
-            f"shift={float(shift_m):.2f} "
-            f"longitudinal={float(longitudinal_m):.2f} "
-            f"lateral={float(lateral_m):.2f} "
-            f"shift_z={float(shift_z_m):.2f} "
-            f"samples={len(self.deferred_longitudinal_shift_samples)} "
-            f"mean={mean_m:.2f} "
-            f"source_track={source_track_id if source_track_id is not None else 'none'} "
-            f"reproj={self._fmt_float(quality.get('reproj'), precision=2)} "
-            f"kp_min={self._fmt_float(quality.get('kp_min'), precision=2)} "
-            f"world_std={self._fmt_float(quality.get('world_std'), precision=2)} "
-            f"planned={self._fmt_vec(planned, precision=3)} "
-            f"latest={self._fmt_vec(latest, precision=3)} "
-            f"axis={self._fmt_vec(self.deferred_longitudinal_shift_axis, precision=3)}",
-            flush=True,
-        )
-        return mean_m
-
-    def _active_corridor_enter_status(
-        self,
-        pos: np.ndarray,
-    ) -> tuple[bool, str, np.ndarray | None, float, float]:
-        if self.active_waypoints is None or self.planner.total_time <= 0.0:
-            return False, "no_active_plan", None, float("nan"), float("nan")
-        roles = list(self.active_waypoint_roles or [])
-        if not roles or len(roles) != len(self.active_waypoints):
-            return False, "missing_roles", None, float("nan"), float("nan")
-        if "gate_enter" not in roles:
-            if "gate_center" in roles:
-                center_idx = roles.index("gate_center")
-                if 0 <= center_idx < len(self.active_waypoints):
-                    center = np.asarray(
-                        self.active_waypoints[center_idx],
-                        dtype=float,
-                    ).reshape(3)
-                    pos = np.asarray(pos, dtype=float).reshape(3)
-                    distance_m = float(np.linalg.norm(pos - center))
-                    progress_m = float("nan")
-                    axis = self._finite_vec3_or_none(self.active_gate_normal)
-                    if axis is not None:
-                        axis_norm = float(np.linalg.norm(axis))
-                        if math.isfinite(axis_norm) and axis_norm > 1e-6:
-                            progress_m = float(np.dot(pos - center, axis / axis_norm))
-                    close_radius_m = max(
-                        float(self.active_target_shift_longitudinal_enter_radius_m),
-                        float(self.active_target_shift_near_gate_distance_m),
-                    )
-                    if (
-                        bool(self.gate_plane_crossed)
-                        or (
-                            math.isfinite(progress_m)
-                            and progress_m >= -float(close_radius_m)
-                        )
-                        or (
-                            math.isfinite(distance_m)
-                            and distance_m <= close_radius_m
-                        )
-                    ):
-                        return (
-                            True,
-                            "no_enter_near_or_past_center",
-                            center,
-                            distance_m,
-                            progress_m,
-                        )
-            return False, "no_corridor_enter", None, float("nan"), float("nan")
-
-        enter_idx = roles.index("gate_enter")
-        if enter_idx < 0 or enter_idx >= len(self.active_waypoints):
-            return False, "bad_enter_idx", None, float("nan"), float("nan")
-
-        enter = np.asarray(self.active_waypoints[enter_idx], dtype=float).reshape(3)
-        axis = None
-        if "gate_center" in roles[enter_idx + 1 :]:
-            center_idx = enter_idx + 1 + roles[enter_idx + 1 :].index("gate_center")
-            center = np.asarray(self.active_waypoints[center_idx], dtype=float).reshape(3)
-            direction = center - enter
-            direction_norm = float(np.linalg.norm(direction))
-            if math.isfinite(direction_norm) and direction_norm > 1e-6:
-                axis = direction / direction_norm
-        if axis is None:
-            axis = self._finite_vec3_or_none(self.active_gate_normal)
-        if axis is None:
-            return False, "missing_axis", enter, float("nan"), float("nan")
-
-        pos = np.asarray(pos, dtype=float).reshape(3)
-        distance_m = float(np.linalg.norm(pos - enter))
-        progress_m = float(np.dot(pos - enter, axis))
-        entered = (
-            math.isfinite(distance_m)
-            and distance_m <= float(self.active_target_shift_longitudinal_enter_radius_m)
-        ) or (
-            math.isfinite(progress_m)
-            and progress_m >= -float(self.active_target_shift_longitudinal_enter_radius_m)
-        )
-        return entered, "entered" if entered else "not_entered", enter, distance_m, progress_m
-
-    def _maybe_apply_deferred_longitudinal_exit_shift(
-        self,
-        *,
-        pos: np.ndarray,
-        vel: np.ndarray,
-        gate_idx: int,
-        track_id: int,
-        target: np.ndarray,
-    ) -> bool:
-        if (
-            self.deferred_longitudinal_shift_gate_idx != int(gate_idx)
-            or self.deferred_longitudinal_shift_track_id != int(track_id)
-            or not self.deferred_longitudinal_shift_samples
-            or self.deferred_longitudinal_shift_applied_generation
-            == self.active_plan_generation
-        ):
-            return False
-
-        if self._active_horizon_protects_current_segment():
-            mean_m = float(np.mean(self.deferred_longitudinal_shift_samples))
-            signature = (
-                int(gate_idx),
-                int(track_id),
-                len(self.deferred_longitudinal_shift_samples),
-                round(mean_m, 2),
-                "protected_horizon",
-            )
-            if signature != self.deferred_longitudinal_shift_pending_signature:
-                self.deferred_longitudinal_shift_pending_signature = signature
-                print(
-                    "active_target_shift_longitudinal_pending "
-                    f"gate_idx={int(gate_idx)} "
-                    f"track={int(track_id)} "
-                    f"samples={len(self.deferred_longitudinal_shift_samples)} "
-                    f"mean={mean_m:.2f} "
-                    "reason=protected_horizon "
-                    f"active_plan_mode={self.active_plan_mode} "
-                    f"horizon_gate_indices={self.active_horizon_gate_indices}",
-                    flush=True,
-                )
-            return False
-
-        entered, reason, enter, enter_dist_m, enter_progress_m = (
-            self._active_corridor_enter_status(pos)
-        )
-        if not entered:
-            mean_m = float(np.mean(self.deferred_longitudinal_shift_samples))
-            signature = (
-                int(gate_idx),
-                int(track_id),
-                len(self.deferred_longitudinal_shift_samples),
-                round(mean_m, 2),
-                str(reason),
-            )
-            if signature != self.deferred_longitudinal_shift_pending_signature:
-                self.deferred_longitudinal_shift_pending_signature = signature
-                print(
-                    "active_target_shift_longitudinal_pending "
-                    f"gate_idx={int(gate_idx)} "
-                    f"track={int(track_id)} "
-                    f"samples={len(self.deferred_longitudinal_shift_samples)} "
-                    f"mean={mean_m:.2f} "
-                    f"reason={reason} "
-                    f"enter={self._fmt_vec(enter, precision=3) if enter is not None else 'none'} "
-                    f"enter_dist={self._fmt_float(enter_dist_m, precision=2)} "
-                    f"enter_progress={self._fmt_float(enter_progress_m, precision=2)}",
-                    flush=True,
-                )
-            return False
-
-        mean_m = float(np.mean(self.deferred_longitudinal_shift_samples))
-        max_shift = float(self.active_target_shift_longitudinal_exit_shift_max_m)
-        clamped_m = float(np.clip(mean_m, -max_shift, max_shift)) if max_shift > 0.0 else 0.0
-        if abs(clamped_m) < 1e-6:
-            return False
-
-        axis = self._finite_vec3_or_none(self.deferred_longitudinal_shift_axis)
-        if axis is None:
-            axis = self._finite_vec3_or_none(self.active_gate_normal)
-        if axis is None:
-            return False
-        axis_norm = float(np.linalg.norm(axis))
-        if not math.isfinite(axis_norm) or axis_norm < 1e-6:
-            return False
-        axis = axis / axis_norm
-
-        return self._path_plan_deferred_corridor_exit_shift(
-            pos=np.asarray(pos, dtype=float).reshape(3),
-            vel=np.asarray(vel, dtype=float).reshape(3),
-            target=np.asarray(target, dtype=float).reshape(3),
-            axis=axis,
-            exit_shift_m=clamped_m,
-            raw_mean_m=mean_m,
-            gate_idx=int(gate_idx),
-            track_id=int(track_id),
-            enter_reason=reason,
-            enter=enter,
-            enter_dist_m=enter_dist_m,
-            enter_progress_m=enter_progress_m,
-        )
-
     def _compute_passthrough_waypoint_velocities(
         self,
         waypoints: np.ndarray,
@@ -3850,7 +3756,6 @@ class PyAIPilotAutonomyAPI:
         if plan_mode not in (
             "gate_horizon",
             "single_gate_corridor",
-            "single_gate_corridor_exit_shift",
             "single_gate_exit",
             "provisional_next_gate",
         ):
@@ -5019,173 +4924,6 @@ class PyAIPilotAutonomyAPI:
             return True
         return committed and stable and math.isfinite(lateral) and lateral <= lateral_limit
 
-    def _path_plan_deferred_corridor_exit_shift(
-        self,
-        *,
-        pos: np.ndarray,
-        vel: np.ndarray,
-        target: np.ndarray,
-        axis: np.ndarray,
-        exit_shift_m: float,
-        raw_mean_m: float,
-        gate_idx: int,
-        track_id: int,
-        enter_reason: str,
-        enter: np.ndarray | None,
-        enter_dist_m: float,
-        enter_progress_m: float,
-    ) -> bool:
-        half_length = 0.5 * max(0.0, float(self.gate_corridor_length_m))
-        min_exit_after_center_m = max(float(VADR_TS_002.gate_depth_m), 0.25)
-        exit_after_center_m = max(
-            min_exit_after_center_m,
-            half_length + float(exit_shift_m),
-        )
-        shifted_exit = target + axis * exit_after_center_m
-        waypoints = np.vstack([pos, target, shifted_exit])
-        waypoint_roles = ["start", "gate_center", "gate_exit_shifted"]
-        waypoint_velocities = self._compute_role_aware_waypoint_velocities(
-            waypoints,
-            waypoint_roles,
-        )
-        times = allocate_segment_times(
-            waypoints,
-            current_vel=vel,
-            vmax=self.planner_vmax,
-            amax=self.planner_amax,
-            T_min=self.planner_t_min,
-        )
-        plan_mode = "single_gate_corridor_exit_shift"
-        terminal_velocity, terminal_policy = self._terminal_velocity_for_plan(
-            waypoints=waypoints,
-            plan_mode=plan_mode,
-            horizon_gate_indices=[int(gate_idx)],
-        )
-        planner = self._build_minimum_snap_plan(
-            waypoints=waypoints,
-            times=times,
-            v_start=vel,
-            v_end=terminal_velocity,
-            waypoint_velocities=waypoint_velocities,
-        )
-        valid_plan, validation_details = self._validate_active_gate_plan_crossing(
-            planner=planner,
-            target=target,
-            normal=axis,
-            plan_mode=plan_mode,
-            gate_idx=int(gate_idx),
-            track_id=int(track_id),
-        )
-        if not valid_plan:
-            self._trace_plan_validation_reject(
-                validation_details,
-                fallback="deferred_exit_shift_hold_current_plan",
-            )
-            print(
-                "active_target_shift_longitudinal_exit_replan_reject "
-                f"gate_idx={int(gate_idx)} "
-                f"track={int(track_id)} "
-                f"mean={float(raw_mean_m):.2f} "
-                f"clamped={float(exit_shift_m):.2f} "
-                f"reason={validation_details.get('reason', 'unknown')}",
-                flush=True,
-            )
-            return False
-
-        self.planner = planner
-        self.current_gate_pos = target.copy()
-        self.active_waypoints = waypoints.copy()
-        self.active_times = np.asarray(times, dtype=float).copy()
-        self.active_waypoint_roles = list(waypoint_roles)
-        self.active_horizon_gate_indices = [int(gate_idx)]
-        self.active_horizon_track_ids = [int(track_id)]
-        self.active_horizon_targets = [target.copy()]
-        self.active_plan_mode = plan_mode
-        self.active_terminal_velocity = terminal_velocity.copy()
-        self.active_terminal_velocity_policy = str(terminal_policy)
-        self.post_gate_exit_until_s = 0.0
-        self.post_gate_exit_reason = ""
-        self.trajectory_start_time = time.time()
-        self.last_plan_wall_time = self.trajectory_start_time
-        self.last_planned_gate_idx = int(gate_idx)
-        self.active_plan_generation += 1
-        self._reset_reference_progress_state()
-        self._record_spline_memory_from_active_plan(source=plan_mode)
-        self.deferred_longitudinal_shift_applied_generation = self.active_plan_generation
-        self.deferred_longitudinal_shift_samples = []
-        self.deferred_longitudinal_shift_pending_signature = None
-        self._reset_gate_pass_state()
-        self._initialize_gate_pass_tracking(
-            pos=pos,
-            target=target,
-            fallback_normal=axis,
-        )
-
-        waypoints_txt = "[" + ";".join(
-            self._fmt_vec(waypoint, precision=3) for waypoint in waypoints
-        ) + "]"
-        times_txt = "(" + ",".join(f"{float(item):.3f}" for item in times) + ")"
-        waypoint_roles_txt = "(" + ",".join(str(role) for role in waypoint_roles) + ")"
-        waypoint_velocities_txt = "none"
-        if waypoint_velocities is not None:
-            waypoint_velocities_txt = "[" + ";".join(
-                self._fmt_vec(velocity, precision=3)
-                if np.all(np.isfinite(velocity))
-                else "nan"
-                for velocity in waypoint_velocities
-            ) + "]"
-        print(
-            "active_target_shift_longitudinal_exit_replan "
-            f"gate_idx={int(gate_idx)} "
-            f"track={int(track_id)} "
-            f"mean={float(raw_mean_m):.2f} "
-            f"clamped={float(exit_shift_m):.2f} "
-            f"exit_after_center={float(exit_after_center_m):.2f} "
-            f"enter_reason={enter_reason} "
-            f"enter={self._fmt_vec(enter, precision=3) if enter is not None else 'none'} "
-            f"enter_dist={self._fmt_float(enter_dist_m, precision=2)} "
-            f"enter_progress={self._fmt_float(enter_progress_m, precision=2)} "
-            f"target_neu={self._fmt_vec(target, precision=3)} "
-            f"axis={self._fmt_vec(axis, precision=3)} "
-            f"shifted_exit={self._fmt_vec(shifted_exit, precision=3)}",
-            flush=True,
-        )
-        plan_samples_txt = self._sample_planner_path_text(self.planner)
-        print(
-            "plan_install "
-            f"gate_idx={int(gate_idx)} "
-            f"track={int(track_id)} "
-            f"mode={plan_mode} "
-            f"horizon_tracks=({int(track_id)}) "
-            f"horizon_gate_indices=({int(gate_idx)}) "
-            f"total_time={float(self.planner.total_time):.3f} "
-            f"segments={max(0, int(len(waypoints) - 1))} "
-            f"target_neu={self._fmt_vec(target, precision=3)} "
-            f"normal_neu={self._fmt_vec(axis, precision=3)} "
-            f"v_start_neu={self._fmt_vec(self._planner_v_start_used(self.planner, vel), precision=3)} "
-            f"v_start_raw_neu={self._fmt_vec(self._planner_v_start_raw(self.planner, vel), precision=3)} "
-            f"v_end_neu={self._fmt_vec(terminal_velocity, precision=3)} "
-            f"terminal_policy={terminal_policy} "
-            f"passthrough_policy={self._passthrough_velocity_policy_text()} "
-            f"waypoint_velocities_neu={waypoint_velocities_txt} "
-            f"times_s={times_txt} "
-            f"waypoint_roles={waypoint_roles_txt} "
-            f"gate_corridor={int(self.gate_corridor_enabled)}:"
-            f"{float(self.gate_corridor_length_m):.2f} "
-            f"exit_shift_m={float(exit_shift_m):.2f} "
-            f"waypoints_neu={waypoints_txt} "
-            f"plan_samples_neu={plan_samples_txt}",
-            flush=True,
-        )
-        self._trace_plan_boundary_continuity(
-            planner=self.planner,
-            waypoints=waypoints,
-            plan_mode=plan_mode,
-            horizon_track_ids=[int(track_id)],
-            horizon_gate_indices=[int(gate_idx)],
-        )
-        return True
-
     def _path_plan(self, pos: np.ndarray, vel: np.ndarray) -> bool:
         pos = np.asarray(pos, dtype=float).reshape(3)
         vel = np.asarray(vel, dtype=float).reshape(3)
@@ -5932,6 +5670,13 @@ class PyAIPilotAutonomyAPI:
     def _exit_tail_soft_pass_distance_m(self) -> float:
         return max(0.50, float(self.gate_pass_lateral_radius_m))
 
+    def _center_plane_clearance_soft_pass_progress_m(self) -> float:
+        return max(
+            float(VADR_TS_002.gate_depth_m),
+            float(self.gate_pass_through_m),
+            0.5 * max(0.0, float(self.gate_corridor_length_m)),
+        )
+
     def _expired_exit_tail_after_center_crossing(
         self,
         pos: np.ndarray,
@@ -5955,13 +5700,14 @@ class PyAIPilotAutonomyAPI:
             return False, exit_target, str(exit_role), float("nan")
         return True, exit_target, str(exit_role), distance
 
-    def _trace_expired_exit_tail_hold(
+    def _trace_expired_exit_tail_allow_replan(
         self,
         *,
         pos: np.ndarray,
         exit_target: np.ndarray,
         exit_role: str,
         distance: float,
+        reason: str,
     ) -> None:
         signature = (
             int(self.current_gate_idx),
@@ -5969,15 +5715,17 @@ class PyAIPilotAutonomyAPI:
             str(exit_role),
             round(float(distance), 2) if math.isfinite(float(distance)) else "nan",
             str(self.active_plan_mode),
+            str(reason),
         )
         if signature == self._last_exit_tail_hold_signature:
             return
         self._last_exit_tail_hold_signature = signature
         print(
-            "gate_exit_tail_hold_no_replan "
+            "gate_exit_tail_allow_replan "
             f"gate_idx={int(self.current_gate_idx)} "
             f"track={self.active_target_track_id if self.active_target_track_id is not None else 'none'} "
             f"role={exit_role} "
+            f"reason={reason} "
             f"distance={self._fmt_float(distance, precision=3)} "
             f"soft_pass_distance={self._fmt_float(self._exit_tail_soft_pass_distance_m(), precision=3)} "
             f"pos_neu={self._fmt_vec(pos, precision=3)} "
@@ -6125,6 +5873,44 @@ class PyAIPilotAutonomyAPI:
                     f"exit_neu={self._fmt_vec(exit_target, precision=3)}",
                     flush=True,
                 )
+            elif expired_tail and exit_target is not None:
+                center_progress = float(center_pass_result.signed_progress_m)
+                center_lateral_error = float(center_pass_result.lateral_error_m)
+                clearance_m = self._center_plane_clearance_soft_pass_progress_m()
+                if (
+                    bool(self.gate_plane_crossed)
+                    and math.isfinite(center_progress)
+                    and center_progress >= clearance_m
+                    and math.isfinite(center_lateral_error)
+                    and center_lateral_error <= float(self.gate_pass_lateral_radius_m)
+                ):
+                    pass_distance = float(distance)
+                    pass_result = GatePlanePassResult(
+                        passed=True,
+                        reason="expired_exit_tail_center_clearance",
+                        distance_m=pass_distance,
+                        signed_progress_m=center_progress,
+                        previous_signed_progress_m=float(
+                            center_pass_result.previous_signed_progress_m
+                        ),
+                        lateral_error_m=center_lateral_error,
+                        crossed_plane=bool(center_pass_result.crossed_plane),
+                        crossing_point=pos.copy(),
+                    )
+                    print(
+                        "gate_center_clearance_soft_pass "
+                        f"gate_idx={int(self.current_gate_idx)} "
+                        f"track={self.active_target_track_id if self.active_target_track_id is not None else 'none'} "
+                        f"role={exit_role} "
+                        f"center_progress={center_progress:.3f} "
+                        f"clearance={clearance_m:.3f} "
+                        f"center_lateral_error={center_lateral_error:.3f} "
+                        f"exit_distance={self._fmt_float(exit_distance, precision=3)} "
+                        f"soft_pass_distance={soft_distance:.3f} "
+                        f"pos_neu={self._fmt_vec(pos, precision=3)} "
+                        f"exit_neu={self._fmt_vec(exit_target, precision=3)}",
+                        flush=True,
+                    )
         if not pass_result.passed:
             if use_exit_pass_target and center_pass_result.passed:
                 print(
@@ -6285,6 +6071,108 @@ class PyAIPilotAutonomyAPI:
 
         return True, "ok", target.copy(), source_track_id
 
+    def _active_horizon_gate_center_waypoint(
+        self,
+        horizon_idx: int,
+    ) -> np.ndarray | None:
+        if self.active_waypoints is None:
+            return None
+        try:
+            horizon_idx = int(horizon_idx)
+        except (TypeError, ValueError):
+            return None
+        if horizon_idx < 0:
+            return None
+
+        roles = list(self.active_waypoint_roles or [])
+        if len(roles) != len(self.active_waypoints):
+            return None
+
+        seen_gate_centers = 0
+        for idx, role in enumerate(roles):
+            if role != "gate_center":
+                continue
+            if seen_gate_centers == horizon_idx:
+                return np.asarray(
+                    self.active_waypoints[idx],
+                    dtype=float,
+                ).reshape(3).copy()
+            seen_gate_centers += 1
+        return None
+
+    def _horizon_continue_preserve_ok(
+        self,
+        *,
+        horizon_idx: int,
+        stored_target: np.ndarray,
+        validated_target: np.ndarray,
+    ) -> tuple[bool, str, float, float]:
+        stored = self._finite_vec3_or_none(stored_target)
+        validated = self._finite_vec3_or_none(validated_target)
+        if stored is None or validated is None:
+            return False, "non_finite_handoff_target", float("inf"), float("inf")
+
+        stored = self._apply_target_z_policy(stored)
+        validated = self._apply_target_z_policy(validated)
+        stored_delta = float(np.linalg.norm(stored - validated))
+
+        waypoint = self._active_horizon_gate_center_waypoint(horizon_idx)
+        waypoint_delta = stored_delta
+        if waypoint is not None:
+            waypoint = self._apply_target_z_policy(waypoint)
+            waypoint_delta = float(np.linalg.norm(waypoint - validated))
+
+        threshold = max(0.0, float(self.replan_target_shift_m))
+        if threshold <= 0.0:
+            threshold = 1e-6
+        max_delta = max(stored_delta, waypoint_delta)
+        if math.isfinite(max_delta) and max_delta <= threshold:
+            return True, "ok", stored_delta, waypoint_delta
+        return False, "stale_horizon_suffix_target", stored_delta, waypoint_delta
+
+    def _stage_horizon_continue_replan_target(
+        self,
+        *,
+        gate_idx: int,
+        track_id,
+        target: np.ndarray,
+        reason: str,
+    ) -> None:
+        target = self._finite_vec3_or_none(target)
+        if target is None:
+            return
+        target = self._apply_target_z_policy(target)
+        gate_idx = int(gate_idx)
+
+        if 0 <= gate_idx < len(self.gate_centers_neu):
+            self.gate_centers_neu[gate_idx] = target.copy()
+        if 0 <= gate_idx < len(self.gate_track_ids):
+            self.gate_track_ids[gate_idx] = track_id
+
+        now = time.time()
+        self.spline_memory_by_gate_idx[gate_idx] = {
+            "gate_idx": gate_idx,
+            "track_id": track_id,
+            "center": target.copy(),
+            "plan_generation": int(self.active_plan_generation),
+            "plan_mode": str(self.active_plan_mode or "handoff"),
+            "source": "horizon_continue_replan_target",
+            "validated_plan": True,
+            "created_time": float(now),
+            "last_used_time": float(now),
+            "completed": False,
+        }
+        self._trace_spline_memory(
+            action="record",
+            gate_idx=gate_idx,
+            track_id=track_id,
+            center=target,
+            context=f"horizon_continue_replan_target:{reason}",
+            plan_generation=int(self.active_plan_generation),
+            plan_mode=str(self.active_plan_mode or "handoff"),
+            horizon_idx=0,
+        )
+
     def _continue_plan_after_gate_pass(
         self,
         *,
@@ -6308,7 +6196,7 @@ class PyAIPilotAutonomyAPI:
         if future_race_gate and next_gate_idx in self.active_horizon_gate_indices:
             horizon_idx = self.active_horizon_gate_indices.index(next_gate_idx)
             if 0 <= horizon_idx < len(self.active_horizon_targets):
-                target = self._apply_target_z_policy(
+                stored_target = self._apply_target_z_policy(
                     self.active_horizon_targets[horizon_idx]
                 )
                 track_id = (
@@ -6319,7 +6207,7 @@ class PyAIPilotAutonomyAPI:
                 valid, validation_reason, target, source_track_id = (
                     self._validated_horizon_continue_target(
                         track_id=track_id,
-                        stored_target=target,
+                        stored_target=stored_target,
                         next_gate_idx=next_gate_idx,
                     )
                 )
@@ -6333,6 +6221,41 @@ class PyAIPilotAutonomyAPI:
                     return False
                 if source_track_id is not None:
                     track_id = source_track_id
+                (
+                    preserve_ok,
+                    preserve_reason,
+                    stored_delta,
+                    waypoint_delta,
+                ) = self._horizon_continue_preserve_ok(
+                    horizon_idx=horizon_idx,
+                    stored_target=stored_target,
+                    validated_target=target,
+                )
+                if not preserve_ok:
+                    self._stage_horizon_continue_replan_target(
+                        gate_idx=next_gate_idx,
+                        track_id=track_id,
+                        target=target,
+                        reason=preserve_reason,
+                    )
+                    print(
+                        "horizon_continue_after_pass "
+                        "mode=replan_suffix "
+                        f"completed_gate_idx={int(completed_gate_idx)} "
+                        f"next_gate_idx={next_gate_idx} "
+                        f"track={track_id if track_id is not None else 'none'} "
+                        f"horizon_idx={horizon_idx} "
+                        f"reason={preserve_reason} "
+                        f"stored_delta={self._fmt_float(stored_delta, precision=2)} "
+                        f"waypoint_delta={self._fmt_float(waypoint_delta, precision=2)} "
+                        f"threshold={float(self.replan_target_shift_m):.2f} "
+                        f"stored_target_neu={self._fmt_vec(stored_target, precision=3)} "
+                        f"validated_target_neu={self._fmt_vec(target, precision=3)} "
+                        f"source={validation_reason} "
+                        f"active_plan_mode={self.active_plan_mode}",
+                        flush=True,
+                    )
+                    return False
                 locked_target = self.target_manager.lock_target(
                     gate_idx=next_gate_idx,
                     track_id=track_id,
@@ -6377,7 +6300,6 @@ class PyAIPilotAutonomyAPI:
             in (
                 "single_gate_exit",
                 "single_gate_corridor",
-                "single_gate_corridor_exit_shift",
             )
             and remaining_s > 0.05
         ):
@@ -6448,13 +6370,13 @@ class PyAIPilotAutonomyAPI:
                 self._expired_exit_tail_after_center_crossing(pos)
             )
             if expired_tail and exit_target is not None:
-                self._trace_expired_exit_tail_hold(
+                self._trace_expired_exit_tail_allow_replan(
                     pos=pos,
                     exit_target=exit_target,
                     exit_role=exit_role,
                     distance=exit_distance,
+                    reason="expired_plan_after_center_crossing",
                 )
-                return False
             return now - self.last_plan_wall_time >= self.replan_min_interval_s
         return self.last_planned_gate_idx != self.current_gate_idx
 
@@ -7029,6 +6951,143 @@ class PyAIPilotAutonomyAPI:
             -float(std_norm),
         )
 
+    def _race_order_reacquired_observation_center(
+        self,
+        track,
+        *,
+        now: float,
+    ) -> tuple[np.ndarray | None, str]:
+        if track is None:
+            return None, "missing_track"
+
+        committed = bool(getattr(track, "committed", False))
+        stable = bool(getattr(track, "is_stable", False))
+        ever_stable = bool(getattr(track, "ever_stable", False))
+        if not committed or not (stable or ever_stable):
+            return None, "not_stable"
+
+        hits = int(getattr(track, "hits", 0))
+        min_hits = max(1, int(getattr(self.gate_memory, "min_hits_for_stable", 1)))
+        if hits < min_hits:
+            return None, "insufficient_hits"
+
+        obs_history = getattr(track, "obs_history", [])
+        if not obs_history:
+            return None, "missing_observation"
+        last_obs = obs_history[-1]
+        if not bool(getattr(last_obs, "quality_ok", True)):
+            return None, str(getattr(last_obs, "quality_reason", "")) or "quality_bad"
+
+        last_seen = self._finite_float(getattr(track, "last_seen_time", 0.0), 0.0)
+        obs_time = self._finite_float(getattr(last_obs, "timestamp", 0.0), 0.0)
+        stamp = max(last_seen, obs_time)
+        max_age = max(
+            self._finite_float(getattr(self.gate_memory, "stale_time", 0.0), 0.0),
+            float(self.provisional_next_gate_max_age_s),
+        )
+        age_s = now - stamp if stamp > 0.0 else float("inf")
+        if max_age > 0.0 and (not math.isfinite(age_s) or age_s > max_age):
+            return None, "stale"
+
+        reproj = self._finite_float(
+            getattr(last_obs, "reprojection_error", float("nan")),
+            float("nan"),
+            allow_nan=True,
+        )
+        max_reproj = max(
+            float(self.max_reprojection_error_for_memory),
+            float(getattr(self.gate_memory, "max_reprojection_error_for_stable", 0.0)),
+            float(self.provisional_next_gate_max_reprojection_error),
+        )
+        if max_reproj > 0.0 and (
+            not math.isfinite(reproj) or reproj > max_reproj
+        ):
+            return None, "reprojection_error_high"
+
+        kp_min = self._finite_float(
+            getattr(last_obs, "keypoint_conf_min", float("nan")),
+            float("nan"),
+            allow_nan=True,
+        )
+        min_kp = max(
+            float(self.min_keypoint_conf_for_memory),
+            float(getattr(self.gate_memory, "min_keypoint_conf_for_stable", 0.0)),
+        )
+        if min_kp > 0.0 and (not math.isfinite(kp_min) or kp_min < min_kp):
+            return None, "keypoint_conf_low"
+
+        center = self._finite_vec3_or_none(getattr(last_obs, "center_world", None))
+        if center is None:
+            return None, "missing_observation_center"
+        return center.copy(), "recent_observation"
+
+    def _race_order_rescue_duplicate_center(
+        self,
+        track_id: int,
+        committed_by_id: dict[int, object],
+        *,
+        reference_center: np.ndarray | None,
+        now: float,
+        excluded_ids,
+    ) -> tuple[int | None, np.ndarray | None, str, float]:
+        reference_center = self._finite_vec3_or_none(reference_center)
+        if reference_center is None:
+            reference_center = self._race_order_track_center(track_id, committed_by_id)
+        if reference_center is None:
+            return None, None, "missing_reference_center", float("nan")
+
+        excluded = {int(item) for item in excluded_ids}
+        excluded.add(int(track_id))
+        radius = float(self.race_order_duplicate_radius_m)
+        if radius <= 0.0:
+            return None, None, "duplicate_radius_disabled", float("nan")
+
+        best = None
+        for candidate_id, track in committed_by_id.items():
+            candidate_id = int(candidate_id)
+            if candidate_id in excluded or candidate_id in self.completed_track_ids:
+                continue
+
+            candidate_center = self._race_order_track_center(candidate_id, committed_by_id)
+            if candidate_center is None:
+                continue
+            duplicate_dist = float(np.linalg.norm(candidate_center - reference_center))
+            if not math.isfinite(duplicate_dist) or duplicate_dist > radius:
+                continue
+
+            center = self._physical_navigation_center(
+                candidate_id,
+                committed_by_id,
+                require_fresh=True,
+            )
+            source = "filtered_center"
+            if center is None:
+                center, source = self._race_order_reacquired_observation_center(
+                    track,
+                    now=now,
+                )
+            if center is None:
+                continue
+
+            reject_reason = self._target_rejection_reason(center, candidate_id)
+            if reject_reason:
+                continue
+
+            score = self._race_order_track_score(candidate_id, committed_by_id)
+            key = (*score, -duplicate_dist, -candidate_id)
+            if best is None or key > best[0]:
+                best = (
+                    key,
+                    candidate_id,
+                    center.copy(),
+                    source,
+                    duplicate_dist,
+                )
+
+        if best is None:
+            return None, None, "no_fresh_duplicate", float("nan")
+        return int(best[1]), best[2], str(best[3]), float(best[4])
+
     def _trace_race_order_duplicate_skips(self, skips: list[tuple]) -> None:
         if not skips:
             self._last_race_order_duplicate_signature = None
@@ -7330,8 +7389,61 @@ class PyAIPilotAutonomyAPI:
             else:
                 center, reason = future_suffix_center(track_id)
                 if center is None:
-                    suffix_filter_skips.append((track_id, reason, None, float("nan")))
-                    continue
+                    rescue_id = None
+                    rescue_center = None
+                    rescue_dist = float("nan")
+                    if reason in {
+                        "missing_fresh_center",
+                        "stale",
+                        "last_observation_outlier",
+                    }:
+                        rescue_id, rescue_center, _, rescue_dist = (
+                            self._race_order_rescue_duplicate_center(
+                                track_id,
+                                committed_by_id,
+                                reference_center=duplicate_guard_center(track_id),
+                                now=time.time(),
+                                excluded_ids=(
+                                    set(filtered_candidate_ids)
+                                    | set(protected_duplicate_ids)
+                                    | set(self.completed_track_ids)
+                                ),
+                            )
+                        )
+                    if rescue_id is None or rescue_center is None:
+                        suffix_filter_skips.append((track_id, reason, None, float("nan")))
+                        continue
+                    duplicate_skips.append(("rescue", track_id, rescue_id, rescue_dist))
+                    track_id = int(rescue_id)
+                    center = rescue_center.copy()
+                else:
+                    exact_track = committed_by_id.get(track_id)
+                    exact_center, exact_quality = self._track_filtered_center_for_navigation(
+                        exact_track,
+                    )
+                    exact_is_fresh = bool(
+                        exact_center is not None
+                        and bool(exact_quality.get("ok", False))
+                        and not bool(exact_quality.get("last_observation_outlier", False))
+                    )
+                    if not exact_is_fresh:
+                        rescue_id, rescue_center, _, rescue_dist = (
+                            self._race_order_rescue_duplicate_center(
+                                track_id,
+                                committed_by_id,
+                                reference_center=center,
+                                now=time.time(),
+                                excluded_ids=(
+                                    set(filtered_candidate_ids)
+                                    | set(protected_duplicate_ids)
+                                    | set(self.completed_track_ids)
+                                ),
+                            )
+                        )
+                        if rescue_id is not None and rescue_center is not None:
+                            duplicate_skips.append(("rescue", track_id, rescue_id, rescue_dist))
+                            track_id = int(rescue_id)
+                            center = rescue_center.copy()
 
             duplicate_guard = protected_candidate_centers + filtered_candidate_centers
             duplicate_centers = [item[1] for item in duplicate_guard]

@@ -198,6 +198,7 @@ class PerceptionSection:
     yolo_imgsz: int
     yolo_device: Optional[int | str]
     yolo_keypoint_order: str
+    yolo_keypoint_layout: str
     transform_mode: str
     world_pose_source: str
     max_reprojection_error_for_memory: float
@@ -1000,6 +1001,10 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 "yolo_keypoint_order",
                 "semantic",
             ).lower(),
+            yolo_keypoint_layout=_env_str(
+                "YOLO_KEYPOINT_LAYOUT",
+                _str(perception_raw, "yolo_keypoint_layout", "inner4"),
+            ).lower(),
             transform_mode=_str(perception_raw, "transform_mode", "competition_official_ned"),
             world_pose_source=perception_world_pose_source,
             max_reprojection_error_for_memory=_float(
@@ -1339,7 +1344,7 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             active_target_preempt_margin_m=_float(
                 planner_raw,
                 "active_target_preempt_margin_m",
-                2.0,
+                0.0,
             ),
             active_target_preempt_lateral_radius_m=_float(
                 planner_raw,
@@ -1413,7 +1418,7 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             active_target_shift_defer_longitudinal_enabled=_bool(
                 planner_raw,
                 "active_target_shift_defer_longitudinal_enabled",
-                True,
+                False,
             ),
             active_target_shift_longitudinal_min_m=_float(
                 planner_raw,
@@ -2061,6 +2066,12 @@ def _validate(config: PilotConfig) -> None:
             f"Invalid perception.yolo_keypoint_order={config.perception.yolo_keypoint_order!r}. "
             "Use 'semantic' for fixed physical gate corners or 'image' for "
             "image-space TL/TR/BR/BL labels."
+        )
+    if config.perception.yolo_keypoint_layout not in ("inner4", "inner4_outer4"):
+        raise RuntimeError(
+            f"Invalid perception.yolo_keypoint_layout={config.perception.yolo_keypoint_layout!r}. "
+            "Use 'inner4' for the 4-keypoint model or 'inner4_outer4' for the "
+            "8-keypoint model."
         )
     if config.perception.world_pose_source not in (
         "mavsdk",
