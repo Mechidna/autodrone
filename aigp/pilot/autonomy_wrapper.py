@@ -3804,6 +3804,26 @@ class PyAIPilotAutonomyAPI:
                 velocity[2] = 0.0
             elif dz < -0.05 and velocity[2] > 0.0:
                 velocity[2] = 0.0
+            if len(waypoints) >= 2 and np.all(np.isfinite(waypoints[:2])):
+                first_segment = waypoints[1] - waypoints[0]
+                first_length = float(np.linalg.norm(first_segment))
+                if math.isfinite(first_length) and first_length > 0.25:
+                    axis = first_segment / first_length
+                    forward_speed = float(np.dot(velocity, axis))
+                    if math.isfinite(forward_speed) and forward_speed < -0.05:
+                        min_forward_speed = min(
+                            0.35,
+                            max(0.15, 0.15 * float(self.planner_vmax)),
+                        )
+                        velocity += (min_forward_speed - forward_speed) * axis
+                        if self.plan_v_start_z_max_m_s > 0.0:
+                            velocity[2] = float(
+                                np.clip(
+                                    velocity[2],
+                                    -float(self.plan_v_start_z_max_m_s),
+                                    float(self.plan_v_start_z_max_m_s),
+                                )
+                            )
         return velocity
 
     @staticmethod
@@ -3892,6 +3912,242 @@ class PyAIPilotAutonomyAPI:
                 return "none"
             samples.append(self._fmt_vec(point, precision=3))
         return "[" + ";".join(samples) + "]"
+
+    def _forward_handoff_axis(
+        self,
+        *,
+        pos: np.ndarray,
+        target: np.ndarray,
+        waypoints: np.ndarray,
+    ) -> np.ndarray | None:
+        pos = self._finite_vec3_or_none(pos)
+        target = self._finite_vec3_or_none(target)
+        if pos is None:
+            return None
+        if target is not None:
+            delta = target - pos
+            norm = float(np.linalg.norm(delta))
+            if math.isfinite(norm) and norm > 1e-6:
+                return delta / norm
+        try:
+            waypoints = np.asarray(waypoints, dtype=float)
+        except (TypeError, ValueError):
+            return None
+        if waypoints.ndim != 2 or waypoints.shape[1] != 3 or len(waypoints) < 2:
+            return None
+        delta = waypoints[1] - waypoints[0]
+        norm = float(np.linalg.norm(delta))
+        if not math.isfinite(norm) or norm < 1e-6:
+            return None
+        return delta / norm
+
+    @staticmethod
+    def _shift_waypoint_velocities_for_handoff(
+        waypoint_velocities,
+        *,
+        old_waypoint_count: int,
+        new_waypoint_count: int,
+        inserted_anchor: bool,
+    ):
+        if waypoint_velocities is None:
+            return None
+        try:
+            old = np.asarray(waypoint_velocities, dtype=float)
+        except (TypeError, ValueError):
+            return None
+        if (
+            old.ndim != 2
+            or old.shape[1] != 3
+            or old.shape[0] != int(old_waypoint_count)
+        ):
+            return None
+        new = np.full((int(new_waypoint_count), 3), np.nan, dtype=float)
+        if inserted_anchor:
+            if int(new_waypoint_count) >= 3:
+                new[2:] = old[1:]
+        else:
+            new[:] = old
+        return new
+
+    def _apply_forward_handoff_to_candidate(
+        self,
+        candidate: dict,
+        *,
+        pos: np.ndarray,
+        vel: np.ndarray,
+        target: np.ndarray,
+        gate_idx: int,
+        track_id,
+    ) -> dict:
+        planner = candidate.get("planner")
+        waypoints = candidate.get("waypoints")
+        times = candidate.get("times")
+        if planner is None or waypoints is None or times is None:
+            return candidate
+        try:
+            waypoints = np.asarray(waypoints, dtype=float)
+            times = np.asarray(times, dtype=float).reshape(-1)
+            total_time = float(planner.total_time)
+        except (TypeError, ValueError):
+            return candidate
+        if (
+            waypoints.ndim != 2
+            or waypoints.shape[1] != 3
+            or len(waypoints) < 2
+            or len(times) != len(waypoints) - 1
+            or not math.isfinite(total_time)
+            or total_time <= 0.0
+        ):
+            return candidate
+
+        pos = np.asarray(pos, dtype=float).reshape(3)
+        vel = np.asarray(vel, dtype=float).reshape(3)
+        axis = self._forward_handoff_axis(
+            pos=pos,
+            target=target,
+            waypoints=waypoints,
+        )
+        if axis is None:
+            return candidate
+
+        raw_v_start = self._planner_v_start_raw(planner, vel)
+        used_v_start = self._planner_v_start_used(planner, vel)
+        raw_start_forward_speed = float(np.dot(raw_v_start, axis))
+        start_forward_speed = float(np.dot(used_v_start, axis))
+        window_s = min(1.0, max(0.20, 0.25 * total_time))
+        sample_count = 40
+        min_progress = 0.0
+        min_forward_speed = start_forward_speed
+        anchor = None
+        anchor_tau = float("nan")
+        anchor_progress = float("nan")
+        target_distance = float(np.linalg.norm(np.asarray(target, dtype=float) - pos))
+        lookahead_m = min(
+            0.75,
+            max(0.40, 0.05 * target_distance),
+        )
+
+        for tau in np.linspace(0.0, window_s, sample_count + 1)[1:]:
+            try:
+                sample_pos, sample_vel, _ = planner.sample(float(tau))
+            except Exception:
+                return candidate
+            sample_pos = self._finite_vec3_or_none(sample_pos)
+            sample_vel = self._finite_vec3_or_none(sample_vel)
+            if sample_pos is None or sample_vel is None:
+                return candidate
+            progress = float(np.dot(sample_pos - pos, axis))
+            forward_speed = float(np.dot(sample_vel, axis))
+            if math.isfinite(progress):
+                min_progress = min(min_progress, progress)
+            if math.isfinite(forward_speed):
+                min_forward_speed = min(min_forward_speed, forward_speed)
+            if (
+                anchor is None
+                and math.isfinite(progress)
+                and math.isfinite(forward_speed)
+                and progress >= lookahead_m
+                and forward_speed >= 0.05
+            ):
+                anchor = sample_pos.copy()
+                anchor_tau = float(tau)
+                anchor_progress = float(progress)
+
+        backward_m = max(0.0, -float(min_progress))
+        needs_handoff = bool(
+            backward_m > 0.05
+            or min_forward_speed < -0.05
+            or raw_start_forward_speed < -0.05
+        )
+        if not needs_handoff:
+            return candidate
+
+        if anchor is None:
+            required_progress = max(0.25, backward_m + 0.20)
+            for tau in np.linspace(0.0, min(total_time, max(window_s, 1.5)), 80)[1:]:
+                try:
+                    sample_pos, sample_vel, _ = planner.sample(float(tau))
+                except Exception:
+                    return candidate
+                sample_pos = self._finite_vec3_or_none(sample_pos)
+                sample_vel = self._finite_vec3_or_none(sample_vel)
+                if sample_pos is None or sample_vel is None:
+                    return candidate
+                progress = float(np.dot(sample_pos - pos, axis))
+                forward_speed = float(np.dot(sample_vel, axis))
+                if (
+                    math.isfinite(progress)
+                    and math.isfinite(forward_speed)
+                    and progress >= required_progress
+                    and forward_speed >= 0.05
+                ):
+                    anchor = sample_pos.copy()
+                    anchor_tau = float(tau)
+                    anchor_progress = float(progress)
+                    break
+        if anchor is None:
+            return candidate
+
+        inserted_anchor = True
+        if float(np.linalg.norm(anchor - waypoints[1])) < 0.15:
+            new_waypoints = waypoints.copy()
+            new_waypoints[0] = pos.copy()
+            new_roles = list(candidate.get("waypoint_roles", []))
+            inserted_anchor = False
+        else:
+            new_waypoints = np.vstack([pos.copy(), anchor.copy(), waypoints[1:]])
+            old_roles = list(candidate.get("waypoint_roles", []))
+            if len(old_roles) == len(waypoints):
+                new_roles = ["start", "handoff"] + old_roles[1:]
+            else:
+                new_roles = ["start", "handoff"] + ["waypoint"] * (len(waypoints) - 1)
+
+        new_times = allocate_segment_times(
+            new_waypoints,
+            current_vel=vel,
+            vmax=self.planner_vmax,
+            amax=self.planner_amax,
+            T_min=self.planner_t_min,
+        )
+        new_waypoint_velocities = self._shift_waypoint_velocities_for_handoff(
+            candidate.get("waypoint_velocities"),
+            old_waypoint_count=len(waypoints),
+            new_waypoint_count=len(new_waypoints),
+            inserted_anchor=inserted_anchor,
+        )
+        new_planner = self._build_minimum_snap_plan(
+            waypoints=new_waypoints,
+            times=new_times,
+            v_start=vel,
+            v_end=candidate["terminal_velocity"],
+            waypoint_velocities=new_waypoint_velocities,
+        )
+        adjusted = dict(candidate)
+        adjusted["planner"] = new_planner
+        adjusted["waypoints"] = new_waypoints
+        adjusted["times"] = new_times
+        adjusted["waypoint_roles"] = new_roles
+        adjusted["waypoint_velocities"] = new_waypoint_velocities
+        adjusted["handoff_adjusted"] = True
+        adjusted["handoff_backward_m"] = float(backward_m)
+        adjusted["handoff_min_forward_speed_m_s"] = float(min_forward_speed)
+        adjusted["handoff_anchor_tau_s"] = float(anchor_tau)
+        adjusted["handoff_anchor_progress_m"] = float(anchor_progress)
+        print(
+            "plan_forward_handoff "
+            f"gate_idx={int(gate_idx)} "
+            f"track={track_id if track_id is not None else 'none'} "
+            f"mode={candidate.get('mode', 'unknown')} "
+            f"backward_m={backward_m:.3f} "
+            f"raw_forward_speed={raw_start_forward_speed:.3f} "
+            f"min_forward_speed={min_forward_speed:.3f} "
+            f"anchor_tau={anchor_tau:.3f} "
+            f"anchor_progress={anchor_progress:.3f} "
+            f"anchor_neu={self._fmt_vec(anchor, precision=3)} "
+            f"inserted={int(inserted_anchor)}",
+            flush=True,
+        )
+        return adjusted
 
     @staticmethod
     def _project_point_to_waypoint_polyline(
@@ -5042,7 +5298,7 @@ class PyAIPilotAutonomyAPI:
                 v_end=candidate_terminal_velocity,
                 waypoint_velocities=candidate_waypoint_velocities,
             )
-            return {
+            candidate = {
                 "planner": candidate_planner,
                 "waypoints": candidate_waypoints,
                 "times": candidate_times,
@@ -5059,6 +5315,14 @@ class PyAIPilotAutonomyAPI:
                 "horizon_gate_indices": list(gate_indices),
                 "prevalidation_details": None,
             }
+            return self._apply_forward_handoff_to_candidate(
+                candidate,
+                pos=pos,
+                vel=vel,
+                target=target,
+                gate_idx=target_idx,
+                track_id=target_track_id,
+            )
 
         candidate = build_candidate(
             horizon_targets,
@@ -5426,7 +5690,7 @@ class PyAIPilotAutonomyAPI:
                 v_end=candidate_terminal_velocity,
                 waypoint_velocities=None,
             )
-            return {
+            candidate = {
                 "planner": candidate_planner,
                 "waypoints": candidate_waypoints,
                 "times": candidate_times,
@@ -5439,6 +5703,14 @@ class PyAIPilotAutonomyAPI:
                     else "provisional_next_gate_direct"
                 ),
             }
+            return self._apply_forward_handoff_to_candidate(
+                candidate,
+                pos=pos,
+                vel=vel,
+                target=target,
+                gate_idx=int(self.current_gate_idx),
+                track_id=track_id,
+            )
 
         candidate = build_provisional_candidate(allow_exit=True)
         valid_plan, validation_details = self._validate_active_gate_plan_crossing(
@@ -6032,6 +6304,7 @@ class PyAIPilotAutonomyAPI:
         target = self._finite_vec3_or_none(stored_target)
         if target is None:
             return False, "non_finite_stored_target", None, None
+        stored = target.copy()
 
         source_track_id = None
         if self.use_perception and track_id is not None:
@@ -6044,6 +6317,57 @@ class PyAIPilotAutonomyAPI:
                     candidate_track_id
                 )
                 if target is None or not bool(quality.get("ok", False)):
+                    committed_by_id = {
+                        int(track.id): track
+                        for track in self.gate_memory.get_committed_tracks()
+                    }
+                    rescue_id, rescue_target, rescue_reason, rescue_dist = (
+                        self._race_order_rescue_duplicate_center(
+                            candidate_track_id,
+                            committed_by_id,
+                            reference_center=stored,
+                            now=time.time(),
+                            excluded_ids=self.completed_track_ids,
+                        )
+                    )
+                    if rescue_target is not None and rescue_id is not None:
+                        return (
+                            True,
+                            f"duplicate_live:{rescue_reason}:{rescue_dist:.2f}",
+                            self._apply_target_z_policy(rescue_target),
+                            int(rescue_id),
+                        )
+                    fallback_target = self._finite_vec3_or_none(target)
+                    if (
+                        fallback_target is not None
+                        and str(quality.get("reason", "")) == "fallback_exact_track"
+                    ):
+                        fallback_target = self._apply_target_z_policy(fallback_target)
+                        stored_for_delta = self._apply_target_z_policy(stored)
+                        fallback_delta = float(
+                            np.linalg.norm(fallback_target - stored_for_delta)
+                        )
+                        threshold = max(0.0, float(self.replan_target_shift_m))
+                        if threshold <= 0.0:
+                            threshold = 1e-6
+                        validation_track_id = (
+                            source_track_id
+                            if source_track_id is not None
+                            else candidate_track_id
+                        )
+                        reject_reason = self._target_rejection_reason(
+                            fallback_target,
+                            validation_track_id,
+                        )
+                        if reject_reason:
+                            return False, reject_reason, None, validation_track_id
+                        if math.isfinite(fallback_delta) and fallback_delta <= threshold:
+                            return (
+                                True,
+                                f"fallback_exact_track_preserve:{fallback_delta:.2f}",
+                                fallback_target,
+                                validation_track_id,
+                            )
                     memory_target, memory_track_id, _ = self._spline_memory_for_gate(
                         next_gate_idx,
                         candidate_track_id,
@@ -6065,7 +6389,8 @@ class PyAIPilotAutonomyAPI:
                 source_track_id = candidate_track_id
 
         target = self._apply_target_z_policy(target)
-        reason = self._target_rejection_reason(target, track_id)
+        validation_track_id = source_track_id if source_track_id is not None else track_id
+        reason = self._target_rejection_reason(target, validation_track_id)
         if reason:
             return False, reason, None, source_track_id
 
@@ -6106,6 +6431,7 @@ class PyAIPilotAutonomyAPI:
         horizon_idx: int,
         stored_target: np.ndarray,
         validated_target: np.ndarray,
+        duplicate_rescue: bool = False,
     ) -> tuple[bool, str, float, float]:
         stored = self._finite_vec3_or_none(stored_target)
         validated = self._finite_vec3_or_none(validated_target)
@@ -6123,6 +6449,11 @@ class PyAIPilotAutonomyAPI:
             waypoint_delta = float(np.linalg.norm(waypoint - validated))
 
         threshold = max(0.0, float(self.replan_target_shift_m))
+        if duplicate_rescue:
+            threshold = max(
+                threshold,
+                max(0.0, float(self.race_order_duplicate_radius_m)),
+            )
         if threshold <= 0.0:
             threshold = 1e-6
         max_delta = max(stored_delta, waypoint_delta)
@@ -6230,6 +6561,9 @@ class PyAIPilotAutonomyAPI:
                     horizon_idx=horizon_idx,
                     stored_target=stored_target,
                     validated_target=target,
+                    duplicate_rescue=str(validation_reason).startswith(
+                        "duplicate_live:"
+                    ),
                 )
                 if not preserve_ok:
                     self._stage_horizon_continue_replan_target(
@@ -6256,6 +6590,10 @@ class PyAIPilotAutonomyAPI:
                         flush=True,
                     )
                     return False
+                if 0 <= horizon_idx < len(self.active_horizon_track_ids):
+                    self.active_horizon_track_ids[horizon_idx] = track_id
+                if 0 <= horizon_idx < len(self.active_horizon_targets):
+                    self.active_horizon_targets[horizon_idx] = target.copy()
                 locked_target = self.target_manager.lock_target(
                     gate_idx=next_gate_idx,
                     track_id=track_id,
@@ -6263,6 +6601,8 @@ class PyAIPilotAutonomyAPI:
                     reason=(
                         "spline_memory_horizon_continue"
                         if validation_reason == "spline_memory"
+                        else "duplicate_horizon_continue"
+                        if str(validation_reason).startswith("duplicate_live:")
                         else "horizon_continue"
                     ),
                     now_s=now,

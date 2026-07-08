@@ -1381,6 +1381,58 @@ def test_plan_builder_clamps_vertical_start_velocity():
     np.testing.assert_allclose(planner._aigp_v_start_raw, [0.0, 1.0, 1.5])
 
 
+def test_plan_builder_forces_backward_start_velocity_forward():
+    api = PyAIPilotAutonomyAPI(use_perception=False, race_gate_count=1)
+    waypoints = np.array([[0.0, 0.0, 1.0], [0.0, 8.0, 1.0]])
+
+    planner = api._build_minimum_snap_plan(
+        waypoints=waypoints,
+        times=[4.0],
+        v_start=np.array([0.0, -0.25, 0.0]),
+        v_end=np.zeros(3),
+        waypoint_velocities=None,
+    )
+
+    assert planner._aigp_v_start_used[1] > 0.0
+    np.testing.assert_allclose(planner._aigp_v_start_raw, [0.0, -0.25, 0.0])
+
+
+def test_path_plan_trims_backward_start_lobe_with_forward_handoff():
+    api = PyAIPilotAutonomyAPI(use_perception=False, race_gate_count=6)
+    api.gate_corridor_enabled = True
+    api.gate_corridor_length_m = 3.0
+    api.current_gate_idx = 5
+    target = np.array([-2.621, 89.649, 3.962])
+    pos = np.array([-1.546, 77.154, 4.504])
+    vel = np.array([0.005, -0.233, -0.017])
+    api.gate_centers_neu = [
+        np.array([0.0, 10.0, 1.5]),
+        np.array([0.0, 20.0, 1.5]),
+        np.array([0.0, 30.0, 1.5]),
+        np.array([0.0, 40.0, 1.5]),
+        np.array([0.0, 50.0, 1.5]),
+        target.copy(),
+    ]
+    api.gate_track_ids = [-1, -2, -3, -4, -5, 29]
+
+    planned = api._path_plan(pos=pos, vel=vel)
+
+    assert planned
+    assert "handoff" in api.active_waypoint_roles
+    assert any(np.linalg.norm(waypoint - target) < 1e-6 for waypoint in api.active_waypoints)
+
+    axis = target - pos
+    axis = axis / np.linalg.norm(axis)
+    used_start = api._planner_v_start_used(api.planner, vel)
+    assert np.dot(used_start, axis) > 0.0
+
+    first_progress = []
+    for tau in np.linspace(0.0, min(1.0, api.planner.total_time), 30):
+        point, _, _ = api.planner.sample(float(tau))
+        first_progress.append(float(np.dot(np.asarray(point) - pos, axis)))
+    assert min(first_progress) >= -0.05
+
+
 def test_plan_shape_validation_allows_course_level_u_turn_waypoint_chain():
     api = PyAIPilotAutonomyAPI(use_perception=False, race_gate_count=1)
 
@@ -1449,6 +1501,113 @@ def test_horizon_continue_uses_spline_memory_when_future_track_is_stale():
     assert reason == "spline_memory"
     assert source_track_id == 49
     np.testing.assert_allclose(target, future_target)
+
+
+def test_horizon_continue_rescues_stale_suffix_with_live_duplicate_track():
+    api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=6)
+    api.race_order_duplicate_radius_m = 5.0
+    api.replan_target_shift_m = 1.0
+    stale_suffix_target = np.array([-2.630, 91.671, 4.093])
+    live_duplicate = _stable_track(
+        29,
+        np.array([-2.621, 89.649, 3.962]),
+        hits=30,
+        score=0.95,
+    )
+    api.gate_memory.tracks = [live_duplicate]
+
+    original_best_duplicate_cluster_center = api._best_duplicate_cluster_center
+
+    def fake_best_duplicate_cluster_center(track_id, committed_by_id=None):
+        if int(track_id) == 26:
+            return stale_suffix_target.copy(), 26, {
+                "ok": False,
+                "reason": "fallback_exact_track",
+                "source_track_id": 26,
+            }
+        return original_best_duplicate_cluster_center(track_id, committed_by_id)
+
+    api._best_duplicate_cluster_center = fake_best_duplicate_cluster_center
+
+    valid, reason, target, source_track_id = api._validated_horizon_continue_target(
+        track_id=26,
+        stored_target=stale_suffix_target,
+        next_gate_idx=5,
+    )
+
+    assert valid
+    assert reason.startswith("duplicate_live:")
+    assert source_track_id == 29
+    np.testing.assert_allclose(target, live_duplicate.filtered_center_world)
+
+    api.active_waypoints = np.vstack(
+        [
+            np.array([-1.5, 76.0, 4.5]),
+            stale_suffix_target,
+        ]
+    )
+    api.active_waypoint_roles = ["start", "gate_center"]
+    preserve_ok, preserve_reason, stored_delta, waypoint_delta = (
+        api._horizon_continue_preserve_ok(
+            horizon_idx=0,
+            stored_target=stale_suffix_target,
+            validated_target=target,
+            duplicate_rescue=True,
+        )
+    )
+
+    assert preserve_ok
+    assert preserve_reason == "ok"
+    assert stored_delta > api.replan_target_shift_m
+    assert waypoint_delta > api.replan_target_shift_m
+
+
+def test_horizon_continue_preserves_small_delta_exact_track_fallback():
+    api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=6)
+    api.replan_target_shift_m = 1.0
+    stored_target = np.array([-2.605, 89.238, 3.931])
+    fallback_target = stored_target + np.array([0.18, 0.12, -0.04])
+
+    def fake_best_duplicate_cluster_center(track_id, committed_by_id=None):
+        assert int(track_id) == 17
+        return fallback_target.copy(), 17, {
+            "ok": False,
+            "reason": "fallback_exact_track",
+            "source_track_id": 17,
+        }
+
+    api._best_duplicate_cluster_center = fake_best_duplicate_cluster_center
+
+    valid, reason, target, source_track_id = api._validated_horizon_continue_target(
+        track_id=17,
+        stored_target=stored_target,
+        next_gate_idx=5,
+    )
+
+    assert valid
+    assert reason.startswith("fallback_exact_track_preserve:")
+    assert source_track_id == 17
+    np.testing.assert_allclose(target, fallback_target)
+
+    api.active_waypoints = np.vstack(
+        [
+            np.array([-1.55, 77.08, 4.48]),
+            fallback_target,
+        ]
+    )
+    api.active_waypoint_roles = ["start", "gate_center"]
+    preserve_ok, preserve_reason, stored_delta, waypoint_delta = (
+        api._horizon_continue_preserve_ok(
+            horizon_idx=0,
+            stored_target=stored_target,
+            validated_target=target,
+        )
+    )
+
+    assert preserve_ok
+    assert preserve_reason == "ok"
+    assert stored_delta < api.replan_target_shift_m
+    assert waypoint_delta == 0.0
 
 
 def test_path_plan_uses_spline_memory_without_live_current_gate_slot():
