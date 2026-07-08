@@ -681,7 +681,7 @@ canvas {
 #recordCanvas { display: none; }
 .toolbar {
   display: grid;
-  grid-template-columns: auto auto auto 1fr auto auto;
+  grid-template-columns: auto auto auto auto 1fr auto auto;
   gap: 10px;
   align-items: center;
   padding: 10px;
@@ -759,6 +759,7 @@ aside {
     <div class="toolbar">
       <button id="playBtn">Play</button>
       <button id="saveVideoBtn">Save video</button>
+      <button id="saveGifBtn">Save GIF</button>
       <select id="viewMode">
         <option value="xy">Top-down x/y</option>
         <option value="yz">Side y/z</option>
@@ -831,6 +832,7 @@ const recordCanvas = document.getElementById('recordCanvas');
 const slider = document.getElementById('slider');
 const playBtn = document.getElementById('playBtn');
 const saveVideoBtn = document.getElementById('saveVideoBtn');
+const saveGifBtn = document.getElementById('saveGifBtn');
 const viewMode = document.getElementById('viewMode');
 const speedSel = document.getElementById('speed');
 const timeLabel = document.getElementById('timeLabel');
@@ -1817,40 +1819,230 @@ function mediaRecorderMimeType() {
   return '';
 }
 
-function composeRecordFrame(ctx, t) {
+function composeRecordFrame(ctx, t, options = {}) {
   const w = recordCanvas.width;
   const h = recordCanvas.height;
+  const sx = w / 1920;
+  const sy = h / 1080;
+  const s = Math.min(sx, sy);
   ctx.fillStyle = '#101418';
   ctx.fillRect(0, 0, w, h);
 
-  const leftW = 1280;
-  const mapH = 840;
+  const leftW = Math.round(w * (1280 / 1920));
+  const mapH = Math.round(h * (840 / 1080));
   const altH = h - mapH;
   const rightX = leftW;
   const rightW = w - leftW;
+  const cameraH = Math.round(h * (360 / 1080));
+  const pad = Math.max(8, Math.round(24 * s));
 
   ctx.drawImage(mapCanvas, 0, 0, leftW, mapH);
   ctx.drawImage(altCanvas, 0, mapH, leftW, altH);
 
   ctx.fillStyle = '#080c10';
   ctx.fillRect(rightX, 0, rightW, h);
-  ctx.drawImage(cameraCanvas, rightX, 0, rightW, 360);
+  ctx.drawImage(cameraCanvas, rightX, 0, rightW, cameraH);
 
   const f = frames[frameIndex] || {};
   const cam = cameraFrameForTime(t);
   ctx.fillStyle = '#eef4f8';
-  ctx.font = '24px ui-monospace, monospace';
-  ctx.fillText(`AIGP replay ${DATA.run_id}`, rightX + 24, 420);
-  ctx.font = '20px ui-monospace, monospace';
-  ctx.fillText(`t ${fmt(t, 2)} s`, rightX + 24, 462);
-  ctx.fillText(`gate ${f.gate_idx ?? 'n/a'} track ${f.active_track ?? 'n/a'}`, rightX + 24, 500);
-  ctx.fillText(`pos ${fmtVec(f.pos)}`, rightX + 24, 538);
-  ctx.fillText(`target ${fmtVec(f.target)}`, rightX + 24, 576);
-  ctx.fillText(`camera ${cam ? `${cam.frame_id ?? 'n/a'} @ ${fmt(cam.t, 2)}s` : 'none'}`, rightX + 24, 614);
+  ctx.font = `${Math.max(12, Math.round(24 * s))}px ui-monospace, monospace`;
+  ctx.fillText(`AIGP replay ${DATA.run_id}`, rightX + pad, Math.round(420 * sy));
+  ctx.font = `${Math.max(10, Math.round(20 * s))}px ui-monospace, monospace`;
+  ctx.fillText(`t ${fmt(t, 2)} s`, rightX + pad, Math.round(462 * sy));
+  ctx.fillText(`gate ${f.gate_idx ?? 'n/a'} track ${f.active_track ?? 'n/a'}`, rightX + pad, Math.round(500 * sy));
+  ctx.fillText(`pos ${fmtVec(f.pos)}`, rightX + pad, Math.round(538 * sy));
+  ctx.fillText(`target ${fmtVec(f.target)}`, rightX + pad, Math.round(576 * sy));
+  ctx.fillText(`camera ${cam ? `${cam.frame_id ?? 'n/a'} @ ${fmt(cam.t, 2)}s` : 'none'}`, rightX + pad, Math.round(614 * sy));
 
   ctx.fillStyle = '#9aa7b3';
-  ctx.font = '16px ui-monospace, monospace';
-  ctx.fillText('3D orbit + follow drone, encoded at 30 fps real-time playback', rightX + 24, h - 36);
+  ctx.font = `${Math.max(8, Math.round(16 * s))}px ui-monospace, monospace`;
+  ctx.fillText(
+    options.label || '3D orbit + follow drone, encoded at 30 fps real-time playback',
+    rightX + pad,
+    h - Math.max(12, Math.round(36 * sy))
+  );
+}
+
+function asciiBytes(text) {
+  const out = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i++) out[i] = text.charCodeAt(i) & 255;
+  return out;
+}
+
+function le16(value) {
+  const v = Math.max(0, Math.min(65535, Math.round(Number(value) || 0)));
+  return [v & 255, (v >> 8) & 255];
+}
+
+function gif332Palette() {
+  const palette = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const r = (i >> 5) & 7;
+    const g = (i >> 2) & 7;
+    const b = i & 3;
+    palette[i * 3 + 0] = Math.round((r / 7) * 255);
+    palette[i * 3 + 1] = Math.round((g / 7) * 255);
+    palette[i * 3 + 2] = Math.round((b / 3) * 255);
+  }
+  // Keep index 0 reserved. Some image viewers treat it as transparent even
+  // when the GIF frame does not enable transparency.
+  palette[0] = 16;
+  palette[1] = 20;
+  palette[2] = 24;
+  palette[3] = 16;
+  palette[4] = 20;
+  palette[5] = 24;
+  palette[254 * 3 + 0] = 238;
+  palette[254 * 3 + 1] = 244;
+  palette[254 * 3 + 2] = 248;
+  palette[255 * 3 + 0] = 16;
+  palette[255 * 3 + 1] = 20;
+  palette[255 * 3 + 2] = 24;
+  return palette;
+}
+
+function quantizeImageData332(imageData) {
+  const data = imageData.data;
+  const indexed = new Uint8Array(imageData.width * imageData.height);
+  for (let src = 0, dst = 0; src < data.length; src += 4, dst++) {
+    if (data[src + 3] < 128) {
+      indexed[dst] = 1;
+    } else {
+      let idx = (data[src] & 0xe0) | ((data[src + 1] & 0xe0) >> 3) | (data[src + 2] >> 6);
+      if (idx === 0) idx = 1;
+      if (idx === 255) idx = 254;
+      indexed[dst] = idx;
+    }
+  }
+  return indexed;
+}
+
+function lzwEncodeIndexed(pixels, minCodeSize = 8) {
+  const clearCode = 1 << minCodeSize;
+  const endCode = clearCode + 1;
+  let codeSize = minCodeSize + 1;
+  let nextCode = endCode + 1;
+  let bitBuffer = 0;
+  let bitCount = 0;
+  const bytes = [];
+
+  function writeCode(code) {
+    bitBuffer |= code << bitCount;
+    bitCount += codeSize;
+    while (bitCount >= 8) {
+      bytes.push(bitBuffer & 255);
+      bitBuffer >>= 8;
+      bitCount -= 8;
+    }
+  }
+
+  writeCode(clearCode);
+  if (!pixels.length) {
+    writeCode(endCode);
+    if (bitCount > 0) bytes.push(bitBuffer & 255);
+    return Uint8Array.from(bytes);
+  }
+
+  const dictionary = new Map();
+  let prefix = pixels[0];
+  for (let i = 1; i < pixels.length; i++) {
+    const k = pixels[i];
+    const key = (prefix << 8) | k;
+    const existing = dictionary.get(key);
+    if (existing !== undefined) {
+      prefix = existing;
+      continue;
+    }
+
+    writeCode(prefix);
+    if (nextCode < 4096) {
+      dictionary.set(key, nextCode++);
+      if (nextCode > (1 << codeSize) && codeSize < 12) codeSize++;
+    } else {
+      writeCode(clearCode);
+      dictionary.clear();
+      codeSize = minCodeSize + 1;
+      nextCode = endCode + 1;
+    }
+    prefix = k;
+  }
+
+  writeCode(prefix);
+  writeCode(endCode);
+  if (bitCount > 0) bytes.push(bitBuffer & 255);
+  return Uint8Array.from(bytes);
+}
+
+function pushGifSubblocks(parts, data) {
+  for (let offset = 0; offset < data.length; offset += 255) {
+    const size = Math.min(255, data.length - offset);
+    parts.push(Uint8Array.of(size));
+    parts.push(data.subarray(offset, offset + size));
+  }
+  parts.push(Uint8Array.of(0));
+}
+
+class GifEncoder {
+  constructor(width, height, fps) {
+    this.width = Math.max(1, Math.round(width));
+    this.height = Math.max(1, Math.round(height));
+    this.delayCs = Math.max(1, Math.round(100 / Math.max(1, Number(fps) || 10)));
+    this.parts = [];
+    this.parts.push(asciiBytes('GIF89a'));
+    this.parts.push(Uint8Array.from([
+      ...le16(this.width),
+      ...le16(this.height),
+      0xf7,
+      0x01,
+      0x00,
+    ]));
+    this.parts.push(gif332Palette());
+    this.parts.push(Uint8Array.from([
+      0x21, 0xff, 0x0b,
+      ...Array.from(asciiBytes('NETSCAPE2.0')),
+      0x03, 0x01, 0x00, 0x00, 0x00,
+    ]));
+  }
+
+  addFrame(indexedPixels) {
+    this.parts.push(Uint8Array.from([
+      0x21, 0xf9, 0x04, 0x00,
+      ...le16(this.delayCs),
+      0xff, 0x00,
+    ]));
+    this.parts.push(Uint8Array.from([
+      0x2c,
+      0x00, 0x00,
+      0x00, 0x00,
+      ...le16(this.width),
+      ...le16(this.height),
+      0x00,
+    ]));
+    this.parts.push(Uint8Array.of(8));
+    pushGifSubblocks(this.parts, lzwEncodeIndexed(indexedPixels, 8));
+  }
+
+  finish() {
+    this.parts.push(Uint8Array.of(0x3b));
+    return new Blob(this.parts, { type: 'image/gif' });
+  }
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+function setRecordButtonsDisabled(disabled) {
+  saveVideoBtn.disabled = disabled;
+  saveGifBtn.disabled = disabled;
 }
 
 async function recordReplayVideo() {
@@ -1861,7 +2053,7 @@ async function recordReplayVideo() {
   }
 
   recording = true;
-  saveVideoBtn.disabled = true;
+  setRecordButtonsDisabled(true);
   const previous = {
     frameIndex,
     playTime,
@@ -1891,7 +2083,7 @@ async function recordReplayVideo() {
     recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
   } catch (err) {
     videoStatus.textContent = `Could not start recorder: ${err}`;
-    saveVideoBtn.disabled = false;
+    setRecordButtonsDisabled(false);
     recording = false;
     return;
   }
@@ -1923,14 +2115,8 @@ async function recordReplayVideo() {
   }
 
   const blob = new Blob(chunks, { type: mimeType || 'video/webm' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `${DATA.run_id || 'aigp_replay'}_replay.webm`;
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 30000);
+  const filename = `${DATA.run_id || 'aigp_replay'}_replay.webm`;
+  downloadBlob(blob, filename);
 
   frameIndex = previous.frameIndex;
   playTime = previous.playTime;
@@ -1938,10 +2124,73 @@ async function recordReplayVideo() {
   viewMode.value = previous.viewMode;
   checks.followDrone.checked = previous.followDrone;
   playBtn.textContent = playing ? 'Pause' : 'Play';
-  videoStatus.textContent = `saved ${link.download}`;
-  saveVideoBtn.disabled = false;
+  videoStatus.textContent = `saved ${filename}`;
+  setRecordButtonsDisabled(false);
   recording = false;
   draw();
+}
+
+async function recordReplayGif() {
+  if (recording || !frames.length) return;
+
+  recording = true;
+  setRecordButtonsDisabled(true);
+  const previous = {
+    frameIndex,
+    playTime,
+    playing,
+    viewMode: viewMode.value,
+    followDrone: checks.followDrone.checked,
+  };
+
+  playing = false;
+  playBtn.textContent = 'Play';
+  viewMode.value = '3d';
+  checks.followDrone.checked = true;
+
+  const fps = 10;
+  const startT = Number(frames[0].t || 0);
+  const endT = Math.max(startT, Number(DATA.duration || frames[frames.length - 1].t || startT));
+  const totalFrames = Math.max(1, Math.ceil((endT - startT) * fps));
+  recordCanvas.width = 960;
+  recordCanvas.height = 540;
+  const recordCtx = recordCanvas.getContext('2d', { willReadFrequently: true });
+  const encoder = new GifEncoder(recordCanvas.width, recordCanvas.height, fps);
+
+  try {
+    for (let i = 0; i <= totalFrames; i++) {
+      const t = Math.min(endT, startT + i / fps);
+      frameIndex = frameIndexForTime(t);
+      playTime = t;
+      const cam = cameraFrameForTime(t);
+      await loadCameraImage(cam);
+      draw();
+      composeRecordFrame(recordCtx, t, {
+        label: '3D orbit + follow drone, GIF 960px wide at 10 fps',
+      });
+      const imageData = recordCtx.getImageData(0, 0, recordCanvas.width, recordCanvas.height);
+      encoder.addFrame(quantizeImageData332(imageData));
+      videoStatus.textContent = `gif ${i}/${totalFrames} frames (${fmt((i / Math.max(1, totalFrames)) * 100, 0)}%)`;
+      await sleep(0);
+    }
+
+    const blob = encoder.finish();
+    const filename = `${DATA.run_id || 'aigp_replay'}_replay.gif`;
+    downloadBlob(blob, filename);
+    videoStatus.textContent = `saved ${filename}`;
+  } catch (err) {
+    videoStatus.textContent = `GIF export failed: ${err}`;
+  } finally {
+    frameIndex = previous.frameIndex;
+    playTime = previous.playTime;
+    playing = previous.playing;
+    viewMode.value = previous.viewMode;
+    checks.followDrone.checked = previous.followDrone;
+    playBtn.textContent = playing ? 'Pause' : 'Play';
+    setRecordButtonsDisabled(false);
+    recording = false;
+    draw();
+  }
 }
 
 mapCanvas.addEventListener('pointerdown', event => {
@@ -1993,6 +2242,7 @@ playBtn.addEventListener('click', () => {
   lastTick = performance.now();
 });
 saveVideoBtn.addEventListener('click', recordReplayVideo);
+saveGifBtn.addEventListener('click', recordReplayGif);
 slider.addEventListener('input', () => {
   frameIndex = Number(slider.value);
   playTime = Number((frames[frameIndex] && frames[frameIndex].t) || 0);

@@ -11,6 +11,9 @@ The stack has two practical operating profiles:
 
 The legacy monolithic runner is not the recommended entry point for new users.
 
+![AIGP debug replay](docs/20260707_185854_replay.gif)
+
+
 ## Confirmed Target Specs
 
 These are the target environments this stack is written for and should be kept
