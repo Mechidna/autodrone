@@ -502,13 +502,13 @@ Train the 8-keypoint model:
 
 ```bash
 yolo pose train \
-  model=/home/paolo/datasets/drone-racing-dataset/yolo11n-pose.pt \
-  data=/home/paolo/datasets/gazebo_gate_yolo_pose_racer_8k/gate_pose.yaml \
+  model=~/datasets/drone-racing-dataset/yolo11n-pose.pt \
+  data=~/datasets/gazebo_gate_yolo_pose_racer_8k/gate_pose.yaml \
   epochs=100 \
   batch=16 \
   imgsz=640 \
   device=0 \
-  project=/home/paolo/datasets/gazebo_gate_yolo_pose_racer_8k_runs \
+  project=~/datasets/gazebo_gate_yolo_pose_racer_8k_runs \
   name=inner4_outer4
 ```
 
@@ -595,7 +595,7 @@ yolo_model_path = "aigp/models/gate_yolo_pose_8k/best.pt"
 If using an absolute Windows path in TOML, use forward slashes:
 
 ```toml
-yolo_model_path = "C:/Users/paolo/autonomy_core/aigp/models/gate_yolo_pose_8k/best.pt"
+yolo_model_path = "C:/Users/<you>/autonomy_core/aigp/models/gate_yolo_pose_8k/best.pt"
 ```
 
 ### ROS import errors on Windows
