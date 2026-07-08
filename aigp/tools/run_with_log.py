@@ -23,6 +23,7 @@ STRUCTURED_PREFIXES = (
     ("thrust_scale_calibration ", "thrust_scale_calibration"),
     ("lateral_response_calibration ", "lateral_response_calibration"),
     ("plan_install ", "plan_install"),
+    ("plan_candidate_reject ", "plan_candidate_reject"),
     ("plan_boundary_continuity ", "plan_boundary_continuity"),
     ("plan_validation_reject ", "plan_validation_reject"),
     ("gate_pass ", "gate_pass"),

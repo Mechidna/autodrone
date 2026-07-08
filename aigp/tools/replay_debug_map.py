@@ -371,6 +371,33 @@ def _compact_plan(event: dict[str, Any], start: float) -> dict[str, Any]:
     }
 
 
+def _compact_rejected_plan(event: dict[str, Any], start: float) -> dict[str, Any]:
+    fields = event.get("fields") or {}
+    out = _compact_plan(event, start)
+    out.update(
+        {
+            "reason": fields.get("reason"),
+            "fallback": fields.get("fallback"),
+            "sample_time": fields.get("sample_time"),
+            "lateral": fields.get("lateral"),
+            "progress": fields.get("progress"),
+            "crossing": _field_vec(fields, "crossing"),
+            "path_ratio": fields.get("path_ratio"),
+            "segment_ratio": fields.get("segment_ratio"),
+            "corridor": fields.get("corridor"),
+            "polyline_backtrack": fields.get("polyline_backtrack"),
+            "speed": fields.get("speed"),
+            "accel": fields.get("accel"),
+            "accel_xy": fields.get("accel_xy"),
+            "lateral_accel": fields.get("lateral_accel"),
+            "accel_z_up": fields.get("accel_z_up"),
+            "accel_z_down": fields.get("accel_z_down"),
+            "z_overshoot": fields.get("z_overshoot"),
+        }
+    )
+    return out
+
+
 def _compact_pass(event: dict[str, Any], start: float) -> dict[str, Any]:
     fields = event.get("fields") or {}
     return {
@@ -493,6 +520,7 @@ def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
     )
     frames = []
     plans = []
+    rejected_plans = []
     passes = []
     locks = []
     shifts = []
@@ -514,6 +542,8 @@ def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
                 frames.append(frame)
         elif kind == "plan_install":
             plans.append(_compact_plan(event, start))
+        elif kind == "plan_candidate_reject":
+            rejected_plans.append(_compact_rejected_plan(event, start))
         elif kind == "gate_pass":
             passes.append(_compact_pass(event, start))
         elif kind == "target_lock":
@@ -541,6 +571,7 @@ def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
         [0.0]
         + [float(item["t"]) for item in frames]
         + [float(item["t"]) for item in plans]
+        + [float(item["t"]) for item in rejected_plans]
         + [float(item["t"]) for item in passes]
     )
     env = {}
@@ -561,6 +592,7 @@ def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
         "returncode": None if run_end is None else run_end.get("returncode"),
         "frames": frames,
         "plans": plans,
+        "rejected_plans": rejected_plans,
         "passes": passes,
         "locks": locks,
         "shifts": shifts,
@@ -571,6 +603,7 @@ def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
         "counts": {
             "frames": len(frames),
             "plans": len(plans),
+            "rejected_plans": len(rejected_plans),
             "passes": len(passes),
             "locks": len(locks),
             "shifts": len(shifts),
@@ -600,6 +633,7 @@ HTML_TEMPLATE = r"""<!doctype html>
   --truth: #60d394;
   --ref: #ffb454;
   --plan: #d38cff;
+  --rejected-plan: #ff8a4c;
   --race: #47d18c;
   --stable: #ffd166;
   --gt: #d6dde5;
@@ -744,6 +778,7 @@ aside {
       <label><input type="checkbox" id="showTruth" checked> truth path</label>
       <label><input type="checkbox" id="showRef" checked> p_ref path</label>
       <label><input type="checkbox" id="showPlan" checked> plan spline</label>
+      <label><input type="checkbox" id="showRejectedPlans" checked> failed plans</label>
       <label><input type="checkbox" id="showRace" checked> race order</label>
       <label><input type="checkbox" id="showStable" checked> stable map</label>
       <label><input type="checkbox" id="showGt" checked> ground truth</label>
@@ -772,6 +807,7 @@ aside {
         <div class="swatch" style="background:var(--truth)"></div><div>truth path</div>
         <div class="swatch" style="background:var(--ref)"></div><div>controller reference p_ref</div>
         <div class="swatch" style="background:var(--plan)"></div><div>latest installed minimum-snap spline</div>
+        <div class="swatch" style="background:var(--rejected-plan)"></div><div>failed validation candidates</div>
         <div class="swatch" style="background:var(--race)"></div><div>internal race order map</div>
         <div class="swatch" style="background:var(--stable)"></div><div>stable perception tracks</div>
         <div class="swatch" style="background:var(--pass)"></div><div>passed gate marker</div>
@@ -802,13 +838,13 @@ const frameInfo = document.getElementById('frameInfo');
 const eventsBox = document.getElementById('events');
 const subtitle = document.getElementById('subtitle');
 const videoStatus = document.getElementById('videoStatus');
-const checks = ['showTruth','showRef','showPlan','showRace','showStable','showGt','showLabels','followDrone']
+const checks = ['showTruth','showRef','showPlan','showRejectedPlans','showRace','showStable','showGt','showLabels','followDrone']
   .reduce((acc, id) => { acc[id] = document.getElementById(id); return acc; }, {});
 
 const frames = DATA.frames || [];
 const cameraFrames = DATA.camera_frames || [];
 slider.max = Math.max(0, frames.length - 1);
-subtitle.textContent = `${DATA.debug_path} | frames=${DATA.counts.frames}, camera=${DATA.counts.camera_frames || 0}, plans=${DATA.counts.plans}, passes=${DATA.counts.passes}, shifts=${DATA.counts.shifts}, return=${DATA.returncode}`;
+subtitle.textContent = `${DATA.debug_path} | frames=${DATA.counts.frames}, camera=${DATA.counts.camera_frames || 0}, plans=${DATA.counts.plans}, failed_plans=${DATA.counts.rejected_plans || 0}, passes=${DATA.counts.passes}, shifts=${DATA.counts.shifts}, return=${DATA.returncode}`;
 const gateSizeM = Number(DATA.gate_size_m || 1.5);
 
 let frameIndex = 0;
@@ -863,6 +899,11 @@ function planCurvePoints(plan) {
   if (!plan) return [];
   if (plan.samples && plan.samples.length >= 2) return plan.samples;
   return plan.waypoints || [];
+}
+
+function rejectedPlansForTime(t) {
+  return recentAt(DATA.rejected_plans || [], t, 10)
+    .filter(p => Number(t) - Number(p.t || 0) <= 8);
 }
 
 function frameIndexForTime(t) {
@@ -990,6 +1031,9 @@ function allPoints() {
     if (pxy(f.target)) pts.push(f.target);
   }
   for (const p of DATA.plans || []) for (const w of p.waypoints || []) if (pxy(w)) pts.push(w);
+  for (const p of DATA.rejected_plans || []) {
+    for (const w of planCurvePoints(p)) if (pxy(w)) pts.push(w);
+  }
   for (const g of DATA.known_gates || []) if (pxy(g.p)) pts.push(g.p);
   for (const m of DATA.maps || []) for (const g of m.gates || []) if (pxy(g.p)) pts.push(g.p);
   for (const gp of DATA.passes || []) {
@@ -1510,6 +1554,19 @@ function drawMap3D() {
   if (checks.showTruth.checked) draw3DLine(ctx, proj, trail.map(f => f.truth), '#60d394', 2, 0.85);
   if (checks.showRef.checked) draw3DLine(ctx, proj, trail.map(f => f.p_ref), '#ffb454', 2, 0.9);
 
+  const rejectedPlans = rejectedPlansForTime(t);
+  if (checks.showRejectedPlans.checked) {
+    for (const rejected of rejectedPlans) {
+      const rejectedCurve = planCurvePoints(rejected);
+      if (rejectedCurve.length) draw3DLine(ctx, proj, rejectedCurve, '#ff8a4c', 1.5, 0.38);
+    }
+    const latestRejected = rejectedPlans[rejectedPlans.length - 1];
+    if (latestRejected) {
+      const labelPoint = latestRejected.target || planCurvePoints(latestRejected).slice(-1)[0];
+      draw3DLabel(ctx, proj, labelPoint, `reject ${latestRejected.reason || 'plan'}`, '#ffb282', 8, 14);
+    }
+  }
+
   const plan = latestAt(DATA.plans, t);
   const planCurve = planCurvePoints(plan);
   if (checks.showPlan.checked && plan && planCurve.length) {
@@ -1578,6 +1635,19 @@ function drawMap() {
     for (const g of race.gates) {
       drawDiamond(ctx, proj, g.p, 6, '#47d18c');
       drawLabel(ctx, proj, g.p, `${g.order}:${g.id}`, '#47d18c');
+    }
+  }
+
+  const rejectedPlans = rejectedPlansForTime(t);
+  if (checks.showRejectedPlans.checked) {
+    for (const rejected of rejectedPlans) {
+      const rejectedCurve = planCurvePoints(rejected);
+      if (rejectedCurve.length) drawLine(ctx, rejectedCurve, proj, '#ff8a4c', 1.5, 0.38);
+    }
+    const latestRejected = rejectedPlans[rejectedPlans.length - 1];
+    if (latestRejected) {
+      const labelPoint = latestRejected.target || planCurvePoints(latestRejected).slice(-1)[0];
+      drawLabel(ctx, proj, labelPoint, `reject ${latestRejected.reason || 'plan'}`, '#ffb282', 8, 14);
     }
   }
 
@@ -1663,6 +1733,7 @@ function updateInfo() {
   timeLabel.textContent = `${fmt(t, 1)}s / frame ${frameIndex + 1}/${frames.length}`;
   const plan = latestAt(DATA.plans, t);
   const planCurve = planCurvePoints(plan);
+  const rejectedPlans = rejectedPlansForTime(t);
   const race = latestAt(DATA.maps, t, m => m.kind === 'race_order_gates');
   const stable = latestAt(DATA.maps, t, m => m.kind === 'stable_perception_gates');
   const cameraFrame = cameraFrameForTime(t);
@@ -1683,6 +1754,7 @@ function updateInfo() {
     ['cmd_deg', fmtVec(f.cmd_deg)],
     ['plan', plan ? `${plan.mode} g=${plan.gate_idx} tracks=(${(plan.horizon_tracks||[]).join(',')})` : 'none'],
     ['plan samples', plan ? `${planCurve.length} curve / ${(plan.waypoints || []).length} waypoints` : 'none'],
+    ['failed plans', `${rejectedPlans.length} recent / ${DATA.counts.rejected_plans || 0} total`],
     ['camera frame', cameraFrame ? `${cameraFrame.frame_id ?? 'n/a'} @ ${fmt(cameraFrame.t, 2)}s` : 'none'],
     ['race gates', race ? race.gates.length : 0],
     ['stable gates', stable ? stable.gates.length : 0],
@@ -1691,6 +1763,7 @@ function updateInfo() {
 
   const ev = [
     ...recentAt(DATA.plans, t, 5).map(p => `[${fmt(p.t,1)}] plan ${p.mode} gate=${p.gate_idx} tracks=(${(p.horizon_tracks||[]).join(',')})`),
+    ...recentAt(DATA.rejected_plans || [], t, 5).map(p => `[${fmt(p.t,1)}] reject ${p.mode} gate=${p.gate_idx} reason=${p.reason ?? 'n/a'} fallback=${p.fallback ?? 'n/a'}`),
     ...recentAt(DATA.shifts, t, 5).map(s => `[${fmt(s.t,1)}] shift gate=${s.gate_idx} track=${s.track} shift=${fmt(s.shift)}`),
     ...recentAt(DATA.passes, t, 5).map(g => `[${fmt(g.t,1)}] pass gate=${g.gate_idx} track=${g.track} d=${fmt(g.distance)} lat=${fmt(g.lateral_error)}`),
     ...recentAt(DATA.alerts, t, 3).map(a => `[${fmt(a.t,1)}] alert ${a.text}`),

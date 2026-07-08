@@ -177,6 +177,80 @@ def test_visibility_negative_evidence_demotes_visible_unmatched_track():
     assert api.race_order_track_ids == []
 
 
+def test_visibility_negative_evidence_holds_active_unpassed_track():
+    api = _visibility_api()
+    snapshot = _visibility_snapshot()
+    first = _visibility_perception(api, frame_id=1, timestamp=1.0)
+    center = _world_from_visibility_camera(
+        api,
+        np.array([0.0, 0.0, 15.0], dtype=float),
+        snapshot,
+        first,
+    )
+    track = _stable_track(35, center)
+    api.gate_memory.tracks = [track]
+    api.race_order_track_ids = [35]
+    api.target_manager.lock_target(
+        gate_idx=3,
+        track_id=35,
+        center_neu=center,
+        reason="test",
+    )
+    api._sync_target_manager_state()
+
+    api._update_gate_memory(first, snapshot=snapshot)
+    api._update_gate_memory(
+        _visibility_perception(api, frame_id=2, timestamp=1.1),
+        snapshot=snapshot,
+    )
+
+    assert track.committed
+    assert track.is_stable
+    assert track.ever_stable
+    assert track.visibility_state == "visible_no_hit"
+    assert track.visible_miss_count >= api.visibility_miss_frames
+    assert api.race_order_track_ids == [35]
+    assert api.target_manager.locked
+    assert api.active_target_track_id == 35
+
+
+def test_visibility_negative_evidence_demotes_active_track_after_grace():
+    api = _visibility_api()
+    snapshot = _visibility_snapshot()
+    first = _visibility_perception(api, frame_id=1, timestamp=1.0)
+    center = _world_from_visibility_camera(
+        api,
+        np.array([0.0, 0.0, 15.0], dtype=float),
+        snapshot,
+        first,
+    )
+    track = _stable_track(36, center)
+    api.gate_memory.tracks = [track]
+    api.race_order_track_ids = [36]
+    api.target_manager.lock_target(
+        gate_idx=3,
+        track_id=36,
+        center_neu=center,
+        reason="test",
+    )
+    api._sync_target_manager_state()
+
+    api._update_gate_memory(first, snapshot=snapshot)
+    api._update_gate_memory(
+        _visibility_perception(
+            api,
+            frame_id=2,
+            timestamp=1.0 + api.active_target_lost_grace_s + 0.2,
+        ),
+        snapshot=snapshot,
+    )
+
+    assert not track.committed
+    assert not track.is_stable
+    assert api.race_order_track_ids == []
+    assert not api.target_manager.locked
+
+
 def test_canonical_gate_pose_record_converts_sdf_pose_to_neu_axes():
     yaw0 = PyAIPilotAutonomyAPI._canonical_gate_pose_record_from_sdf_pose(
         gate_id=0,

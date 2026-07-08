@@ -5156,6 +5156,137 @@ class PyAIPilotAutonomyAPI:
             flush=True,
         )
 
+    def _trace_plan_candidate_reject(
+        self,
+        candidate: dict | None,
+        details: dict,
+        *,
+        fallback: str,
+        target: np.ndarray,
+        normal: np.ndarray | None,
+        v_start: np.ndarray,
+        sample_count: int = 60,
+    ) -> None:
+        if candidate is None:
+            return
+        planner = candidate.get("planner")
+        waypoints = candidate.get("waypoints")
+        times = candidate.get("times")
+        terminal_velocity = candidate.get("terminal_velocity", np.zeros(3, dtype=float))
+        terminal_policy = candidate.get("terminal_policy", "unknown")
+        waypoint_velocities = candidate.get("waypoint_velocities")
+        waypoint_roles = list(candidate.get("waypoint_roles", []))
+        horizon_track_ids = list(candidate.get("horizon_track_ids", []))
+        horizon_gate_indices = list(candidate.get("horizon_gate_indices", []))
+        plan_mode = str(candidate.get("mode", details.get("plan_mode", "unknown")))
+        gate_idx = int(details.get("gate_idx", self.current_gate_idx))
+        track_id = details.get("track_id", None)
+        reason = str(details.get("reason", "unknown"))
+
+        try:
+            waypoints = np.asarray(waypoints, dtype=float)
+        except (TypeError, ValueError):
+            waypoints = np.zeros((0, 3), dtype=float)
+        try:
+            times = np.asarray(times, dtype=float).reshape(-1)
+        except (TypeError, ValueError):
+            times = np.zeros(0, dtype=float)
+
+        waypoints_txt = "[" + ";".join(
+            self._fmt_vec(waypoint, precision=3) for waypoint in waypoints
+        ) + "]"
+        times_txt = "(" + ",".join(f"{float(item):.3f}" for item in times) + ")"
+        waypoint_roles_txt = "(" + ",".join(str(role) for role in waypoint_roles) + ")"
+        horizon_tracks_txt = "(" + ",".join(
+            str(track_id) if track_id is not None else "none"
+            for track_id in horizon_track_ids
+        ) + ")"
+        horizon_indices_txt = "(" + ",".join(str(idx) for idx in horizon_gate_indices) + ")"
+        waypoint_velocities_txt = "none"
+        if waypoint_velocities is not None:
+            try:
+                velocities = np.asarray(waypoint_velocities, dtype=float)
+            except (TypeError, ValueError):
+                velocities = np.zeros((0, 3), dtype=float)
+            waypoint_velocities_txt = "[" + ";".join(
+                self._fmt_vec(velocity, precision=3)
+                if np.all(np.isfinite(velocity))
+                else "nan"
+                for velocity in velocities
+            ) + "]"
+
+        total_time = float("nan")
+        plan_samples_txt = "none"
+        v_start_used_txt = "none"
+        v_start_raw_txt = "none"
+        if planner is not None:
+            total_time = self._finite_float(
+                getattr(planner, "total_time", float("nan")),
+                float("nan"),
+            )
+            plan_samples_txt = self._sample_planner_path_text(
+                planner,
+                sample_count=sample_count,
+            )
+            v_start_used_txt = self._fmt_vec(
+                self._planner_v_start_used(planner, v_start),
+                precision=3,
+            )
+            v_start_raw_txt = self._fmt_vec(
+                self._planner_v_start_raw(planner, v_start),
+                precision=3,
+            )
+
+        lateral = details.get("lateral_error_m", details.get("closest_lateral_error_m"))
+        progress = details.get(
+            "plane_progress_m",
+            details.get("progress_m", details.get("closest_abs_progress_m")),
+        )
+        sample_time = details.get("sample_time_s", details.get("closest_sample_time_s"))
+        crossing = self._finite_vec3_or_none(
+            details.get("crossing_point", details.get("closest_position"))
+        )
+        z_overshoot = details.get("z_overshoot_m", details.get("z_undershoot_m"))
+        print(
+            "plan_candidate_reject "
+            f"gate_idx={gate_idx} "
+            f"track={track_id if track_id is not None else 'none'} "
+            f"mode={plan_mode} "
+            f"reason={reason} "
+            f"fallback={fallback} "
+            f"horizon_tracks={horizon_tracks_txt} "
+            f"horizon_gate_indices={horizon_indices_txt} "
+            f"total_time={self._fmt_float(total_time, precision=3)} "
+            f"segments={max(0, int(len(waypoints) - 1))} "
+            f"target_neu={self._fmt_vec(target, precision=3)} "
+            f"normal_neu={self._fmt_vec(normal, precision=3) if normal is not None else 'none'} "
+            f"v_start_neu={v_start_used_txt} "
+            f"v_start_raw_neu={v_start_raw_txt} "
+            f"v_end_neu={self._fmt_vec(terminal_velocity, precision=3)} "
+            f"terminal_policy={terminal_policy} "
+            f"waypoint_velocities_neu={waypoint_velocities_txt} "
+            f"times_s={times_txt} "
+            f"waypoint_roles={waypoint_roles_txt} "
+            f"waypoints_neu={waypoints_txt} "
+            f"plan_samples_neu={plan_samples_txt} "
+            f"lateral={self._fmt_float(lateral, precision=2)} "
+            f"progress={self._fmt_float(progress, precision=2)} "
+            f"sample_time={self._fmt_float(sample_time, precision=2)} "
+            f"crossing={self._fmt_vec(crossing, precision=3) if crossing is not None else 'none'} "
+            f"path_ratio={self._fmt_float(details.get('path_length_ratio'), precision=3)} "
+            f"segment_ratio={self._fmt_float(details.get('segment_path_length_ratio'), precision=3)} "
+            f"corridor={self._fmt_float(details.get('corridor_m'), precision=2)} "
+            f"polyline_backtrack={self._fmt_float(details.get('polyline_backtrack_m'), precision=2)} "
+            f"speed={self._fmt_float(details.get('speed_m_s'), precision=2)} "
+            f"accel={self._fmt_float(details.get('accel_m_s2'), precision=2)} "
+            f"accel_xy={self._fmt_float(details.get('accel_xy_m_s2'), precision=2)} "
+            f"lateral_accel={self._fmt_float(details.get('lateral_accel_m_s2'), precision=2)} "
+            f"accel_z_up={self._fmt_float(details.get('accel_z_up_m_s2'), precision=2)} "
+            f"accel_z_down={self._fmt_float(details.get('accel_z_down_m_s2'), precision=2)} "
+            f"z_overshoot={self._fmt_float(z_overshoot, precision=2)}",
+            flush=True,
+        )
+
     def _plan_validation_retry_scale(self, details: dict) -> float | None:
         reason = str(details.get("reason", ""))
         retry_specs = {
@@ -5430,6 +5561,17 @@ class PyAIPilotAutonomyAPI:
                     retried["planner"] = retry_planner
                     retried["times"] = times
                     return retried, True, retry_details
+                rejected_retry = dict(candidate)
+                rejected_retry["planner"] = retry_planner
+                rejected_retry["times"] = times
+                self._trace_plan_candidate_reject(
+                    rejected_retry,
+                    retry_details,
+                    fallback=f"retry_{attempt + 1}",
+                    target=target,
+                    normal=normal,
+                    v_start=vel,
+                )
                 best_details = retry_details
                 retry_scale = self._plan_validation_retry_scale(retry_details)
                 if retry_scale is None:
@@ -5438,6 +5580,14 @@ class PyAIPilotAutonomyAPI:
             return candidate, False, best_details
 
         if not valid_plan:
+            self._trace_plan_candidate_reject(
+                candidate,
+                validation_details,
+                fallback="primary",
+                target=target,
+                normal=normal,
+                v_start=vel,
+            )
             candidate, valid_plan, validation_details = (
                 retry_candidate_with_slower_timing(candidate, validation_details)
             )
@@ -5466,6 +5616,14 @@ class PyAIPilotAutonomyAPI:
                     )
                 )
             if not fallback_valid:
+                self._trace_plan_candidate_reject(
+                    fallback_candidate,
+                    fallback_details,
+                    fallback="active_gate_only",
+                    target=target,
+                    normal=normal,
+                    v_start=vel,
+                )
                 fallback_candidate, fallback_valid, fallback_details = (
                     retry_candidate_with_slower_timing(
                         fallback_candidate,
@@ -5498,6 +5656,14 @@ class PyAIPilotAutonomyAPI:
                     fallback_candidate = direct_candidate
                     fallback_valid = True
                 else:
+                    self._trace_plan_candidate_reject(
+                        direct_candidate,
+                        direct_details,
+                        fallback="single_gate",
+                        target=target,
+                        normal=normal,
+                        v_start=vel,
+                    )
                     fallback_details = direct_details
             if not fallback_valid:
                 self._trace_plan_validation_reject(
@@ -5538,6 +5704,14 @@ class PyAIPilotAutonomyAPI:
                 track_id=target_track_id,
             )
             if not fallback_valid:
+                self._trace_plan_candidate_reject(
+                    fallback_candidate,
+                    fallback_details,
+                    fallback="single_gate",
+                    target=target,
+                    normal=normal,
+                    v_start=vel,
+                )
                 fallback_candidate, fallback_valid, fallback_details = (
                     retry_candidate_with_slower_timing(
                         fallback_candidate,
@@ -9798,6 +9972,47 @@ class PyAIPilotAutonomyAPI:
             and track.visible_miss_time_s >= float(self.visibility_miss_time_s)
         )
 
+    def _is_active_unpassed_track(self, track_id) -> bool:
+        try:
+            track_id = int(track_id)
+        except (TypeError, ValueError):
+            return False
+        if track_id in self.completed_track_ids:
+            return False
+
+        active_ids: set[int] = set()
+        try:
+            if (
+                self.active_target_track_id is not None
+                and self.current_gate_pos is not None
+            ):
+                active_ids.add(int(self.active_target_track_id))
+        except (TypeError, ValueError):
+            pass
+
+        diag = self.target_manager.diagnostics()
+        try:
+            if diag.locked and diag.active_track_id is not None:
+                active_ids.add(int(diag.active_track_id))
+        except (TypeError, ValueError):
+            pass
+        return track_id in active_ids
+
+    def _active_visibility_hold_reason(self, track_id, track) -> str:
+        if not self._is_active_unpassed_track(track_id):
+            return ""
+        active_grace_s = max(
+            float(self.visibility_miss_time_s),
+            float(self.active_target_lost_grace_s),
+        )
+        miss_time_s = self._finite_float(
+            getattr(track, "visible_miss_time_s", 0.0),
+            0.0,
+        )
+        if active_grace_s > 0.0 and miss_time_s < active_grace_s:
+            return "active_target_lost_grace"
+        return ""
+
     def _clear_spline_memory_for_track(self, track_id, *, reason: str) -> None:
         try:
             track_id = int(track_id)
@@ -9953,6 +10168,17 @@ class PyAIPilotAutonomyAPI:
                     state="visible_no_hit",
                     action="count",
                     reason="below_threshold",
+                )
+                continue
+
+            active_hold_reason = self._active_visibility_hold_reason(track_id, track)
+            if active_hold_reason:
+                self._trace_visibility_negative_evidence(
+                    track=track,
+                    projection=projection,
+                    state="visible_no_hit",
+                    action="hold",
+                    reason=active_hold_reason,
                 )
                 continue
 
