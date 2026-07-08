@@ -27,7 +27,7 @@ compatible with.
 | CPU fallback | Works for import/smoke tests, not recommended for real-time YOLO |
 | Camera image | 640x360 competition camera model |
 | Runtime model | MAVLink telemetry plus UDP image stream |
-| YOLO model path | `aigp/models/gate_yolo_pose/best.pt` |
+| YOLO model path | `aigp/models/gate_yolo_pose_8k/best.pt` |
 
 Python 3.11 is also acceptable for most of the code. Python 3.10 is not
 recommended because the runtime imports `tomllib`.
@@ -69,7 +69,7 @@ aigp/
   config/
     runtime.toml                 # Main runtime configuration
   models/
-    gate_yolo_pose/
+    gate_yolo_pose_8k/
       best.pt                    # Trained YOLO pose weights
   pilot/
     main.py                      # Active runner
@@ -97,21 +97,23 @@ autonomy_core/
 For runtime, only the trained weights are required:
 
 ```text
-aigp/models/gate_yolo_pose/best.pt
+aigp/models/gate_yolo_pose_8k/best.pt
 ```
 
 Recommended optional files for reproducibility:
 
 ```text
-aigp/models/gate_yolo_pose/args.yaml
-aigp/models/gate_yolo_pose/gate_pose.yaml
+aigp/models/gate_yolo_pose_8k/args.yaml
+aigp/models/gate_yolo_pose_8k/gate_pose.yaml
 ```
 
 The configured path should be repo-relative:
 
 ```toml
 [perception]
-yolo_model_path = "aigp/models/gate_yolo_pose/best.pt"
+yolo_model_path = "aigp/models/gate_yolo_pose_8k/best.pt"
+yolo_keypoint_layout = "inner4_outer4"
+yolo_keypoint_order = "image"
 ```
 
 This works on Linux and Windows as long as the stack is launched from the repo
@@ -121,7 +123,7 @@ If committing `.pt` files to GitHub, use Git LFS if the file is large:
 
 ```bash
 git lfs track "*.pt"
-git add .gitattributes aigp/models/gate_yolo_pose/best.pt
+git add .gitattributes aigp/models/gate_yolo_pose_8k/best.pt
 ```
 
 ## Python Dependencies
@@ -218,7 +220,7 @@ export PERCEPTION_WORLD_POSE_SOURCE=mavsdk
 export CAMERA_MOUNT_PROFILE=competition
 export MAVLINK_IP=0.0.0.0
 export MAVLINK_PORT=14550
-export YOLO_MODEL_PATH=aigp/models/gate_yolo_pose/best.pt
+export YOLO_MODEL_PATH=aigp/models/gate_yolo_pose_8k/best.pt
 
 python3 ./aigp/pilot/main.py
 ```
@@ -287,6 +289,7 @@ Use these runtime settings:
 ```toml
 [runtime]
 runner_mode = "competition"
+competition_arm = false  # first Windows smoke test only; set true when ready to arm
 
 [vision]
 source = "udp"
@@ -299,7 +302,9 @@ competition_yaw_correction_deg = 0.0
 [perception]
 backend = "yolo"
 world_pose_source = "mavsdk"
-yolo_model_path = "aigp/models/gate_yolo_pose/best.pt"
+yolo_model_path = "aigp/models/gate_yolo_pose_8k/best.pt"
+yolo_keypoint_layout = "inner4_outer4"
+yolo_keypoint_order = "image"
 
 [perception_geometry_audit]
 enabled = false
@@ -307,6 +312,30 @@ enabled = false
 [gate_source]
 mode = "perception"
 allow_ground_truth = false
+
+[state_estimation]
+allow_known_gate_correction = false
+```
+
+Current development configs may keep `perception_geometry_audit.enabled = true`
+for PX4/Gazebo debugging. Competition mode will refuse to start until that is
+disabled. For a first Windows networking/perception smoke test, also set
+`competition_arm = false` so the stack cannot arm while you are checking packet
+flow.
+
+PowerShell preflight:
+
+```powershell
+$env:RUNNER_MODE="competition"
+$env:VISION_SOURCE="udp"
+$env:PERCEPTION_BACKEND="yolo"
+$env:PERCEPTION_WORLD_POSE_SOURCE="mavsdk"
+$env:CAMERA_MOUNT_PROFILE="competition"
+$env:MAVLINK_IP="0.0.0.0"
+$env:MAVLINK_PORT="14550"
+$env:YOLO_MODEL_PATH="$PWD\aigp\models\gate_yolo_pose_8k\best.pt"
+
+python -c "import sys; sys.path.insert(0,'aigp/pilot'); from runtime_config import load_runtime_config; c=load_runtime_config(); print(c.runtime.runner_mode, c.runtime.competition_arm, c.vision.source, c.camera.mount_profile, c.perception.yolo_model_path)"
 ```
 
 PowerShell launch:
@@ -321,7 +350,7 @@ $env:PERCEPTION_WORLD_POSE_SOURCE="mavsdk"
 $env:CAMERA_MOUNT_PROFILE="competition"
 $env:MAVLINK_IP="0.0.0.0"
 $env:MAVLINK_PORT="14550"
-$env:YOLO_MODEL_PATH="$PWD\aigp\models\gate_yolo_pose\best.pt"
+$env:YOLO_MODEL_PATH="$PWD\aigp\models\gate_yolo_pose_8k\best.pt"
 
 python .\aigp\pilot\main.py
 ```
@@ -340,6 +369,7 @@ Waiting for heartbeat...
 then MAVLink is not reaching the process. Check:
 
 - Windows Firewall allows Python.
+- Inbound UDP `14550` is allowed for MAVLink.
 - `MAVLINK_PORT` matches the sender.
 - The sender is targeting the Windows machine IP.
 - `MAVLINK_IP=0.0.0.0` is used for external senders.
@@ -347,6 +377,7 @@ then MAVLink is not reaching the process. Check:
 If MAVLink connects but perception never updates, check:
 
 - UDP vision port is `5600` unless changed.
+- Inbound UDP `5600` is allowed for camera frames.
 - Firewall allows UDP vision packets.
 - The competition sender is using the expected packet format.
 - `VISION_SOURCE=udp`.
@@ -393,8 +424,8 @@ The runtime supports these useful environment variables:
 | `YOLO_MODEL_PATH` | Path to YOLO `.pt` weights |
 | `GATE_SOURCE_MODE` | `perception` or `ground_truth` |
 
-There is no environment override for `perception_geometry_audit.enabled`; edit
-`runtime.toml` before competition runs.
+There is no environment override for `perception_geometry_audit.enabled` or
+`runtime.competition_arm`; edit `runtime.toml` before competition runs.
 
 ## Debug Logging
 
@@ -539,7 +570,7 @@ Check:
 
 Check:
 
-- `aigp/models/gate_yolo_pose/best.pt` exists.
+- `aigp/models/gate_yolo_pose_8k/best.pt` exists.
 - `YOLO_MODEL_PATH` points to the correct file.
 - `ultralytics` and `torch` import.
 - CUDA device exists if `yolo_device = 0`.
@@ -555,13 +586,13 @@ yolo_device = "cpu"
 Prefer repo-relative paths in `runtime.toml`:
 
 ```toml
-yolo_model_path = "aigp/models/gate_yolo_pose/best.pt"
+yolo_model_path = "aigp/models/gate_yolo_pose_8k/best.pt"
 ```
 
 If using an absolute Windows path in TOML, use forward slashes:
 
 ```toml
-yolo_model_path = "C:/Users/paolo/autonomy_core/aigp/models/gate_yolo_pose/best.pt"
+yolo_model_path = "C:/Users/paolo/autonomy_core/aigp/models/gate_yolo_pose_8k/best.pt"
 ```
 
 ### ROS import errors on Windows
@@ -609,6 +640,6 @@ $env:PERCEPTION_WORLD_POSE_SOURCE="mavsdk"
 $env:CAMERA_MOUNT_PROFILE="competition"
 $env:MAVLINK_IP="0.0.0.0"
 $env:MAVLINK_PORT="14550"
-$env:YOLO_MODEL_PATH="$PWD\aigp\models\gate_yolo_pose\best.pt"
+$env:YOLO_MODEL_PATH="$PWD\aigp\models\gate_yolo_pose_8k\best.pt"
 python .\aigp\pilot\main.py
 ```
