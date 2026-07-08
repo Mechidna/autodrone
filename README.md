@@ -266,6 +266,9 @@ Known target:
 - Windows Firewall allowing Python UDP traffic
 - YOLO weights copied into the repo
 
+For a step-by-step PyCharm setup with smoke tests and firewall checks, see
+[`docs/windows_setup_pycharm.md`](docs/windows_setup_pycharm.md).
+
 ### Windows Virtual Environment
 
 From PowerShell in the repo root:
