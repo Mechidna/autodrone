@@ -49,6 +49,12 @@ class GateTrack:
     outlier_count: int = 0
     inlier_count: int = 0
     ever_stable: bool = False
+    visible_miss_count: int = 0
+    visible_miss_start_time: float = 0.0
+    visible_miss_time_s: float = 0.0
+    last_expected_visible_time: float = 0.0
+    visibility_state: str = "unknown"
+    negative_evidence_score: float = 0.0
 
     def append_observation(
         self,
@@ -73,6 +79,12 @@ class GateTrack:
 
         self.confidence_sum += float(confidence)
         self.hits += 1
+        self.visible_miss_count = 0
+        self.visible_miss_start_time = 0.0
+        self.visible_miss_time_s = 0.0
+        self.last_expected_visible_time = 0.0
+        self.visibility_state = "visible_hit"
+        self.negative_evidence_score = 0.0
         if self.first_seen_time <= 0.0:
             self.first_seen_time = float(timestamp)
         self.last_seen_time = float(timestamp)

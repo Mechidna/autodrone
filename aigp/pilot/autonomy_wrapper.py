@@ -12,6 +12,11 @@ from pathlib import Path
 import numpy as np
 
 from autonomy_core.core.competition_config import VADR_TS_002
+from autonomy_core.core.frame_conventions import (
+    body_frd_to_local_ned_rotmat,
+    local_neu_to_ned,
+    official_camera_to_body_frd_rotmat,
+)
 from autonomy_core.controller.attitude_controller3 import (
     RPGHighLevelTracker,
     Reference,
@@ -510,6 +515,44 @@ class PyAIPilotAutonomyAPI:
         self.race_order_duplicate_radius_m = float(
             self.gate_memory.duplicate_merge_radius
         )
+        self.visibility_negative_evidence_enabled = bool(
+            gate_memory_config.visibility_negative_evidence_enabled
+        )
+        self.visibility_min_projected_area_px2 = max(
+            0.0,
+            float(gate_memory_config.visibility_min_projected_area_px2),
+        )
+        self.visibility_border_margin_px = max(
+            0.0,
+            float(gate_memory_config.visibility_border_margin_px),
+        )
+        self.visibility_match_radius_px = max(
+            0.0,
+            float(gate_memory_config.visibility_match_radius_px),
+        )
+        self.visibility_occlusion_fraction = min(
+            1.0,
+            max(0.0, float(gate_memory_config.visibility_occlusion_fraction)),
+        )
+        self.visibility_occlusion_depth_margin_m = max(
+            0.0,
+            float(gate_memory_config.visibility_occlusion_depth_margin_m),
+        )
+        self.visibility_miss_frames = max(
+            1,
+            int(gate_memory_config.visibility_miss_frames),
+        )
+        self.visibility_miss_time_s = max(
+            0.0,
+            float(gate_memory_config.visibility_miss_time_s),
+        )
+        self.visibility_delete_unstable_after_misses = bool(
+            gate_memory_config.visibility_delete_unstable_after_misses
+        )
+        self.visibility_demote_committed_after_misses = bool(
+            gate_memory_config.visibility_demote_committed_after_misses
+        )
+        self.visibility_trace = bool(gate_memory_config.visibility_trace)
         state_estimation_config = self.config.state_estimation
         self.estimator_landmark_map = EstimatorLandmarkMap(
             min_hits=state_estimation_config.estimator_landmark_min_hits,
@@ -537,6 +580,7 @@ class PyAIPilotAutonomyAPI:
         self._last_race_order_suffix_filter_signature = None
         self._last_race_order_front_blocker_signature = None
         self._last_race_order_closer_blocker_signature = None
+        self._last_visibility_negative_signature = None
         self._last_provisional_horizon_signature = None
         self._last_target_reject_signature = None
         self._last_plan_validation_reject_signature = None
@@ -6909,7 +6953,7 @@ class PyAIPilotAutonomyAPI:
     def _observe_perception_for_diagnostics(self, snapshot) -> None:
         latest_perception = getattr(snapshot, "latest_perception", None)
         if isinstance(latest_perception, dict):
-            self._update_gate_memory(latest_perception)
+            self._update_gate_memory(latest_perception, snapshot=snapshot)
 
     def _ground_truth_gates_from_config(self) -> list[np.ndarray]:
         gates = [gate.copy() for gate in self.ground_truth_gate_positions_neu]
@@ -7155,7 +7199,7 @@ class PyAIPilotAutonomyAPI:
     def _perception_gates_from_snapshot(self, snapshot) -> list[np.ndarray]:
         latest_perception = getattr(snapshot, "latest_perception", None)
         if isinstance(latest_perception, dict):
-            self._update_gate_memory(latest_perception)
+            self._update_gate_memory(latest_perception, snapshot=snapshot)
 
         pos = np.asarray(snapshot.pos_neu, dtype=float).reshape(3)
         committed_tracks = self.gate_memory.get_committed_tracks()
@@ -9388,20 +9432,598 @@ class PyAIPilotAutonomyAPI:
             return float("nan")
         return float(np.mean(depths))
 
-    def _update_gate_memory(self, latest_perception: dict) -> None:
+    @staticmethod
+    def _matrix3_or_none(value) -> np.ndarray | None:
+        try:
+            arr = np.asarray(value, dtype=float).reshape(3, 3)
+        except (TypeError, ValueError):
+            return None
+        if not np.all(np.isfinite(arr)):
+            return None
+        return arr.copy()
+
+    @staticmethod
+    def _bbox_area(box) -> float:
+        if box is None:
+            return 0.0
+        x0, y0, x1, y1 = (float(item) for item in box)
+        return max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+    @staticmethod
+    def _bbox_intersection_area(a, b) -> float:
+        if a is None or b is None:
+            return 0.0
+        ax0, ay0, ax1, ay1 = (float(item) for item in a)
+        bx0, by0, bx1, by1 = (float(item) for item in b)
+        return PyAIPilotAutonomyAPI._bbox_area(
+            (
+                max(ax0, bx0),
+                max(ay0, by0),
+                min(ax1, bx1),
+                min(ay1, by1),
+            )
+        )
+
+    @staticmethod
+    def _bbox_center(box) -> np.ndarray | None:
+        if box is None:
+            return None
+        try:
+            x0, y0, x1, y1 = (float(item) for item in box)
+        except (TypeError, ValueError):
+            return None
+        if not all(math.isfinite(item) for item in (x0, y0, x1, y1)):
+            return None
+        return np.array([0.5 * (x0 + x1), 0.5 * (y0 + y1)], dtype=float)
+
+    def _visibility_camera_to_body(self, latest_perception: dict) -> np.ndarray:
+        camera_to_body = self._matrix3_or_none(latest_perception.get("camera_to_body"))
+        if camera_to_body is not None:
+            return camera_to_body
+        detections = latest_perception.get("detections")
+        if detections:
+            for detection in detections:
+                if not isinstance(detection, dict):
+                    continue
+                camera_to_body = self._matrix3_or_none(
+                    detection.get("camera_to_body_matrix_used")
+                )
+                if camera_to_body is not None:
+                    return camera_to_body
+        return np.asarray(official_camera_to_body_frd_rotmat(VADR_TS_002), dtype=float)
+
+    def _visibility_pose_context(self, latest_perception: dict, snapshot) -> dict | None:
+        pos_neu = self._finite_vec3_or_none(getattr(snapshot, "pos_neu", None))
+        if pos_neu is None and self.last_state_estimate is not None:
+            pos_neu = self._finite_vec3_or_none(
+                getattr(self.last_state_estimate, "pos_neu", None)
+            )
+        if pos_neu is None:
+            return None
+
+        roll = self._finite_float(getattr(snapshot, "roll_rad", 0.0), float("nan"), allow_nan=True)
+        pitch = self._finite_float(getattr(snapshot, "pitch_rad", 0.0), float("nan"), allow_nan=True)
+        yaw = self._finite_float(getattr(snapshot, "yaw_rad", 0.0), float("nan"), allow_nan=True)
+        if not all(math.isfinite(value) for value in (roll, pitch, yaw)):
+            return None
+        yaw += self._finite_float(
+            latest_perception.get("perception_yaw_correction_rad"),
+            0.0,
+        )
+
+        camera_translation = self._finite_vec3_or_none(
+            latest_perception.get("camera_translation_body")
+        )
+        if camera_translation is None:
+            camera_translation = self._finite_vec3_or_none(
+                getattr(self.config.camera, "body_translation_m", None)
+            )
+        if camera_translation is None:
+            camera_translation = np.zeros(3, dtype=float)
+
+        camera_matrix = self._matrix3_or_none(latest_perception.get("camera_matrix"))
+        if camera_matrix is None:
+            camera_matrix = np.asarray(self.camera_matrix, dtype=float).reshape(3, 3)
+
+        return {
+            "pos_ned": local_neu_to_ned(pos_neu),
+            "rot_ned_body": body_frd_to_local_ned_rotmat(roll, pitch, yaw),
+            "camera_to_body": self._visibility_camera_to_body(latest_perception),
+            "camera_translation_body": camera_translation,
+            "camera_matrix": camera_matrix,
+            "width": float(self.config.camera.width),
+            "height": float(self.config.camera.height),
+        }
+
+    def _world_neu_to_camera_for_visibility(
+        self,
+        point_neu,
+        context: dict,
+    ) -> np.ndarray | None:
+        point = self._finite_vec3_or_none(point_neu)
+        if point is None:
+            return None
+        point_ned = local_neu_to_ned(point)
+        body = np.asarray(context["rot_ned_body"], dtype=float).reshape(3, 3).T @ (
+            point_ned - np.asarray(context["pos_ned"], dtype=float).reshape(3)
+        )
+        camera = np.asarray(context["camera_to_body"], dtype=float).reshape(3, 3).T @ (
+            body - np.asarray(context["camera_translation_body"], dtype=float).reshape(3)
+        )
+        if not np.all(np.isfinite(camera)):
+            return None
+        return camera
+
+    def _camera_point_visibility_box(
+        self,
+        point_camera,
+        context: dict,
+    ) -> dict:
+        camera = self._finite_vec3_or_none(point_camera)
+        if camera is None:
+            return {"state": "missing_camera_point"}
+        depth = float(camera[2])
+        if not math.isfinite(depth) or depth <= 0.0:
+            return {"state": "behind_camera", "depth_m": depth}
+
+        k = np.asarray(context["camera_matrix"], dtype=float).reshape(3, 3)
+        fx = float(k[0, 0])
+        fy = float(k[1, 1])
+        cx = float(k[0, 2])
+        cy = float(k[1, 2])
+        if not all(math.isfinite(value) for value in (fx, fy, cx, cy)):
+            return {"state": "bad_camera_matrix", "depth_m": depth}
+
+        u = fx * (float(camera[0]) / depth) + cx
+        v = fy * (float(camera[1]) / depth) + cy
+        gate_size = max(float(self.config.perception.gate_size_m), 1e-6)
+        width_px = abs(fx) * gate_size / depth
+        height_px = abs(fy) * gate_size / depth
+        box = (
+            u - 0.5 * width_px,
+            v - 0.5 * height_px,
+            u + 0.5 * width_px,
+            v + 0.5 * height_px,
+        )
+        area = self._bbox_area(box)
+        width = float(context["width"])
+        height = float(context["height"])
+        clipped = (
+            max(0.0, min(width, box[0])),
+            max(0.0, min(height, box[1])),
+            max(0.0, min(width, box[2])),
+            max(0.0, min(height, box[3])),
+        )
+        clipped_area = self._bbox_area(clipped)
+        out = {
+            "state": "visible",
+            "depth_m": depth,
+            "center_px": np.array([u, v], dtype=float),
+            "bbox": box,
+            "clipped_bbox": clipped,
+            "area_px2": area,
+            "clipped_area_px2": clipped_area,
+        }
+        if clipped_area <= 0.0 or u < 0.0 or u > width or v < 0.0 or v > height:
+            out["state"] = "outside_fov"
+        elif area < float(self.visibility_min_projected_area_px2):
+            out["state"] = "too_small"
+        else:
+            margin = float(self.visibility_border_margin_px)
+            if (
+                box[0] < margin
+                or box[1] < margin
+                or box[2] > width - margin
+                or box[3] > height - margin
+            ):
+                out["state"] = "border_clipped"
+        return out
+
+    def _track_visibility_projection(self, track, context: dict) -> dict:
+        center = self._track_navigation_center(track)
+        if center is None:
+            return {"state": "missing_center"}
+        camera = self._world_neu_to_camera_for_visibility(center, context)
+        out = self._camera_point_visibility_box(camera, context)
+        out["center_neu"] = center.copy()
+        return out
+
+    def _visibility_detection_boxes(
+        self,
+        detections,
+        context: dict | None,
+    ) -> list[dict]:
+        boxes = []
+        if not detections:
+            return boxes
+        for detection in detections:
+            if not isinstance(detection, dict):
+                continue
+            keypoints = detection.get("keypoints_px")
+            if keypoints is not None:
+                try:
+                    pts = np.asarray(keypoints, dtype=float)
+                except (TypeError, ValueError):
+                    pts = None
+                if pts is not None and pts.ndim == 2 and pts.shape[0] >= 4 and pts.shape[1] >= 2:
+                    pts = pts[:4, :2]
+                    if np.all(np.isfinite(pts)):
+                        box = (
+                            float(np.min(pts[:, 0])),
+                            float(np.min(pts[:, 1])),
+                            float(np.max(pts[:, 0])),
+                            float(np.max(pts[:, 1])),
+                        )
+                        if self._bbox_area(box) > 0.0:
+                            boxes.append(
+                                {
+                                    "bbox": box,
+                                    "clipped_bbox": box,
+                                    "center_px": self._bbox_center(box),
+                                    "source": "keypoints",
+                                }
+                            )
+                            continue
+
+            if context is None:
+                continue
+            camera = self._finite_vec3_or_none(detection.get("gate_center_camera"))
+            if camera is None:
+                continue
+            projected = self._camera_point_visibility_box(camera, context)
+            if projected.get("state") in ("behind_camera", "missing_camera_point"):
+                continue
+            box = projected.get("clipped_bbox")
+            if self._bbox_area(box) <= 0.0:
+                continue
+            boxes.append(
+                {
+                    "bbox": projected.get("bbox"),
+                    "clipped_bbox": box,
+                    "center_px": projected.get("center_px"),
+                    "source": "camera_center",
+                }
+            )
+        return boxes
+
+    def _visibility_detection_matches_projection(
+        self,
+        projection: dict,
+        detection_boxes: list[dict],
+    ) -> bool:
+        target_center = projection.get("center_px")
+        target_box = projection.get("clipped_bbox")
+        target_area = max(self._bbox_area(target_box), 1e-6)
+        for detection in detection_boxes:
+            det_center = self._finite_vec2_or_none(detection.get("center_px"))
+            if target_center is not None and det_center is not None:
+                dist = float(np.linalg.norm(np.asarray(target_center, dtype=float) - det_center))
+                if dist <= float(self.visibility_match_radius_px):
+                    return True
+            overlap = self._bbox_intersection_area(target_box, detection.get("clipped_bbox"))
+            if overlap / target_area >= 0.20:
+                return True
+        return False
+
+    @staticmethod
+    def _finite_vec2_or_none(value) -> np.ndarray | None:
+        try:
+            arr = np.asarray(value, dtype=float).reshape(2)
+        except (TypeError, ValueError):
+            return None
+        if not np.all(np.isfinite(arr)):
+            return None
+        return arr.copy()
+
+    def _visibility_occluded_by_trusted_track(
+        self,
+        *,
+        target_track_id: int,
+        target_projection: dict,
+        context: dict,
+    ) -> tuple[bool, int | None, float]:
+        target_depth = float(target_projection.get("depth_m", float("nan")))
+        target_box = target_projection.get("clipped_bbox")
+        target_area = max(self._bbox_area(target_box), 1e-6)
+        if not math.isfinite(target_depth) or target_area <= 0.0:
+            return False, None, 0.0
+
+        best_id = None
+        best_fraction = 0.0
+        for other in list(getattr(self.gate_memory, "tracks", [])):
+            other_id = int(getattr(other, "id", -1))
+            if other_id == int(target_track_id):
+                continue
+            trusted = bool(
+                other_id in self.completed_track_ids
+                or other_id == self.active_target_track_id
+                or (
+                    bool(getattr(other, "committed", False))
+                    and (
+                        bool(getattr(other, "is_stable", False))
+                        or bool(getattr(other, "ever_stable", False))
+                    )
+                )
+            )
+            if not trusted:
+                continue
+            projection = self._track_visibility_projection(other, context)
+            other_depth = float(projection.get("depth_m", float("nan")))
+            if not math.isfinite(other_depth):
+                continue
+            if other_depth + float(self.visibility_occlusion_depth_margin_m) >= target_depth:
+                continue
+            if projection.get("state") in ("behind_camera", "outside_fov", "too_small"):
+                continue
+            overlap = self._bbox_intersection_area(
+                target_box,
+                projection.get("clipped_bbox"),
+            )
+            fraction = overlap / target_area
+            if fraction > best_fraction:
+                best_fraction = float(fraction)
+                best_id = other_id
+
+        return (
+            best_fraction >= float(self.visibility_occlusion_fraction),
+            best_id,
+            best_fraction,
+        )
+
+    def _reset_track_visibility_evidence(self, track, state: str) -> None:
+        track.visible_miss_count = 0
+        track.visible_miss_start_time = 0.0
+        track.visible_miss_time_s = 0.0
+        track.last_expected_visible_time = 0.0
+        track.visibility_state = str(state)
+        track.negative_evidence_score = 0.0
+
+    def _record_visible_track_miss(self, track, timestamp: float) -> bool:
+        if int(getattr(track, "visible_miss_count", 0)) <= 0:
+            track.visible_miss_start_time = float(timestamp)
+        track.visible_miss_count = int(getattr(track, "visible_miss_count", 0)) + 1
+        track.last_expected_visible_time = float(timestamp)
+        start = float(getattr(track, "visible_miss_start_time", timestamp))
+        track.visible_miss_time_s = max(0.0, float(timestamp) - start)
+        frames_ratio = track.visible_miss_count / max(float(self.visibility_miss_frames), 1.0)
+        time_ratio = (
+            1.0
+            if self.visibility_miss_time_s <= 0.0
+            else track.visible_miss_time_s / max(float(self.visibility_miss_time_s), 1e-6)
+        )
+        track.negative_evidence_score = min(frames_ratio, time_ratio)
+        track.visibility_state = "visible_no_hit"
+        return bool(
+            track.visible_miss_count >= int(self.visibility_miss_frames)
+            and track.visible_miss_time_s >= float(self.visibility_miss_time_s)
+        )
+
+    def _clear_spline_memory_for_track(self, track_id, *, reason: str) -> None:
+        try:
+            track_id = int(track_id)
+        except (TypeError, ValueError):
+            return
+        for gate_idx, record in list(self.spline_memory_by_gate_idx.items()):
+            try:
+                memory_track_id = int(record.get("track_id"))
+            except (TypeError, ValueError):
+                continue
+            if memory_track_id == track_id:
+                self._clear_spline_memory_for_gate(
+                    int(gate_idx),
+                    reason=reason,
+                    track_id=track_id,
+                )
+
+    def _invalidate_track_references_after_negative_evidence(
+        self,
+        track_id: int,
+        *,
+        reason: str,
+    ) -> None:
+        track_id = int(track_id)
+        self.race_order_track_ids = [
+            int(item) for item in self.race_order_track_ids if int(item) != track_id
+        ]
+        self._clear_spline_memory_for_track(track_id, reason=reason)
+        self._last_gate_signature = None
+        active_track = self.active_target_track_id
+        manager_track = getattr(self.target_manager, "active_target_track_id", None)
+        if (
+            (active_track is not None and int(active_track) == track_id)
+            or (manager_track is not None and int(manager_track) == track_id)
+        ):
+            self.target_manager.clear_active(reason=reason)
+            self._sync_target_manager_state(clear_unlocked_current=True)
+            self._reset_gate_pass_state()
+            self._clear_active_plan(reason=reason)
+
+    def _trace_visibility_negative_evidence(
+        self,
+        *,
+        track,
+        projection: dict,
+        state: str,
+        action: str,
+        reason: str = "",
+        occluder_id=None,
+        occlusion_fraction: float = 0.0,
+    ) -> None:
+        if not self.visibility_trace:
+            return
+        track_id = int(getattr(track, "id", -1))
+        signature = (
+            track_id,
+            str(state),
+            int(getattr(track, "visible_miss_count", 0)),
+            str(action),
+            str(reason),
+            None if occluder_id is None else int(occluder_id),
+        )
+        if signature == self._last_visibility_negative_signature:
+            return
+        self._last_visibility_negative_signature = signature
+        center_px = projection.get("center_px")
+        if center_px is not None:
+            center_px = np.asarray(center_px, dtype=float).reshape(2)
+            pixel = f"({center_px[0]:.0f},{center_px[1]:.0f})"
+        else:
+            pixel = "none"
+        print(
+            "visibility_negative_evidence "
+            f"track={track_id} "
+            f"state={state} "
+            f"action={action} "
+            f"misses={int(getattr(track, 'visible_miss_count', 0))} "
+            f"miss_time={float(getattr(track, 'visible_miss_time_s', 0.0)):.2f} "
+            f"depth={self._fmt_float(projection.get('depth_m'), precision=2)} "
+            f"pixel={pixel} "
+            f"occluder={occluder_id if occluder_id is not None else 'none'} "
+            f"occlusion={float(occlusion_fraction):.2f} "
+            f"reason={reason}",
+            flush=True,
+        )
+
+    def _apply_visibility_negative_evidence(
+        self,
+        latest_perception: dict,
+        *,
+        snapshot,
+        timestamp: float,
+        detection_boxes: list[dict],
+        matched_track_ids: set[int],
+    ) -> None:
+        if (
+            not self.visibility_negative_evidence_enabled
+            or snapshot is None
+            or not hasattr(self, "gate_memory")
+        ):
+            return
+        context = self._visibility_pose_context(latest_perception, snapshot)
+        if context is None:
+            return
+
+        remove_ids: set[int] = set()
+        for track in list(self.gate_memory.tracks):
+            track_id = int(getattr(track, "id", -1))
+            if track_id < 0:
+                continue
+            if track_id in matched_track_ids:
+                self._reset_track_visibility_evidence(track, "visible_hit")
+                continue
+            if track_id in self.completed_track_ids:
+                self._reset_track_visibility_evidence(track, "completed")
+                continue
+
+            projection = self._track_visibility_projection(track, context)
+            state = str(projection.get("state", "unknown"))
+            if state != "visible":
+                self._reset_track_visibility_evidence(track, state)
+                continue
+
+            occluded, occluder_id, occlusion_fraction = (
+                self._visibility_occluded_by_trusted_track(
+                    target_track_id=track_id,
+                    target_projection=projection,
+                    context=context,
+                )
+            )
+            if occluded:
+                self._reset_track_visibility_evidence(track, "occluded")
+                self._trace_visibility_negative_evidence(
+                    track=track,
+                    projection=projection,
+                    state="occluded",
+                    action="hold",
+                    reason="trusted_occluder",
+                    occluder_id=occluder_id,
+                    occlusion_fraction=occlusion_fraction,
+                )
+                continue
+
+            if self._visibility_detection_matches_projection(projection, detection_boxes):
+                self._reset_track_visibility_evidence(track, "visible_detection_nearby")
+                continue
+
+            threshold_reached = self._record_visible_track_miss(track, timestamp)
+            if not threshold_reached:
+                self._trace_visibility_negative_evidence(
+                    track=track,
+                    projection=projection,
+                    state="visible_no_hit",
+                    action="count",
+                    reason="below_threshold",
+                )
+                continue
+
+            was_committed = bool(getattr(track, "committed", False))
+            if was_committed and self.visibility_demote_committed_after_misses:
+                track.committed = False
+                track.is_stable = False
+                track.ever_stable = False
+                track.promotion_blocked_reason = "negative_visibility_evidence"
+                self._invalidate_track_references_after_negative_evidence(
+                    track_id,
+                    reason="negative_visibility_demote",
+                )
+                self._trace_visibility_negative_evidence(
+                    track=track,
+                    projection=projection,
+                    state="visible_no_hit",
+                    action="demote",
+                    reason="threshold_reached",
+                )
+                continue
+
+            if (not was_committed) and self.visibility_delete_unstable_after_misses:
+                remove_ids.add(track_id)
+                self._invalidate_track_references_after_negative_evidence(
+                    track_id,
+                    reason="negative_visibility_delete",
+                )
+                self._trace_visibility_negative_evidence(
+                    track=track,
+                    projection=projection,
+                    state="visible_no_hit",
+                    action="delete",
+                    reason="threshold_reached",
+                )
+                continue
+
+            self._trace_visibility_negative_evidence(
+                track=track,
+                projection=projection,
+                state="visible_no_hit",
+                action="hold_threshold",
+                reason="deletion_demote_disabled",
+            )
+
+        if remove_ids:
+            self.gate_memory.tracks = [
+                track
+                for track in self.gate_memory.tracks
+                if int(getattr(track, "id", -1)) not in remove_ids
+            ]
+
+    def _update_gate_memory(self, latest_perception: dict, *, snapshot=None) -> None:
         frame_key = self._perception_frame_key(latest_perception)
         if frame_key is not None and frame_key == self._last_gate_memory_frame_key:
             return
         self._last_gate_memory_frame_key = frame_key
 
-        detections = latest_perception.get("detections")
-        if not detections:
-            return
-
         timestamp = self._finite_float(
             latest_perception.get("perception_wall_time"),
             time.time(),
         )
+        detections = latest_perception.get("detections") or []
+        context = (
+            self._visibility_pose_context(latest_perception, snapshot)
+            if snapshot is not None
+            else None
+        )
+        detection_boxes = self._visibility_detection_boxes(detections, context)
+        matched_track_ids: set[int] = set()
+
         for detection in sorted(detections, key=self._detection_sort_key):
             position = detection.get("gate_center_world")
             if position is None:
@@ -9486,7 +10108,21 @@ class PyAIPilotAutonomyAPI:
                 quality_reason=quality_reason,
             )
             self._maybe_print_perception_chain_event(detection, memory_result)
+            if isinstance(memory_result, dict) and memory_result.get("accepted", False):
+                track_id = memory_result.get("track_id")
+                try:
+                    if track_id is not None:
+                        matched_track_ids.add(int(track_id))
+                except (TypeError, ValueError):
+                    pass
 
+        self._apply_visibility_negative_evidence(
+            latest_perception,
+            snapshot=snapshot,
+            timestamp=timestamp,
+            detection_boxes=detection_boxes,
+            matched_track_ids=matched_track_ids,
+        )
         self.gate_memory.prune(timestamp)
 
     def _maybe_print_perception_chain_event(

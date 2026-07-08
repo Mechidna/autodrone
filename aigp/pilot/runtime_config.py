@@ -261,6 +261,17 @@ class GateMemorySection:
     max_outlier_distance: float
     max_committed_match_distance: float
     min_observation_time: float
+    visibility_negative_evidence_enabled: bool
+    visibility_min_projected_area_px2: float
+    visibility_border_margin_px: float
+    visibility_match_radius_px: float
+    visibility_occlusion_fraction: float
+    visibility_occlusion_depth_margin_m: float
+    visibility_miss_frames: int
+    visibility_miss_time_s: float
+    visibility_delete_unstable_after_misses: bool
+    visibility_demote_committed_after_misses: bool
+    visibility_trace: bool
 
 
 @dataclass(frozen=True)
@@ -1170,6 +1181,56 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 0.60,
             ),
             min_observation_time=_float(gate_memory_raw, "min_observation_time", 0.50),
+            visibility_negative_evidence_enabled=_bool(
+                gate_memory_raw,
+                "visibility_negative_evidence_enabled",
+                True,
+            ),
+            visibility_min_projected_area_px2=_float(
+                gate_memory_raw,
+                "visibility_min_projected_area_px2",
+                80.0,
+            ),
+            visibility_border_margin_px=_float(
+                gate_memory_raw,
+                "visibility_border_margin_px",
+                8.0,
+            ),
+            visibility_match_radius_px=_float(
+                gate_memory_raw,
+                "visibility_match_radius_px",
+                32.0,
+            ),
+            visibility_occlusion_fraction=_float(
+                gate_memory_raw,
+                "visibility_occlusion_fraction",
+                0.35,
+            ),
+            visibility_occlusion_depth_margin_m=_float(
+                gate_memory_raw,
+                "visibility_occlusion_depth_margin_m",
+                1.0,
+            ),
+            visibility_miss_frames=max(
+                1,
+                _int(gate_memory_raw, "visibility_miss_frames", 5),
+            ),
+            visibility_miss_time_s=_float(
+                gate_memory_raw,
+                "visibility_miss_time_s",
+                0.25,
+            ),
+            visibility_delete_unstable_after_misses=_bool(
+                gate_memory_raw,
+                "visibility_delete_unstable_after_misses",
+                True,
+            ),
+            visibility_demote_committed_after_misses=_bool(
+                gate_memory_raw,
+                "visibility_demote_committed_after_misses",
+                True,
+            ),
+            visibility_trace=_bool(gate_memory_raw, "visibility_trace", True),
         ),
         race=RaceSection(
             gate_count=_int_optional(
@@ -2439,6 +2500,26 @@ def _validate(config: PilotConfig) -> None:
             config.gate_memory.min_keypoint_conf_for_stable,
         ),
         (
+            "gate_memory.visibility_min_projected_area_px2",
+            config.gate_memory.visibility_min_projected_area_px2,
+        ),
+        (
+            "gate_memory.visibility_border_margin_px",
+            config.gate_memory.visibility_border_margin_px,
+        ),
+        (
+            "gate_memory.visibility_match_radius_px",
+            config.gate_memory.visibility_match_radius_px,
+        ),
+        (
+            "gate_memory.visibility_occlusion_depth_margin_m",
+            config.gate_memory.visibility_occlusion_depth_margin_m,
+        ),
+        (
+            "gate_memory.visibility_miss_time_s",
+            config.gate_memory.visibility_miss_time_s,
+        ),
+        (
             "planner.race_order_front_blocker_margin_m",
             config.planner.race_order_front_blocker_margin_m,
         ),
@@ -2513,6 +2594,12 @@ def _validate(config: PilotConfig) -> None:
     ):
         if float(value) < 0.0:
             raise RuntimeError(f"{key} must be non-negative.")
+    if not 0.0 <= config.gate_memory.visibility_occlusion_fraction <= 1.0:
+        raise RuntimeError(
+            "gate_memory.visibility_occlusion_fraction must be within [0, 1]."
+        )
+    if config.gate_memory.visibility_miss_frames < 1:
+        raise RuntimeError("gate_memory.visibility_miss_frames must be at least 1.")
     if config.perception_geometry_audit.max_prints < 0:
         raise RuntimeError("perception_geometry_audit.max_prints must be non-negative.")
     if config.planner.plan_validation_samples_per_segment < 2:
