@@ -1,0 +1,95 @@
+%YAML:1.0
+
+# ORB-SLAM3 monocular-inertial calibration for the AIGP/VADR racer mono camera.
+#
+# Source assumptions:
+# - Camera: VADR/racer mono camera from aigp/config/runtime.toml.
+# - Image: 640x360, fx=fy=320, cx=320, cy=180, zero distortion.
+# - Camera frame: OpenCV optical, x right, y down, z forward.
+# - Body/IMU frame: MAVLink body FRD, x forward, y right, z down.
+# - Mount: camera optical center coincident with body origin, 20 deg upward tilt.
+#
+# IMPORTANT:
+# - IMU noise values below are starter values from the ORB-SLAM3 calibration
+#   tutorial/TUM-VI example. Replace with measured PX4/Gazebo or hardware values.
+# - ORB-SLAM3 requires image and IMU timestamps in the same clock domain.
+
+File.version: "1.0"
+
+#--------------------------------------------------------------------------------------------
+# Camera Parameters
+#--------------------------------------------------------------------------------------------
+Camera.type: "PinHole"
+
+Camera.width: 640
+Camera.height: 360
+# Match aigp/config/runtime.toml [orbslam3_vio].hz. The Python bridge feeds
+# ORB-SLAM3 at this rate even when the raw camera/perception path runs faster.
+Camera.fps: 20
+Camera.RGB: 0
+
+Camera1.fx: 320.0
+Camera1.fy: 320.0
+Camera1.cx: 320.0
+Camera1.cy: 180.0
+
+Camera1.k1: 0.0
+Camera1.k2: 0.0
+Camera1.p1: 0.0
+Camera1.p2: 0.0
+Camera1.k3: 0.0
+
+#--------------------------------------------------------------------------------------------
+# IMU Parameters
+#--------------------------------------------------------------------------------------------
+# T_b_c1 maps a point/vector from Camera1 optical coordinates into body/IMU coordinates:
+# x_body_frd = T_b_c1 * x_camera_optical
+#
+# For a 20 deg upward-tilted OpenCV optical camera:
+# R_b_c =
+#   [ 0, sin(20deg),  cos(20deg)]
+#   [ 1,          0,           0]
+#   [ 0, cos(20deg), -sin(20deg)]
+#
+# Translation is zero for racer_mono_cam_body_translation_m.
+IMU.T_b_c1: !!opencv-matrix
+  rows: 4
+  cols: 4
+  dt: f
+  data: [0.0, 0.3420201433, 0.9396926208, 0.0,
+         1.0, 0.0,          0.0,          0.0,
+         0.0, 0.9396926208, -0.3420201433, 0.0,
+         0.0, 0.0,          0.0,          1.0]
+
+IMU.Frequency: 50.0
+IMU.NoiseGyro: 0.00016
+IMU.NoiseAcc: 0.0028
+IMU.GyroWalk: 0.000022
+IMU.AccWalk: 0.00086
+IMU.InsertKFsWhenLost: 0
+
+#--------------------------------------------------------------------------------------------
+# ORB Parameters
+#--------------------------------------------------------------------------------------------
+# Tuned for the sparse, fast-changing AIGP gate view. The monocular
+# initializer gets 5x this feature budget inside ORB-SLAM3.
+ORBextractor.nFeatures: 2000
+ORBextractor.scaleFactor: 1.2
+ORBextractor.nLevels: 8
+ORBextractor.iniThFAST: 10
+ORBextractor.minThFAST: 3
+
+#--------------------------------------------------------------------------------------------
+# Viewer Parameters
+#--------------------------------------------------------------------------------------------
+Viewer.KeyFrameSize: 0.05
+Viewer.KeyFrameLineWidth: 1.0
+Viewer.GraphLineWidth: 0.9
+Viewer.PointSize: 2.0
+Viewer.CameraSize: 0.08
+Viewer.CameraLineWidth: 3.0
+Viewer.ViewpointX: 0.0
+Viewer.ViewpointY: -0.7
+Viewer.ViewpointZ: -1.8
+Viewer.ViewpointF: 500.0
+Viewer.imageViewScale: 1.0

@@ -8,3 +8,6 @@ __pycache__/
 
 # JetBrains IDE
 .idea/
+
+# Generated ORB-SLAM3 sidecar build output
+/aigp/pilot/orbslam3_vio_server/build/
