@@ -1,0 +1,7 @@
+path: /home/paolo/datasets/gazebo_gate_yolo_pose_ed4016_8k
+train: images/train
+val: images/val
+kpt_shape: [8, 3]
+flip_idx: [1, 0, 3, 2, 5, 4, 7, 6]
+names:
+  0: gate

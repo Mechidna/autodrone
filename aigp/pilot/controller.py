@@ -4,6 +4,7 @@ import math
 from pymavlink import mavutil
 from hover_hold import HoverHold
 from runtime_config import load_runtime_config
+from autonomy_core.core.frame_conventions import competition_yaw_boundary_rad
 
 # --------------------------------------------------------------------------------------
 # RESET COMMAND
@@ -50,7 +51,11 @@ def euler_to_quaternion(roll, pitch, yaw):
 
     return [w, x, y, z]
 
-def get_latest_autonomy_command(data, print_period_s=1.0):
+def get_latest_autonomy_command(
+    data,
+    print_period_s=1.0,
+    return_status=False,
+):
     lock = data.get("lock") if isinstance(data, dict) else None
 
     if lock is not None:
@@ -68,9 +73,14 @@ def get_latest_autonomy_command(data, print_period_s=1.0):
 
     if now - get_latest_autonomy_command.last_cmd_print_time >= float(print_period_s):
         if cmd is None:
+            command_label = (
+                "suppressed"
+                if _flight_control_suppressed(command_status)
+                else "fallback hover"
+            )
             print(
                 "controller command:",
-                f"fallback hover status={command_status}",
+                f"{command_label} status={command_status}",
                 flush=True,
             )
         else:
@@ -84,7 +94,14 @@ def get_latest_autonomy_command(data, print_period_s=1.0):
             )
         get_latest_autonomy_command.last_cmd_print_time = now
 
+    if return_status:
+        return cmd, str(command_status)
     return cmd
+
+
+def _flight_control_suppressed(command_status):
+    return str(command_status).startswith("startup_observation_")
+
 
 def get_latest_attitude_command(data, fallback_thrust=None, print_period_s=1.0):
     cmd = get_latest_autonomy_command(data, print_period_s=print_period_s)
@@ -98,6 +115,25 @@ def get_latest_attitude_command(data, fallback_thrust=None, print_period_s=1.0):
 
 def get_autonomy_attitude_command(data):
     return get_latest_attitude_command(data)
+
+def get_current_yaw_deg(data):
+    lock = data.get("lock") if isinstance(data, dict) else None
+
+    if lock is not None:
+        with lock:
+            attitude = data.get("attitude")
+    else:
+        attitude = data.get("attitude") if isinstance(data, dict) else None
+
+    if not isinstance(attitude, dict):
+        return 0.0
+
+    try:
+        yaw_rad = float(attitude.get("yaw", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+
+    return math.degrees(yaw_rad) if math.isfinite(yaw_rad) else 0.0
 
 ANGLE_ATTITUDE_MASK = (
     mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_BODY_ROLL_RATE_IGNORE |
@@ -250,6 +286,13 @@ class Controller:
         self.control_hz = float(self.config.command.stream_hz)
         self.fallback_thrust = float(self.config.controller.fallback_thrust)
         self.command_print_period_s = float(self.config.controller.command_print_period_s)
+        self.calibration_only = bool(self.config.runtime.calibration_only)
+        self.perception_hold = bool(self.config.runtime.perception_hold)
+        self.runner_mode = str(self.config.runtime.runner_mode).lower()
+        self.competition_yaw_inverted = bool(
+            self.runner_mode == "competition"
+            and self.config.runtime.competition_yaw_inverted
+        )
         self.hover_hold = HoverHold(
             stale_after_s=self.config.hover.stale_after_s,
             takeoff_alt_m=self.config.hover.takeoff_alt_m,
@@ -258,17 +301,48 @@ class Controller:
             near_ground_abs_z_m=self.config.hover.near_ground_abs_z_m,
         )
 
-    def update(self):
-        cmd = get_latest_autonomy_command(
-            self.data,
-            print_period_s=self.command_print_period_s,
+    def _send_attitude(self, roll_deg, pitch_deg, yaw_deg, thrust):
+        wire_yaw_rad = competition_yaw_boundary_rad(
+            math.radians(float(yaw_deg)),
+            inverted=self.competition_yaw_inverted,
+        )
+        send_attitude_angle_flight_control(
+            self.sim_conn,
+            self.system_boot_ms,
+            roll_deg,
+            pitch_deg,
+            math.degrees(wire_yaw_rad),
+            thrust,
         )
 
-        if cmd is None:
-            if not self.hover_hold.update_and_send(self.sim_conn, self.system_boot_ms, self.data):
-                send_attitude_angle_flight_control(
-                    self.sim_conn,
-                    self.system_boot_ms,
+    def update(self):
+        cmd, command_status = get_latest_autonomy_command(
+            self.data,
+            print_period_s=self.command_print_period_s,
+            return_status=True,
+        )
+
+        if cmd is None and _flight_control_suppressed(command_status):
+            self.hover_hold.reset()
+        elif cmd is None:
+            if (
+                self.calibration_only
+                or self.perception_hold
+                or self.runner_mode == "competition"
+            ):
+                self.hover_hold.reset()
+                self._send_attitude(
+                    0.0,
+                    0.0,
+                    get_current_yaw_deg(self.data),
+                    self.fallback_thrust,
+                )
+            elif not self.hover_hold.update_and_send(
+                self.sim_conn,
+                self.system_boot_ms,
+                self.data,
+            ):
+                self._send_attitude(
                     0.0,
                     0.0,
                     0.0,
@@ -276,9 +350,7 @@ class Controller:
                 )
         else:
             self.hover_hold.reset()
-            send_attitude_angle_flight_control(
-                self.sim_conn,
-                self.system_boot_ms,
+            self._send_attitude(
                 cmd.roll_deg,
                 cmd.pitch_deg,
                 cmd.yaw_deg,

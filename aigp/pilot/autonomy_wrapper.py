@@ -16,6 +16,7 @@ from autonomy_core.core.frame_conventions import (
     body_frd_to_local_ned_rotmat,
     local_neu_to_ned,
     official_camera_to_body_frd_rotmat,
+    perception_rpy_for_transform,
 )
 from autonomy_core.controller.attitude_controller3 import (
     RPGHighLevelTracker,
@@ -73,11 +74,43 @@ class PyAIPilotAutonomyAPI:
         config=None,
     ):
         self.config = config if config is not None else load_runtime_config()
-        self.use_perception = (
+        self.calibration_only = bool(self.config.runtime.calibration_only)
+        self.perception_hold = bool(self.config.runtime.perception_hold)
+        requested_use_perception = (
             self.config.runtime.use_perception
             if use_perception is None
             else bool(use_perception)
         )
+        self.use_perception = (
+            bool(requested_use_perception)
+            and not self.calibration_only
+        )
+        self.startup_observation_duration_s = max(
+            0.0,
+            float(
+                getattr(
+                    self.config.runtime,
+                    "startup_observation_duration_s",
+                    0.0,
+                )
+            ),
+        )
+        self.startup_observation_enabled = bool(
+            self.startup_observation_duration_s > 0.0
+            and str(self.config.runtime.runner_mode).lower() == "competition"
+            and self.use_perception
+            and not self.perception_hold
+            and str(self.config.gate_source.mode).lower() == "perception"
+        )
+        self.startup_observation_active = self.startup_observation_enabled
+        self.startup_observation_status = (
+            "waiting_perception"
+            if self.startup_observation_enabled
+            else "disabled"
+        )
+        self._startup_observation_start_monotonic = None
+        self._startup_observation_last_trace_monotonic = None
+        self._startup_observation_completion_traced = False
         self.pass_radius_m = (
             float(self.config.race.pass_radius_m)
             if pass_radius_m is None
@@ -85,10 +118,11 @@ class PyAIPilotAutonomyAPI:
         )
         spec_gate_lateral_radius_m = float(VADR_TS_002.gate_inner_half_extent_m)
         configured_lateral_radius_m = float(self.config.race.pass_lateral_radius_m)
+        self.gate_physical_aperture_radius_m = spec_gate_lateral_radius_m
         self.gate_pass_lateral_radius_m = (
             spec_gate_lateral_radius_m
             if configured_lateral_radius_m <= 0.0
-            else min(configured_lateral_radius_m, spec_gate_lateral_radius_m)
+            else configured_lateral_radius_m
         )
         self.gate_plane_tolerance_m = max(
             0.0,
@@ -156,6 +190,7 @@ class PyAIPilotAutonomyAPI:
         self.active_waypoint_roles = []
         self.active_plan_generation = 0
         self.active_gate_normal = None
+        self.gate_pass_tracking_gate_idx = None
         self.previous_gate_pass_position = None
         self.gate_plane_crossed = False
         self.near_gate_but_not_crossed = False
@@ -177,9 +212,28 @@ class PyAIPilotAutonomyAPI:
             2.0 * float(self.gate_pass_lateral_radius_m),
         )
         self.reference_progress_clamp_max_tau_step_s = 1.0
+        self.reference_progress_lag_hold_enabled = bool(
+            self.config.planner.reference_progress_lag_hold_enabled
+        )
+        self.reference_progress_lag_tolerance_m = max(
+            0.0,
+            float(self.config.planner.reference_progress_lag_tolerance_m),
+        )
+        self.reference_progress_lag_max_path_error_m = max(
+            0.0,
+            float(self.config.planner.reference_progress_lag_max_path_error_m),
+        )
+        self.reference_progress_lag_max_lead_s = max(
+            0.0,
+            float(self.config.planner.reference_progress_lag_max_lead_s),
+        )
         self.last_desired_yaw = 0.0
         self.last_yaw_target_source = "init"
         self.last_yaw_target = None
+        self._yaw_rate_last_cmd_rad = None
+        self._yaw_rate_last_time = None
+        self._yaw_rate_limited = False
+        self._yaw_rate_target_rad = None
         self.replan_target_shift_m = float(self.config.planner.replan_target_shift_m)
         self.replan_after_trajectory_s = float(self.config.planner.replan_after_trajectory_s)
         self.replan_min_interval_s = float(self.config.planner.replan_min_interval_s)
@@ -336,6 +390,13 @@ class PyAIPilotAutonomyAPI:
             0.0,
             float(self.config.planner.race_order_front_blocker_lateral_radius_m),
         )
+        self.race_order_gap_guard_enabled = bool(
+            self.config.planner.race_order_gap_guard_enabled
+        )
+        self.race_order_max_next_gate_gap_m = max(
+            0.0,
+            float(self.config.planner.race_order_max_next_gate_gap_m),
+        )
         self.provisional_next_gate_enabled = bool(
             self.config.planner.provisional_next_gate_enabled
         )
@@ -399,6 +460,17 @@ class PyAIPilotAutonomyAPI:
         self.planner_vmax = float(self.config.planner.vmax)
         self.planner_amax = float(self.config.planner.amax)
         self.planner_t_min = float(self.config.planner.t_min)
+        self.forward_progress_constraint_enabled = bool(
+            self.config.planner.forward_progress_constraint_enabled
+        )
+        self.forward_progress_min_speed_m_s = max(
+            0.0,
+            float(self.config.planner.forward_progress_min_speed_m_s),
+        )
+        self.forward_progress_solver_max_iterations = max(
+            1,
+            int(self.config.planner.forward_progress_solver_max_iterations),
+        )
         self.plan_validation_shape_enabled = bool(
             self.config.planner.plan_validation_shape_enabled
         )
@@ -508,9 +580,47 @@ class PyAIPilotAutonomyAPI:
             min_keypoint_conf_for_stable=gate_memory_config.min_keypoint_conf_for_stable,
             max_outlier_distance=gate_memory_config.max_outlier_distance,
             min_observation_time=gate_memory_config.min_observation_time,
+            temporal_image_association_enabled=(
+                gate_memory_config.temporal_image_association_enabled
+            ),
+            temporal_image_association_max_age_s=(
+                gate_memory_config.temporal_image_association_max_age_s
+            ),
+            temporal_image_association_max_center_distance_px=(
+                gate_memory_config.temporal_image_association_max_center_distance_px
+            ),
+            temporal_image_association_max_size_ratio=(
+                gate_memory_config.temporal_image_association_max_size_ratio
+            ),
+            temporal_image_association_min_depth_m=(
+                gate_memory_config.temporal_image_association_min_depth_m
+            ),
+            tiny_detection_area_px2=gate_memory_config.tiny_detection_area_px2,
+            tiny_detection_min_hits_for_stable=(
+                gate_memory_config.tiny_detection_min_hits_for_stable
+            ),
+            tiny_detection_min_observation_time=(
+                gate_memory_config.tiny_detection_min_observation_time
+            ),
+            known_position_commit_filter_enabled=(
+                gate_memory_config.known_position_commit_filter_enabled
+            ),
+            known_position_commit_radius_m=(
+                gate_memory_config.known_position_commit_radius_m
+            ),
+            known_gate_positions_neu=(
+                self.config.gate_source.known_gate_positions_neu
+            ),
         )
         self.gate_memory.max_committed_match_distance = (
             gate_memory_config.max_committed_match_distance
+        )
+        self.active_gate_transit_suppression_enabled = bool(
+            gate_memory_config.active_gate_transit_suppression_enabled
+        )
+        self.active_gate_transit_suppression_radius_m = max(
+            0.0,
+            float(gate_memory_config.active_gate_transit_suppression_radius_m),
         )
         self.race_order_duplicate_radius_m = float(
             self.gate_memory.duplicate_merge_radius
@@ -580,12 +690,15 @@ class PyAIPilotAutonomyAPI:
         self._last_race_order_suffix_filter_signature = None
         self._last_race_order_front_blocker_signature = None
         self._last_race_order_closer_blocker_signature = None
+        self._last_race_order_gap_guard_signature = None
         self._last_visibility_negative_signature = None
         self._last_provisional_horizon_signature = None
         self._last_target_reject_signature = None
         self._last_plan_validation_reject_signature = None
         self._last_exit_tail_hold_signature = None
         self._last_perception_reject_print_time = 0.0
+        self._active_gate_transit_suppression_was_active = False
+        self._last_active_gate_transit_suppression_trace_time = 0.0
         self._last_trace_print_time = 0.0
         self._trace_period_s = 0.5
         self._last_shadow_trace_print_time = 0.0
@@ -615,7 +728,49 @@ class PyAIPilotAutonomyAPI:
             "[GATE_SOURCE_CONFIG] "
             f"mode={self.gate_source_mode} "
             f"known_gates={len(self.ground_truth_gate_positions_neu)} "
-            f"allow_ground_truth={int(bool(self.config.gate_source.allow_ground_truth))}",
+            f"allow_ground_truth={int(bool(self.config.gate_source.allow_ground_truth))} "
+            f"competition_ground_truth_debug="
+            f"{int(bool(self.config.gate_source.allow_competition_ground_truth_debug))} "
+            f"active_gate_transit_suppression="
+            f"{int(self.active_gate_transit_suppression_enabled)} "
+            f"active_gate_transit_radius_m="
+            f"{self.active_gate_transit_suppression_radius_m:.2f}",
+            flush=True,
+        )
+        print(
+            "[GATE_MEMORY_CONFIG] "
+            f"temporal_image_association="
+            f"{int(self.gate_memory.temporal_image_association_enabled)} "
+            f"image_max_age_s="
+            f"{self.gate_memory.temporal_image_association_max_age_s:.2f} "
+            f"image_center_radius_px="
+            f"{self.gate_memory.temporal_image_association_max_center_distance_px:.2f} "
+            f"image_size_ratio="
+            f"{self.gate_memory.temporal_image_association_max_size_ratio:.2f} "
+            f"image_min_depth_m="
+            f"{self.gate_memory.temporal_image_association_min_depth_m:.1f} "
+            f"tiny_area_px2={self.gate_memory.tiny_detection_area_px2:.1f} "
+            f"tiny_min_hits="
+            f"{self.gate_memory.tiny_detection_min_hits_for_stable} "
+            f"tiny_min_time_s="
+            f"{self.gate_memory.tiny_detection_min_observation_time:.2f} "
+            f"known_commit_filter="
+            f"{int(self.gate_memory.known_position_commit_filter_enabled)} "
+            f"known_commit_radius_m="
+            f"{self.gate_memory.known_position_commit_radius_m:.2f} "
+            f"known_commit_references="
+            f"{self.gate_memory.known_gate_positions_neu.shape[0]}",
+            flush=True,
+        )
+        print(
+            "[RACE_ORDER_CONFIG] "
+            f"gap_guard={int(self.race_order_gap_guard_enabled)} "
+            f"max_next_gate_gap_m={self.race_order_max_next_gate_gap_m:.2f} "
+            f"active_preempt={int(self.active_target_preempt_enabled)} "
+            f"active_preempt_lateral_m="
+            f"{self.active_target_preempt_lateral_radius_m:.2f} "
+            f"front_blocker_lateral_m="
+            f"{self.race_order_front_blocker_lateral_radius_m:.2f}",
             flush=True,
         )
         self._trace_canonical_gate_poses_from_active_world()
@@ -631,7 +786,11 @@ class PyAIPilotAutonomyAPI:
             max_acc_z_up=self.config.controller.max_acc_z_up,
             max_acc_z_down=self.config.controller.max_acc_z_down,
             lateral_accel_gain_xy=self.config.controller.lateral_accel_gain_xy,
+            tilt_thrust_compensation_enabled=(
+                self.config.controller.tilt_thrust_compensation_enabled
+            ),
             thrust_hover=self.config.controller.thrust_hover,
+            thrust_from_acc_gain=self.config.controller.thrust_from_acc_gain,
             thrust_min=self.config.controller.thrust_min,
             thrust_max=self.config.controller.thrust_max,
             max_acc_z_slew_m_s3=self.config.controller.max_acc_z_slew_m_s3,
@@ -676,11 +835,190 @@ class PyAIPilotAutonomyAPI:
         self._last_hover_acquisition_trace_time = 0.0
         self.thrust_scale_calibration = ThrustScaleCalibration(self.config)
         self._last_thrust_scale_calibration_trace_time = 0.0
+        self._last_thrust_scale_failure_hold_trace_time = 0.0
+        self._thrust_scale_failure_hold_z_m = None
+        self._thrust_scale_failure_hold_xy_m = None
         self.lateral_response_calibration = LateralResponseCalibration(self.config)
         self._last_lateral_response_calibration_trace_time = 0.0
+        self._last_lateral_response_failure_hold_trace_time = 0.0
+        self._lateral_response_failure_hold_z_m = None
+        self._lateral_response_failure_hold_xy_m = None
+        self._last_calibration_only_hold_trace_time = 0.0
+        self._calibration_only_hold_z_m = None
+        self._calibration_only_hold_xy_m = None
+        self._perception_hold_active = False
+        self._perception_hold_memory_active = False
+        self._perception_hold_settle_since = None
+        self._perception_hold_frame_barrier = -1
+        self._perception_hold_image_time_barrier = 0.0
+        self._last_perception_hold_trace_time = 0.0
+        self._perception_hold_z_m = None
+        self._perception_hold_xy_m = None
+        self._perception_hold_yaw_rad = None
+        self._attitude_slew_target_roll_rad = 0.0
+        self._attitude_slew_target_pitch_rad = 0.0
+        self._attitude_slew_last_roll_rad = None
+        self._attitude_slew_last_pitch_rad = None
+        self._attitude_slew_last_time = None
+        self._attitude_slew_limited = False
+        self._last_competition_no_plan_hold_trace_time = 0.0
+        self._competition_no_plan_hold_z_m = None
+        self._competition_no_plan_hold_xy_m = None
+        self._competition_no_plan_hold_yaw_rad = None
+        no_target_search = self.config.no_target_search
+        self.no_target_search_enabled = bool(no_target_search.enabled)
+        self.no_target_search_require_armed = bool(no_target_search.require_armed)
+        self.no_target_search_require_race_start = bool(
+            no_target_search.require_race_start
+        )
+        self.no_target_search_loss_grace_s = max(
+            0.0,
+            float(no_target_search.loss_grace_s),
+        )
+        self.no_target_search_settle_horizontal_speed_m_s = max(
+            0.0,
+            float(no_target_search.settle_horizontal_speed_m_s),
+        )
+        self.no_target_search_forward_before_descent_enabled = bool(
+            no_target_search.forward_before_descent_enabled
+        )
+        self.no_target_search_forward_distance_m = max(
+            0.0,
+            float(no_target_search.forward_distance_m),
+        )
+        self.no_target_search_forward_reached_tolerance_m = max(
+            0.0,
+            float(no_target_search.forward_reached_tolerance_m),
+        )
+        self.no_target_search_descent_rate_m_s = max(
+            0.0,
+            float(no_target_search.descent_rate_m_s),
+        )
+        self.no_target_search_max_descent_per_search_m = max(
+            0.0,
+            float(no_target_search.max_descent_per_search_m),
+        )
+        self.no_target_search_min_z_neu_m = float(no_target_search.min_z_neu_m)
+        self.no_target_search_candidate_min_hits = max(
+            1,
+            int(no_target_search.candidate_min_hits),
+        )
+        self.no_target_search_candidate_min_keypoint_conf = max(
+            0.0,
+            float(no_target_search.candidate_min_keypoint_conf),
+        )
+        self.no_target_search_candidate_max_reprojection_error = max(
+            0.0,
+            float(no_target_search.candidate_max_reprojection_error),
+        )
+        self.no_target_search_candidate_min_image_area_px2 = max(
+            0.0,
+            float(no_target_search.candidate_min_image_area_px2),
+        )
+        self.no_target_search_candidate_lost_grace_s = max(
+            0.0,
+            float(no_target_search.candidate_lost_grace_s),
+        )
+        self.no_target_search_center_yaw_enabled = bool(
+            no_target_search.center_yaw_enabled
+        )
+        self.no_target_search_center_yaw_deadband_px = max(
+            0.0,
+            float(no_target_search.center_yaw_deadband_px),
+        )
+        self.no_target_search_center_yaw_max_rate_deg_s = max(
+            0.0,
+            float(no_target_search.center_yaw_max_rate_deg_s),
+        )
+        self.no_target_search_center_vertical_enabled = bool(
+            no_target_search.center_vertical_enabled
+        )
+        self.no_target_search_center_vertical_target_y_px = max(
+            0.0,
+            float(no_target_search.center_vertical_target_y_px),
+        )
+        self.no_target_search_center_vertical_deadband_px = max(
+            0.0,
+            float(no_target_search.center_vertical_deadband_px),
+        )
+        self.no_target_search_center_vertical_max_descent_rate_m_s = max(
+            0.0,
+            float(no_target_search.center_vertical_max_descent_rate_m_s),
+        )
+        self._no_target_search_state = "idle"
+        self._no_target_search_entry_z_m = None
+        self._no_target_search_ready_since = None
+        self._no_target_search_last_monotonic = None
+        self._no_target_search_candidate_track_id = None
+        self._no_target_search_candidate_hold_z_m = None
+        self._no_target_search_forward_started = False
+        self._no_target_search_forward_completed = False
+        self._no_target_search_forward_start_xy_m = None
+        self._no_target_search_forward_target_xy_m = None
+        print(
+            "[ATTITUDE_SLEW_CONFIG] "
+            f"enabled={int(self.config.controller.attitude_slew_limit_enabled)} "
+            f"max_roll_rate_deg_s="
+            f"{self.config.controller.max_roll_slew_rate_deg_s:.1f} "
+            f"max_pitch_rate_deg_s="
+            f"{self.config.controller.max_pitch_slew_rate_deg_s:.1f} "
+            f"tilt_thrust_compensation="
+            f"{int(self.config.controller.tilt_thrust_compensation_enabled)}",
+            flush=True,
+        )
+        print(
+            "[FLIGHT_NOSE_DOWN_CONFIG] "
+            f"enabled={int(self.config.controller.flight_nose_down_enabled)} "
+            f"min_nose_down_deg="
+            f"{self.config.controller.flight_min_nose_down_deg:.1f} "
+            "scope=competition_active_trajectory",
+            flush=True,
+        )
+        print(
+            "[NO_TARGET_SEARCH_CONFIG] "
+            f"enabled={int(self.no_target_search_enabled)} "
+            f"require_armed={int(self.no_target_search_require_armed)} "
+            f"require_race_start={int(self.no_target_search_require_race_start)} "
+            f"loss_grace_s={self.no_target_search_loss_grace_s:.2f} "
+            f"settle_xy_speed_m_s="
+            f"{self.no_target_search_settle_horizontal_speed_m_s:.2f} "
+            f"forward_before_descent="
+            f"{int(self.no_target_search_forward_before_descent_enabled)} "
+            f"forward_distance_m="
+            f"{self.no_target_search_forward_distance_m:.2f} "
+            f"forward_tolerance_m="
+            f"{self.no_target_search_forward_reached_tolerance_m:.2f} "
+            f"descent_rate_m_s={self.no_target_search_descent_rate_m_s:.2f} "
+            f"max_drop_m={self.no_target_search_max_descent_per_search_m:.1f} "
+            f"min_z_neu_m={self.no_target_search_min_z_neu_m:.1f} "
+            f"candidate_min_hits={self.no_target_search_candidate_min_hits} "
+            f"candidate_min_kp="
+            f"{self.no_target_search_candidate_min_keypoint_conf:.2f} "
+            f"candidate_max_reproj="
+            f"{self.no_target_search_candidate_max_reprojection_error:.2f} "
+            f"candidate_min_area_px2="
+            f"{self.no_target_search_candidate_min_image_area_px2:.1f} "
+            f"center_yaw={int(self.no_target_search_center_yaw_enabled)} "
+            f"center_vertical="
+            f"{int(self.no_target_search_center_vertical_enabled)} "
+            f"center_vertical_target_y_px="
+            f"{self.no_target_search_center_vertical_target_y_px:.1f} "
+            f"center_vertical_deadband_px="
+            f"{self.no_target_search_center_vertical_deadband_px:.1f} "
+            f"center_vertical_max_descent_rate_m_s="
+            f"{self.no_target_search_center_vertical_max_descent_rate_m_s:.2f}",
+            flush=True,
+        )
 
     def update(self, snapshot) -> AutonomyCommandRad | None:
-        snapshot.stable_gate_landmarks_neu = self._stable_gate_landmarks_neu()
+        perception_memory_active = self._perception_memory_active()
+        snapshot.stable_gate_landmarks_neu = (
+            (
+                self._stable_gate_landmarks_neu()
+                if perception_memory_active and not self.perception_hold
+                else []
+            )
+        )
         estimate = self.state_estimator.update(snapshot)
         self.last_state_estimate = estimate
         self._update_shadow_estimator(snapshot)
@@ -712,7 +1050,18 @@ class PyAIPilotAutonomyAPI:
             )
         )
 
-        self._install_gate_centers(self._gates_from_snapshot(snapshot))
+        if perception_memory_active:
+            if self.perception_hold:
+                # Observe memory only: no estimator feedback, race target, or
+                # target-manager state is installed in this mode.
+                self.active_track_count = (
+                    self._observe_perception_hold_memory(snapshot)
+                )
+            else:
+                self._install_gate_centers(self._gates_from_snapshot(snapshot))
+
+        if self._startup_observation_blocks_flight(snapshot):
+            return None
 
         if not self.hover_acquisition.completed:
             acquisition_result = self.hover_acquisition.update(
@@ -731,6 +1080,10 @@ class PyAIPilotAutonomyAPI:
 
             if acquisition_result.command is not None:
                 command = acquisition_result.command
+                self._remember_attitude_slew_state(
+                    command.roll_rad,
+                    command.pitch_rad,
+                )
                 return AutonomyCommandRad(
                     roll_rad=command.roll_rad,
                     pitch_rad=command.pitch_rad,
@@ -746,7 +1099,10 @@ class PyAIPilotAutonomyAPI:
                 hover_acquisition_completed=self.hover_acquisition.completed,
                 current_thrust_from_acc_gain=self.tracker.thrust_from_acc_gain,
             )
-            if calibration_result.thrust_from_acc_gain is not None:
+            if (
+                calibration_result.succeeded
+                and calibration_result.thrust_from_acc_gain is not None
+            ):
                 self.tracker.thrust_from_acc_gain = float(
                     calibration_result.thrust_from_acc_gain
                 )
@@ -765,17 +1121,57 @@ class PyAIPilotAutonomyAPI:
                     thrust=command.thrust,
                 )
 
+        thrust_scale_required = bool(self.thrust_scale_calibration.enabled) and not (
+            bool(self.thrust_scale_calibration.estimator_mode_only)
+            and str(self.config.state_estimation.mode).lower() != "estimator"
+        )
+        if (
+            thrust_scale_required
+            and self.thrust_scale_calibration.completed
+            and not self.thrust_scale_calibration.succeeded
+        ):
+            if self._thrust_scale_failure_hold_z_m is None:
+                self._thrust_scale_failure_hold_z_m = float(pos[2])
+            if self._thrust_scale_failure_hold_xy_m is None:
+                self._thrust_scale_failure_hold_xy_m = pos[:2].copy()
+            command, thrust_correction, hold_debug = self._level_attitude_hold_command(
+                pos=pos,
+                vel=vel,
+                yaw_rad=yaw_rad,
+                target_z_m=float(self._thrust_scale_failure_hold_z_m),
+                target_xy_m=self._thrust_scale_failure_hold_xy_m,
+            )
+            self._trace_thrust_scale_failure_hold(
+                pos=pos,
+                vel=vel,
+                command=command,
+                target_z_m=float(self._thrust_scale_failure_hold_z_m),
+                thrust_correction=thrust_correction,
+                hold_debug=hold_debug,
+            )
+            return command
+
+        lateral_response_required = bool(
+            self.lateral_response_calibration.enabled
+        ) and not (
+            bool(self.lateral_response_calibration.estimator_mode_only)
+            and str(self.config.state_estimation.mode).lower() != "estimator"
+        )
         if not self.lateral_response_calibration.completed:
             lateral_result = self.lateral_response_calibration.update(
                 snapshot=snapshot,
                 estimate=estimate,
                 hover_thrust=self.adaptive_hover.value,
                 thrust_scale_calibration_completed=(
-                    self.thrust_scale_calibration.completed
+                    self.thrust_scale_calibration.succeeded
+                    or not thrust_scale_required
                 ),
                 current_lateral_accel_gain_xy=self.tracker.lateral_accel_gain_xy,
             )
-            if lateral_result.lateral_accel_gain_xy is not None:
+            if (
+                lateral_result.succeeded
+                and lateral_result.lateral_accel_gain_xy is not None
+            ):
                 self.tracker.lateral_accel_gain_xy = np.asarray(
                     lateral_result.lateral_accel_gain_xy,
                     dtype=float,
@@ -795,6 +1191,102 @@ class PyAIPilotAutonomyAPI:
                     thrust=command.thrust,
                 )
 
+        if (
+            lateral_response_required
+            and self.lateral_response_calibration.completed
+            and not self.lateral_response_calibration.succeeded
+        ):
+            if self._lateral_response_failure_hold_z_m is None:
+                self._lateral_response_failure_hold_z_m = float(pos[2])
+            if self._lateral_response_failure_hold_xy_m is None:
+                self._lateral_response_failure_hold_xy_m = pos[:2].copy()
+            polarity_mismatch = (
+                self.lateral_response_calibration.last_debug.status
+                == "polarity_mismatch_fallback"
+            )
+            command, thrust_correction, hold_debug = (
+                self._level_attitude_hold_command(
+                    pos=pos,
+                    vel=vel,
+                    yaw_rad=yaw_rad,
+                    target_z_m=float(
+                        self._lateral_response_failure_hold_z_m
+                    ),
+                    # A polarity failure invalidates XY attitude feedback.
+                    # Hold level attitude instead of reusing that mapping.
+                    target_xy_m=(
+                        None
+                        if polarity_mismatch
+                        else self._lateral_response_failure_hold_xy_m
+                    ),
+                )
+            )
+            self._trace_lateral_response_failure_hold(
+                pos=pos,
+                vel=vel,
+                command=command,
+                target_z_m=float(self._lateral_response_failure_hold_z_m),
+                thrust_correction=thrust_correction,
+                hold_debug=hold_debug,
+            )
+            return command
+
+        if self.calibration_only:
+            if self._calibration_only_hold_z_m is None:
+                self._calibration_only_hold_z_m = float(pos[2])
+            if self._calibration_only_hold_xy_m is None:
+                self._calibration_only_hold_xy_m = pos[:2].copy()
+            command, thrust_correction, hold_debug = (
+                self._level_attitude_hold_command(
+                    pos=pos,
+                    vel=vel,
+                    yaw_rad=yaw_rad,
+                    target_z_m=float(self._calibration_only_hold_z_m),
+                    target_xy_m=self._calibration_only_hold_xy_m,
+                )
+            )
+            self._trace_calibration_only_hold(
+                pos,
+                vel,
+                command,
+                float(self._calibration_only_hold_z_m),
+                thrust_correction,
+                hold_debug,
+            )
+            return command
+
+        if self.perception_hold:
+            if not self._perception_hold_active:
+                self._perception_hold_active = True
+            if self._perception_hold_z_m is None:
+                self._perception_hold_z_m = float(pos[2])
+            if self._perception_hold_xy_m is None:
+                self._perception_hold_xy_m = pos[:2].copy()
+            if self._perception_hold_yaw_rad is None:
+                self._perception_hold_yaw_rad = float(yaw_rad)
+            self._update_perception_hold_memory_readiness(
+                snapshot=snapshot,
+                vel=vel,
+            )
+            command, thrust_correction, hold_debug = (
+                self._level_attitude_hold_command(
+                    pos=pos,
+                    vel=vel,
+                    yaw_rad=float(self._perception_hold_yaw_rad),
+                    target_z_m=float(self._perception_hold_z_m),
+                    target_xy_m=self._perception_hold_xy_m,
+                )
+            )
+            self._trace_perception_hold(
+                pos=pos,
+                vel=vel,
+                command=command,
+                target_z_m=float(self._perception_hold_z_m),
+                thrust_correction=thrust_correction,
+                hold_debug=hold_debug,
+            )
+            return command
+
         shift_replanned = self._maybe_apply_active_target_shift(pos, vel)
         advanced = self._advance_gate_if_needed(pos, vel=vel)
         if not shift_replanned and self._should_plan(advanced, pos, vel):
@@ -805,8 +1297,48 @@ class PyAIPilotAutonomyAPI:
                 self._clear_active_plan(reason="replan_failed_expired")
 
         if self.active_waypoints is None or self.planner.total_time <= 0.0:
+            if str(self.config.runtime.runner_mode).lower() == "competition":
+                if self._no_target_search_should_run():
+                    return self._competition_no_target_search_command(
+                        snapshot=snapshot,
+                        pos=pos,
+                        vel=vel,
+                        yaw_rad=yaw_rad,
+                    )
+                self._reset_no_target_search(clear_hold=False)
+                if self._competition_no_plan_hold_z_m is None:
+                    self._competition_no_plan_hold_z_m = float(pos[2])
+                command, thrust_correction, _ = self._level_attitude_hold_command(
+                    pos=pos,
+                    vel=vel,
+                    yaw_rad=yaw_rad,
+                    target_z_m=float(self._competition_no_plan_hold_z_m),
+                )
+                limited_roll_rad, limited_pitch_rad = (
+                    self._apply_attitude_slew_limit(
+                        command.roll_rad,
+                        command.pitch_rad,
+                    )
+                )
+                command = AutonomyCommandRad(
+                    roll_rad=limited_roll_rad,
+                    pitch_rad=limited_pitch_rad,
+                    yaw_rad=command.yaw_rad,
+                    thrust=command.thrust,
+                )
+                self._trace_competition_no_plan_hold(
+                    pos,
+                    vel,
+                    yaw_rad,
+                    command,
+                    float(self._competition_no_plan_hold_z_m),
+                    thrust_correction,
+                )
+                return command
             return None
 
+        self._reset_no_target_search(clear_hold=True)
+        self._competition_no_plan_hold_z_m = None
         tau_raw = max(0.0, time.time() - self.trajectory_start_time)
         tau_raw = min(tau_raw, float(self.planner.total_time))
         tau = self._reference_progress_clamped_tau(tau_raw, pos)
@@ -822,10 +1354,20 @@ class PyAIPilotAutonomyAPI:
         )
 
         self.tracker.thrust_hover = float(self.adaptive_hover.value)
-        roll_rad, pitch_rad, yaw_cmd_rad, thrust, tracker_debug = (
+        roll_rad, pitch_rad, yaw_cmd_rad, tracker_thrust, tracker_debug = (
             self.tracker.update(state, ref)
         )
-        thrust = float(np.clip(thrust, 0.0, 1.0))
+        roll_rad, pitch_rad = self._attitude_command_boundary(
+            roll_rad,
+            pitch_rad,
+            apply_flight_nose_down=True,
+        )
+        thrust = self._finalize_tracker_thrust(
+            tracker_thrust=tracker_thrust,
+            tracker_debug=tracker_debug,
+            roll_rad=roll_rad,
+            pitch_rad=pitch_rad,
+        )
         hover_debug = self.adaptive_hover.update(
             state=state,
             ref=ref,
@@ -836,9 +1378,6 @@ class PyAIPilotAutonomyAPI:
         self.hover_thrust = float(self.adaptive_hover.value)
         self.tracker.thrust_hover = self.hover_thrust
 
-        # Preserve autonomy_api6's PX4/Gazebo sign convention.
-        roll_rad = -float(roll_rad)
-        pitch_rad = -float(pitch_rad)
         yaw_cmd_rad = float(yaw_cmd_rad)
 
         self._trace_autonomy(
@@ -862,6 +1401,221 @@ class PyAIPilotAutonomyAPI:
             yaw_rad=yaw_cmd_rad,
             thrust=thrust,
         )
+
+    def _finalize_tracker_thrust(
+        self,
+        *,
+        tracker_thrust: float,
+        tracker_debug: dict | None,
+        roll_rad: float,
+        pitch_rad: float,
+    ) -> float:
+        """Recompute tilt compensation from the final slew-limited attitude."""
+        if (
+            not isinstance(tracker_debug, dict)
+            or "thrust_uncompensated" not in tracker_debug
+        ):
+            return float(np.clip(tracker_thrust, 0.0, 1.0))
+
+        thrust, final_thrust_debug = self.tracker.thrust_for_attitude(
+            tracker_debug["thrust_uncompensated"],
+            roll_rad,
+            pitch_rad,
+        )
+        tracker_debug.update(final_thrust_debug)
+        tracker_debug["tilt_compensation_attitude_source"] = "final_command"
+        tracker_debug["tilt_compensation_roll_rad"] = float(roll_rad)
+        tracker_debug["tilt_compensation_pitch_rad"] = float(pitch_rad)
+        return float(np.clip(thrust, 0.0, 1.0))
+
+    def _startup_observation_blocks_flight(self, snapshot, *, now=None) -> bool:
+        if not self.startup_observation_enabled:
+            self.startup_observation_active = False
+            self.startup_observation_status = "disabled"
+            return False
+
+        monotonic_now = time.monotonic() if now is None else float(now)
+        latest_perception = getattr(snapshot, "latest_perception", None)
+        if not isinstance(latest_perception, dict):
+            self.startup_observation_active = True
+            self.startup_observation_status = "waiting_perception"
+            self._trace_startup_observation(
+                monotonic_now=monotonic_now,
+                elapsed_s=0.0,
+            )
+            return True
+
+        if self._startup_observation_start_monotonic is None:
+            self._startup_observation_start_monotonic = monotonic_now
+
+        elapsed_s = max(
+            0.0,
+            monotonic_now - float(self._startup_observation_start_monotonic),
+        )
+        if elapsed_s < self.startup_observation_duration_s:
+            self.startup_observation_active = True
+            self.startup_observation_status = "observing"
+            self._trace_startup_observation(
+                monotonic_now=monotonic_now,
+                elapsed_s=elapsed_s,
+            )
+            return True
+
+        self.startup_observation_active = False
+        self.startup_observation_status = "complete"
+        self._trace_startup_observation(
+            monotonic_now=monotonic_now,
+            elapsed_s=elapsed_s,
+            force=not self._startup_observation_completion_traced,
+        )
+        self._startup_observation_completion_traced = True
+        return False
+
+    def _trace_startup_observation(
+        self,
+        *,
+        monotonic_now: float,
+        elapsed_s: float,
+        force: bool = False,
+    ) -> None:
+        if (
+            not force
+            and self._startup_observation_last_trace_monotonic is not None
+            and monotonic_now - self._startup_observation_last_trace_monotonic
+            < 0.5
+        ):
+            return
+        self._startup_observation_last_trace_monotonic = float(monotonic_now)
+        flight_control_status = (
+            "suppressed"
+            if self.startup_observation_active
+            else "released"
+        )
+        print(
+            "startup_observation "
+            f"status={self.startup_observation_status} "
+            f"active={int(self.startup_observation_active)} "
+            f"elapsed={elapsed_s:.2f} "
+            f"duration={self.startup_observation_duration_s:.2f} "
+            f"tracks={int(self.active_track_count)} "
+            f"flight_control={flight_control_status}",
+            flush=True,
+        )
+
+    def _attitude_command_boundary(
+        self,
+        roll_rad: float,
+        pitch_rad: float,
+        *,
+        apply_flight_nose_down: bool = False,
+        now: float | None = None,
+    ) -> tuple[float, float]:
+        # Competition boundary verified from LOCAL_POSITION_NED response:
+        # roll is inverted, while pitch is passed through. PX4 retains the
+        # legacy inversion on both axes.
+        roll_cmd = -float(roll_rad)
+        pitch_cmd = float(pitch_rad)
+        if str(self.config.runtime.runner_mode).lower() != "competition":
+            pitch_cmd = -pitch_cmd
+        elif (
+            apply_flight_nose_down
+            and bool(self.config.controller.flight_nose_down_enabled)
+        ):
+            # The competition flight-control boundary uses positive commanded
+            # pitch for the observed physical nose-down response.
+            pitch_cmd = max(
+                pitch_cmd,
+                math.radians(
+                    float(self.config.controller.flight_min_nose_down_deg)
+                ),
+            )
+        return self._apply_attitude_slew_limit(
+            roll_cmd,
+            pitch_cmd,
+            now=now,
+        )
+
+    def _remember_attitude_slew_state(
+        self,
+        roll_rad: float,
+        pitch_rad: float,
+        *,
+        now: float | None = None,
+    ) -> None:
+        self._attitude_slew_target_roll_rad = float(roll_rad)
+        self._attitude_slew_target_pitch_rad = float(pitch_rad)
+        self._attitude_slew_last_roll_rad = float(roll_rad)
+        self._attitude_slew_last_pitch_rad = float(pitch_rad)
+        self._attitude_slew_last_time = (
+            time.monotonic() if now is None else float(now)
+        )
+        self._attitude_slew_limited = False
+
+    def _apply_attitude_slew_limit(
+        self,
+        roll_rad: float,
+        pitch_rad: float,
+        *,
+        now: float | None = None,
+    ) -> tuple[float, float]:
+        roll_target = float(roll_rad)
+        pitch_target = float(pitch_rad)
+        monotonic_now = time.monotonic() if now is None else float(now)
+        self._attitude_slew_target_roll_rad = roll_target
+        self._attitude_slew_target_pitch_rad = pitch_target
+
+        if not bool(self.config.controller.attitude_slew_limit_enabled):
+            self._remember_attitude_slew_state(
+                roll_target,
+                pitch_target,
+                now=monotonic_now,
+            )
+            return roll_target, pitch_target
+
+        if (
+            self._attitude_slew_last_roll_rad is None
+            or self._attitude_slew_last_pitch_rad is None
+            or self._attitude_slew_last_time is None
+        ):
+            self._remember_attitude_slew_state(
+                roll_target,
+                pitch_target,
+                now=monotonic_now,
+            )
+            return roll_target, pitch_target
+
+        dt = max(
+            0.0,
+            monotonic_now - float(self._attitude_slew_last_time),
+        )
+        max_roll_delta = math.radians(
+            float(self.config.controller.max_roll_slew_rate_deg_s)
+        ) * dt
+        max_pitch_delta = math.radians(
+            float(self.config.controller.max_pitch_slew_rate_deg_s)
+        ) * dt
+        roll_limited = float(
+            np.clip(
+                roll_target,
+                float(self._attitude_slew_last_roll_rad) - max_roll_delta,
+                float(self._attitude_slew_last_roll_rad) + max_roll_delta,
+            )
+        )
+        pitch_limited = float(
+            np.clip(
+                pitch_target,
+                float(self._attitude_slew_last_pitch_rad) - max_pitch_delta,
+                float(self._attitude_slew_last_pitch_rad) + max_pitch_delta,
+            )
+        )
+        self._attitude_slew_limited = bool(
+            abs(roll_limited - roll_target) > 1e-12
+            or abs(pitch_limited - pitch_target) > 1e-12
+        )
+        self._attitude_slew_last_roll_rad = roll_limited
+        self._attitude_slew_last_pitch_rad = pitch_limited
+        self._attitude_slew_last_time = monotonic_now
+        return roll_limited, pitch_limited
 
     def _trace_hover_acquisition(self, pos, debug) -> None:
         now = time.time()
@@ -923,10 +1677,59 @@ class PyAIPilotAutonomyAPI:
             f"z_hold_vz_err={debug.z_hold_vz_error_m_s:.2f} "
             f"z_hold_corr={debug.z_hold_thrust_correction:.3f} "
             f"samples={debug.samples} "
+            f"samples_signed=({debug.positive_samples},"
+            f"{debug.negative_samples}) "
             f"accel_per_thrust={debug.accel_per_thrust:.2f} "
+            f"accel_per_thrust_signed=({debug.positive_accel_per_thrust:.2f},"
+            f"{debug.negative_accel_per_thrust:.2f}) "
+            f"sign_disagreement={debug.sign_slope_disagreement:.2f} "
+            f"neutral_accel={debug.neutral_accel_m_s2:.2f} "
             f"thrust_gain={debug.thrust_from_acc_gain:.4f} "
             f"conf={debug.confidence:.2f} "
             f"pos_neu=({arr[0]:.2f},{arr[1]:.2f},{arr[2]:.2f})",
+            flush=True,
+        )
+
+    def _trace_thrust_scale_failure_hold(
+        self,
+        *,
+        pos,
+        vel,
+        command: AutonomyCommandRad,
+        target_z_m: float,
+        thrust_correction: float,
+        hold_debug: dict,
+    ) -> None:
+        now = time.time()
+        period_s = float(self.config.controller.command_print_period_s)
+        if now - self._last_thrust_scale_failure_hold_trace_time < period_s:
+            return
+        self._last_thrust_scale_failure_hold_trace_time = now
+
+        pos_arr = np.asarray(pos, dtype=float).reshape(3)
+        vel_arr = np.asarray(vel, dtype=float).reshape(3)
+        target_xy = np.asarray(hold_debug["target_xy_m"], dtype=float).reshape(2)
+        error_xy = np.asarray(hold_debug["error_xy_m"], dtype=float).reshape(2)
+        accel_xy = np.asarray(
+            hold_debug["accel_xy_m_s2"],
+            dtype=float,
+        ).reshape(2)
+        print(
+            "thrust_scale_failure_hold "
+            "reason=calibration_failed "
+            "command_type=SET_ATTITUDE_TARGET "
+            f"status={self.thrust_scale_calibration.last_debug.status} "
+            f"pos_neu=({pos_arr[0]:.2f},{pos_arr[1]:.2f},{pos_arr[2]:.2f}) "
+            f"vel_neu=({vel_arr[0]:.2f},{vel_arr[1]:.2f},{vel_arr[2]:.2f}) "
+            f"target_xy=({target_xy[0]:.2f},{target_xy[1]:.2f}) "
+            f"xy_err=({error_xy[0]:.2f},{error_xy[1]:.2f}) "
+            f"a_xy=({accel_xy[0]:.2f},{accel_xy[1]:.2f}) "
+            f"target_z={target_z_m:.2f} "
+            f"z_corr={thrust_correction:.3f} "
+            f"cmd_deg=({math.degrees(command.roll_rad):.2f},"
+            f"{math.degrees(command.pitch_rad):.2f},"
+            f"{math.degrees(command.yaw_rad):.2f}) "
+            f"thrust={command.thrust:.3f}",
             flush=True,
         )
 
@@ -944,6 +1747,8 @@ class PyAIPilotAutonomyAPI:
         cmd_xy = debug.command_accel_xy_m_s2
         sample_cmd_xy = debug.sampled_command_accel_xy_m_s2
         acc_xy = debug.measured_accel_xy_m_s2
+        imu_acc_xy = debug.imu_accel_xy_m_s2
+        kinematic_acc_xy = debug.kinematic_accel_xy_m_s2
         sample_acc_xy = debug.sampled_measured_accel_xy_m_s2
         ratio_xy = debug.response_ratio_xy
         gain_xy = debug.lateral_accel_gain_xy
@@ -954,6 +1759,7 @@ class PyAIPilotAutonomyAPI:
             f"status={debug.status} "
             f"active={int(debug.active)} "
             f"done={int(debug.completed)} "
+            f"succeeded={int(debug.succeeded)} "
             f"armed={debug.armed} "
             f"elapsed={debug.elapsed_s:.2f} "
             f"xy_rel={debug.xy_rel_m:.2f} "
@@ -965,6 +1771,9 @@ class PyAIPilotAutonomyAPI:
             f"acc_src={debug.accel_source} "
             f"cmd_acc_xy=({cmd_xy[0]:.2f},{cmd_xy[1]:.2f}) "
             f"meas_acc_xy=({acc_xy[0]:.2f},{acc_xy[1]:.2f}) "
+            f"imu_acc_xy=({imu_acc_xy[0]:.2f},{imu_acc_xy[1]:.2f}) "
+            f"kin_acc_xy=({kinematic_acc_xy[0]:.2f},"
+            f"{kinematic_acc_xy[1]:.2f}) "
             f"sample_cmd_xy=({sample_cmd_xy[0]:.2f},{sample_cmd_xy[1]:.2f}) "
             f"sample_meas_xy=({sample_acc_xy[0]:.2f},{sample_acc_xy[1]:.2f}) "
             f"sample_axis={debug.sampled_axis} "
@@ -979,8 +1788,1103 @@ class PyAIPilotAutonomyAPI:
             f"samples_xy=({samples_xy[0]},{samples_xy[1]}) "
             f"signed_samples_xy=({signed_samples_xy[0]},{signed_samples_xy[1]},"
             f"{signed_samples_xy[2]},{signed_samples_xy[3]}) "
+            f"kin_mismatch_xy=({debug.kinematic_mismatch_samples_xy[0]},"
+            f"{debug.kinematic_mismatch_samples_xy[1]}) "
+            f"kin_mismatch_streak_xy=({debug.kinematic_mismatch_streak_xy[0]},"
+            f"{debug.kinematic_mismatch_streak_xy[1]}) "
+            f"polarity_mismatch={int(debug.polarity_mismatch_detected)} "
             f"conf={debug.confidence:.2f} "
             f"pos_neu=({arr[0]:.2f},{arr[1]:.2f},{arr[2]:.2f})",
+            flush=True,
+        )
+
+    def _trace_lateral_response_failure_hold(
+        self,
+        *,
+        pos,
+        vel,
+        command: AutonomyCommandRad,
+        target_z_m: float,
+        thrust_correction: float,
+        hold_debug: dict,
+    ) -> None:
+        now = time.time()
+        period_s = float(self.config.controller.command_print_period_s)
+        if (
+            now - self._last_lateral_response_failure_hold_trace_time
+            < period_s
+        ):
+            return
+        self._last_lateral_response_failure_hold_trace_time = now
+
+        pos_arr = np.asarray(pos, dtype=float).reshape(3)
+        vel_arr = np.asarray(vel, dtype=float).reshape(3)
+        target_xy = np.asarray(hold_debug["target_xy_m"], dtype=float).reshape(2)
+        error_xy = np.asarray(hold_debug["error_xy_m"], dtype=float).reshape(2)
+        accel_xy = np.asarray(
+            hold_debug["accel_xy_m_s2"],
+            dtype=float,
+        ).reshape(2)
+        print(
+            "lateral_response_failure_hold "
+            "reason=calibration_failed "
+            "command_type=SET_ATTITUDE_TARGET "
+            f"status={self.lateral_response_calibration.last_debug.status} "
+            f"pos_neu=({pos_arr[0]:.2f},{pos_arr[1]:.2f},{pos_arr[2]:.2f}) "
+            f"vel_neu=({vel_arr[0]:.2f},{vel_arr[1]:.2f},{vel_arr[2]:.2f}) "
+            f"target_xy=({target_xy[0]:.2f},{target_xy[1]:.2f}) "
+            f"xy_err=({error_xy[0]:.2f},{error_xy[1]:.2f}) "
+            f"a_xy=({accel_xy[0]:.2f},{accel_xy[1]:.2f}) "
+            f"target_z={target_z_m:.2f} "
+            f"z_corr={thrust_correction:.3f} "
+            f"cmd_deg=({math.degrees(command.roll_rad):.2f},"
+            f"{math.degrees(command.pitch_rad):.2f},"
+            f"{math.degrees(command.yaw_rad):.2f}) "
+            f"thrust={command.thrust:.3f}",
+            flush=True,
+        )
+
+    def _trace_calibration_only_hold(
+        self,
+        pos,
+        vel,
+        command: AutonomyCommandRad,
+        target_z_m: float,
+        thrust_correction: float,
+        hold_debug: dict,
+    ) -> None:
+        now = time.time()
+        period_s = float(self.config.controller.command_print_period_s)
+        if now - self._last_calibration_only_hold_trace_time < period_s:
+            return
+        self._last_calibration_only_hold_trace_time = now
+
+        pos_arr = np.asarray(pos, dtype=float).reshape(3)
+        vel_arr = np.asarray(vel, dtype=float).reshape(3)
+        target_xy = np.asarray(hold_debug["target_xy_m"], dtype=float).reshape(2)
+        error_xy = np.asarray(hold_debug["error_xy_m"], dtype=float).reshape(2)
+        accel_xy = np.asarray(
+            hold_debug["accel_xy_m_s2"],
+            dtype=float,
+        ).reshape(2)
+        attitude_accel_xy = np.asarray(
+            hold_debug["attitude_accel_xy_m_s2"],
+            dtype=float,
+        ).reshape(2)
+        print(
+            "calibration_only_hold "
+            "command_type=SET_ATTITUDE_TARGET "
+            f"pos_neu=({pos_arr[0]:.2f},{pos_arr[1]:.2f},{pos_arr[2]:.2f}) "
+            f"vel_neu=({vel_arr[0]:.2f},{vel_arr[1]:.2f},{vel_arr[2]:.2f}) "
+            f"target_xy=({target_xy[0]:.2f},{target_xy[1]:.2f}) "
+            f"xy_err=({error_xy[0]:.2f},{error_xy[1]:.2f}) "
+            f"a_xy=({accel_xy[0]:.2f},{accel_xy[1]:.2f}) "
+            f"a_cmd_xy=({attitude_accel_xy[0]:.2f},"
+            f"{attitude_accel_xy[1]:.2f}) "
+            f"target_z={target_z_m:.2f} "
+            f"z_corr={thrust_correction:.3f} "
+            f"cmd_deg=({math.degrees(command.roll_rad):.2f},"
+            f"{math.degrees(command.pitch_rad):.2f},"
+            f"{math.degrees(command.yaw_rad):.2f}) "
+            f"thrust={command.thrust:.3f}",
+            flush=True,
+        )
+
+    def _perception_memory_active(self) -> bool:
+        if self.calibration_only:
+            return False
+        if not self.perception_hold:
+            return True
+        return bool(self._perception_hold_memory_active)
+
+    def _quarantine_perception_hold_frames(self, snapshot) -> None:
+        try:
+            raw_frame_id = int(getattr(snapshot, "frame_id", -1))
+        except (TypeError, ValueError):
+            raw_frame_id = -1
+        if raw_frame_id >= 0:
+            self._perception_hold_frame_barrier = max(
+                int(self._perception_hold_frame_barrier),
+                raw_frame_id,
+            )
+
+        image_wall_time = self._finite_float(
+            getattr(snapshot, "image_wall_time", 0.0),
+            0.0,
+        )
+        if image_wall_time > 0.0:
+            self._perception_hold_image_time_barrier = max(
+                float(self._perception_hold_image_time_barrier),
+                image_wall_time,
+            )
+
+        latest_perception = getattr(snapshot, "latest_perception", None)
+        if isinstance(latest_perception, dict):
+            frame_key = self._perception_frame_key(latest_perception)
+            if frame_key is not None:
+                self._last_gate_memory_frame_key = frame_key
+
+    def _update_perception_hold_memory_readiness(self, *, snapshot, vel) -> None:
+        if self._perception_hold_memory_active:
+            return
+
+        # Continuously advance the source-image barrier while calibration
+        # residual motion settles. This also excludes YOLO work already in
+        # flight from a frame captured before the hold became stationary.
+        self._quarantine_perception_hold_frames(snapshot)
+        speed_m_s = float(
+            np.linalg.norm(np.asarray(vel, dtype=float).reshape(3))
+        )
+        max_speed_m_s = max(
+            0.0,
+            float(self.config.runtime.perception_hold_settle_speed_m_s),
+        )
+        now = time.monotonic()
+        if not math.isfinite(speed_m_s) or speed_m_s > max_speed_m_s:
+            self._perception_hold_settle_since = None
+            return
+
+        if self._perception_hold_settle_since is None:
+            self._perception_hold_settle_since = now
+        settle_duration_s = max(
+            0.0,
+            float(self.config.runtime.perception_hold_settle_duration_s),
+        )
+        if now - float(self._perception_hold_settle_since) >= settle_duration_s:
+            self._perception_hold_memory_active = True
+
+    def _observe_perception_hold_memory(self, snapshot) -> int:
+        latest_perception = getattr(snapshot, "latest_perception", None)
+        if not isinstance(latest_perception, dict):
+            return len(self.gate_memory.get_committed_tracks())
+
+        try:
+            perception_frame_id = int(latest_perception.get("frame_id", -1))
+        except (TypeError, ValueError):
+            perception_frame_id = -1
+        perception_image_time = self._finite_float(
+            latest_perception.get("image_wall_time"),
+            0.0,
+        )
+        has_source_stamp = perception_frame_id >= 0 or perception_image_time > 0.0
+        captured_before_barrier = (
+            (
+                perception_frame_id >= 0
+                and self._perception_hold_frame_barrier >= 0
+                and perception_frame_id <= self._perception_hold_frame_barrier
+            )
+            or (
+                perception_image_time > 0.0
+                and self._perception_hold_image_time_barrier > 0.0
+                and perception_image_time
+                <= self._perception_hold_image_time_barrier
+            )
+        )
+        if not has_source_stamp or captured_before_barrier:
+            frame_key = self._perception_frame_key(latest_perception)
+            if frame_key is not None:
+                self._last_gate_memory_frame_key = frame_key
+            return len(self.gate_memory.get_committed_tracks())
+
+        self._update_gate_memory(latest_perception, snapshot=snapshot)
+        return len(self.gate_memory.get_committed_tracks())
+
+    def _trace_perception_hold(
+        self,
+        *,
+        pos,
+        vel,
+        command: AutonomyCommandRad,
+        target_z_m: float,
+        thrust_correction: float,
+        hold_debug: dict,
+    ) -> None:
+        now = time.time()
+        period_s = float(self.config.controller.command_print_period_s)
+        if now - self._last_perception_hold_trace_time < period_s:
+            return
+        self._last_perception_hold_trace_time = now
+
+        pos_arr = np.asarray(pos, dtype=float).reshape(3)
+        vel_arr = np.asarray(vel, dtype=float).reshape(3)
+        target_xy = np.asarray(hold_debug["target_xy_m"], dtype=float).reshape(2)
+        error_xy = np.asarray(hold_debug["error_xy_m"], dtype=float).reshape(2)
+        accel_xy = np.asarray(
+            hold_debug["accel_xy_m_s2"],
+            dtype=float,
+        ).reshape(2)
+        attitude_accel_xy = np.asarray(
+            hold_debug["attitude_accel_xy_m_s2"],
+            dtype=float,
+        ).reshape(2)
+        memory_tracks = len(getattr(self.gate_memory, "tracks", []))
+        committed_tracks = len(self.gate_memory.get_committed_tracks())
+        stable_tracks = len(self.gate_memory.get_stable_tracks())
+        print(
+            "perception_hold "
+            "reason=post_calibration_perception_only "
+            "command_type=SET_ATTITUDE_TARGET "
+            f"memory_active={int(self._perception_hold_memory_active)} "
+            f"frame_barrier={int(self._perception_hold_frame_barrier)} "
+            f"memory_tracks={memory_tracks} "
+            f"committed_tracks={committed_tracks} "
+            f"stable_tracks={stable_tracks} "
+            f"pos_neu=({pos_arr[0]:.2f},{pos_arr[1]:.2f},{pos_arr[2]:.2f}) "
+            f"vel_neu=({vel_arr[0]:.2f},{vel_arr[1]:.2f},{vel_arr[2]:.2f}) "
+            f"target_xy=({target_xy[0]:.2f},{target_xy[1]:.2f}) "
+            f"xy_err=({error_xy[0]:.2f},{error_xy[1]:.2f}) "
+            f"a_xy=({accel_xy[0]:.2f},{accel_xy[1]:.2f}) "
+            f"a_cmd_xy=({attitude_accel_xy[0]:.2f},"
+            f"{attitude_accel_xy[1]:.2f}) "
+            f"target_z={target_z_m:.2f} "
+            f"z_corr={thrust_correction:.3f} "
+            f"cmd_deg=({math.degrees(command.roll_rad):.2f},"
+            f"{math.degrees(command.pitch_rad):.2f},"
+            f"{math.degrees(command.yaw_rad):.2f}) "
+            f"thrust={command.thrust:.3f}",
+            flush=True,
+        )
+
+    def _level_attitude_hold_command(
+        self,
+        *,
+        pos,
+        vel,
+        yaw_rad: float,
+        target_z_m: float,
+        target_xy_m=None,
+        control_yaw_rad: float | None = None,
+    ) -> tuple[AutonomyCommandRad, float, dict]:
+        pos_arr = np.asarray(pos, dtype=float).reshape(3)
+        vel_arr = np.asarray(vel, dtype=float).reshape(3)
+        z_error_m = float(target_z_m - pos_arr[2])
+        vz_error_m_s = float(-vel_arr[2])
+        hold_section = self.config.lateral_response_calibration
+        thrust_correction = 0.0
+        if bool(hold_section.z_hold_enabled):
+            raw_correction = (
+                float(hold_section.z_hold_kp) * z_error_m
+                + float(hold_section.z_hold_kv) * vz_error_m_s
+            )
+            max_correction = max(
+                0.0,
+                float(hold_section.z_hold_max_correction),
+            )
+            thrust_correction = float(
+                np.clip(
+                    raw_correction,
+                    -max_correction,
+                    max_correction,
+                )
+            )
+        thrust = float(
+            np.clip(
+                self.adaptive_hover.value + thrust_correction,
+                0.0,
+                1.0,
+            )
+        )
+
+        roll_rad = 0.0
+        pitch_rad = 0.0
+        hold_debug = {
+            "target_xy_m": pos_arr[:2].copy(),
+            "error_xy_m": np.zeros(2, dtype=float),
+            "accel_xy_m_s2": np.zeros(2, dtype=float),
+            "attitude_accel_xy_m_s2": np.zeros(2, dtype=float),
+        }
+        if target_xy_m is not None:
+            target_xy = np.asarray(target_xy_m, dtype=float).reshape(2)
+            error_xy = target_xy - pos_arr[:2]
+            kp_xy = np.asarray(self.config.controller.kp, dtype=float).reshape(3)[:2]
+            kv_xy = np.asarray(self.config.controller.kv, dtype=float).reshape(3)[:2]
+            accel_xy = np.nan_to_num(
+                kp_xy * error_xy - kv_xy * vel_arr[:2],
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            max_acc_xy = min(
+                max(0.0, float(self.config.controller.max_acc_xy)),
+                max(
+                    0.0,
+                    float(self.lateral_response_calibration.probe_accel_m_s2),
+                ),
+            )
+            accel_norm = float(np.linalg.norm(accel_xy))
+            if max_acc_xy <= 0.0:
+                accel_xy[:] = 0.0
+            elif accel_norm > max_acc_xy:
+                accel_xy *= max_acc_xy / accel_norm
+
+            lateral_gain_xy = np.asarray(
+                self.tracker.lateral_accel_gain_xy,
+                dtype=float,
+            ).reshape(2)
+            lateral_gain_xy = np.where(
+                np.isfinite(lateral_gain_xy) & (lateral_gain_xy > 0.0),
+                lateral_gain_xy,
+                1.0,
+            )
+            attitude_accel_xy = accel_xy * lateral_gain_xy
+            roll_rad, pitch_rad, _ = (
+                self.lateral_response_calibration._command_from_accel(
+                    command_accel_xy=attitude_accel_xy,
+                    yaw_rad=float(
+                        yaw_rad
+                        if control_yaw_rad is None
+                        else control_yaw_rad
+                    ),
+                    hover_thrust=float(self.adaptive_hover.value),
+                    thrust_correction=thrust_correction,
+                )
+            )
+            hold_debug = {
+                "target_xy_m": target_xy.copy(),
+                "error_xy_m": error_xy.copy(),
+                "accel_xy_m_s2": accel_xy.copy(),
+                "attitude_accel_xy_m_s2": attitude_accel_xy.copy(),
+            }
+
+        return (
+            AutonomyCommandRad(
+                roll_rad=float(roll_rad),
+                pitch_rad=float(pitch_rad),
+                yaw_rad=float(yaw_rad),
+                thrust=thrust,
+            ),
+            thrust_correction,
+            hold_debug,
+        )
+
+    def _no_target_search_should_run(self) -> bool:
+        if not self.no_target_search_enabled:
+            return False
+        if not self.use_perception or self.gate_source_mode != "perception":
+            return False
+        if (
+            self.race_gate_count is not None
+            and self.current_gate_idx >= self.race_gate_count
+        ):
+            return False
+        if self.provisional_target_active:
+            return False
+        if self._finite_vec3_or_none(self.current_gate_pos) is not None:
+            return False
+        if 0 <= self.current_gate_idx < len(self.gate_centers_neu):
+            return False
+        try:
+            if bool(self.target_manager.diagnostics().locked):
+                return False
+        except (AttributeError, TypeError, ValueError):
+            pass
+        return True
+
+    def _competition_no_target_search_command(
+        self,
+        *,
+        snapshot,
+        pos,
+        vel,
+        yaw_rad: float,
+        now: float | None = None,
+        wall_time: float | None = None,
+    ) -> AutonomyCommandRad:
+        monotonic_now = time.monotonic() if now is None else float(now)
+        wall_now = time.time() if wall_time is None else float(wall_time)
+        pos_arr = np.asarray(pos, dtype=float).reshape(3)
+        vel_arr = np.nan_to_num(
+            np.asarray(vel, dtype=float).reshape(3),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        if self._no_target_search_entry_z_m is None:
+            self._no_target_search_entry_z_m = float(pos_arr[2])
+            self._competition_no_plan_hold_xy_m = pos_arr[:2].copy()
+            self._competition_no_plan_hold_z_m = float(pos_arr[2])
+            self._competition_no_plan_hold_yaw_rad = self._wrap_pi(yaw_rad)
+        if self._competition_no_plan_hold_xy_m is None:
+            self._competition_no_plan_hold_xy_m = pos_arr[:2].copy()
+        if self._competition_no_plan_hold_z_m is None:
+            self._competition_no_plan_hold_z_m = float(pos_arr[2])
+        if self._competition_no_plan_hold_yaw_rad is None:
+            self._competition_no_plan_hold_yaw_rad = self._wrap_pi(yaw_rad)
+        if self._no_target_search_last_monotonic is None:
+            self._no_target_search_last_monotonic = monotonic_now
+
+        dt_s = float(
+            np.clip(
+                monotonic_now - float(self._no_target_search_last_monotonic),
+                0.0,
+                0.25,
+            )
+        )
+        self._no_target_search_last_monotonic = monotonic_now
+
+        ready, waiting_state = self._no_target_search_ready(snapshot)
+        candidate = None
+        if ready:
+            candidate = self._select_no_target_search_candidate(
+                wall_now,
+                current_pos=pos_arr,
+            )
+
+        if not ready:
+            self._no_target_search_state = waiting_state
+            self._no_target_search_ready_since = None
+            self._no_target_search_candidate_track_id = None
+            self._no_target_search_candidate_hold_z_m = None
+        else:
+            if self._no_target_search_ready_since is None:
+                self._no_target_search_ready_since = monotonic_now
+
+            if candidate is not None:
+                candidate_id = int(candidate.id)
+                candidate_changed = (
+                    self._no_target_search_candidate_track_id != candidate_id
+                )
+                if candidate_changed:
+                    self._no_target_search_candidate_hold_z_m = float(pos_arr[2])
+                    self._competition_no_plan_hold_xy_m = pos_arr[:2].copy()
+                self._no_target_search_candidate_track_id = candidate_id
+                candidate_y_px = self._no_target_search_candidate_y_px(
+                    candidate
+                )
+                vertical_error_px = (
+                    candidate_y_px
+                    - self.no_target_search_center_vertical_target_y_px
+                )
+                center_vertical = bool(
+                    self.no_target_search_center_vertical_enabled
+                    and math.isfinite(candidate_y_px)
+                    and vertical_error_px
+                    > self.no_target_search_center_vertical_deadband_px
+                )
+                if center_vertical:
+                    floor_z_m = self._no_target_search_floor_z_m()
+                    excess_error_px = (
+                        vertical_error_px
+                        - self.no_target_search_center_vertical_deadband_px
+                    )
+                    rate_ramp_px = max(
+                        1.0,
+                        self.no_target_search_center_vertical_deadband_px,
+                    )
+                    descent_rate_scale = float(
+                        np.clip(excess_error_px / rate_ramp_px, 0.10, 1.0)
+                    )
+                    descent_rate_m_s = (
+                        self.no_target_search_center_vertical_max_descent_rate_m_s
+                        * descent_rate_scale
+                    )
+                    next_target_z_m = max(
+                        floor_z_m,
+                        float(self._no_target_search_candidate_hold_z_m)
+                        - descent_rate_m_s * dt_s,
+                    )
+                    self._no_target_search_candidate_hold_z_m = (
+                        next_target_z_m
+                    )
+                    self._no_target_search_state = (
+                        "centering_vertical_floor"
+                        if next_target_z_m <= floor_z_m + 1e-6
+                        else "centering_vertical"
+                    )
+                else:
+                    if (
+                        candidate_changed
+                        or self._no_target_search_state
+                        in (
+                            "centering_vertical",
+                            "centering_vertical_floor",
+                        )
+                        or self._no_target_search_candidate_hold_z_m is None
+                    ):
+                        self._no_target_search_candidate_hold_z_m = float(
+                            pos_arr[2]
+                        )
+                    self._no_target_search_state = "acquiring"
+                self._competition_no_plan_hold_z_m = float(
+                    self._no_target_search_candidate_hold_z_m
+                )
+                self._competition_no_plan_hold_yaw_rad = (
+                    self._no_target_search_center_yaw(
+                        candidate,
+                        current_yaw_rad=float(yaw_rad),
+                        command_yaw_rad=float(
+                            self._competition_no_plan_hold_yaw_rad
+                        ),
+                        dt_s=dt_s,
+                    )
+                )
+            else:
+                self._no_target_search_candidate_track_id = None
+                self._no_target_search_candidate_hold_z_m = None
+                ready_elapsed_s = max(
+                    0.0,
+                    monotonic_now - float(self._no_target_search_ready_since),
+                )
+                horizontal_speed_m_s = float(np.linalg.norm(vel_arr[:2]))
+                if ready_elapsed_s < self.no_target_search_loss_grace_s:
+                    self._no_target_search_state = "loss_grace"
+                else:
+                    can_descend = False
+                    forward_required = bool(
+                        self.no_target_search_forward_before_descent_enabled
+                        and self.no_target_search_forward_distance_m > 0.0
+                    )
+                    if (
+                        forward_required
+                        and not self._no_target_search_forward_started
+                    ):
+                        if (
+                            horizontal_speed_m_s
+                            > self.no_target_search_settle_horizontal_speed_m_s
+                        ):
+                            self._no_target_search_state = "settling"
+                        else:
+                            forward_heading_rad = float(yaw_rad)
+                            forward_direction_neu = np.array(
+                                [
+                                    math.cos(forward_heading_rad),
+                                    math.sin(forward_heading_rad),
+                                ],
+                                dtype=float,
+                            )
+                            self._no_target_search_forward_start_xy_m = (
+                                pos_arr[:2].copy()
+                            )
+                            self._no_target_search_forward_target_xy_m = (
+                                self._no_target_search_forward_start_xy_m
+                                + self.no_target_search_forward_distance_m
+                                * forward_direction_neu
+                            )
+                            self._competition_no_plan_hold_xy_m = (
+                                self._no_target_search_forward_target_xy_m.copy()
+                            )
+                            self._no_target_search_forward_started = True
+                            self._no_target_search_state = "advancing"
+                    elif (
+                        forward_required
+                        and not self._no_target_search_forward_completed
+                    ):
+                        forward_target_xy_m = np.asarray(
+                            self._no_target_search_forward_target_xy_m,
+                            dtype=float,
+                        ).reshape(2)
+                        self._competition_no_plan_hold_xy_m = (
+                            forward_target_xy_m.copy()
+                        )
+                        forward_remaining_m = float(
+                            np.linalg.norm(
+                                forward_target_xy_m - pos_arr[:2]
+                            )
+                        )
+                        if (
+                            forward_remaining_m
+                            > self.no_target_search_forward_reached_tolerance_m
+                        ):
+                            self._no_target_search_state = "advancing"
+                        else:
+                            self._no_target_search_forward_completed = True
+                            if (
+                                horizontal_speed_m_s
+                                > self.no_target_search_settle_horizontal_speed_m_s
+                            ):
+                                self._no_target_search_state = (
+                                    "forward_settling"
+                                )
+                            else:
+                                can_descend = True
+                    elif (
+                        horizontal_speed_m_s
+                        > self.no_target_search_settle_horizontal_speed_m_s
+                    ):
+                        self._no_target_search_state = (
+                            "forward_settling"
+                            if forward_required
+                            else "settling"
+                        )
+                    else:
+                        can_descend = True
+
+                    if can_descend:
+                        floor_z_m = self._no_target_search_floor_z_m()
+                        next_target_z_m = max(
+                            floor_z_m,
+                            float(self._competition_no_plan_hold_z_m)
+                            - self.no_target_search_descent_rate_m_s * dt_s,
+                        )
+                        self._competition_no_plan_hold_z_m = next_target_z_m
+                        self._no_target_search_state = (
+                            "floor_hold"
+                            if next_target_z_m <= floor_z_m + 1e-6
+                            else "descending"
+                        )
+
+        command, thrust_correction, hold_debug = (
+            self._level_attitude_hold_command(
+                pos=pos_arr,
+                vel=vel_arr,
+                yaw_rad=float(self._competition_no_plan_hold_yaw_rad),
+                target_z_m=float(self._competition_no_plan_hold_z_m),
+                target_xy_m=self._competition_no_plan_hold_xy_m,
+                control_yaw_rad=float(yaw_rad),
+            )
+        )
+        limited_roll_rad, limited_pitch_rad = self._apply_attitude_slew_limit(
+            command.roll_rad,
+            command.pitch_rad,
+            now=monotonic_now,
+        )
+        command = AutonomyCommandRad(
+            roll_rad=limited_roll_rad,
+            pitch_rad=limited_pitch_rad,
+            yaw_rad=command.yaw_rad,
+            thrust=command.thrust,
+        )
+        self._trace_no_target_search(
+            pos=pos_arr,
+            vel=vel_arr,
+            command=command,
+            target_z_m=float(self._competition_no_plan_hold_z_m),
+            thrust_correction=thrust_correction,
+            hold_debug=hold_debug,
+            candidate=candidate,
+            wall_now=wall_now,
+        )
+        return command
+
+    def _no_target_search_ready(self, snapshot) -> tuple[bool, str]:
+        if self.no_target_search_require_armed:
+            armed = getattr(snapshot, "armed", None)
+            if armed is None:
+                heartbeat = getattr(snapshot, "heartbeat", None)
+                if isinstance(heartbeat, dict):
+                    armed = heartbeat.get("armed")
+            if armed is not True:
+                return False, "waiting_armed"
+
+        if (
+            self.no_target_search_require_race_start
+            and str(self.config.runtime.runner_mode).lower() == "competition"
+        ):
+            race_status = getattr(snapshot, "race_status", None)
+            if not isinstance(race_status, dict):
+                return False, "waiting_race_status"
+            try:
+                sim_boot_time_ms = int(race_status["sim_boot_time_ms"])
+                race_start_boot_time_ms = int(
+                    race_status["race_start_boot_time_ms"]
+                )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False, "waiting_race_status"
+            if (
+                race_start_boot_time_ms <= 0
+                or sim_boot_time_ms < race_start_boot_time_ms
+            ):
+                return False, "waiting_race_start"
+        return True, "ready"
+
+    def _select_no_target_search_candidate(
+        self,
+        wall_now: float,
+        *,
+        current_pos,
+    ):
+        candidates = []
+        gap_anchor = self._next_gate_gap_anchor(current_pos)
+        gap_guard_enabled = bool(
+            self.race_order_gap_guard_enabled
+            and self.race_order_max_next_gate_gap_m > 0.0
+        )
+        for track in getattr(self.gate_memory, "tracks", []):
+            try:
+                track_id = int(track.id)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if track_id in self.completed_track_ids:
+                continue
+            hits = int(getattr(track, "hits", 0))
+            if hits < self.no_target_search_candidate_min_hits:
+                continue
+            observations = list(getattr(track, "obs_history", []))
+            if not observations:
+                continue
+            observation = observations[-1]
+            if (
+                not bool(getattr(observation, "quality_ok", True))
+                or bool(getattr(observation, "is_outlier", False))
+            ):
+                continue
+            last_seen_time = self._finite_float(
+                getattr(track, "last_seen_time", None),
+                float("nan"),
+                allow_nan=True,
+            )
+            if not math.isfinite(last_seen_time):
+                continue
+            age_s = max(0.0, float(wall_now) - last_seen_time)
+            if age_s > self.no_target_search_candidate_lost_grace_s:
+                continue
+
+            keypoint_conf = self._finite_float(
+                getattr(observation, "keypoint_conf_min", None),
+                float("nan"),
+                allow_nan=True,
+            )
+            if self.no_target_search_candidate_min_keypoint_conf > 0.0 and (
+                not math.isfinite(keypoint_conf)
+                or keypoint_conf
+                < self.no_target_search_candidate_min_keypoint_conf
+            ):
+                continue
+
+            reprojection_error = self._finite_float(
+                getattr(observation, "reprojection_error", None),
+                float("nan"),
+                allow_nan=True,
+            )
+            if (
+                self.no_target_search_candidate_max_reprojection_error > 0.0
+                and (
+                    not math.isfinite(reprojection_error)
+                    or reprojection_error
+                    > self.no_target_search_candidate_max_reprojection_error
+                )
+            ):
+                continue
+
+            image_area_px2 = self._finite_float(
+                getattr(observation, "image_area_px2", None),
+                float("nan"),
+                allow_nan=True,
+            )
+            if self.no_target_search_candidate_min_image_area_px2 > 0.0 and (
+                not math.isfinite(image_area_px2)
+                or image_area_px2
+                < self.no_target_search_candidate_min_image_area_px2
+            ):
+                continue
+
+            candidate_center = self._track_plausible_blocker_center(track)
+            if candidate_center is None:
+                continue
+            candidate_gap_m = float(
+                np.linalg.norm(candidate_center - gap_anchor)
+            )
+            if not math.isfinite(candidate_gap_m):
+                continue
+            if (
+                gap_guard_enabled
+                and candidate_gap_m > self.race_order_max_next_gate_gap_m
+            ):
+                continue
+
+            known_gate_priority = 0
+            if bool(
+                getattr(
+                    self.gate_memory,
+                    "known_position_commit_filter_enabled",
+                    False,
+                )
+            ):
+                center = self._finite_vec3_or_none(
+                    getattr(track, "filtered_center_world", None)
+                )
+                if center is None:
+                    center = self._finite_vec3_or_none(
+                        getattr(track, "center", None)
+                    )
+                known_positions = np.asarray(
+                    getattr(
+                        self.gate_memory,
+                        "known_gate_positions_neu",
+                        np.empty((0, 3), dtype=float),
+                    ),
+                    dtype=float,
+                ).reshape(-1, 3)
+                if center is None or known_positions.shape[0] <= 0:
+                    continue
+                known_distances = np.linalg.norm(
+                    known_positions - center.reshape(1, 3),
+                    axis=1,
+                )
+                known_gate_idx = int(np.argmin(known_distances))
+                known_gate_distance_m = float(
+                    known_distances[known_gate_idx]
+                )
+                known_radius_m = max(
+                    0.0,
+                    float(
+                        getattr(
+                            self.gate_memory,
+                            "known_position_commit_radius_m",
+                            0.0,
+                        )
+                    ),
+                )
+                if (
+                    known_radius_m <= 0.0
+                    or known_gate_distance_m > known_radius_m
+                    or known_gate_idx < int(self.current_gate_idx)
+                ):
+                    continue
+                known_gate_priority = -max(
+                    0,
+                    known_gate_idx - int(self.current_gate_idx),
+                )
+
+            candidates.append(
+                (
+                    (
+                        -candidate_gap_m
+                        if gap_guard_enabled
+                        else 0.0
+                    ),
+                    known_gate_priority,
+                    int(bool(getattr(track, "is_stable", False))),
+                    int(bool(getattr(track, "committed", False))),
+                    hits,
+                    keypoint_conf if math.isfinite(keypoint_conf) else 0.0,
+                    image_area_px2 if math.isfinite(image_area_px2) else 0.0,
+                    (
+                        -reprojection_error
+                        if math.isfinite(reprojection_error)
+                        else float("-inf")
+                    ),
+                    -age_s,
+                    track,
+                )
+            )
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: item[:-1], reverse=True)
+        return candidates[0][-1]
+
+    def _no_target_search_floor_z_m(self) -> float:
+        entry_z_m = float(self._no_target_search_entry_z_m)
+        relative_floor_z_m = (
+            entry_z_m - self.no_target_search_max_descent_per_search_m
+        )
+        return min(
+            entry_z_m,
+            max(
+                self.no_target_search_min_z_neu_m,
+                relative_floor_z_m,
+            ),
+        )
+
+    @staticmethod
+    def _no_target_search_candidate_y_px(track) -> float:
+        image_center = getattr(track, "last_image_center_px", None)
+        try:
+            image_center = np.asarray(image_center, dtype=float).reshape(2)
+        except (TypeError, ValueError):
+            return float("nan")
+        if not np.all(np.isfinite(image_center)):
+            return float("nan")
+        return float(image_center[1])
+
+    def _no_target_search_center_yaw(
+        self,
+        track,
+        *,
+        current_yaw_rad: float,
+        command_yaw_rad: float,
+        dt_s: float,
+    ) -> float:
+        if (
+            not self.no_target_search_center_yaw_enabled
+            or self.no_target_search_center_yaw_max_rate_deg_s <= 0.0
+        ):
+            return self._wrap_pi(command_yaw_rad)
+
+        image_center = getattr(track, "last_image_center_px", None)
+        try:
+            image_center = np.asarray(image_center, dtype=float).reshape(2)
+        except (TypeError, ValueError):
+            return self._wrap_pi(command_yaw_rad)
+        if not np.all(np.isfinite(image_center)):
+            return self._wrap_pi(command_yaw_rad)
+
+        principal_x_px = float(self.camera_matrix[0, 2])
+        focal_x_px = float(self.camera_matrix[0, 0])
+        error_x_px = float(image_center[0] - principal_x_px)
+        if (
+            abs(error_x_px) <= self.no_target_search_center_yaw_deadband_px
+            or not math.isfinite(focal_x_px)
+            or abs(focal_x_px) <= 1e-6
+        ):
+            return self._wrap_pi(command_yaw_rad)
+
+        image_yaw_error_rad = math.atan2(error_x_px, focal_x_px)
+        desired_yaw_rad = self._wrap_pi(
+            float(current_yaw_rad) + image_yaw_error_rad
+        )
+        command_error_rad = self._wrap_pi(
+            desired_yaw_rad - float(command_yaw_rad)
+        )
+        max_step_rad = math.radians(
+            self.no_target_search_center_yaw_max_rate_deg_s
+        ) * max(0.0, float(dt_s))
+        step_rad = float(
+            np.clip(command_error_rad, -max_step_rad, max_step_rad)
+        )
+        return self._wrap_pi(float(command_yaw_rad) + step_rad)
+
+    def _reset_no_target_search(self, *, clear_hold: bool = True) -> None:
+        self._no_target_search_state = "idle"
+        self._no_target_search_entry_z_m = None
+        self._no_target_search_ready_since = None
+        self._no_target_search_last_monotonic = None
+        self._no_target_search_candidate_track_id = None
+        self._no_target_search_candidate_hold_z_m = None
+        self._no_target_search_forward_started = False
+        self._no_target_search_forward_completed = False
+        self._no_target_search_forward_start_xy_m = None
+        self._no_target_search_forward_target_xy_m = None
+        self._competition_no_plan_hold_xy_m = None
+        self._competition_no_plan_hold_yaw_rad = None
+        if clear_hold:
+            self._competition_no_plan_hold_z_m = None
+
+    def _trace_no_target_search(
+        self,
+        *,
+        pos: np.ndarray,
+        vel: np.ndarray,
+        command: AutonomyCommandRad,
+        target_z_m: float,
+        thrust_correction: float,
+        hold_debug: dict,
+        candidate,
+        wall_now: float,
+    ) -> None:
+        period_s = float(self.config.controller.command_print_period_s)
+        if wall_now - self._last_competition_no_plan_hold_trace_time < period_s:
+            return
+        self._last_competition_no_plan_hold_trace_time = float(wall_now)
+
+        candidate_id = "none"
+        candidate_hits = 0
+        candidate_age_s = float("nan")
+        candidate_image_x_px = float("nan")
+        candidate_image_y_px = float("nan")
+        if candidate is not None:
+            candidate_id = int(candidate.id)
+            candidate_hits = int(getattr(candidate, "hits", 0))
+            candidate_age_s = max(
+                0.0,
+                float(wall_now)
+                - self._finite_float(
+                    getattr(candidate, "last_seen_time", None),
+                    float(wall_now),
+                ),
+            )
+            image_center = getattr(candidate, "last_image_center_px", None)
+            try:
+                image_center = np.asarray(image_center, dtype=float).reshape(2)
+            except (TypeError, ValueError):
+                image_center = None
+            if image_center is not None and np.all(np.isfinite(image_center)):
+                candidate_image_x_px = float(image_center[0])
+                candidate_image_y_px = float(image_center[1])
+
+        candidate_vertical_error_px = (
+            candidate_image_y_px
+            - self.no_target_search_center_vertical_target_y_px
+        )
+        forward_remaining_m = float("nan")
+        if self._no_target_search_forward_target_xy_m is not None:
+            forward_remaining_m = float(
+                np.linalg.norm(
+                    np.asarray(
+                        self._no_target_search_forward_target_xy_m,
+                        dtype=float,
+                    ).reshape(2)
+                    - pos[:2]
+                )
+            )
+
+        target_xy = np.asarray(
+            hold_debug.get("target_xy_m", pos[:2]),
+            dtype=float,
+        ).reshape(2)
+        error_xy = np.asarray(
+            hold_debug.get("error_xy_m", np.zeros(2, dtype=float)),
+            dtype=float,
+        ).reshape(2)
+        print(
+            "no_target_search "
+            f"state={self._no_target_search_state} "
+            f"gate_idx={int(self.current_gate_idx)} "
+            f"candidate_track={candidate_id} "
+            f"candidate_hits={candidate_hits} "
+            f"candidate_age_s={self._fmt_float(candidate_age_s, precision=2)} "
+            f"candidate_x_px="
+            f"{self._fmt_float(candidate_image_x_px, precision=1)} "
+            f"candidate_y_px="
+            f"{self._fmt_float(candidate_image_y_px, precision=1)} "
+            f"candidate_y_error_px="
+            f"{self._fmt_float(candidate_vertical_error_px, precision=1)} "
+            f"forward_started="
+            f"{int(self._no_target_search_forward_started)} "
+            f"forward_completed="
+            f"{int(self._no_target_search_forward_completed)} "
+            f"forward_remaining_m="
+            f"{self._fmt_float(forward_remaining_m, precision=2)} "
+            f"pos_neu={self._fmt_vec(pos, precision=2)} "
+            f"vel_neu={self._fmt_vec(vel, precision=2)} "
+            f"target_xy=({target_xy[0]:.2f},{target_xy[1]:.2f}) "
+            f"xy_err=({error_xy[0]:.2f},{error_xy[1]:.2f}) "
+            f"target_z={target_z_m:.2f} "
+            f"drop_m="
+            f"{max(0.0, float(self._no_target_search_entry_z_m) - target_z_m):.2f} "
+            f"z_corr={thrust_correction:.3f} "
+            f"cmd_deg=({math.degrees(command.roll_rad):.2f},"
+            f"{math.degrees(command.pitch_rad):.2f},"
+            f"{math.degrees(command.yaw_rad):.2f}) "
+            f"thrust={command.thrust:.3f}",
+            flush=True,
+        )
+
+    def _trace_competition_no_plan_hold(
+        self,
+        pos,
+        vel,
+        yaw_rad: float,
+        command: AutonomyCommandRad,
+        target_z_m: float,
+        thrust_correction: float,
+    ) -> None:
+        now = time.time()
+        period_s = float(self.config.controller.command_print_period_s)
+        if now - self._last_competition_no_plan_hold_trace_time < period_s:
+            return
+        self._last_competition_no_plan_hold_trace_time = now
+
+        pos_arr = np.asarray(pos, dtype=float).reshape(3)
+        vel_arr = np.asarray(vel, dtype=float).reshape(3)
+        print(
+            "competition_no_plan_hold "
+            "reason=no_active_plan "
+            "command_type=SET_ATTITUDE_TARGET "
+            f"pos_neu=({pos_arr[0]:.2f},{pos_arr[1]:.2f},{pos_arr[2]:.2f}) "
+            f"vel_neu=({vel_arr[0]:.2f},{vel_arr[1]:.2f},{vel_arr[2]:.2f}) "
+            f"target_z={target_z_m:.2f} "
+            f"z_corr={thrust_correction:.3f} "
+            f"cmd_deg=({math.degrees(command.roll_rad):.2f},"
+            f"{math.degrees(command.pitch_rad):.2f},"
+            f"{math.degrees(yaw_rad):.2f}) "
+            f"cmd_target_deg=("
+            f"{math.degrees(self._attitude_slew_target_roll_rad):.2f},"
+            f"{math.degrees(self._attitude_slew_target_pitch_rad):.2f}) "
+            f"attitude_slew_limited={int(self._attitude_slew_limited)} "
+            f"thrust={command.thrust:.3f}",
             flush=True,
         )
 
@@ -1164,6 +3068,9 @@ class PyAIPilotAutonomyAPI:
         tracker_near_z_txt = "0"
         tracker_vz_limited_txt = "0"
         tracker_slew_limited_txt = "0"
+        tracker_tilt_source_txt = "none"
+        tracker_tilt_fraction_txt = "nan"
+        tracker_tilt_factor_txt = "nan"
         if tracker_debug is not None:
             try:
                 tracker_a_raw = np.asarray(
@@ -1192,6 +3099,18 @@ class PyAIPilotAutonomyAPI:
             tracker_slew_limited_txt = str(
                 int(bool(tracker_debug.get("vertical_accel_slew_limited", False)))
             )
+            tracker_tilt_source_txt = str(
+                tracker_debug.get("tilt_compensation_attitude_source", "tracker")
+            )
+            try:
+                tracker_tilt_fraction_txt = (
+                    f"{float(tracker_debug['tilt_vertical_fraction']):.3f}"
+                )
+                tracker_tilt_factor_txt = (
+                    f"{float(tracker_debug['tilt_thrust_compensation_factor']):.3f}"
+                )
+            except (KeyError, TypeError, ValueError):
+                pass
 
         target_diag = self.target_manager.diagnostics()
         lateral_gain = np.asarray(
@@ -1239,7 +3158,13 @@ class PyAIPilotAutonomyAPI:
             f"yaw_source={self.last_yaw_target_source} "
             f"yaw_target_neu={yaw_target_txt} "
             f"cmd_deg=({math.degrees(roll_rad):.2f},{math.degrees(pitch_rad):.2f},{math.degrees(yaw_rad):.2f}) "
+            f"cmd_target_deg=("
+            f"{math.degrees(self._attitude_slew_target_roll_rad):.2f},"
+            f"{math.degrees(self._attitude_slew_target_pitch_rad):.2f}) "
+            f"attitude_slew_limited={int(self._attitude_slew_limited)} "
             f"thrust={thrust:.3f} "
+            f"tilt_comp={tracker_tilt_source_txt}:"
+            f"{tracker_tilt_fraction_txt}:{tracker_tilt_factor_txt} "
             f"hover={hover_txt} "
             f"thrust_gain={float(self.tracker.thrust_from_acc_gain):.4f} "
             f"lat_gain=({lateral_gain[0]:.3f},{lateral_gain[1]:.3f}) "
@@ -1277,6 +3202,7 @@ class PyAIPilotAutonomyAPI:
 
     def _reset_gate_pass_state(self) -> None:
         self.active_gate_normal = None
+        self.gate_pass_tracking_gate_idx = None
         self.previous_gate_pass_position = None
         self.gate_plane_crossed = False
         self.near_gate_but_not_crossed = False
@@ -1293,8 +3219,36 @@ class PyAIPilotAutonomyAPI:
     ) -> None:
         pos = np.asarray(pos, dtype=float).reshape(3)
         target = np.asarray(target, dtype=float).reshape(3)
+        preserve_crossed_direction = bool(
+            self.gate_plane_crossed
+            and self.gate_pass_tracking_gate_idx is not None
+            and int(self.gate_pass_tracking_gate_idx) == int(self.current_gate_idx)
+            and self._finite_vec3_or_none(self.active_gate_normal) is not None
+        )
+        if preserve_crossed_direction:
+            normal = self._finite_vec3_or_none(self.active_gate_normal)
+            normal_norm = float(np.linalg.norm(normal))
+            if math.isfinite(normal_norm) and normal_norm > 1e-6:
+                normal = normal / normal_norm
+                self.active_gate_normal = normal.copy()
+                if self._finite_vec3_or_none(self.previous_gate_pass_position) is None:
+                    self.previous_gate_pass_position = pos.copy()
+                self.near_gate_but_not_crossed = False
+                self.gate_progress_along_approach = float(
+                    np.dot(pos - target, normal)
+                )
+                print(
+                    "gate_pass_tracking preserve_crossed_direction "
+                    f"gate_idx={int(self.current_gate_idx)} "
+                    f"normal_neu={self._fmt_vec(normal, precision=3)} "
+                    f"progress={self.gate_progress_along_approach:.3f}",
+                    flush=True,
+                )
+                return
+
         normal = unit_vector_from_to(pos, target, fallback=fallback_normal)
         self.active_gate_normal = None if normal is None else normal.copy()
+        self.gate_pass_tracking_gate_idx = int(self.current_gate_idx)
         self.previous_gate_pass_position = pos.copy()
         self.gate_plane_crossed = False
         self.near_gate_but_not_crossed = False
@@ -1459,6 +3413,26 @@ class PyAIPilotAutonomyAPI:
             self.reference_path_distance_m = path_distance
             self.reference_progress_m = reference_progress
             self.reference_vehicle_progress_m = vehicle_progress
+
+            if (
+                self.reference_progress_lag_hold_enabled
+                and math.isfinite(path_lag)
+                and math.isfinite(path_distance)
+                and path_distance
+                <= float(self.reference_progress_lag_max_path_error_m)
+                and path_lag < -float(self.reference_progress_lag_tolerance_m)
+            ):
+                max_lead_tau = min(
+                    total_time,
+                    vehicle_tau + float(self.reference_progress_lag_max_lead_s),
+                )
+                held_tau = max(
+                    float(self.reference_tau_floor),
+                    min(float(tau), float(max_lead_tau)),
+                )
+                if held_tau < tau - 1e-6:
+                    tau = held_tau
+                    reason = "path_lag_hold"
 
             if (
                 math.isfinite(path_lag)
@@ -1976,7 +3950,7 @@ class PyAIPilotAutonomyAPI:
         if not obs_history:
             return False, "missing_observation"
         last_obs = obs_history[-1]
-        if bool(getattr(last_obs, "is_outlier", False)):
+        if bool(getattr(last_obs, "is_outlier", False)) and not ever_stable:
             return False, "last_observation_outlier"
         if not bool(getattr(last_obs, "quality_ok", True)):
             return False, "last_observation_bad_quality"
@@ -2840,6 +4814,19 @@ class PyAIPilotAutonomyAPI:
             return None
         return arr.copy()
 
+    def _ever_stable_planning_center(self, track) -> np.ndarray | None:
+        if (
+            track is None
+            or not bool(getattr(track, "committed", False))
+            or not bool(getattr(track, "ever_stable", False))
+        ):
+            return None
+        for attr in ("planning_center", "center", "filtered_center_world"):
+            center = self._finite_vec3_or_none(getattr(track, attr, None))
+            if center is not None:
+                return center
+        return None
+
     def _track_filtered_center_for_navigation(
         self,
         track,
@@ -2853,15 +4840,9 @@ class PyAIPilotAutonomyAPI:
             "age_s": float("nan"),
             "inliers": int(getattr(track, "inlier_count", 0)) if track is not None else 0,
             "stable": bool(getattr(track, "is_stable", False)) if track is not None else False,
+            "retained_last_good_center": False,
         }
         if track is None or not bool(getattr(track, "committed", False)):
-            return None, details
-
-        center = self._finite_vec3_or_none(
-            getattr(track, "filtered_center_world", None)
-        )
-        if center is None:
-            details["reason"] = "missing_filtered_center"
             return None, details
 
         ever_stable = bool(getattr(track, "ever_stable", False))
@@ -2870,12 +4851,26 @@ class PyAIPilotAutonomyAPI:
             details["reason"] = str(getattr(track, "promotion_blocked_reason", "")) or "unstable"
             return None, details
 
+        obs_history = getattr(track, "obs_history", [])
+        if not obs_history:
+            details["reason"] = "missing_observation"
+            return None, details
+        last_obs = obs_history[-1]
+        latest_is_outlier = bool(getattr(last_obs, "is_outlier", False))
+        details["last_observation_outlier"] = latest_is_outlier
+        details["retained_last_good_center"] = False
+        details["retained_reason"] = ""
+
+        center = self._finite_vec3_or_none(
+            getattr(track, "filtered_center_world", None)
+        )
+        if center is None:
+            details["reason"] = "missing_filtered_center"
+            return None, details
+
         min_inliers = max(1, int(getattr(self.gate_memory, "min_hits_for_stable", 1)))
         inliers = int(getattr(track, "inlier_count", 0))
         details["inliers"] = inliers
-        if inliers < min_inliers:
-            details["reason"] = "insufficient_inliers"
-            return None, details
 
         last_seen = self._finite_float(getattr(track, "last_seen_time", 0.0), 0.0)
         stale_time = self._finite_float(getattr(self.gate_memory, "stale_time", 0.5), 0.5)
@@ -2894,22 +4889,9 @@ class PyAIPilotAutonomyAPI:
         )
         details["world_std"] = world_std_norm
         max_world_std = float(self.active_target_shift_max_world_std_m)
-        if max_world_std > 0.0 and (
+        world_std_high = bool(max_world_std > 0.0 and (
             not math.isfinite(world_std_norm) or world_std_norm > max_world_std
-        ):
-            details["reason"] = "world_std_high"
-            return None, details
-
-        obs_history = getattr(track, "obs_history", [])
-        if not obs_history:
-            details["reason"] = "missing_observation"
-            return None, details
-        last_obs = obs_history[-1]
-        if bool(getattr(last_obs, "is_outlier", False)):
-            details["last_observation_outlier"] = True
-        if bool(getattr(last_obs, "is_outlier", False)) and not ever_stable:
-            details["reason"] = "last_observation_outlier"
-            return None, details
+        ))
 
         reproj = self._finite_float(
             getattr(last_obs, "reprojection_error", float("nan")),
@@ -2918,11 +4900,9 @@ class PyAIPilotAutonomyAPI:
         )
         details["reproj"] = reproj
         max_reproj = float(self.active_target_shift_max_reprojection_error)
-        if max_reproj > 0.0 and (
+        reprojection_error_high = bool(max_reproj > 0.0 and (
             not math.isfinite(reproj) or reproj > max_reproj
-        ):
-            details["reason"] = "reprojection_error_high"
-            return None, details
+        ))
 
         kp_min = self._finite_float(
             getattr(last_obs, "keypoint_conf_min", float("nan")),
@@ -2931,12 +4911,43 @@ class PyAIPilotAutonomyAPI:
         )
         details["kp_min"] = kp_min
         min_kp = float(self.active_target_shift_min_keypoint_conf)
-        if min_kp > 0.0 and (not math.isfinite(kp_min) or kp_min < min_kp):
-            details["reason"] = "keypoint_conf_low"
-            return None, details
+        keypoint_conf_low = bool(
+            min_kp > 0.0 and (not math.isfinite(kp_min) or kp_min < min_kp)
+        )
+
+        failure_reason = ""
+        if latest_is_outlier:
+            failure_reason = "last_observation_outlier"
+        elif not bool(getattr(last_obs, "quality_ok", True)):
+            failure_reason = "last_observation_bad_quality"
+        elif inliers < min_inliers:
+            failure_reason = "insufficient_inliers"
+        elif world_std_high:
+            failure_reason = "world_std_high"
+        elif reprojection_error_high:
+            failure_reason = "reprojection_error_high"
+        elif keypoint_conf_low:
+            failure_reason = "keypoint_conf_low"
+
+        if failure_reason:
+            retained = (
+                self._ever_stable_planning_center(track)
+                if ever_stable
+                else None
+            )
+            if retained is None:
+                details["reason"] = failure_reason
+                return None, details
+            center = retained
+            details["retained_last_good_center"] = True
+            details["retained_reason"] = failure_reason
 
         details["ok"] = True
-        details["reason"] = "ok"
+        details["reason"] = (
+            "ever_stable_last_good_center"
+            if details["retained_last_good_center"]
+            else "ok"
+        )
         return center, details
 
     def _active_track_filtered_center(self, track) -> np.ndarray | None:
@@ -3841,33 +5852,32 @@ class PyAIPilotAutonomyAPI:
             waypoints.ndim == 2
             and waypoints.shape[1] == 3
             and len(waypoints) >= 2
-            and np.all(np.isfinite(waypoints[[0, -1], 2]))
+            and np.all(np.isfinite(waypoints[:2]))
         ):
-            dz = float(waypoints[-1, 2] - waypoints[0, 2])
-            if dz > 0.05 and velocity[2] < 0.0:
-                velocity[2] = 0.0
-            elif dz < -0.05 and velocity[2] > 0.0:
-                velocity[2] = 0.0
-            if len(waypoints) >= 2 and np.all(np.isfinite(waypoints[:2])):
-                first_segment = waypoints[1] - waypoints[0]
-                first_length = float(np.linalg.norm(first_segment))
-                if math.isfinite(first_length) and first_length > 0.25:
-                    axis = first_segment / first_length
-                    forward_speed = float(np.dot(velocity, axis))
-                    if math.isfinite(forward_speed) and forward_speed < -0.05:
-                        min_forward_speed = min(
-                            0.35,
-                            max(0.15, 0.15 * float(self.planner_vmax)),
-                        )
-                        velocity += (min_forward_speed - forward_speed) * axis
-                        if self.plan_v_start_z_max_m_s > 0.0:
-                            velocity[2] = float(
-                                np.clip(
-                                    velocity[2],
-                                    -float(self.plan_v_start_z_max_m_s),
-                                    float(self.plan_v_start_z_max_m_s),
-                                )
+            # Preserve valid measured vertical momentum.  A vehicle may be
+            # rising while the next gate is lower (or vice versa) and the new
+            # polynomial must brake that motion continuously.  Only repair a
+            # velocity that is genuinely backward along the complete first
+            # segment direction.
+            first_segment = waypoints[1] - waypoints[0]
+            first_length = float(np.linalg.norm(first_segment))
+            if math.isfinite(first_length) and first_length > 0.25:
+                axis = first_segment / first_length
+                forward_speed = float(np.dot(velocity, axis))
+                if math.isfinite(forward_speed) and forward_speed < -0.05:
+                    min_forward_speed = min(
+                        0.35,
+                        max(0.15, 0.15 * float(self.planner_vmax)),
+                    )
+                    velocity += (min_forward_speed - forward_speed) * axis
+                    if self.plan_v_start_z_max_m_s > 0.0:
+                        velocity[2] = float(
+                            np.clip(
+                                velocity[2],
+                                -float(self.plan_v_start_z_max_m_s),
+                                float(self.plan_v_start_z_max_m_s),
                             )
+                        )
         return velocity
 
     @staticmethod
@@ -3917,17 +5927,46 @@ class PyAIPilotAutonomyAPI:
         )
         used_v_start = self._sanitize_plan_start_velocity(raw_v_start, waypoints)
         planner = MultiSegmentMinimumSnapPlanner()
-        planner.update(
-            waypoints=waypoints,
-            times=times,
-            v_start=used_v_start,
-            v_end=v_end,
-            a_start=np.zeros(3, dtype=float),
-            a_end=np.zeros(3, dtype=float),
-            j_start=np.zeros(3, dtype=float),
-            j_end=np.zeros(3, dtype=float),
-            waypoint_velocities=waypoint_velocities,
-        )
+        update_kwargs = {
+            "waypoints": waypoints,
+            "times": times,
+            "v_start": used_v_start,
+            "v_end": v_end,
+            "a_start": np.zeros(3, dtype=float),
+            "a_end": np.zeros(3, dtype=float),
+            "j_start": np.zeros(3, dtype=float),
+            "j_end": np.zeros(3, dtype=float),
+            "waypoint_velocities": waypoint_velocities,
+        }
+        try:
+            planner.update(
+                **update_kwargs,
+                forward_progress_enabled=self.forward_progress_constraint_enabled,
+                forward_progress_min_speed_m_s=self.forward_progress_min_speed_m_s,
+                forward_progress_solver_max_iterations=(
+                    self.forward_progress_solver_max_iterations
+                ),
+            )
+        except RuntimeError as exc:
+            if not self.forward_progress_constraint_enabled:
+                raise
+            # A short candidate can be infeasible when its measured incoming
+            # velocity already carries it beyond the endpoint.  Keep candidate
+            # construction alive so the existing handoff insertion and shape
+            # validator can repair/reject it; never silently install it as a
+            # constrained plan.
+            planner = MultiSegmentMinimumSnapPlanner()
+            planner.update(**update_kwargs, forward_progress_enabled=False)
+            planner.forward_progress_enabled = True
+            planner.forward_progress_solver_status = "legacy_infeasible_fallback"
+            planner.forward_progress_min_speed_m_s_solved = float("nan")
+            planner._aigp_forward_progress_error = str(exc)
+            print(
+                "plan_forward_progress_fallback "
+                f"segments={max(0, int(len(np.asarray(waypoints)) - 1))} "
+                f"reason={type(exc).__name__}",
+                flush=True,
+            )
         planner._aigp_v_start_raw = raw_v_start.copy()
         planner._aigp_v_start_used = used_v_start.copy()
         return planner
@@ -4146,18 +6185,20 @@ class PyAIPilotAutonomyAPI:
             else:
                 new_roles = ["start", "handoff"] + ["waypoint"] * (len(waypoints) - 1)
 
+        new_waypoint_velocities = self._shift_waypoint_velocities_for_handoff(
+            candidate.get("waypoint_velocities"),
+            old_waypoint_count=len(waypoints),
+            new_waypoint_count=len(new_waypoints),
+            inserted_anchor=inserted_anchor,
+        )
         new_times = allocate_segment_times(
             new_waypoints,
             current_vel=vel,
             vmax=self.planner_vmax,
             amax=self.planner_amax,
             T_min=self.planner_t_min,
-        )
-        new_waypoint_velocities = self._shift_waypoint_velocities_for_handoff(
-            candidate.get("waypoint_velocities"),
-            old_waypoint_count=len(waypoints),
-            new_waypoint_count=len(new_waypoints),
-            inserted_anchor=inserted_anchor,
+            waypoint_velocities=new_waypoint_velocities,
+            terminal_vel=candidate["terminal_velocity"],
         )
         new_planner = self._build_minimum_snap_plan(
             waypoints=new_waypoints,
@@ -4304,6 +6345,7 @@ class PyAIPilotAutonomyAPI:
         max_lateral_accel = 0.0
         max_accel_z_up = 0.0
         max_accel_z_down = 0.0
+        peak_dynamic_samples = {}
         max_corridor = 0.0
         max_corridor_segment = -1
         max_polyline_backtrack = 0.0
@@ -4365,6 +6407,32 @@ class PyAIPilotAutonomyAPI:
                 accel_z = float(acceleration[2])
                 accel_z_up = max(0.0, accel_z)
                 accel_z_down = max(0.0, -accel_z)
+                dynamic_sample = {
+                    "segment_idx": int(segment_idx),
+                    "sample_time_s": float(sample_time),
+                    "position": position.copy(),
+                    "speed_m_s": float(speed),
+                    "speed_xy_m_s": float(speed_xy),
+                    "accel_m_s2": float(accel),
+                    "accel_xy_m_s2": float(accel_xy),
+                    "lateral_accel_m_s2": float(lateral_accel),
+                    "accel_z_up_m_s2": float(accel_z_up),
+                    "accel_z_down_m_s2": float(accel_z_down),
+                }
+                for metric_name, metric_value in (
+                    ("speed_m_s", speed),
+                    ("accel_m_s2", accel),
+                    ("accel_xy_m_s2", accel_xy),
+                    ("lateral_accel_m_s2", lateral_accel),
+                    ("accel_z_up_m_s2", accel_z_up),
+                    ("accel_z_down_m_s2", accel_z_down),
+                ):
+                    previous_peak = peak_dynamic_samples.get(metric_name)
+                    if (
+                        previous_peak is None
+                        or metric_value > float(previous_peak[metric_name])
+                    ):
+                        peak_dynamic_samples[metric_name] = dict(dynamic_sample)
                 max_speed = max(max_speed, speed)
                 max_accel = max(max_accel, accel)
                 max_accel_xy = max(max_accel_xy, accel_xy)
@@ -4415,123 +6483,6 @@ class PyAIPilotAutonomyAPI:
                         "accel_z_up_m_s2": float(accel_z_up),
                         "accel_z_down_m_s2": float(accel_z_down),
                     }
-                if (
-                    self.plan_validation_max_speed_m_s > 0.0
-                    and speed
-                    > self.plan_validation_max_speed_m_s
-                    + self.plan_validation_speed_tolerance_m_s
-                ):
-                    return False, {
-                        "reason": "max_speed_too_large",
-                        "plan_mode": str(plan_mode),
-                        "gate_idx": int(gate_idx),
-                        "track_id": track_id,
-                        "segment_idx": int(segment_idx),
-                        "sample_time_s": float(sample_time),
-                        "speed_m_s": float(speed),
-                        "max_speed_m_s": float(self.plan_validation_max_speed_m_s),
-                        "speed_tolerance_m_s": float(
-                            self.plan_validation_speed_tolerance_m_s
-                        ),
-                        "position": position.copy(),
-                    }
-                if (
-                    self.plan_validation_max_acc_xy_m_s2 > 0.0
-                    and accel_xy > self.plan_validation_max_acc_xy_m_s2
-                ):
-                    return False, {
-                        "reason": "max_acc_xy_too_large",
-                        "plan_mode": str(plan_mode),
-                        "gate_idx": int(gate_idx),
-                        "track_id": track_id,
-                        "segment_idx": int(segment_idx),
-                        "sample_time_s": float(sample_time),
-                        "accel_xy_m_s2": float(accel_xy),
-                        "max_acc_xy_m_s2": float(
-                            self.plan_validation_max_acc_xy_m_s2
-                        ),
-                        "speed_m_s": float(speed),
-                        "accel_m_s2": float(accel),
-                        "lateral_accel_m_s2": float(lateral_accel),
-                        "position": position.copy(),
-                    }
-                if (
-                    self.plan_validation_max_lateral_accel_m_s2 > 0.0
-                    and lateral_accel > self.plan_validation_max_lateral_accel_m_s2
-                ):
-                    return False, {
-                        "reason": "max_lateral_accel_too_large",
-                        "plan_mode": str(plan_mode),
-                        "gate_idx": int(gate_idx),
-                        "track_id": track_id,
-                        "segment_idx": int(segment_idx),
-                        "sample_time_s": float(sample_time),
-                        "lateral_accel_m_s2": float(lateral_accel),
-                        "max_lateral_accel_m_s2": float(
-                            self.plan_validation_max_lateral_accel_m_s2
-                        ),
-                        "speed_m_s": float(speed),
-                        "speed_xy_m_s": float(speed_xy),
-                        "accel_m_s2": float(accel),
-                        "accel_xy_m_s2": float(accel_xy),
-                        "position": position.copy(),
-                    }
-                if (
-                    self.plan_validation_max_acc_z_up_m_s2 > 0.0
-                    and accel_z_up > self.plan_validation_max_acc_z_up_m_s2
-                ):
-                    return False, {
-                        "reason": "max_acc_z_up_too_large",
-                        "plan_mode": str(plan_mode),
-                        "gate_idx": int(gate_idx),
-                        "track_id": track_id,
-                        "segment_idx": int(segment_idx),
-                        "sample_time_s": float(sample_time),
-                        "accel_z_up_m_s2": float(accel_z_up),
-                        "max_acc_z_up_m_s2": float(
-                            self.plan_validation_max_acc_z_up_m_s2
-                        ),
-                        "speed_m_s": float(speed),
-                        "accel_m_s2": float(accel),
-                        "position": position.copy(),
-                    }
-                if (
-                    self.plan_validation_max_acc_z_down_m_s2 > 0.0
-                    and accel_z_down > self.plan_validation_max_acc_z_down_m_s2
-                ):
-                    return False, {
-                        "reason": "max_acc_z_down_too_large",
-                        "plan_mode": str(plan_mode),
-                        "gate_idx": int(gate_idx),
-                        "track_id": track_id,
-                        "segment_idx": int(segment_idx),
-                        "sample_time_s": float(sample_time),
-                        "accel_z_down_m_s2": float(accel_z_down),
-                        "max_acc_z_down_m_s2": float(
-                            self.plan_validation_max_acc_z_down_m_s2
-                        ),
-                        "speed_m_s": float(speed),
-                        "accel_m_s2": float(accel),
-                        "position": position.copy(),
-                    }
-                if (
-                    self.plan_validation_max_accel_m_s2 > 0.0
-                    and accel > self.plan_validation_max_accel_m_s2
-                ):
-                    return False, {
-                        "reason": "max_accel_too_large",
-                        "plan_mode": str(plan_mode),
-                        "gate_idx": int(gate_idx),
-                        "track_id": track_id,
-                        "segment_idx": int(segment_idx),
-                        "sample_time_s": float(sample_time),
-                        "accel_m_s2": float(accel),
-                        "max_accel_m_s2": float(
-                            self.plan_validation_max_accel_m_s2
-                        ),
-                        "position": position.copy(),
-                    }
-
                 corridor, polyline_progress, nearest_segment = (
                     self._project_point_to_waypoint_polyline(position, waypoints)
                 )
@@ -4672,6 +6623,92 @@ class PyAIPilotAutonomyAPI:
                         "accel_z_up_m_s2": float(max_accel_z_up),
                         "accel_z_down_m_s2": float(max_accel_z_down),
                     }
+
+        # Dynamic limits are deliberately evaluated after sampling the whole
+        # curve.  Returning on the first threshold crossing understated the
+        # required uniform retime, causing several retries and sometimes a
+        # slow single-gate fallback.  Select the peak that demands the largest
+        # time dilation so one cheap retime can satisfy every dynamic limit.
+        dynamic_limits = (
+            (
+                "max_speed_too_large",
+                "speed_m_s",
+                float(self.plan_validation_max_speed_m_s),
+                "max_speed_m_s",
+                float(self.plan_validation_speed_tolerance_m_s),
+                1.0,
+            ),
+            (
+                "max_acc_xy_too_large",
+                "accel_xy_m_s2",
+                float(self.plan_validation_max_acc_xy_m_s2),
+                "max_acc_xy_m_s2",
+                0.0,
+                0.5,
+            ),
+            (
+                "max_lateral_accel_too_large",
+                "lateral_accel_m_s2",
+                float(self.plan_validation_max_lateral_accel_m_s2),
+                "max_lateral_accel_m_s2",
+                0.0,
+                0.5,
+            ),
+            (
+                "max_acc_z_up_too_large",
+                "accel_z_up_m_s2",
+                float(self.plan_validation_max_acc_z_up_m_s2),
+                "max_acc_z_up_m_s2",
+                0.0,
+                0.5,
+            ),
+            (
+                "max_acc_z_down_too_large",
+                "accel_z_down_m_s2",
+                float(self.plan_validation_max_acc_z_down_m_s2),
+                "max_acc_z_down_m_s2",
+                0.0,
+                0.5,
+            ),
+            (
+                "max_accel_too_large",
+                "accel_m_s2",
+                float(self.plan_validation_max_accel_m_s2),
+                "max_accel_m_s2",
+                0.0,
+                0.5,
+            ),
+        )
+        worst_dynamic_violation = None
+        for reason, value_key, limit, limit_key, tolerance, exponent in dynamic_limits:
+            peak = peak_dynamic_samples.get(value_key)
+            if peak is None or limit <= 0.0:
+                continue
+            value = float(peak[value_key])
+            effective_limit = limit + tolerance
+            if value <= effective_limit:
+                continue
+            required_time_scale = (value / effective_limit) ** exponent
+            if (
+                worst_dynamic_violation is None
+                or required_time_scale > worst_dynamic_violation[0]
+            ):
+                details = dict(peak)
+                details.update(
+                    {
+                        "reason": reason,
+                        "plan_mode": str(plan_mode),
+                        "gate_idx": int(gate_idx),
+                        "track_id": track_id,
+                        limit_key: float(limit),
+                        "required_time_scale": float(required_time_scale),
+                    }
+                )
+                if reason == "max_speed_too_large":
+                    details["speed_tolerance_m_s"] = float(tolerance)
+                worst_dynamic_violation = (required_time_scale, details)
+        if worst_dynamic_violation is not None:
+            return False, worst_dynamic_violation[1]
 
         return True, {
             "reason": "shape_validation_ok",
@@ -4997,7 +7034,7 @@ class PyAIPilotAutonomyAPI:
                     position=position,
                     center=target,
                     normal=normal,
-                    lateral_radius_m=self.gate_pass_lateral_radius_m,
+                    lateral_radius_m=self.gate_physical_aperture_radius_m,
                     plane_tolerance_m=self.gate_plane_tolerance_m,
                 )
                 if result.crossing_point is not None:
@@ -5236,6 +7273,13 @@ class PyAIPilotAutonomyAPI:
                 self._planner_v_start_raw(planner, v_start),
                 precision=3,
             )
+        forward_progress_txt = (
+            f"{int(bool(getattr(planner, 'forward_progress_enabled', False)))}:"
+            f"{getattr(planner, 'forward_progress_solver_status', 'unknown')}:"
+            f"{self._fmt_float(getattr(planner, 'forward_progress_min_speed_m_s_solved', None), precision=3)}"
+            if planner is not None
+            else "none"
+        )
 
         lateral = details.get("lateral_error_m", details.get("closest_lateral_error_m"))
         progress = details.get(
@@ -5264,6 +7308,7 @@ class PyAIPilotAutonomyAPI:
             f"v_start_raw_neu={v_start_raw_txt} "
             f"v_end_neu={self._fmt_vec(terminal_velocity, precision=3)} "
             f"terminal_policy={terminal_policy} "
+            f"forward_progress={forward_progress_txt} "
             f"waypoint_velocities_neu={waypoint_velocities_txt} "
             f"times_s={times_txt} "
             f"waypoint_roles={waypoint_roles_txt} "
@@ -5314,6 +7359,12 @@ class PyAIPilotAutonomyAPI:
             ),
         }
         if reason in retry_specs:
+            required_time_scale = self._finite_float(
+                details.get("required_time_scale"),
+                float("nan"),
+            )
+            if math.isfinite(required_time_scale) and required_time_scale > 1.0:
+                return min(3.0, 1.02 * required_time_scale)
             value_key, limit_key, exponent = retry_specs[reason]
             value = self._finite_float(details.get(value_key), float("nan"))
             limit = self._finite_float(details.get(limit_key), float("nan"))
@@ -5325,10 +7376,121 @@ class PyAIPilotAutonomyAPI:
             ):
                 return None
             ratio = max(1.0, value / limit)
-            return max(1.15, min(3.0, 1.15 * (ratio ** exponent)))
+            return min(3.0, 1.02 * (ratio ** exponent))
         if reason in ("z_overshoot_too_large", "z_undershoot_too_large"):
             return 1.35
         return None
+
+    def _locally_slow_candidate_gate_velocities(
+        self,
+        candidate: dict,
+        validation_details: dict,
+    ) -> dict | None:
+        """Reduce only the gate velocities bordering a failed plan segment.
+
+        This deliberately performs at most one new constrained solve per plan
+        candidate.  It avoids the old behavior of repeatedly rebuilding the
+        entire minimum-snap trajectory inside the control update while still
+        giving a locally over-aggressive gate transition a chance to pass.
+        """
+
+        supported_reasons = {
+            "max_speed_too_large",
+            "max_accel_too_large",
+            "max_acc_xy_too_large",
+            "max_lateral_accel_too_large",
+            "max_acc_z_up_too_large",
+            "max_acc_z_down_too_large",
+            "z_overshoot_too_large",
+            "z_undershoot_too_large",
+        }
+        if str(validation_details.get("reason", "")) not in supported_reasons:
+            return None
+
+        try:
+            segment_idx = int(validation_details["segment_idx"])
+            waypoints = np.asarray(candidate["waypoints"], dtype=float)
+            waypoint_velocities = np.asarray(
+                candidate["waypoint_velocities"],
+                dtype=float,
+            ).copy()
+            terminal_velocity = np.asarray(
+                candidate["terminal_velocity"],
+                dtype=float,
+            ).reshape(3)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (
+            waypoints.ndim != 2
+            or waypoints.shape[1] != 3
+            or waypoint_velocities.shape != waypoints.shape
+            or segment_idx < 0
+            or segment_idx >= len(waypoints) - 1
+        ):
+            return None
+
+        retry_scale = self._plan_validation_retry_scale(validation_details)
+        if retry_scale is None:
+            return None
+        velocity_factor = float(np.clip(1.0 / retry_scale, 0.65, 0.90))
+        affected_indices = []
+        for waypoint_idx in (segment_idx, segment_idx + 1):
+            if (
+                0 < waypoint_idx < len(waypoints) - 1
+                and np.all(np.isfinite(waypoint_velocities[waypoint_idx]))
+            ):
+                waypoint_velocities[waypoint_idx] *= velocity_factor
+                affected_indices.append(int(waypoint_idx))
+        if not affected_indices:
+            return None
+
+        planner = candidate.get("planner")
+        v_start = self._planner_v_start_raw(planner, np.zeros(3, dtype=float))
+        times = allocate_segment_times(
+            waypoints,
+            current_vel=v_start,
+            vmax=self.planner_vmax,
+            amax=self.planner_amax,
+            T_min=self.planner_t_min,
+            waypoint_velocities=waypoint_velocities,
+            terminal_vel=terminal_velocity,
+        )
+        rebuilt_planner = self._build_minimum_snap_plan(
+            waypoints=waypoints,
+            times=times,
+            v_start=v_start,
+            v_end=terminal_velocity,
+            waypoint_velocities=waypoint_velocities,
+        )
+        adjusted = dict(candidate)
+        adjusted["planner"] = rebuilt_planner
+        adjusted["times"] = np.asarray(times, dtype=float).copy()
+        adjusted["waypoint_velocities"] = waypoint_velocities
+        adjusted["retry_mode"] = "local_gate_velocity"
+        adjusted["retry_velocity_factor"] = velocity_factor
+        adjusted["retry_waypoint_indices"] = tuple(affected_indices)
+        return adjusted
+
+    @staticmethod
+    def _retime_plan_candidate(candidate: dict, scale: float) -> dict:
+        """Uniformly slow a candidate without changing its spatial curve."""
+        scale = float(scale)
+        retimed = dict(candidate)
+        retimed_planner = candidate["planner"].retimed(scale)
+        retimed["planner"] = retimed_planner
+        retimed["times"] = np.asarray(retimed_planner.times, dtype=float).copy()
+        retimed["terminal_velocity"] = np.asarray(
+            retimed_planner.v_end,
+            dtype=float,
+        ).copy()
+        waypoint_velocities = candidate.get("waypoint_velocities")
+        if waypoint_velocities is not None:
+            retimed["waypoint_velocities"] = (
+                np.asarray(waypoint_velocities, dtype=float) / scale
+            )
+        retimed["retry_mode"] = "uniform_retime"
+        retimed["retry_time_scale"] = scale
+        return retimed
 
     def _allow_provisional_direct_fallback(self, track, details: dict) -> bool:
         if track is None:
@@ -5392,6 +7554,40 @@ class PyAIPilotAutonomyAPI:
                 context="path_plan_selected_target",
             )
             return False
+
+        crossed_normal = self._finite_vec3_or_none(self.active_gate_normal)
+        preserving_crossed_gate = bool(
+            self.gate_plane_crossed
+            and self.gate_pass_tracking_gate_idx is not None
+            and int(self.gate_pass_tracking_gate_idx) == target_idx
+            and crossed_normal is not None
+        )
+        if preserving_crossed_gate:
+            crossed_normal_norm = float(np.linalg.norm(crossed_normal))
+            if math.isfinite(crossed_normal_norm) and crossed_normal_norm > 1e-6:
+                crossed_normal = crossed_normal / crossed_normal_norm
+                target_forward_m = float(np.dot(target - pos, crossed_normal))
+                behind_tolerance_m = max(
+                    0.05,
+                    float(self.gate_plane_tolerance_m),
+                )
+                if (
+                    math.isfinite(target_forward_m)
+                    and target_forward_m < -behind_tolerance_m
+                ):
+                    print(
+                        "path_plan_reject "
+                        f"gate_idx={target_idx} "
+                        f"track={target_track_id if target_track_id is not None else 'none'} "
+                        "reason=crossed_gate_target_behind "
+                        f"target_forward_m={target_forward_m:.3f} "
+                        f"normal_neu={self._fmt_vec(crossed_normal, precision=3)} "
+                        f"pos_neu={self._fmt_vec(pos, precision=3)} "
+                        f"target_neu={self._fmt_vec(target, precision=3)}",
+                        flush=True,
+                    )
+                    return False
+
         target = self.target_manager.lock_target(
             gate_idx=target_idx,
             track_id=target_track_id,
@@ -5452,19 +7648,21 @@ class PyAIPilotAutonomyAPI:
                 )
                 candidate_waypoint_velocities = None
                 candidate_mode = "single_gate_corridor"
-            candidate_times = allocate_segment_times(
-                candidate_waypoints,
-                current_vel=vel,
-                vmax=self.planner_vmax,
-                amax=self.planner_amax,
-                T_min=self.planner_t_min,
-            )
             candidate_terminal_velocity, candidate_terminal_policy = (
                 self._terminal_velocity_for_plan(
                     waypoints=candidate_waypoints,
                     plan_mode=candidate_mode,
                     horizon_gate_indices=gate_indices,
                 )
+            )
+            candidate_times = allocate_segment_times(
+                candidate_waypoints,
+                current_vel=vel,
+                vmax=self.planner_vmax,
+                amax=self.planner_amax,
+                T_min=self.planner_t_min,
+                waypoint_velocities=candidate_waypoint_velocities,
+                terminal_vel=candidate_terminal_velocity,
             )
             candidate_planner = self._build_minimum_snap_plan(
                 waypoints=candidate_waypoints,
@@ -5524,14 +7722,8 @@ class PyAIPilotAutonomyAPI:
             scale = float(initial_scale)
             best_details = validation_details
             for attempt in range(3):
-                times = np.asarray(candidate["times"], dtype=float) * scale
-                retry_planner = self._build_minimum_snap_plan(
-                    waypoints=candidate["waypoints"],
-                    times=times,
-                    v_start=vel,
-                    v_end=candidate["terminal_velocity"],
-                    waypoint_velocities=candidate["waypoint_velocities"],
-                )
+                retried = self._retime_plan_candidate(candidate, scale)
+                retry_planner = retried["planner"]
                 retry_valid, retry_details = self._validate_active_gate_plan_crossing(
                     planner=retry_planner,
                     target=target,
@@ -5547,6 +7739,8 @@ class PyAIPilotAutonomyAPI:
                     f"mode={candidate['mode']} "
                     f"attempt={attempt + 1} "
                     f"time_scale={scale:.2f} "
+                    f"velocity_scale={1.0 / scale:.3f} "
+                    "retry_mode=uniform_retime "
                     f"valid={int(retry_valid)} "
                     f"reason={retry_details.get('reason', 'ok')} "
                     f"speed={self._fmt_float(retry_details.get('speed_m_s'), precision=2)} "
@@ -5557,15 +7751,9 @@ class PyAIPilotAutonomyAPI:
                     flush=True,
                 )
                 if retry_valid:
-                    retried = dict(candidate)
-                    retried["planner"] = retry_planner
-                    retried["times"] = times
                     return retried, True, retry_details
-                rejected_retry = dict(candidate)
-                rejected_retry["planner"] = retry_planner
-                rejected_retry["times"] = times
                 self._trace_plan_candidate_reject(
-                    rejected_retry,
+                    retried,
                     retry_details,
                     fallback=f"retry_{attempt + 1}",
                     target=target,
@@ -5591,6 +7779,52 @@ class PyAIPilotAutonomyAPI:
             candidate, valid_plan, validation_details = (
                 retry_candidate_with_slower_timing(candidate, validation_details)
             )
+        if not valid_plan:
+            local_candidate = self._locally_slow_candidate_gate_velocities(
+                candidate,
+                validation_details,
+            )
+            if local_candidate is not None:
+                local_valid, local_details = self._validate_active_gate_plan_crossing(
+                    planner=local_candidate["planner"],
+                    target=target,
+                    normal=normal,
+                    plan_mode=local_candidate["mode"],
+                    gate_idx=target_idx,
+                    track_id=target_track_id,
+                )
+                print(
+                    "plan_gate_speed_retry "
+                    f"gate_idx={target_idx} "
+                    f"track={target_track_id if target_track_id is not None else 'none'} "
+                    f"mode={local_candidate['mode']} "
+                    f"segment={validation_details.get('segment_idx', 'unknown')} "
+                    "waypoints="
+                    f"{local_candidate.get('retry_waypoint_indices', ())} "
+                    f"velocity_factor="
+                    f"{local_candidate.get('retry_velocity_factor', float('nan')):.3f} "
+                    f"valid={int(local_valid)} "
+                    f"reason={local_details.get('reason', 'ok')}",
+                    flush=True,
+                )
+                candidate = local_candidate
+                valid_plan = local_valid
+                validation_details = local_details
+                if not local_valid:
+                    self._trace_plan_candidate_reject(
+                        local_candidate,
+                        local_details,
+                        fallback="local_gate_velocity",
+                        target=target,
+                        normal=normal,
+                        v_start=vel,
+                    )
+                    candidate, valid_plan, validation_details = (
+                        retry_candidate_with_slower_timing(
+                            local_candidate,
+                            local_details,
+                        )
+                    )
         if not valid_plan and len(horizon_targets) >= 2:
             self._trace_plan_validation_reject(
                 validation_details,
@@ -5664,7 +7898,17 @@ class PyAIPilotAutonomyAPI:
                         normal=normal,
                         v_start=vel,
                     )
-                    fallback_details = direct_details
+                    direct_candidate, direct_valid, direct_details = (
+                        retry_candidate_with_slower_timing(
+                            direct_candidate,
+                            direct_details,
+                        )
+                    )
+                    if direct_valid:
+                        fallback_candidate = direct_candidate
+                        fallback_valid = True
+                    else:
+                        fallback_details = direct_details
             if not fallback_valid:
                 self._trace_plan_validation_reject(
                     fallback_details,
@@ -5793,6 +8037,11 @@ class PyAIPilotAutonomyAPI:
                 else "nan"
                 for velocity in waypoint_velocities
             ) + "]"
+        forward_progress_txt = (
+            f"{int(bool(getattr(self.planner, 'forward_progress_enabled', False)))}:"
+            f"{getattr(self.planner, 'forward_progress_solver_status', 'unknown')}:"
+            f"{self._fmt_float(getattr(self.planner, 'forward_progress_min_speed_m_s_solved', None), precision=3)}"
+        )
         print(
             "plan_install "
             f"gate_idx={self.current_gate_idx} "
@@ -5809,6 +8058,7 @@ class PyAIPilotAutonomyAPI:
             f"v_end_neu={self._fmt_vec(terminal_velocity, precision=3)} "
             f"terminal_policy={terminal_policy} "
             f"passthrough_policy={self._passthrough_velocity_policy_text()} "
+            f"forward_progress={forward_progress_txt} "
             f"waypoint_velocities_neu={waypoint_velocities_txt} "
             f"times_s={times_txt} "
             f"waypoint_roles={waypoint_roles_txt} "
@@ -5887,19 +8137,21 @@ class PyAIPilotAutonomyAPI:
             else:
                 candidate_waypoints = np.vstack([pos, target])
                 candidate_waypoint_roles = ["start", "gate_center"]
-            candidate_times = allocate_segment_times(
-                candidate_waypoints,
-                current_vel=vel,
-                vmax=provisional_vmax,
-                amax=self.planner_amax,
-                T_min=self.planner_t_min,
-            )
             candidate_terminal_velocity, candidate_terminal_policy = (
                 self._terminal_velocity_for_plan(
                     waypoints=candidate_waypoints,
                     plan_mode="provisional_next_gate",
                     horizon_gate_indices=[int(self.current_gate_idx)],
                 )
+            )
+            candidate_times = allocate_segment_times(
+                candidate_waypoints,
+                current_vel=vel,
+                vmax=provisional_vmax,
+                amax=self.planner_amax,
+                T_min=self.planner_t_min,
+                waypoint_velocities=None,
+                terminal_vel=candidate_terminal_velocity,
             )
             candidate_planner = self._build_minimum_snap_plan(
                 waypoints=candidate_waypoints,
@@ -5947,14 +8199,8 @@ class PyAIPilotAutonomyAPI:
                 scale = float(initial_scale)
                 best_details = validation_details
                 for attempt in range(3):
-                    times = np.asarray(candidate["times"], dtype=float) * scale
-                    retry_planner = self._build_minimum_snap_plan(
-                        waypoints=candidate["waypoints"],
-                        times=times,
-                        v_start=vel,
-                        v_end=candidate["terminal_velocity"],
-                        waypoint_velocities=None,
-                    )
+                    retried = self._retime_plan_candidate(candidate, scale)
+                    retry_planner = retried["planner"]
                     retry_valid, retry_details = self._validate_active_gate_plan_crossing(
                         planner=retry_planner,
                         target=target,
@@ -5970,6 +8216,8 @@ class PyAIPilotAutonomyAPI:
                         f"mode={candidate['mode']} "
                         f"attempt={attempt + 1} "
                         f"time_scale={scale:.2f} "
+                        f"velocity_scale={1.0 / scale:.3f} "
+                        "retry_mode=uniform_retime "
                         f"valid={int(retry_valid)} "
                         f"reason={retry_details.get('reason', 'ok')} "
                         f"speed={self._fmt_float(retry_details.get('speed_m_s'), precision=2)} "
@@ -5980,9 +8228,6 @@ class PyAIPilotAutonomyAPI:
                         flush=True,
                     )
                     if retry_valid:
-                        retried = dict(candidate)
-                        retried["planner"] = retry_planner
-                        retried["times"] = times
                         return retried, True, retry_details
                     best_details = retry_details
                     retry_scale = self._plan_validation_retry_scale(retry_details)
@@ -6158,7 +8403,21 @@ class PyAIPilotAutonomyAPI:
         return out
 
     def _exit_tail_soft_pass_distance_m(self) -> float:
-        return max(0.50, float(self.gate_pass_lateral_radius_m))
+        # Navigation pass tolerance is intentionally separate from the physical
+        # aperture used to validate a planned trajectory. It must not also make
+        # the longitudinal exit-tail completion tolerance artificially small.
+        # Once the center plane has been crossed within the navigation tolerance
+        # and the plan has expired, allow the configured pass radius to finish
+        # the gate, bounded by the planned center-to-exit distance.
+        longitudinal_tolerance = min(
+            max(0.0, float(self.pass_radius_m)),
+            self._centerline_gate_exit_distance_m(),
+        )
+        return max(
+            0.50,
+            float(self.gate_pass_lateral_radius_m),
+            longitudinal_tolerance,
+        )
 
     def _center_plane_clearance_soft_pass_progress_m(self) -> float:
         return max(
@@ -6899,6 +9158,141 @@ class PyAIPilotAutonomyAPI:
         )
         return False
 
+    def _active_horizon_intermediate_gate_replan_details(
+        self,
+        pos: np.ndarray,
+    ) -> dict | None:
+        if (
+            not self.use_perception
+            or self.gate_plane_crossed
+            or self.active_waypoints is None
+            or self.planner.total_time <= 0.0
+            or self.active_plan_mode != "gate_horizon"
+        ):
+            return None
+
+        current_idx = int(self.current_gate_idx)
+        next_idx = current_idx + 1
+        if (
+            current_idx < 0
+            or next_idx >= len(self.gate_centers_neu)
+            or next_idx >= len(self.gate_track_ids)
+            or current_idx not in self.active_horizon_gate_indices
+        ):
+            return None
+
+        active_horizon_idx = self.active_horizon_gate_indices.index(current_idx)
+        planned_horizon_idx = active_horizon_idx + 1
+        if (
+            planned_horizon_idx >= len(self.active_horizon_targets)
+            or planned_horizon_idx >= len(self.active_horizon_track_ids)
+        ):
+            return None
+
+        candidate_track_id = self.gate_track_ids[next_idx]
+        planned_track_id = self.active_horizon_track_ids[planned_horizon_idx]
+        try:
+            candidate_track_id = int(candidate_track_id)
+        except (TypeError, ValueError):
+            return None
+        try:
+            planned_track_id = (
+                None if planned_track_id is None else int(planned_track_id)
+            )
+        except (TypeError, ValueError):
+            planned_track_id = None
+        if (
+            candidate_track_id < 0
+            or candidate_track_id == planned_track_id
+            or candidate_track_id in self.completed_track_ids
+        ):
+            return None
+
+        track = self.gate_memory.get_track_by_id(candidate_track_id)
+        if (
+            track is None
+            or not bool(getattr(track, "committed", False))
+            or not (
+                bool(getattr(track, "is_stable", False))
+                or bool(getattr(track, "ever_stable", False))
+            )
+        ):
+            return None
+
+        current_target = self._finite_vec3_or_none(self.current_gate_pos)
+        candidate_target = self._finite_vec3_or_none(
+            self.gate_centers_neu[next_idx]
+        )
+        planned_target = self._finite_vec3_or_none(
+            self.active_horizon_targets[planned_horizon_idx]
+        )
+        pos = self._finite_vec3_or_none(pos)
+        if (
+            current_target is None
+            or candidate_target is None
+            or planned_target is None
+            or pos is None
+        ):
+            return None
+
+        reject_reason = self._target_rejection_reason(
+            candidate_target,
+            candidate_track_id,
+        )
+        if reject_reason:
+            return None
+
+        duplicate_radius = max(0.0, float(self.race_order_duplicate_radius_m))
+        candidate_from_current = candidate_target - current_target
+        planned_from_current = planned_target - current_target
+        planned_span = float(np.linalg.norm(planned_from_current))
+        candidate_to_current = float(np.linalg.norm(candidate_from_current))
+        candidate_to_planned = float(np.linalg.norm(candidate_target - planned_target))
+        if (
+            not math.isfinite(planned_span)
+            or planned_span <= max(1e-6, duplicate_radius)
+            or not math.isfinite(candidate_to_current)
+            or not math.isfinite(candidate_to_planned)
+            or candidate_to_current <= duplicate_radius
+            or candidate_to_planned <= duplicate_radius
+        ):
+            return None
+
+        course = planned_from_current / planned_span
+        projection = float(np.dot(candidate_from_current, course))
+        lateral = float(
+            np.linalg.norm(candidate_from_current - projection * course)
+        )
+        margin = max(0.0, float(self.race_order_front_blocker_margin_m))
+        lateral_limit = max(
+            float(self.race_order_front_blocker_lateral_radius_m),
+            float(self.gate_pass_lateral_radius_m),
+        )
+        candidate_distance = float(np.linalg.norm(candidate_target - pos))
+        planned_distance = float(np.linalg.norm(planned_target - pos))
+        if (
+            not math.isfinite(projection)
+            or not math.isfinite(lateral)
+            or projection <= duplicate_radius
+            or projection + margin >= planned_span
+            or lateral > lateral_limit
+            or not math.isfinite(candidate_distance)
+            or not math.isfinite(planned_distance)
+            or candidate_distance + margin >= planned_distance
+        ):
+            return None
+
+        return {
+            "candidate_track_id": candidate_track_id,
+            "planned_track_id": planned_track_id,
+            "candidate_target": candidate_target.copy(),
+            "planned_target": planned_target.copy(),
+            "projection": projection,
+            "lateral": lateral,
+            "candidate_distance": candidate_distance,
+            "planned_distance": planned_distance,
+        }
+
     def _should_plan(
         self,
         advanced: bool,
@@ -6922,6 +9316,27 @@ class PyAIPilotAutonomyAPI:
         if self.active_waypoints is None or self.planner.total_time <= 0.0:
             return True
         now = time.time()
+        repair = self._active_horizon_intermediate_gate_replan_details(pos)
+        if (
+            repair is not None
+            and now - self.last_plan_wall_time >= self.replan_min_interval_s
+        ):
+            print(
+                "active_horizon_repair "
+                "reason=intermediate_gate_reappeared "
+                f"gate_idx={int(self.current_gate_idx)} "
+                f"candidate_track={int(repair['candidate_track_id'])} "
+                f"planned_next_track="
+                f"{repair['planned_track_id'] if repair['planned_track_id'] is not None else 'none'} "
+                f"projection={float(repair['projection']):.2f} "
+                f"lateral={float(repair['lateral']):.2f} "
+                f"candidate_distance={float(repair['candidate_distance']):.2f} "
+                f"planned_distance={float(repair['planned_distance']):.2f} "
+                f"candidate_neu={self._fmt_vec(repair['candidate_target'], precision=3)} "
+                f"planned_neu={self._fmt_vec(repair['planned_target'], precision=3)}",
+                flush=True,
+            )
+            return True
         elapsed = now - self.trajectory_start_time
         if elapsed > float(self.planner.total_time) + self.replan_after_trajectory_s:
             expired_tail, exit_target, exit_role, exit_distance = (
@@ -7913,12 +10328,16 @@ class PyAIPilotAutonomyAPI:
                     age_s = now - last_seen if last_seen > 0.0 else float("inf")
                     obs_history = getattr(track, "obs_history", [])
                     last_obs = obs_history[-1] if obs_history else None
+                    ever_stable = bool(getattr(track, "ever_stable", False))
                     retained_ok = bool(
                         max_age > 0.0
                         and math.isfinite(age_s)
                         and age_s <= max_age
                         and last_obs is not None
-                        and not bool(getattr(last_obs, "is_outlier", False))
+                        and (
+                            not bool(getattr(last_obs, "is_outlier", False))
+                            or ever_stable
+                        )
                         and bool(getattr(last_obs, "quality_ok", True))
                     )
                 if retained_ok:
@@ -7982,7 +10401,20 @@ class PyAIPilotAutonomyAPI:
                     exact_is_fresh = bool(
                         exact_center is not None
                         and bool(exact_quality.get("ok", False))
-                        and not bool(exact_quality.get("last_observation_outlier", False))
+                        and (
+                            not bool(
+                                exact_quality.get(
+                                    "last_observation_outlier",
+                                    False,
+                                )
+                            )
+                            or bool(
+                                exact_quality.get(
+                                    "retained_last_good_center",
+                                    False,
+                                )
+                            )
+                        )
                     )
                     if not exact_is_fresh:
                         rescue_id, rescue_center, _, rescue_dist = (
@@ -8421,6 +10853,15 @@ class PyAIPilotAutonomyAPI:
         return self._finite_vec3_or_none(getattr(track, "center", None))
 
     def _provisional_track_center(self, track) -> np.ndarray | None:
+        obs_history = getattr(track, "obs_history", [])
+        if (
+            obs_history
+            and bool(getattr(obs_history[-1], "is_outlier", False))
+            and bool(getattr(track, "ever_stable", False))
+        ):
+            center = self._ever_stable_planning_center(track)
+            if center is not None:
+                return center
         center = self._finite_vec3_or_none(
             getattr(track, "filtered_center_world", None)
         )
@@ -8499,8 +10940,10 @@ class PyAIPilotAutonomyAPI:
         if not obs_history:
             return False, "missing_observation", details
         last_obs = obs_history[-1]
-        if bool(getattr(last_obs, "is_outlier", False)):
+        if bool(getattr(last_obs, "is_outlier", False)) and not stable_retained:
             return False, "last_observation_outlier", details
+        if bool(getattr(last_obs, "is_outlier", False)):
+            details["retained_last_good_center"] = 1.0
         if not bool(getattr(last_obs, "quality_ok", True)):
             return (
                 False,
@@ -9217,6 +11660,79 @@ class PyAIPilotAutonomyAPI:
             flush=True,
         )
 
+    def _next_gate_gap_anchor(self, current_pos) -> np.ndarray:
+        if self.completed_gate_positions:
+            completed = self._finite_vec3_or_none(
+                self.completed_gate_positions[-1]
+            )
+            if completed is not None:
+                return completed.copy()
+        return np.asarray(current_pos, dtype=float).reshape(3).copy()
+
+    def _apply_race_order_gap_guard(
+        self,
+        ordered_ids: list[int],
+        current_pos: np.ndarray,
+        committed_by_id: dict[int, object],
+    ) -> list[int]:
+        if (
+            not self.race_order_gap_guard_enabled
+            or self.race_order_max_next_gate_gap_m <= 0.0
+            or not ordered_ids
+        ):
+            self._last_race_order_gap_guard_signature = None
+            return list(ordered_ids)
+
+        anchor = self._next_gate_gap_anchor(current_pos)
+        accepted: list[int] = []
+        deferred: list[int] = []
+        rejected_gap_m = float("nan")
+
+        for order_idx, track_id in enumerate(ordered_ids):
+            track_id = int(track_id)
+            center = self._race_order_track_center(track_id, committed_by_id)
+            if center is None:
+                deferred = [int(item) for item in ordered_ids[order_idx:]]
+                break
+
+            gap_m = float(np.linalg.norm(center - anchor))
+            if (
+                not math.isfinite(gap_m)
+                or gap_m > self.race_order_max_next_gate_gap_m
+            ):
+                rejected_gap_m = gap_m
+                deferred = [int(item) for item in ordered_ids[order_idx:]]
+                break
+
+            accepted.append(track_id)
+            anchor = center.copy()
+
+        if deferred:
+            signature = (
+                tuple(accepted),
+                tuple(deferred),
+                (
+                    round(rejected_gap_m, 1)
+                    if math.isfinite(rejected_gap_m)
+                    else None
+                ),
+            )
+            if signature != self._last_race_order_gap_guard_signature:
+                print(
+                    "race_order gap_guard "
+                    f"max_gap_m={self.race_order_max_next_gate_gap_m:.2f} "
+                    f"accepted={accepted} "
+                    f"deferred={deferred} "
+                    f"first_deferred_gap_m="
+                    f"{self._fmt_float(rejected_gap_m, precision=2)}",
+                    flush=True,
+                )
+                self._last_race_order_gap_guard_signature = signature
+        else:
+            self._last_race_order_gap_guard_signature = None
+
+        return accepted
+
     def _order_track_ids_by_progress(
         self,
         candidate_ids: list[int],
@@ -9290,7 +11806,11 @@ class PyAIPilotAutonomyAPI:
 
         rest = [track_id for track_id in unique_ids if track_id != first_id]
         if not rest:
-            return [first_id]
+            return self._apply_race_order_gap_guard(
+                [first_id],
+                current_pos,
+                committed_by_id,
+            )
 
         first_center = center_for(first_id)
         farthest_id = max(
@@ -9309,11 +11829,16 @@ class PyAIPilotAutonomyAPI:
                     int(track_id),
                 )
             )
-            return [first_id] + rest
-        course = course / norm
+            return self._apply_race_order_gap_guard(
+                [first_id] + rest,
+                current_pos,
+                committed_by_id,
+            )
 
-        if float(np.dot(first_center - current_pos, course)) < 0.0:
-            course = -course
+        # This vector is already anchored from the active/first gate toward a
+        # future gate. Do not orient it from the vehicle position: immediately
+        # after crossing the active gate, that would reverse the entire suffix.
+        course = course / norm
 
         rest.sort(
             key=lambda track_id: (
@@ -9322,7 +11847,11 @@ class PyAIPilotAutonomyAPI:
                 int(track_id),
             )
         )
-        return [first_id] + rest
+        return self._apply_race_order_gap_guard(
+            [first_id] + rest,
+            current_pos,
+            committed_by_id,
+        )
 
     def _ordered_perception_gates(
         self,
@@ -9680,9 +12209,13 @@ class PyAIPilotAutonomyAPI:
         yaw = self._finite_float(getattr(snapshot, "yaw_rad", 0.0), float("nan"), allow_nan=True)
         if not all(math.isfinite(value) for value in (roll, pitch, yaw)):
             return None
-        yaw += self._finite_float(
-            latest_perception.get("perception_yaw_correction_rad"),
-            0.0,
+        rpy_used = perception_rpy_for_transform(
+            np.array([roll, pitch, yaw], dtype=float),
+            transform_mode=str(latest_perception.get("transform_mode", "")),
+            yaw_correction_rad=self._finite_float(
+                latest_perception.get("perception_yaw_correction_rad"),
+                0.0,
+            ),
         )
 
         camera_translation = self._finite_vec3_or_none(
@@ -9701,7 +12234,7 @@ class PyAIPilotAutonomyAPI:
 
         return {
             "pos_ned": local_neu_to_ned(pos_neu),
-            "rot_ned_body": body_frd_to_local_ned_rotmat(roll, pitch, yaw),
+            "rot_ned_body": body_frd_to_local_ned_rotmat(*rpy_used),
             "camera_to_body": self._visibility_camera_to_body(latest_perception),
             "camera_translation_body": camera_translation,
             "camera_matrix": camera_matrix,
@@ -10231,6 +12764,86 @@ class PyAIPilotAutonomyAPI:
                 if int(getattr(track, "id", -1)) not in remove_ids
             ]
 
+    def _active_gate_transit_suppression_context(self, snapshot) -> dict:
+        context = {
+            "active": False,
+            "reason": "inactive",
+            "distance_m": float("nan"),
+            "gate_idx": int(self.current_gate_idx),
+            "track_id": self.active_target_track_id,
+            "plane_crossed": bool(self.gate_plane_crossed),
+        }
+        if not self.active_gate_transit_suppression_enabled:
+            context["reason"] = "disabled"
+            return context
+        if self.gate_source_mode != "perception":
+            context["reason"] = "non_perception_gate_source"
+            return context
+        if snapshot is None:
+            context["reason"] = "no_snapshot"
+            return context
+        if self.active_target_track_id is None:
+            context["reason"] = "no_active_track"
+            return context
+
+        position = self._finite_vec3_or_none(getattr(snapshot, "pos_neu", None))
+        target = self._finite_vec3_or_none(self.current_gate_pos)
+        if position is None or target is None:
+            context["reason"] = "missing_pose_or_target"
+            return context
+
+        distance_m = float(np.linalg.norm(position - target))
+        context["distance_m"] = distance_m
+        if bool(self.gate_plane_crossed):
+            context["active"] = True
+            context["reason"] = "center_plane_crossed"
+        elif distance_m <= self.active_gate_transit_suppression_radius_m:
+            context["active"] = True
+            context["reason"] = "near_active_gate"
+        else:
+            context["reason"] = "outside_radius"
+        return context
+
+    def _trace_active_gate_transit_suppression(
+        self,
+        context: dict,
+        *,
+        new_tracks_blocked: int,
+        candidate_updates_no_commit: int,
+        existing_tracks_updated: int,
+    ) -> None:
+        active = bool(context.get("active", False))
+        state_changed = active != self._active_gate_transit_suppression_was_active
+        now = time.time()
+        activity = bool(new_tracks_blocked or candidate_updates_no_commit)
+        periodic_activity = bool(
+            active
+            and activity
+            and (
+                now - self._last_active_gate_transit_suppression_trace_time
+                >= 0.5
+            )
+        )
+        if state_changed or periodic_activity:
+            track_id = context.get("track_id")
+            print(
+                "active_gate_transit_suppression "
+                f"active={int(active)} "
+                f"reason={context.get('reason', 'unknown')} "
+                f"gate_idx={int(context.get('gate_idx', self.current_gate_idx))} "
+                f"track={track_id if track_id is not None else 'none'} "
+                f"distance={self._fmt_float(context.get('distance_m'), precision=3)} "
+                f"radius={self.active_gate_transit_suppression_radius_m:.3f} "
+                f"plane_crossed={int(bool(context.get('plane_crossed', False)))} "
+                f"new_tracks_blocked={int(new_tracks_blocked)} "
+                f"candidate_updates_no_commit={int(candidate_updates_no_commit)} "
+                f"existing_tracks_updated={int(existing_tracks_updated)} "
+                f"negative_evidence={'held' if active else 'enabled'}",
+                flush=True,
+            )
+            self._last_active_gate_transit_suppression_trace_time = now
+        self._active_gate_transit_suppression_was_active = active
+
     def _update_gate_memory(self, latest_perception: dict, *, snapshot=None) -> None:
         frame_key = self._perception_frame_key(latest_perception)
         if frame_key is not None and frame_key == self._last_gate_memory_frame_key:
@@ -10249,6 +12862,11 @@ class PyAIPilotAutonomyAPI:
         )
         detection_boxes = self._visibility_detection_boxes(detections, context)
         matched_track_ids: set[int] = set()
+        transit_suppression = self._active_gate_transit_suppression_context(snapshot)
+        suppress_admission = bool(transit_suppression["active"])
+        new_tracks_blocked = 0
+        candidate_updates_no_commit = 0
+        existing_tracks_updated = 0
 
         for detection in sorted(detections, key=self._detection_sort_key):
             position = detection.get("gate_center_world")
@@ -10321,20 +12939,40 @@ class PyAIPilotAutonomyAPI:
             keypoint_conf_min, keypoint_conf_mean = (
                 self._detection_keypoint_conf_summary(detection)
             )
+            keypoints_px = self._detection_keypoints_px(detection)
             memory_result = self.gate_memory.add_detection(
                 center=arr.copy(),
                 confidence=confidence,
                 timestamp=timestamp,
                 center_camera=center_camera,
+                keypoints_px=keypoints_px,
                 reprojection_error=reprojection_error,
                 keypoint_conf_min=keypoint_conf_min,
                 keypoint_conf_mean=keypoint_conf_mean,
                 solver_name="latest_perception",
+                active_gate_idx=int(self.current_gate_idx),
                 quality_ok=True,
                 quality_reason=quality_reason,
+                allow_new_track=not suppress_admission,
+                allow_candidate_commit=not suppress_admission,
+                admission_reason="active_gate_transit",
             )
             self._maybe_print_perception_chain_event(detection, memory_result)
-            if isinstance(memory_result, dict) and memory_result.get("accepted", False):
+            if isinstance(memory_result, dict):
+                result_reason = str(memory_result.get("reason", ""))
+                if result_reason == "new_track_suppressed:active_gate_transit":
+                    new_tracks_blocked += 1
+                if bool(memory_result.get("commit_suppressed", False)):
+                    candidate_updates_no_commit += 1
+                if (
+                    memory_result.get("accepted", False)
+                    and result_reason != "new_track"
+                ):
+                    existing_tracks_updated += 1
+            if isinstance(memory_result, dict) and (
+                memory_result.get("accepted", False)
+                or memory_result.get("matched_visually", False)
+            ):
                 track_id = memory_result.get("track_id")
                 try:
                     if track_id is not None:
@@ -10342,14 +12980,21 @@ class PyAIPilotAutonomyAPI:
                 except (TypeError, ValueError):
                     pass
 
-        self._apply_visibility_negative_evidence(
-            latest_perception,
-            snapshot=snapshot,
-            timestamp=timestamp,
-            detection_boxes=detection_boxes,
-            matched_track_ids=matched_track_ids,
+        if not suppress_admission:
+            self._apply_visibility_negative_evidence(
+                latest_perception,
+                snapshot=snapshot,
+                timestamp=timestamp,
+                detection_boxes=detection_boxes,
+                matched_track_ids=matched_track_ids,
+            )
+            self.gate_memory.prune(timestamp)
+        self._trace_active_gate_transit_suppression(
+            transit_suppression,
+            new_tracks_blocked=new_tracks_blocked,
+            candidate_updates_no_commit=candidate_updates_no_commit,
+            existing_tracks_updated=existing_tracks_updated,
         )
-        self.gate_memory.prune(timestamp)
 
     def _maybe_print_perception_chain_event(
         self,
@@ -10392,6 +13037,17 @@ class PyAIPilotAutonomyAPI:
         committed = getattr(track, "committed", memory_result.get("committed", False))
         stable = getattr(track, "is_stable", memory_result.get("stable", False))
         track_center = getattr(track, "center", memory_result.get("center"))
+        commit_blocked_reason = getattr(track, "commit_blocked_reason", "")
+        known_position_match_index = getattr(
+            track,
+            "known_position_match_index",
+            None,
+        )
+        known_position_distance_m = getattr(
+            track,
+            "known_position_distance_m",
+            float("nan"),
+        )
         world_std = getattr(track, "center_world_std", None)
         cam_median = self._track_camera_median(track)
         rpy_rad = detection.get("drone_rpy_rad_used")
@@ -10406,12 +13062,17 @@ class PyAIPilotAutonomyAPI:
             f"hits={hits} "
             f"committed={bool(committed)} "
             f"stable={bool(stable)} "
+            f"commit_blocked={self._blank_na(commit_blocked_reason)} "
+            f"known_gate_idx={self._blank_na(known_position_match_index)} "
+            f"known_dist={self._fmt_float(known_position_distance_m, precision=2)} "
             f"order={self._blank_na(detection.get('pnp_selected_order'))} "
             f"solver={self._blank_na(detection.get('pnp_selected_solver'))} "
             f"debug_best_order={self._blank_na(detection.get('pnp_debug_best_order'))} "
             f"reproj={self._fmt_float(detection.get('reprojection_error'), precision=2)} "
             f"conf={self._fmt_float(detection.get('memory_confidence'), precision=2)} "
             f"cam={self._fmt_vec(detection.get('gate_center_camera'), precision=2)} "
+            f"cam_corrected={self._fmt_vec(detection.get('gate_center_camera_corrected'), precision=2)} "
+            f"depth_correction_m={self._fmt_float(detection.get('depth_correction_m'), precision=2)} "
             f"body={self._fmt_vec(detection.get('gate_center_body_frd'), precision=2)} "
             f"world_neu={self._fmt_vec(detection.get('gate_center_world'), precision=2)} "
             f"world_ned={self._fmt_vec(detection.get('gate_center_world_ned'), precision=2)} "

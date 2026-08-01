@@ -31,6 +31,7 @@ class LateralResponseCalibrationDebug:
     status: str
     active: bool
     completed: bool
+    succeeded: bool
     elapsed_s: float
     dt_s: float
     roll_rad: float
@@ -40,6 +41,8 @@ class LateralResponseCalibrationDebug:
     command_accel_xy_m_s2: tuple[float, float]
     sampled_command_accel_xy_m_s2: tuple[float, float]
     measured_accel_xy_m_s2: tuple[float, float]
+    imu_accel_xy_m_s2: tuple[float, float]
+    kinematic_accel_xy_m_s2: tuple[float, float]
     sampled_measured_accel_xy_m_s2: tuple[float, float]
     sampled_axis: int
     sampled_age_s: float
@@ -49,6 +52,9 @@ class LateralResponseCalibrationDebug:
     lateral_accel_gain_xy: tuple[float, float]
     samples_xy: tuple[int, int]
     signed_samples_xy: tuple[int, int, int, int]
+    kinematic_mismatch_samples_xy: tuple[int, int]
+    kinematic_mismatch_streak_xy: tuple[int, int]
+    polarity_mismatch_detected: bool
     z_hold_error_m: float
     z_hold_vz_error_m_s: float
     z_hold_thrust_correction: float
@@ -64,6 +70,7 @@ class LateralResponseCalibrationDebug:
 class LateralResponseCalibrationResult:
     command: Optional[LateralResponseCalibrationCommand]
     lateral_accel_gain_xy: Optional[np.ndarray]
+    succeeded: bool
     debug: LateralResponseCalibrationDebug
 
 
@@ -78,6 +85,7 @@ class LateralResponseCalibration:
 
     def __init__(self, config):
         section = config.lateral_response_calibration
+        self.runner_mode = str(config.runtime.runner_mode).lower()
         self.state_mode = str(config.state_estimation.mode).lower()
         self.gravity_m_s2 = float(config.state_estimation.gravity_m_s2)
 
@@ -134,14 +142,21 @@ class LateralResponseCalibration:
         )
 
         self.completed = False
+        self.succeeded = False
         self.start_time: Optional[float] = None
         self.last_update_time: Optional[float] = None
         self.initial_pos: Optional[np.ndarray] = None
         self.command_accel_xy = np.zeros(2, dtype=float)
         self.command_accel_since: Optional[float] = None
-        self.filtered_accel_xy: Optional[np.ndarray] = None
+        self.filtered_imu_accel_xy: Optional[np.ndarray] = None
+        self.filtered_kinematic_accel_xy: Optional[np.ndarray] = None
         self.prev_vel_xy: Optional[np.ndarray] = None
         self.prev_vel_time: Optional[float] = None
+        self.last_imu_accel_xy = np.full(2, math.nan, dtype=float)
+        self.last_kinematic_accel_xy = np.full(2, math.nan, dtype=float)
+        self.kinematic_mismatch_samples = np.zeros(2, dtype=int)
+        self.kinematic_mismatch_streak = np.zeros(2, dtype=int)
+        self.polarity_mismatch_detected = False
         self.signed_ratio_sums = np.zeros((2, 2), dtype=float)
         self.signed_sample_counts = np.zeros((2, 2), dtype=int)
         self.ratio_sums = np.zeros(2, dtype=float)
@@ -184,17 +199,19 @@ class LateralResponseCalibration:
         now = time.monotonic() if now is None else float(now)
         hover = _clamp(self._finite_float(hover_thrust, 0.5), 0.0, 1.0)
         current_gain = self._valid_gain_xy(current_lateral_accel_gain_xy)
-        if current_gain is not None:
+        if current_gain is not None and not self.succeeded:
             self.last_gain_xy = current_gain
 
         if not self.enabled:
             self.completed = True
+            self.succeeded = False
             return self._inactive("disabled", hover)
         if self.estimator_mode_only and self.state_mode != "estimator":
             self.completed = True
+            self.succeeded = False
             return self._inactive("skipped_state_mode", hover)
         if self.completed:
-            return self._inactive("complete", hover)
+            return self._inactive("complete" if self.succeeded else "failed", hover)
         if self.require_thrust_scale_calibration and not thrust_scale_calibration_completed:
             return self._inactive("waiting_thrust_scale", hover)
         if not bool(getattr(estimate, "valid", False)):
@@ -202,7 +219,7 @@ class LateralResponseCalibration:
 
         pos, vel, yaw_rad = self._state_terms(snapshot, estimate)
         armed = self._armed(snapshot)
-        if self.require_armed and armed is False:
+        if self.require_armed and armed is not True:
             self._reset_runtime()
             debug = self._debug(
                 status="waiting_armed",
@@ -224,6 +241,7 @@ class LateralResponseCalibration:
             return LateralResponseCalibrationResult(
                 command=LateralResponseCalibrationCommand(0.0, 0.0, yaw_rad, hover),
                 lateral_accel_gain_xy=None,
+                succeeded=False,
                 debug=debug,
             )
 
@@ -233,9 +251,10 @@ class LateralResponseCalibration:
             self.initial_pos = pos.copy()
             self.command_accel_xy = np.zeros(2, dtype=float)
             self.command_accel_since = now
-            self.filtered_accel_xy = None
+            self.filtered_imu_accel_xy = None
+            self.filtered_kinematic_accel_xy = None
             self.prev_vel_xy = vel[:2].copy()
-            self.prev_vel_time = now
+            self.prev_vel_time = self._position_sample_time(snapshot, now)
             elapsed_s = 0.0
             dt_s = 0.0
         else:
@@ -256,20 +275,49 @@ class LateralResponseCalibration:
             z_error_m=z_hold_error_m,
             vz_error_m_s=z_hold_vz_error_m_s,
         )
-        accel_raw, accel_source = self._accel_xy_neu(snapshot, vel[:2], now)
-        measured_accel_xy = self._filtered_accel_xy(accel_raw)
+        imu_accel_raw, kinematic_accel_raw = self._accel_sources_xy_neu(
+            snapshot,
+            vel[:2],
+            now,
+        )
+        imu_accel_xy, self.filtered_imu_accel_xy = self._filter_accel_stream(
+            imu_accel_raw,
+            self.filtered_imu_accel_xy,
+        )
+        (
+            kinematic_accel_xy,
+            self.filtered_kinematic_accel_xy,
+        ) = self._filter_accel_stream(
+            kinematic_accel_raw,
+            self.filtered_kinematic_accel_xy,
+        )
+        self.last_imu_accel_xy = imu_accel_xy.copy()
+        self.last_kinematic_accel_xy = kinematic_accel_xy.copy()
+        if self.state_mode == "mavlink":
+            measured_accel_xy = kinematic_accel_xy
+            accel_source = (
+                "velocity+imu_check"
+                if np.all(np.isfinite(imu_accel_xy))
+                else "velocity"
+            )
+        elif np.all(np.isfinite(imu_accel_xy)):
+            measured_accel_xy = imu_accel_xy
+            accel_source = "imu"
+        else:
+            measured_accel_xy = kinematic_accel_xy
+            accel_source = "velocity"
         self._record_sample(
             now=now,
             command_accel_xy=self.command_accel_xy,
             measured_accel_xy=measured_accel_xy,
+            validation_accel_xy=imu_accel_xy,
+            require_validation=self.state_mode == "mavlink",
             vxy_m_s=vxy_m_s,
         )
 
         response_ratio = self._response_ratio_xy()
         enough_samples = self._has_enough_signed_samples()
         estimated_gain = self._gain_from_ratio(response_ratio) if enough_samples else None
-        if estimated_gain is not None:
-            self.last_gain_xy = self._blend_gain(self.last_gain_xy, estimated_gain)
 
         motion_limited = self._motion_limited(
             xy_rel_m=xy_rel_m,
@@ -282,16 +330,39 @@ class LateralResponseCalibration:
             and estimated_gain is not None
             and elapsed_s >= self.min_duration_s
         )
-        if motion_limited or timed_out or valid_calibration:
+        if self.polarity_mismatch_detected:
             self.completed = True
-            if valid_calibration:
-                status = "calibrated"
-            elif enough_samples and estimated_gain is not None:
-                status = "motion_limited_calibrated" if motion_limited else "timeout_calibrated"
-            elif motion_limited:
-                status = "motion_limited_fallback"
-            else:
-                status = "timeout_fallback"
+            self.succeeded = False
+            debug = self._debug(
+                status="polarity_mismatch_fallback",
+                active=False,
+                completed=True,
+                elapsed_s=elapsed_s,
+                dt_s=dt_s,
+                roll_rad=0.0,
+                pitch_rad=0.0,
+                thrust=hover,
+                hover_thrust=hover,
+                measured_accel_xy=measured_accel_xy,
+                accel_source=accel_source,
+                xy_rel_m=xy_rel_m,
+                vxy_m_s=vxy_m_s,
+                z_rel_m=z_rel_m,
+                z_hold_error_m=z_hold_error_m,
+                z_hold_vz_error_m_s=z_hold_vz_error_m_s,
+                z_hold_thrust_correction=z_hold_thrust_correction,
+                armed=armed,
+            )
+            return LateralResponseCalibrationResult(
+                command=None,
+                lateral_accel_gain_xy=None,
+                succeeded=False,
+                debug=debug,
+            )
+        if motion_limited or timed_out:
+            self.completed = True
+            self.succeeded = False
+            status = "motion_limited_fallback" if motion_limited else "timeout_fallback"
             debug = self._debug(
                 status=status,
                 active=False,
@@ -314,7 +385,39 @@ class LateralResponseCalibration:
             )
             return LateralResponseCalibrationResult(
                 command=None,
+                lateral_accel_gain_xy=None,
+                succeeded=False,
+                debug=debug,
+            )
+
+        if valid_calibration:
+            self.last_gain_xy = self._blend_gain(self.last_gain_xy, estimated_gain)
+            self.completed = True
+            self.succeeded = True
+            debug = self._debug(
+                status="calibrated",
+                active=False,
+                completed=True,
+                elapsed_s=elapsed_s,
+                dt_s=dt_s,
+                roll_rad=0.0,
+                pitch_rad=0.0,
+                thrust=hover,
+                hover_thrust=hover,
+                measured_accel_xy=measured_accel_xy,
+                accel_source=accel_source,
+                xy_rel_m=xy_rel_m,
+                vxy_m_s=vxy_m_s,
+                z_rel_m=z_rel_m,
+                z_hold_error_m=z_hold_error_m,
+                z_hold_vz_error_m_s=z_hold_vz_error_m_s,
+                z_hold_thrust_correction=z_hold_thrust_correction,
+                armed=armed,
+            )
+            return LateralResponseCalibrationResult(
+                command=None,
                 lateral_accel_gain_xy=self.last_gain_xy.copy(),
+                succeeded=True,
                 debug=debug,
             )
 
@@ -322,6 +425,9 @@ class LateralResponseCalibration:
         if np.linalg.norm(desired_accel_xy - self.command_accel_xy) > 1e-6:
             self.command_accel_xy = desired_accel_xy
             self.command_accel_since = now
+            self.filtered_imu_accel_xy = None
+            self.filtered_kinematic_accel_xy = None
+            self.kinematic_mismatch_streak[:] = 0
 
         roll_rad, pitch_rad, thrust = self._command_from_accel(
             command_accel_xy=self.command_accel_xy,
@@ -358,6 +464,7 @@ class LateralResponseCalibration:
                 thrust=thrust,
             ),
             lateral_accel_gain_xy=None,
+            succeeded=False,
             debug=debug,
         )
 
@@ -406,8 +513,15 @@ class LateralResponseCalibration:
         r_des = np.column_stack((x_b_des, y_b_des, z_b_des))
         roll_des, pitch_des, _ = rotmat_to_euler_zyx(r_des)
 
+        # The competition attitude boundary inverts tracker roll, but its
+        # observed pitch response already matches the tracker's pitch sign.
+        # PX4 keeps the legacy pitch bridge. Keeping the PX4 bridge in
+        # competition made X feedback positive: a braking command accelerated
+        # the vehicle farther away from its hold point.
         roll_cmd = -_clamp(roll_des, -self.max_tilt_rad, self.max_tilt_rad)
-        pitch_cmd = -_clamp(pitch_des, -self.max_tilt_rad, self.max_tilt_rad)
+        pitch_cmd = _clamp(pitch_des, -self.max_tilt_rad, self.max_tilt_rad)
+        if self.runner_mode != "competition":
+            pitch_cmd = -pitch_cmd
         thrust = float(hover_thrust)
         if self.tilt_thrust_compensation:
             tilt_norm = min(self.max_tilt_rad, math.hypot(roll_cmd, pitch_cmd))
@@ -439,6 +553,8 @@ class LateralResponseCalibration:
         now: float,
         command_accel_xy: np.ndarray,
         measured_accel_xy: np.ndarray,
+        validation_accel_xy: np.ndarray,
+        require_validation: bool,
         vxy_m_s: float,
     ) -> None:
         self.last_sample_command_accel_xy = np.asarray(
@@ -479,9 +595,39 @@ class LateralResponseCalibration:
         if command_mag < self.min_probe_accel_m_s2:
             self.last_sample_status = "probe_small"
             return
+
         sign = 1.0 if command_accel_xy[axis] >= 0.0 else -1.0
         along = sign * float(measured_accel_xy[axis])
         cross = float(measured_accel_xy[1 - axis])
+        validation_floor = max(
+            self.accel_deadband_m_s2,
+            self.min_abs_accel_m_s2,
+            1e-6,
+        )
+        if along <= -validation_floor:
+            self._record_polarity_mismatch(axis)
+            self.last_sample_status = "kinematic_command_polarity_mismatch"
+            return
+
+        if require_validation:
+            validation = np.asarray(validation_accel_xy, dtype=float).reshape(2)
+            if not np.all(np.isfinite(validation)):
+                self.last_sample_status = "imu_validation_unavailable"
+                return
+            measured_axis = float(measured_accel_xy[axis])
+            validation_axis = float(validation[axis])
+            if (
+                abs(measured_axis) < validation_floor
+                or abs(validation_axis) < validation_floor
+            ):
+                self.last_sample_status = "imu_validation_weak"
+                return
+            if measured_axis * validation_axis < 0.0:
+                self._record_polarity_mismatch(axis)
+                self.last_sample_status = "imu_kinematic_polarity_mismatch"
+                return
+            self.kinematic_mismatch_streak[axis] = 0
+
         if abs(along) <= self.accel_deadband_m_s2:
             self.last_sample_status = "deadband"
             return
@@ -503,6 +649,12 @@ class LateralResponseCalibration:
         self.signed_sample_counts[axis, sign_index] += 1
         self.ratio_sums[axis] += response_ratio
         self.sample_counts[axis] += 1
+
+    def _record_polarity_mismatch(self, axis: int) -> None:
+        self.kinematic_mismatch_samples[axis] += 1
+        self.kinematic_mismatch_streak[axis] += 1
+        if self.kinematic_mismatch_streak[axis] >= self.min_samples_per_axis:
+            self.polarity_mismatch_detected = True
 
     def _response_ratio_xy(self) -> np.ndarray:
         ratio = np.full(2, math.nan, dtype=float)
@@ -540,7 +692,10 @@ class LateralResponseCalibration:
             return None
         if np.any(response_ratio_xy <= 1e-6):
             return None
-        return np.clip(1.0 / response_ratio_xy, self.min_gain, self.max_gain)
+        gain_xy = 1.0 / response_ratio_xy
+        if np.any(gain_xy < self.min_gain) or np.any(gain_xy > self.max_gain):
+            return None
+        return np.asarray(gain_xy, dtype=float)
 
     def _blend_gain(self, current_gain: np.ndarray, estimated_gain: np.ndarray) -> np.ndarray:
         alpha = self.result_alpha
@@ -580,6 +735,7 @@ class LateralResponseCalibration:
         return LateralResponseCalibrationResult(
             command=None,
             lateral_accel_gain_xy=None,
+            succeeded=self.succeeded,
             debug=debug,
         )
 
@@ -589,9 +745,15 @@ class LateralResponseCalibration:
         self.initial_pos = None
         self.command_accel_xy = np.zeros(2, dtype=float)
         self.command_accel_since = None
-        self.filtered_accel_xy = None
+        self.filtered_imu_accel_xy = None
+        self.filtered_kinematic_accel_xy = None
         self.prev_vel_xy = None
         self.prev_vel_time = None
+        self.last_imu_accel_xy = np.full(2, math.nan, dtype=float)
+        self.last_kinematic_accel_xy = np.full(2, math.nan, dtype=float)
+        self.kinematic_mismatch_samples[:] = 0
+        self.kinematic_mismatch_streak[:] = 0
+        self.polarity_mismatch_detected = False
         self.signed_ratio_sums[:, :] = 0.0
         self.signed_sample_counts[:, :] = 0
         self.ratio_sums[:] = 0.0
@@ -635,6 +797,7 @@ class LateralResponseCalibration:
             status=str(status),
             active=bool(active),
             completed=bool(completed),
+            succeeded=bool(self.succeeded),
             elapsed_s=float(elapsed_s),
             dt_s=float(dt_s),
             roll_rad=float(roll_rad),
@@ -652,6 +815,14 @@ class LateralResponseCalibration:
             measured_accel_xy_m_s2=(
                 float(measured_accel_xy[0]),
                 float(measured_accel_xy[1]),
+            ),
+            imu_accel_xy_m_s2=(
+                float(self.last_imu_accel_xy[0]),
+                float(self.last_imu_accel_xy[1]),
+            ),
+            kinematic_accel_xy_m_s2=(
+                float(self.last_kinematic_accel_xy[0]),
+                float(self.last_kinematic_accel_xy[1]),
             ),
             sampled_measured_accel_xy_m_s2=(
                 float(self.last_sample_measured_accel_xy[0]),
@@ -673,6 +844,15 @@ class LateralResponseCalibration:
                 int(self.signed_sample_counts[1, 0]),
                 int(self.signed_sample_counts[1, 1]),
             ),
+            kinematic_mismatch_samples_xy=(
+                int(self.kinematic_mismatch_samples[0]),
+                int(self.kinematic_mismatch_samples[1]),
+            ),
+            kinematic_mismatch_streak_xy=(
+                int(self.kinematic_mismatch_streak[0]),
+                int(self.kinematic_mismatch_streak[1]),
+            ),
+            polarity_mismatch_detected=bool(self.polarity_mismatch_detected),
             z_hold_error_m=float(z_hold_error_m),
             z_hold_vz_error_m_s=float(z_hold_vz_error_m_s),
             z_hold_thrust_correction=float(z_hold_thrust_correction),
@@ -694,46 +874,105 @@ class LateralResponseCalibration:
         )
         return pos.copy(), vel.copy(), float(yaw_rad)
 
-    def _accel_xy_neu(
+    def _accel_sources_xy_neu(
         self,
         snapshot,
         vel_xy: np.ndarray,
         now: float,
-    ) -> tuple[np.ndarray, str]:
+    ) -> tuple[np.ndarray, np.ndarray]:
+        imu_accel_xy = np.full(2, math.nan, dtype=float)
         acc_body = self._vec3(getattr(snapshot, "accel_xyz", None))
         if acc_body is not None:
+            # The competition simulator's reported pitch has the opposite
+            # physical sign from its LOCAL_POSITION_NED response. Roll and yaw
+            # follow MAVLink convention. Apply that observed boundary only to
+            # this calibration-local IMU audit; the shared frame helper remains
+            # standards-correct.
+            reported_pitch = self._finite_float(
+                getattr(snapshot, "pitch_rad", None),
+                0.0,
+            )
+            calibration_pitch = (
+                -reported_pitch
+                if self.runner_mode == "competition"
+                else reported_pitch
+            )
             rot_ned_body = body_frd_to_local_ned_rotmat(
                 self._finite_float(getattr(snapshot, "roll_rad", None), 0.0),
-                self._finite_float(getattr(snapshot, "pitch_rad", None), 0.0),
+                calibration_pitch,
                 self._finite_float(getattr(snapshot, "yaw_rad", None), 0.0),
             )
             acc_ned = rot_ned_body @ acc_body
             acc_ned = acc_ned + np.array([0.0, 0.0, self.gravity_m_s2], dtype=float)
             acc_neu = local_ned_to_neu(acc_ned)
-            return np.asarray(acc_neu[:2], dtype=float), "imu"
+            imu_accel_xy = np.asarray(acc_neu[:2], dtype=float)
 
-        if self.prev_vel_xy is not None and self.prev_vel_time is not None:
-            dt_s = now - self.prev_vel_time
-            prev_vel = self.prev_vel_xy.copy()
-            self.prev_vel_xy = np.asarray(vel_xy, dtype=float).reshape(2).copy()
-            self.prev_vel_time = now
-            if math.isfinite(dt_s) and 0.01 <= dt_s <= 0.5:
-                return (self.prev_vel_xy - prev_vel) / dt_s, "velocity"
+        kinematic_accel_xy = self._velocity_accel_xy(
+            snapshot=snapshot,
+            vel_xy=vel_xy,
+            now=now,
+        )
+        return imu_accel_xy, kinematic_accel_xy
 
-        self.prev_vel_xy = np.asarray(vel_xy, dtype=float).reshape(2).copy()
-        self.prev_vel_time = now
-        return np.full(2, math.nan, dtype=float), "none"
+    def _velocity_accel_xy(
+        self,
+        *,
+        snapshot,
+        vel_xy: np.ndarray,
+        now: float,
+    ) -> np.ndarray:
+        current_vel = np.asarray(vel_xy, dtype=float).reshape(2)
+        sample_time = self._position_sample_time(snapshot, now)
+        if self.prev_vel_xy is None or self.prev_vel_time is None:
+            self.prev_vel_xy = current_vel.copy()
+            self.prev_vel_time = sample_time
+            return np.full(2, math.nan, dtype=float)
 
-    def _filtered_accel_xy(self, accel_raw: np.ndarray) -> np.ndarray:
+        dt_s = sample_time - float(self.prev_vel_time)
+        if not math.isfinite(dt_s):
+            return np.full(2, math.nan, dtype=float)
+        if dt_s < -1e-9:
+            self.prev_vel_xy = current_vel.copy()
+            self.prev_vel_time = sample_time
+            return np.full(2, math.nan, dtype=float)
+        if dt_s <= 1e-9:
+            # The control loop can run more often than LOCAL_POSITION_NED.
+            # Do not turn a duplicate telemetry sample into zero acceleration.
+            return np.full(2, math.nan, dtype=float)
+        if dt_s < 0.01:
+            # Retain the older baseline so the next fresh sample accumulates a
+            # sufficiently large differentiation interval.
+            return np.full(2, math.nan, dtype=float)
+        if dt_s > 0.5:
+            self.prev_vel_xy = current_vel.copy()
+            self.prev_vel_time = sample_time
+            return np.full(2, math.nan, dtype=float)
+
+        previous_vel = self.prev_vel_xy.copy()
+        self.prev_vel_xy = current_vel.copy()
+        self.prev_vel_time = sample_time
+        return (current_vel - previous_vel) / dt_s
+
+    def _position_sample_time(self, snapshot, now: float) -> float:
+        value = getattr(snapshot, "position_wall_time", None)
+        if value is None:
+            return float(now)
+        return self._finite_float(value, now)
+
+    def _filter_accel_stream(
+        self,
+        accel_raw: np.ndarray,
+        previous: Optional[np.ndarray],
+    ) -> tuple[np.ndarray, Optional[np.ndarray]]:
         accel = np.asarray(accel_raw, dtype=float).reshape(2)
         if not np.all(np.isfinite(accel)):
-            return np.full(2, math.nan, dtype=float)
-        if self.filtered_accel_xy is None or not np.all(np.isfinite(self.filtered_accel_xy)):
-            self.filtered_accel_xy = accel.copy()
+            return np.full(2, math.nan, dtype=float), previous
+        if previous is None or not np.all(np.isfinite(previous)):
+            filtered = accel.copy()
         else:
             alpha = self.accel_filter_alpha
-            self.filtered_accel_xy = (1.0 - alpha) * self.filtered_accel_xy + alpha * accel
-        return self.filtered_accel_xy.copy()
+            filtered = (1.0 - alpha) * previous + alpha * accel
+        return filtered.copy(), filtered.copy()
 
     def _valid_gain_xy(self, value) -> Optional[np.ndarray]:
         try:

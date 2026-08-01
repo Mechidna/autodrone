@@ -12,6 +12,7 @@ from autonomy_core.core.frame_conventions import (
     body_frd_to_local_ned_rotmat,
     local_ned_to_neu,
     local_neu_to_ned,
+    perception_rpy_for_transform,
 )
 from feature_visual_odometry import FeatureVisualOdometry
 from visual_odometry import GateKeypointVisualOdometry, VisualOdometryMeasurement
@@ -162,15 +163,18 @@ class VehicleStateEstimator:
             camera_translation_body = np.zeros(3, dtype=float)
 
         pos_ned = local_neu_to_ned(estimate.pos_neu)
-        rpy_used = np.array(
-            [
-                float(getattr(snapshot, "roll_rad", 0.0)),
-                float(getattr(snapshot, "pitch_rad", 0.0)),
-                float(getattr(snapshot, "yaw_rad", estimate.yaw_rad)),
-            ],
-            dtype=float,
+        rpy_used = perception_rpy_for_transform(
+            np.array(
+                [
+                    float(getattr(snapshot, "roll_rad", 0.0)),
+                    float(getattr(snapshot, "pitch_rad", 0.0)),
+                    float(getattr(snapshot, "yaw_rad", estimate.yaw_rad)),
+                ],
+                dtype=float,
+            ),
+            transform_mode=str(latest_perception.get("transform_mode", "")),
+            yaw_correction_rad=self._perception_yaw_correction_rad(latest_perception),
         )
-        rpy_used[2] += self._perception_yaw_correction_rad(latest_perception)
         rot_ned_body = body_frd_to_local_ned_rotmat(*rpy_used)
 
         projected = dict(latest_perception)
@@ -368,12 +372,19 @@ class VehicleStateEstimator:
                 visual_now,
             )
 
-        rot_ned_body = body_frd_to_local_ned_rotmat(
-            float(getattr(snapshot, "roll_rad", 0.0)),
-            float(getattr(snapshot, "pitch_rad", 0.0)),
-            float(getattr(snapshot, "yaw_rad", 0.0))
-            + self._perception_yaw_correction_rad(latest_perception),
+        rpy_used = perception_rpy_for_transform(
+            np.array(
+                [
+                    float(getattr(snapshot, "roll_rad", 0.0)),
+                    float(getattr(snapshot, "pitch_rad", 0.0)),
+                    float(getattr(snapshot, "yaw_rad", 0.0)),
+                ],
+                dtype=float,
+            ),
+            transform_mode=str(latest_perception.get("transform_mode", "")),
+            yaw_correction_rad=self._perception_yaw_correction_rad(latest_perception),
         )
+        rot_ned_body = body_frd_to_local_ned_rotmat(*rpy_used)
         camera_translation_body = self._vec3(
             latest_perception.get("camera_translation_body")
         )

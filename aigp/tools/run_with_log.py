@@ -22,6 +22,8 @@ STRUCTURED_PREFIXES = (
     ("hover_acquisition ", "hover_acquisition"),
     ("thrust_scale_calibration ", "thrust_scale_calibration"),
     ("lateral_response_calibration ", "lateral_response_calibration"),
+    ("calibration_only_hold ", "calibration_only_hold"),
+    ("perception_hold ", "perception_hold"),
     ("plan_install ", "plan_install"),
     ("plan_candidate_reject ", "plan_candidate_reject"),
     ("plan_boundary_continuity ", "plan_boundary_continuity"),
@@ -142,6 +144,8 @@ def _metadata(command: list[str], cwd: Path, repo: Path, run_id: str) -> dict[st
             key: os.environ[key]
             for key in (
                 "RUNNER_MODE",
+                "CALIBRATION_ONLY",
+                "PERCEPTION_HOLD",
                 "VISION_SOURCE",
                 "MAVLINK_IP",
                 "MAVLINK_PORT",

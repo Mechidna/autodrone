@@ -314,6 +314,9 @@ def _compact_frame(event: dict[str, Any], start: float) -> dict[str, Any] | None
         return None
     return {
         "t": _event_time(event, start),
+        "phase": "flight",
+        "state_source": "autonomy_trace",
+        "timeline_source": "state",
         "gate_idx": fields.get("gate_idx"),
         "active_track": fields.get("active_track"),
         "tracks": fields.get("tracks"),
@@ -330,6 +333,135 @@ def _compact_frame(event: dict[str, Any], start: float) -> dict[str, Any] | None
         "v_ref": _field_vec(fields, "v_ref"),
         "cmd_deg": _field_vec(fields, "cmd_deg"),
     }
+
+
+def _compact_auxiliary_state_frame(
+    event: dict[str, Any],
+    start: float,
+) -> dict[str, Any] | None:
+    """Build a replay state from telemetry emitted outside autonomy_trace.
+
+    Shadow-estimator traces contain both the experimental estimator position and
+    the MAVLink position used as truth for diagnostics.  The latter is the safe
+    replay position: the shadow estimate can intentionally drift without being
+    used to fly the vehicle.
+    """
+
+    fields = event.get("fields") or {}
+    kind = str(event.get("event") or "")
+    truth = _field_vec(fields, "truth_pos_neu")
+    logged_pos = _field_vec(fields, "pos_neu")
+    if kind == "shadow_estimator_trace":
+        pos = truth if truth is not None else logged_pos
+        state_source = "mavlink_truth" if truth is not None else "shadow_estimator"
+        phase = "telemetry"
+    else:
+        pos = logged_pos if logged_pos is not None else truth
+        state_source = kind
+        phase = {
+            "hover_acquisition": "hover_acquisition",
+            "thrust_scale_calibration": "thrust_calibration",
+            "lateral_response_calibration": "lateral_calibration",
+            "perception_hold": "perception_hold",
+        }.get(kind, "startup")
+    if pos is None:
+        return None
+
+    return {
+        "t": _event_time(event, start),
+        "phase": phase,
+        "state_source": state_source,
+        "timeline_source": "state",
+        "gate_idx": fields.get("gate_idx"),
+        "active_track": fields.get("active_track"),
+        "tracks": fields.get("tracks"),
+        "target_lock": fields.get("target_lock"),
+        "target_event": fields.get("status"),
+        "target_shift": None,
+        "dist": None,
+        "yaw_source": None,
+        "pos": pos,
+        "truth": truth,
+        "p_ref": None,
+        "target": None,
+        "yaw_target": None,
+        "v_ref": None,
+        "cmd_deg": None,
+    }
+
+
+def _camera_timeline_frame(
+    camera_frame: dict[str, Any],
+    state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if state is None:
+        frame = {
+            "phase": "camera",
+            "state_source": "camera_only",
+            "gate_idx": None,
+            "active_track": None,
+            "tracks": None,
+            "target_lock": None,
+            "target_event": None,
+            "target_shift": None,
+            "dist": None,
+            "yaw_source": None,
+            "pos": None,
+            "truth": None,
+            "p_ref": None,
+            "target": None,
+            "yaw_target": None,
+            "v_ref": None,
+            "cmd_deg": None,
+        }
+    else:
+        frame = dict(state)
+    frame.update(
+        {
+            "t": float(camera_frame.get("t") or 0.0),
+            "timeline_source": "camera",
+            "camera_frame_id": camera_frame.get("frame_id"),
+        }
+    )
+    return frame
+
+
+def _build_timeline_frames(
+    state_frames: list[dict[str, Any]],
+    camera_frames: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge camera time with state time so stationary startup is playable."""
+
+    states = sorted(state_frames, key=lambda item: float(item.get("t") or 0.0))
+    cameras = sorted(camera_frames, key=lambda item: float(item.get("t") or 0.0))
+    if not cameras:
+        return states
+    if not states:
+        return [_camera_timeline_frame(item, None) for item in cameras]
+
+    camera_samples: list[dict[str, Any]] = []
+    state_idx = -1
+    for camera_frame in cameras:
+        camera_t = float(camera_frame.get("t") or 0.0)
+        while (
+            state_idx + 1 < len(states)
+            and float(states[state_idx + 1].get("t") or 0.0) <= camera_t
+        ):
+            state_idx += 1
+        # Camera capture can begin before MAVLink telemetry is ready. Backfill
+        # those first images with the earliest real position rather than
+        # discarding the images or inventing a zero pose.
+        state = states[state_idx] if state_idx >= 0 else states[0]
+        camera_samples.append(_camera_timeline_frame(camera_frame, state))
+
+    frames = states + camera_samples
+    return sorted(
+        frames,
+        key=lambda item: (
+            float(item.get("t") or 0.0),
+            1 if item.get("timeline_source") == "camera" else 0,
+        ),
+    )
 
 
 def _compact_plan(event: dict[str, Any], start: float) -> dict[str, Any]:
@@ -518,7 +650,8 @@ def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
         for event in events
         if _finite_float(event.get("wall_time")) is not None
     )
-    frames = []
+    autonomy_frames = []
+    auxiliary_state_frames = []
     plans = []
     rejected_plans = []
     passes = []
@@ -539,7 +672,17 @@ def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
         elif kind == "autonomy_trace":
             frame = _compact_frame(event, start)
             if frame is not None:
-                frames.append(frame)
+                autonomy_frames.append(frame)
+        elif kind in (
+            "shadow_estimator_trace",
+            "hover_acquisition",
+            "thrust_scale_calibration",
+            "lateral_response_calibration",
+            "perception_hold",
+        ):
+            frame = _compact_auxiliary_state_frame(event, start)
+            if frame is not None:
+                auxiliary_state_frames.append(frame)
         elif kind == "plan_install":
             plans.append(_compact_plan(event, start))
         elif kind == "plan_candidate_reject":
@@ -566,10 +709,43 @@ def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
                 }
             )
 
-    frames = _downsample(frames, max_frames)
+    autonomy_frames.sort(key=lambda item: float(item.get("t") or 0.0))
+    auxiliary_state_frames.sort(key=lambda item: float(item.get("t") or 0.0))
+    if autonomy_frames:
+        first_autonomy_t = float(autonomy_frames[0].get("t") or 0.0)
+        last_autonomy_t = float(autonomy_frames[-1].get("t") or 0.0)
+        auxiliary_state_frames = [
+            frame
+            for frame in auxiliary_state_frames
+            if float(frame.get("t") or 0.0) < first_autonomy_t
+            or float(frame.get("t") or 0.0) > last_autonomy_t
+        ]
+        for frame in auxiliary_state_frames:
+            frame_t = float(frame.get("t") or 0.0)
+            if frame_t > last_autonomy_t:
+                frame["phase"] = "postflight"
+            elif frame.get("state_source") in (
+                "mavlink_truth",
+                "shadow_estimator",
+            ):
+                frame["phase"] = "startup"
+
+    state_frames = sorted(
+        autonomy_frames + auxiliary_state_frames,
+        key=lambda item: (
+            float(item.get("t") or 0.0),
+            1 if item.get("state_source") == "autonomy_trace" else 0,
+        ),
+    )
+    camera_frames = _load_camera_frames(path.parent, start)
+    frames = _downsample(
+        _build_timeline_frames(state_frames, camera_frames),
+        max_frames,
+    )
     duration = max(
         [0.0]
         + [float(item["t"]) for item in frames]
+        + [float(item["t"]) for item in camera_frames]
         + [float(item["t"]) for item in plans]
         + [float(item["t"]) for item in rejected_plans]
         + [float(item["t"]) for item in passes]
@@ -579,8 +755,6 @@ def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
     if isinstance(run_start, dict):
         env = run_start.get("env") or {}
         runtime_config = run_start.get("runtime_config")
-    camera_frames = _load_camera_frames(path.parent, start)
-
     return {
         "run_id": path.parent.name,
         "debug_path": str(path),
@@ -602,6 +776,9 @@ def _load_debug(path: Path, *, max_frames: int) -> dict[str, Any]:
         "alerts": alerts[-20:],
         "counts": {
             "frames": len(frames),
+            "state_frames": len(state_frames),
+            "autonomy_frames": len(autonomy_frames),
+            "auxiliary_state_frames": len(auxiliary_state_frames),
             "plans": len(plans),
             "rejected_plans": len(rejected_plans),
             "passes": len(passes),
@@ -846,7 +1023,7 @@ const checks = ['showTruth','showRef','showPlan','showRejectedPlans','showRace',
 const frames = DATA.frames || [];
 const cameraFrames = DATA.camera_frames || [];
 slider.max = Math.max(0, frames.length - 1);
-subtitle.textContent = `${DATA.debug_path} | frames=${DATA.counts.frames}, camera=${DATA.counts.camera_frames || 0}, plans=${DATA.counts.plans}, failed_plans=${DATA.counts.rejected_plans || 0}, passes=${DATA.counts.passes}, shifts=${DATA.counts.shifts}, return=${DATA.returncode}`;
+subtitle.textContent = `${DATA.debug_path} | timeline=${DATA.counts.frames}, state=${DATA.counts.state_frames || 0}, autonomy=${DATA.counts.autonomy_frames || 0}, camera=${DATA.counts.camera_frames || 0}, plans=${DATA.counts.plans}, failed_plans=${DATA.counts.rejected_plans || 0}, passes=${DATA.counts.passes}, shifts=${DATA.counts.shifts}, return=${DATA.returncode}`;
 const gateSizeM = Number(DATA.gate_size_m || 1.5);
 
 let frameIndex = 0;
@@ -1744,6 +1921,8 @@ function updateInfo() {
     : (viewMode.value === 'yz' ? 'side y/z' : 'top-down x/y');
   const rows = [
     ['t', `${fmt(t, 2)} s`],
+    ['phase', f.phase ?? 'n/a'],
+    ['state source', f.state_source ?? 'n/a'],
     ['view', viewText],
     ['gate_idx', f.gate_idx ?? 'n/a'],
     ['active_track', f.active_track ?? 'n/a'],
@@ -2255,7 +2434,7 @@ for (const el of Object.values(checks)) el.addEventListener('change', draw);
 window.addEventListener('resize', draw);
 
 if (!frames.length) {
-  document.body.innerHTML = '<main><section class="panel side-section">No autonomy_trace frames found in this debug log.</section></main>';
+  document.body.innerHTML = '<main><section class="panel side-section">No replayable telemetry or camera frames found in this debug log.</section></main>';
 } else {
   draw();
   requestAnimationFrame(tick);
@@ -2299,7 +2478,7 @@ def _parse_args() -> argparse.Namespace:
         "--max-frames",
         type=int,
         default=5000,
-        help="Downsample autonomy_trace frames to this maximum. Use 0 to keep all.",
+        help="Downsample merged state/camera timeline frames to this maximum. Use 0 to keep all.",
     )
     return parser.parse_args()
 
@@ -2325,6 +2504,9 @@ def main() -> int:
     print(
         "summary: "
         f"frames={data['counts']['frames']} "
+        f"state={data['counts']['state_frames']} "
+        f"autonomy={data['counts']['autonomy_frames']} "
+        f"camera={data['counts']['camera_frames']} "
         f"plans={data['counts']['plans']} "
         f"passes={data['counts']['passes']} "
         f"maps={data['counts']['maps']} "

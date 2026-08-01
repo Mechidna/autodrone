@@ -25,7 +25,11 @@ def setup_components(shared_data, system_boot_ms, config):
     # Setup Mavlink msg receiver
     # -------------------------------
     print("Setting up MAVLink rx...", flush=True)
-    mavlink_rx = MAVLinkRX.create_mavlink_rx(sim_conn, shared_data)
+    mavlink_rx = MAVLinkRX.create_mavlink_rx(
+        sim_conn,
+        shared_data,
+        config=config,
+    )
 
     # -------------------------------
     # Timesync request Loop

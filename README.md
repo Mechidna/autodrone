@@ -295,6 +295,8 @@ Use these runtime settings:
 ```toml
 [runtime]
 runner_mode = "competition"
+calibration_only = false
+perception_hold = false
 competition_arm = false  # first Windows smoke test only; set true when ready to arm
 
 [vision]
@@ -413,6 +415,174 @@ Behavior:
 - Can arm if `competition_arm=true`.
 - Rejects debug-only sim truth modes.
 
+### Competition Calibration-Only Mode
+
+Use calibration-only mode to run hover acquisition, thrust-scale calibration,
+and lateral-response calibration without starting YOLO, gate tracking, or
+trajectory planning. After all enabled calibration stages finish, the stack
+continues streaming a level `SET_ATTITUDE_TARGET` at the learned hover thrust
+and current yaw, with bounded vertical position/velocity damping. It does not
+enter the `SET_POSITION_TARGET_LOCAL_NED`
+`HoverHold` fallback.
+
+For an armed competition-simulator calibration run:
+
+```toml
+[runtime]
+runner_mode = "competition"
+calibration_only = true
+perception_hold = false
+prearm_gate_acquisition = false
+competition_arm = true
+```
+
+The equivalent temporary PowerShell override is:
+
+```powershell
+$env:CALIBRATION_ONLY="true"
+$env:PREARM_GATE_ACQUISITION="false"
+python .\aigp\tools\run_with_log.py
+Remove-Item Env:\CALIBRATION_ONLY
+Remove-Item Env:\PREARM_GATE_ACQUISITION
+```
+
+`competition_arm` has no environment override, so it must be enabled in
+`runtime.toml` when the stack is responsible for arming. Leave it `false` if
+the simulator is armed separately.
+
+Calibration-only mode automatically suppresses the perception worker even if
+`runtime.use_perception` and `perception.enabled` remain `true`. Camera frames
+are not required in this mode; attitude, IMU, armed state, and the configured
+position estimate remain required by the calibration stages.
+
+A clean completion is visible in the run log as:
+
+```text
+hover_acquisition ... done=1 status=stable
+thrust_scale_calibration ... done=1 status=calibrated
+lateral_response_calibration ... done=1 status=calibrated
+calibration_only_hold command_type=SET_ATTITUDE_TARGET ... thrust=...
+```
+
+`timeout_fallback` or `motion_limited_fallback` means the sequence finished
+using fallback values, not that calibration succeeded cleanly. In competition
+mode, stopping the client does not currently send a land or disarm command;
+stop or reset the simulator safely rather than relying on `Ctrl+C` to disarm.
+
+### Competition Perception-Hold Mode
+
+Use perception-hold mode for an armed perception diagnostic after calibration.
+It runs hover acquisition, thrust-scale calibration, and lateral-response
+calibration, captures the resulting XY/Z/yaw pose, and holds that pose with
+`SET_ATTITUDE_TARGET`. YOLO and GateMemory continue running, but perceived
+landmarks are not fed into the state estimator, no navigation target is
+installed, and all trajectory planning, gate advancement, and gate-pass logic
+are bypassed.
+
+```toml
+[runtime]
+runner_mode = "competition"
+use_perception = true
+calibration_only = false
+perception_hold = true
+prearm_gate_acquisition = false
+perception_hold_settle_speed_m_s = 0.15
+perception_hold_settle_duration_s = 0.50
+competition_arm = true
+
+[state_estimation]
+mode = "mavlink"
+
+[gate_source]
+mode = "perception"
+```
+
+The temporary PowerShell override is:
+
+```powershell
+$env:CALIBRATION_ONLY="false"
+$env:PERCEPTION_HOLD="true"
+$env:PREARM_GATE_ACQUISITION="false"
+python .\aigp\tools\run_with_log.py
+Remove-Item Env:\PERCEPTION_HOLD
+Remove-Item Env:\PREARM_GATE_ACQUISITION
+```
+
+GateMemory is deliberately quarantined during calibration and while residual
+motion settles. It also rejects perception results originating from camera
+frames captured before the post-calibration barrier, including inference that
+was still in flight at handoff. A missing or failed camera stream prevents the
+perception diagnostic from succeeding, but does not interrupt the MAVLink-based
+flight hold.
+
+A healthy run shows all enabled calibrations completing with `succeeded=1`,
+then recurring lines such as:
+
+```text
+perception_hold reason=post_calibration_perception_only ... memory_tracks=...
+[PERCEPTION_CHAIN] event=committed ...
+[PERCEPTION_CHAIN] event=stable ...
+```
+
+There should be no `plan_install`, target-shift, gate-pass, or race-advance
+events. Stop the client and reset the simulator after this diagnostic; do not
+reuse a perception-hold process across a disarm/re-arm or simulator reset.
+
+### Pre-Control Gate Acquisition
+
+For a normal perception flight, pre-control acquisition lets the passive
+MAVLink and camera receivers build GateMemory before the client emits any
+flight-control or thrust commands. In the official competition simulator it
+can also continue while the externally armed vehicle is still pinned by the
+Ready countdown:
+
+```toml
+[runtime]
+calibration_only = false
+perception_hold = false
+prearm_gate_acquisition = true
+prearm_gate_min_duration_s = 2.0
+prearm_gate_min_stable = 1
+prearm_gate_max_age_s = 0.75
+prearm_gate_ready_updates = 2
+```
+
+The collection duration starts with the first valid projected perception
+result. Only fresh, stable, committed tracks count, and every consecutive
+readiness update must match a stable track in that new YOLO result. Their
+current filtered centers are locked for planning at handoff. GateMemory is
+then frozen during hover/thrust/lateral calibration so vehicle motion cannot
+rewrite the pre-arm map, and it resumes only on a newer post-calibration
+camera result. Acquisition waits indefinitely for readiness. During this
+phase the controller is not updated, so no `SET_ATTITUDE_TARGET` or thrust
+command is emitted.
+
+PX4 still requires a disarmed heartbeat. In competition mode, an armed
+heartbeat is accepted only while fresh race-status timing proves the race has
+not started. The projected countdown deadline is checked between status
+packets; if the race starts before a gate is locked, startup reports
+`race_started_before_prearm_ready` and does not enter the control loop. Reset
+the simulator before retrying. When the competition heartbeat is already
+armed, the later duplicate arm request is skipped.
+
+Start the client before pressing **Ready**. Model and perception initialization
+can take longer than the simulator's five-second countdown, so launching after
+Ready may correctly report `race_started_before_prearm_ready` before gate
+acquisition has had time to run.
+
+A successful startup includes:
+
+```text
+prearm_gate_lock track=... center_neu=(...) hits=... score=...
+prearm_gate_acquisition ready ... locked=[...]
+```
+
+To temporarily bypass this wait for a non-flight diagnostic:
+
+```powershell
+$env:PREARM_GATE_ACQUISITION="false"
+```
+
 ## Environment Overrides
 
 The runtime supports these useful environment variables:
@@ -420,6 +590,9 @@ The runtime supports these useful environment variables:
 | Variable | Purpose |
 | --- | --- |
 | `RUNNER_MODE` | `px4` or `competition` |
+| `CALIBRATION_ONLY` | `true` runs calibration stages, then attitude-only hover |
+| `PERCEPTION_HOLD` | `true` calibrates, then holds XY/Z/yaw while observing perception only |
+| `PREARM_GATE_ACQUISITION` | `true` requires fresh committed gates before any local flight-control output |
 | `VISION_SOURCE` | `udp` or `ros` |
 | `PERCEPTION_BACKEND` | `yolo`, `blue`, or `orange` |
 | `PERCEPTION_HZ` | Perception loop rate |

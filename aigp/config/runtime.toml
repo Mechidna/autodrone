@@ -3,8 +3,14 @@
 profile = "py_aipilot_example"
 
 [runtime]
-runner_mode = "px4"              # px4 | competition
+runner_mode = "competition"              # px4 | competition
+competition_yaw_inverted = true          # invert competition MAVLink yaw/yaw-rate at both telemetry and command boundaries
 use_perception = true
+calibration_only = false                 # true: calibrate, then hover without perception
+perception_hold = false                  # true: calibrate, then hold XY/Z while tracking gates
+startup_observation_duration_s = 10.0     # competition only: ingest perception without transmitting flight commands
+perception_hold_settle_speed_m_s = 0.15   # quarantine frames until nearly stationary
+perception_hold_settle_duration_s = 0.50
 control_hz = 50
 flow_status_period_s = 1.0
 join_timeout_s = 1.0
@@ -165,14 +171,21 @@ enabled = true
 backend = "yolo"                 # blue | orange | yolo
 hz = 30
 gate_size_m = 1.5
-yolo_model_path = "aigp/models/gate_yolo_pose_8k/best.pt"
+# Experimental correction to the raw OpenCV/PnP optical +z depth.
+# applied = min(max_m, base_m + raw_depth_m * per_m)
+# This gives +1 m at 50 m and +2 m at 100 m. Applied after PnP
+# validation and before camera-to-body/world projection.
+depth_correction_m = 0.0
+depth_correction_per_m = 0.02
+depth_correction_max_m = 3.0 # <= 0 disables the clamp
+yolo_model_path = "aigp/models/gate_yolo_pose_ed4016/best.pt"
 preprocess_mode = "raw"
 yolo_conf = 0.1
-yolo_imgsz = 512
+yolo_imgsz = 640
 yolo_device = 0
 yolo_keypoint_order = "image"    # image for current autolabeler output; semantic for fixed physical corner IDs
 yolo_keypoint_layout = "inner4_outer4"   # inner4 for 4-keypoint model; inner4_outer4 for 8-keypoint model
-transform_mode = "physical_direct_rad_x_mirror"
+transform_mode = "physical_direct_rad_pitch_inverted" # competition perception only: invert MAVLink pitch for body-to-world projection
 world_pose_source = "mavsdk" # mavsdk | camera_only | none | estimator | gazebo_camera_sim; gazebo_camera_sim is PX4/ROS sim-only and is ignored in competition
 max_reprojection_error_for_memory = 1.5
 min_keypoint_conf_for_memory = 0.5
@@ -186,7 +199,7 @@ max_depth_m_for_memory = 200.0
 reject_negative_depth = true
 
 [perception_geometry_audit]
-enabled = true                    # debug/PX4 only; disable for competition
+enabled = false                    # debug/PX4 only; disable for competition
 print_period_s = 0.5
 max_prints = 120
 max_match_distance_m = 5.0
@@ -200,48 +213,64 @@ gazebo_camera_mount_rpy = [0.0, -0.3490658503988659, 0.0]
 gazebo_rotation_mode = "transpose"
 gazebo_optical_mode = "physical_minus_y"
 known_gate_positions_neu = [
-  [0.330537, 13.689265, 2.047032],
-  [0.691434, 29.059388, 1.757845],
-  [-1.569852, 44.718608, 1.988404],
-  [-1.250506, 60.615929, 2.754443],
-  [-1.493352, 75.545305, 4.491667],
-  [-2.618036, 89.612741, 3.941568],
+    [-25.94, -0.54, 1.00],
+    [-47.28, -2.25, -4.5],
+    [-73.84, 0.99, -12.5],
+    [-111.37, -5.25, -24.0],
+    [-135.27, -0.88, -24.5],
+    [-160.0, -4.5, -25.0],
 ]
 gate_right_axis_neu = [1.0, 0.0, 0.0]
 gate_up_axis_neu = [0.0, 0.0, 1.0]
 
 [gate_source]
-mode = "perception"               # perception | ground_truth
-allow_ground_truth = false         # debug/PX4 only; not competition-valid
+mode = "ground_truth"               # perception | ground_truth
+allow_ground_truth = true           # explicitly acknowledges the sim-truth dependency
+allow_competition_ground_truth_debug = true # local planner debug over competition transport only
 known_gate_positions_neu = [
-  [0.330537, 13.689265, 2.047032],
-  [0.691434, 29.059388, 1.757845],
-  [-1.569852, 44.718608, 1.988404],
-  [-1.250506, 60.615929, 2.754443],
-  [-1.493352, 75.545305, 4.491667],
-  [-2.618036, 89.612741, 3.941568],
+    [-25.94, -0.54, 1.00],
+    [-47.28, -2.25, -4.5],
+    [-73.84, 0.99, -12.5],
+    [-111.37, -5.25, -24.0],
+    [-135.27, -0.88, -24.5],
+    [-160.0, -4.5, -25.0],
 ]
 
 [gate_memory]
 association_radius = 1.5
 commit_radius = 1.5
 new_track_block_radius = 4.5
+# Sim/debug-only ground-truth guard. Candidate tracks still collect observations,
+# but may commit only within this 3D distance of a [gate_source] known position.
+# Accepted tracks retain their perceived center; they are not snapped to truth.
+known_position_commit_filter_enabled = true
+known_position_commit_radius_m = 4.0
+active_gate_transit_suppression_enabled = true # freeze new-track admission while entering/clearing the active gate
+active_gate_transit_suppression_radius_m = 4.0 # begins this far from the current perceived gate center
 min_confidence_per_hit = 0.2
 commit_hits = 2
-commit_confidence_sum = 1.8
+commit_confidence_sum = 0.5
 commit_spread_radius = 0.60
-stale_time = 3.0
+stale_time = 60.0
 alpha = 0.35
 use_lookahead_gate_filter = true
 history_size = 15
 min_hits_for_stable = 3
-max_center_std_for_stable = 0.30
+max_center_std_for_stable = 1.0
 max_camera_std_for_stable = 0.30
 max_reprojection_error_for_stable = 1.25
 min_keypoint_conf_for_stable = 0.6
-max_outlier_distance = 0.60
+max_outlier_distance = 1.5
 max_committed_match_distance = 3.0
-min_observation_time = 0.10
+min_observation_time = 0.0
+temporal_image_association_enabled = true # keep a repeated image box on one track when far-range PnP depth jumps
+temporal_image_association_max_age_s = 1.0
+temporal_image_association_max_center_distance_px = 2.5
+temporal_image_association_max_size_ratio = 1.5
+temporal_image_association_min_depth_m = 20.0
+tiny_detection_area_px2 = 50.0 # roughly <= 7x7 px: require a longer depth-consistent history
+tiny_detection_min_hits_for_stable = 6
+tiny_detection_min_observation_time = 0.5
 visibility_negative_evidence_enabled = true
 visibility_min_projected_area_px2 = 80.0
 visibility_border_margin_px = 8.0
@@ -251,13 +280,15 @@ visibility_occlusion_depth_margin_m = 1.0
 visibility_miss_frames = 5
 visibility_miss_time_s = 0.25
 visibility_delete_unstable_after_misses = true
-visibility_demote_committed_after_misses = true
+visibility_demote_committed_after_misses = false
 visibility_trace = true
 
 [race]
 gate_count = 6
-pass_radius_m = 1.25
-pass_lateral_radius_m = 0.75
+pass_radius_m = 2.0
+# Navigation bookkeeping tolerance. Physical trajectory validation remains
+# constrained to the competition gate's 0.75 m inner half-extent.
+pass_lateral_radius_m = 1.5
 pass_plane_tolerance_m = 0.05
 near_plane_pass_enabled = true
 near_plane_pass_back_tolerance_m = 0.35
@@ -269,53 +300,71 @@ expected_gate_altitude_m = 1.5
 active_target_lost_grace_s = 2.0
 
 [planner]
-vmax = 5.0 #2.5
-amax = 3.5 #2.0
+vmax = 9.0 # ~28.3 s full plan; final-gate waypoint occurs at ~27.3 s
+amax = 6.0
 t_min = 1.0
+# Keep the time reference close enough for feedback control to recover. The
+# former one-sided clamp advanced when ahead but ran away on any large lag.
+reference_progress_lag_hold_enabled = true
+reference_progress_lag_tolerance_m = 0.75
+reference_progress_lag_max_path_error_m = 4.5
+reference_progress_lag_max_lead_s = 0.25
+# Joint 3-D minimum-snap solve.  The velocity projected onto every ordered
+# waypoint chord is constrained nonnegative over the full segment, preventing
+# the Gate 5 -> Gate 6 turnaround seen in run 20260731_124358.
+forward_progress_constraint_enabled = true
+forward_progress_min_speed_m_s = 0.0
+forward_progress_solver_max_iterations = 300
 plan_validation_shape_enabled = true
 plan_validation_samples_per_segment = 80
 plan_validation_max_path_length_ratio = 1.45
 plan_validation_max_segment_path_length_ratio = 2.20
 plan_validation_max_corridor_m = 4.5
-plan_validation_max_polyline_backtrack_m = 10.0
-plan_validation_max_speed_m_s = 0.0
-plan_validation_max_accel_m_s2 = 8.0
-plan_validation_max_acc_xy_m_s2 = 7.0
+# Secondary guard; generation now enforces nonnegative local progress itself.
+plan_validation_max_polyline_backtrack_m = 0.25
+plan_validation_max_speed_m_s = 14.0
+# The sub-30 s spline peaks near 19.1 m/s^2 while braking at/after the final
+# gate. Before that finish maneuver its XY demand remains about 5.6 m/s^2.
+plan_validation_max_accel_m_s2 = 20.0
+plan_validation_max_acc_xy_m_s2 = 20.0
 plan_validation_max_lateral_accel_m_s2 = 3.5
 plan_validation_max_acc_z_up_m_s2 = 1.2
-plan_validation_max_acc_z_down_m_s2 = 1.2
+# Match the controller's near-reference downward acceleration envelope.  The
+# former 1.2 value caused otherwise trackable descent segments to be retimed
+# as though the vehicle had to stop vertically at each gate.
+plan_validation_max_acc_z_down_m_s2 = 2.0
 plan_validation_max_z_overshoot_m = 0.65
 plan_v_start_z_max_m_s = 0.4
 safe_min_target_z = -inf
 safe_max_target_z = inf
 target_z_mode = "observed_clamped" # observed_clamped | expected
-replan_target_shift_m = 1.0
-horizon_gates = 3
+replan_target_shift_m = 2.0
+horizon_gates = 6
 horizon_continuation_enabled = true
 post_gate_exit_continuation_enabled = true
 gate_corridor_enabled = true
 gate_corridor_length_m = 3.0
 passthrough_velocity_enabled = true
-passthrough_velocity_mode = "adaptive" # fixed | adaptive
-passthrough_speed_m_s = 4.0 #2.5
-passthrough_speed_max_m_s = 5.0 #3.0
-passthrough_turn_slowdown = 0.5
+passthrough_velocity_mode = "fixed" # fixed | adaptive
+passthrough_speed_m_s = 7.0
+passthrough_speed_max_m_s = 9.0
+passthrough_turn_slowdown = 0.0
 terminal_velocity_enabled = true
-terminal_speed_m_s = 2.0 #0.5
+terminal_speed_m_s = 7.0
 yaw_reference_motion_near_gate_enabled = true
 yaw_reference_motion_distance_m = 3.0
-active_target_preempt_enabled = true
+active_target_preempt_enabled = false
 active_target_preempt_min_active_distance_m = 6.0
 active_target_preempt_margin_m = 0.0
-active_target_preempt_lateral_radius_m = 6.0
-active_target_shift_enabled = true
+active_target_preempt_lateral_radius_m = 8.0
+active_target_shift_enabled = false
 active_target_shift_threshold_m = 0.45
 active_target_shift_required_frames = 2
 active_target_shift_replan_min_interval_s = 0.25
 active_target_shift_alpha = 0.3
 active_target_shift_min_keypoint_conf = 0.7
 active_target_shift_max_reprojection_error = 1.25
-active_target_shift_max_world_std_m = 0.30
+active_target_shift_max_world_std_m = 0.75
 active_target_shift_max_step_m = 0.60
 active_target_shift_max_total_m = 3.00
 active_target_shift_near_gate_distance_m = 2.0
@@ -331,8 +380,12 @@ active_target_shift_horizon_lateral_replan_min_m = 0.75
 active_target_shift_horizon_total_replan_min_m = 1.25
 race_order_front_blocker_enabled = true
 race_order_front_blocker_margin_m = 3.0
-race_order_front_blocker_lateral_radius_m = 6.0
-provisional_next_gate_enabled = true
+race_order_front_blocker_lateral_radius_m = 8.0
+# Perception-only sequence guard. Far gates remain in memory but cannot occupy
+# the next race slot until a chain of perceived gates bridges each gap.
+race_order_gap_guard_enabled = true
+race_order_max_next_gate_gap_m = 45.0
+provisional_next_gate_enabled = false
 provisional_next_gate_min_hits = 2
 provisional_next_gate_max_age_s = 3.0
 provisional_next_gate_min_keypoint_conf = 0.6
@@ -343,7 +396,7 @@ provisional_next_gate_max_lateral_m = 20.0
 provisional_next_gate_closer_margin_m = 3.0
 provisional_next_gate_max_duration_s = 6.0
 provisional_next_gate_replan_shift_m = 0.75
-provisional_next_gate_vmax_m_s = 5.0 #1.5
+provisional_next_gate_vmax_m_s = 2.5
 spline_memory_live_override_m = 4.0
 replan_after_trajectory_s = 0.25
 replan_min_interval_s = 0.15
@@ -354,19 +407,29 @@ mass = 1.0
 gravity = 9.81
 kp = [2.5, 2.5, 1.6]
 kv = [2.0, 2.0, 1.1]
-max_acc_xy = 3.5 #2.0
+attitude_slew_limit_enabled = true
+max_roll_slew_rate_deg_s = 75.0
+max_pitch_slew_rate_deg_s = 75.0
+# Competition active-trajectory experiment: keep the vehicle at least this
+# many degrees nose-down so the fixed 20 deg upward camera sees farther below.
+# This is not applied during startup, calibration, perception hold, or no-plan hold.
+flight_nose_down_enabled = false
+flight_min_nose_down_deg = 10.0
+max_acc_xy = 6.5
 max_acc_z_up = 1.2
-max_acc_z_down = 1.0
-max_acc_z_slew_m_s3 = 6.0
+max_acc_z_down = 3.0
+max_acc_z_slew_m_s3 = 10.0
 max_acc_z_slew_reset_s = 0.5
 near_reference_z_error_m = 0.4
 near_reference_vz_error_max_m_s = 0.7
 near_reference_max_acc_z_up = 0.8
-near_reference_max_acc_z_down = 0.8
-lateral_accel_gain_xy = [1.0, 1.0]
-thrust_hover_initial = 0.5
-fallback_thrust_initial = 0.5       # last-resort initial guess only
-adaptive_hover_enabled = true
+near_reference_max_acc_z_down = 2.0
+lateral_accel_gain_xy = [1.37, 1.39] # fixed median-style baseline from competition calibration
+tilt_thrust_compensation_enabled = true
+thrust_hover_initial = 0.264
+thrust_from_acc_gain = 0.027       # normalized thrust change per m/s^2
+fallback_thrust_initial = 0.28      # last-resort initial guess only
+adaptive_hover_enabled = false
 adaptive_hover_gain = 0.04
 adaptive_hover_z_gain = 0.30
 adaptive_hover_min = 0.0
@@ -377,24 +440,67 @@ adaptive_hover_max_ref_az = 1.5
 adaptive_hover_max_z_error = 2.0
 adaptive_hover_saturation_margin = 0.03
 adaptive_hover_min_confidence = 0.0
-adaptive_hover_fast_enabled = true
+adaptive_hover_fast_enabled = false
 adaptive_hover_fast_gain = 0.25
 adaptive_hover_fast_min_z_error = 0.05
 adaptive_hover_fast_stable_signal = 0.08
 adaptive_hover_fast_stable_z_error = 0.15
 adaptive_hover_fast_stable_samples = 20
 adaptive_hover_fast_decay_s = 3.0
-max_tilt_deg = 35.0 #20.0
+max_tilt_deg = 42.0
 max_yaw_rate_deg_s = 90.0
 command_print_period_s = 1.0
+
+[no_target_search]
+# Competition perception recovery. This runs only when there is no active plan
+# and no admitted current/provisional target. Normal planner attitude commands
+# are never modified.
+enabled = false
+require_armed = true
+require_race_start = true
+loss_grace_s = 1.0
+settle_horizontal_speed_m_s = 0.30
+
+# Clear the previous gate before beginning the vertical search. Forward is
+# captured from the vehicle yaw when this phase begins.
+forward_before_descent_enabled = true
+forward_distance_m = 2.0
+forward_reached_tolerance_m = 0.25
+
+descent_rate_m_s = 1.0
+max_descent_per_search_m = 20.0
+min_z_neu_m = -28.0
+
+# One credible observation begins centering so the existing gate-memory
+# commit/stability rules can collect repeated hits from a useful image pose.
+candidate_min_hits = 1
+candidate_min_keypoint_conf = 0.60
+candidate_max_reprojection_error = 1.25
+candidate_min_image_area_px2 = 20.0
+candidate_lost_grace_s = 0.75
+
+# Center horizontally with bounded yaw. Pitch remains under the XY hold
+# controller, avoiding the flight_nose_down tracking conflict.
+center_yaw_enabled = true
+center_yaw_deadband_px = 35.0
+center_yaw_max_rate_deg_s = 4.0
+
+# Image Y grows downward. If a candidate is below this band, keep descending
+# (without climbing if it is above the band) until the gate is near image center.
+# The descent rate is reduced proportionally over the final deadband-sized band.
+center_vertical_enabled = true
+center_vertical_target_y_px = 180.0
+center_vertical_deadband_px = 30.0
+center_vertical_max_descent_rate_m_s = 1.0
 
 [hover_acquisition]
 enabled = true
 estimator_mode_only = false
 require_armed = true
-initial_thrust = 0.5
+require_race_start = true           # competition only; wait through Ready countdown
+initial_thrust = 0.27
 min_thrust = 0.0
-max_probe_thrust = 0.85
+max_probe_thrust = 0.75
 thrust_step_per_s = 0.25
 thrust_trim_step_per_s = 0.12
 overshoot_thrust_step_per_s = 0.60
@@ -406,67 +512,73 @@ max_up_vz_m_s = 0.80
 max_relative_z_m = 2.0
 max_settle_vz_m_s = 0.60
 min_duration_s = 0.75
-max_duration_s = 4.0
-stable_duration_s = 0.50
+max_duration_s = 10.0
+stable_duration_s = 0.25
 stable_vz_abs_m_s = 0.25
 stable_accel_abs_m_s2 = 0.80
-lift_confirm_z_m = 0.0
+lift_confirm_z_m = 0.15
 lift_confirm_vz_m_s = 0.15
-relative_airborne_z_m = 0.0     # relative to acquisition start; 0 allows airborne/no-climb starts
-min_release_z_m = 0.0           # relative to acquisition start; 0 does not force a takeoff bump
+relative_airborne_z_m = 0.25
+min_release_z_m = 0.25
 min_confidence = 0.0
-overshoot_max_thrust_drop = 0.0
+# Shed at most 0.25 from the liftoff command, and never command below the
+# known hover estimate while takeoff overshoot recovery is active.
+overshoot_max_thrust_drop = 0.25
 z_hold_enabled = true
 z_hold_kp = 0.10
 z_hold_kv = 0.08
 z_hold_max_correction = 0.08
 reset_hover_on_disarm = true
-release_on_timeout_while_unstable = true # safe-timeout only; still blocks overshoot/high vertical speed
+release_on_timeout_while_unstable = false
 print_period_s = 0.5
 
 [thrust_scale_calibration]
-enabled = true
+enabled = false
 estimator_mode_only = false
-require_hover_acquisition = true
+require_hover_acquisition = false
 require_armed = true
-initial_delay_s = 0.20
-min_duration_s = 0.80
-max_duration_s = 2.00
-phase_duration_s = 0.60
+initial_delay_s = 0.50
+min_duration_s = 1.50
+max_duration_s = 4.00
+phase_duration_s = 0.30
 settle_duration_s = 0.08
-probe_delta_thrust = 0.04
-min_probe_delta_thrust = 0.02
-max_probe_delta_thrust = 0.08
-min_samples = 12
+probe_delta_thrust = 0.01
+min_probe_delta_thrust = 0.005
+max_probe_delta_thrust = 0.02
+min_samples = 16
+min_samples_per_sign = 8
+neutral_max_abs_vz_m_s = 0.20
+neutral_max_abs_accel_m_s2 = 0.50
+max_sign_slope_disagreement = 0.50
 accel_filter_alpha = 0.35
 accel_deadband_m_s2 = 0.05
 min_abs_accel_m_s2 = 0.10
 max_abs_accel_m_s2 = 6.00
-max_abs_vz_m_s = 1.00
-max_relative_z_m = 0.75
-z_hold_enabled = true
+max_abs_vz_m_s = 0.80
+max_relative_z_m = 0.50
+z_hold_enabled = false
 z_hold_kp = 0.10
 z_hold_kv = 0.08
 z_hold_max_correction = 0.08
-min_gain = 0.03
-max_gain = 0.30
+min_gain = 0.008
+max_gain = 0.04
 result_alpha = 1.0
 print_period_s = 0.5
 
 [lateral_response_calibration]
-enabled = true
+enabled = false
 estimator_mode_only = false
-require_thrust_scale_calibration = true
+require_thrust_scale_calibration = false
 require_armed = true
-initial_delay_s = 0.20
-min_duration_s = 3.60
+initial_delay_s = 0.30
+min_duration_s = 2.60
 max_duration_s = 5.00
-phase_duration_s = 0.80
-settle_duration_s = 0.30
-probe_accel_m_s2 = 0.70
+phase_duration_s = 0.55
+settle_duration_s = 0.20
+probe_accel_m_s2 = 0.40
 min_probe_accel_m_s2 = 0.20
 max_probe_accel_m_s2 = 1.00
-max_tilt_deg = 5.0
+max_tilt_deg = 4.0
 min_samples_per_axis = 8
 accel_filter_alpha = 0.35
 accel_deadband_m_s2 = 0.05
@@ -474,7 +586,7 @@ min_abs_accel_m_s2 = 0.08
 max_abs_accel_m_s2 = 5.00
 max_cross_axis_ratio = 1.50
 max_abs_vxy_m_s = 1.20
-max_xy_displacement_m = 0.80
+max_xy_displacement_m = 1.50
 max_relative_z_m = 0.75
 max_sign_ratio_disagreement = 0.35
 z_hold_enabled = true
@@ -482,7 +594,7 @@ z_hold_kp = 0.10
 z_hold_kv = 0.08
 z_hold_max_correction = 0.08
 min_gain = 0.50
-max_gain = 1.25
+max_gain = 1.50
 result_alpha = 0.25
 tilt_thrust_compensation = true
 print_period_s = 0.5

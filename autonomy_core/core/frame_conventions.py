@@ -1,9 +1,4 @@
-"""Passive frame-convention helpers for competition adapter boundaries.
-
-Nothing in this module is wired into runtime perception or control. These
-helpers document and test the protocol-boundary conventions before any adapter
-uses them.
-"""
+"""Frame-convention helpers for competition adapter boundaries."""
 
 from __future__ import annotations
 
@@ -35,6 +30,8 @@ MAVLINK_BODY_FRD = FrameConvention(
     y_axis="right",
     z_axis="down",
 )
+
+PERCEPTION_PITCH_INVERTED_MODE = "physical_direct_rad_pitch_inverted"
 
 INTERNAL_BODY_FLU = FrameConvention(
     name="internal_body_flu",
@@ -145,6 +142,54 @@ def body_frd_to_local_ned_rotmat(
     )
 
 
+def perception_rpy_for_transform(
+    rpy_rad: np.ndarray,
+    *,
+    transform_mode: str,
+    yaw_correction_rad: float = 0.0,
+) -> np.ndarray:
+    """Return the attitude used only for camera/body-to-world perception."""
+
+    rpy = np.asarray(rpy_rad, dtype=float).reshape(3).copy()
+    if str(transform_mode).lower() == PERCEPTION_PITCH_INVERTED_MODE:
+        rpy[1] = -rpy[1]
+    rpy[2] += float(yaw_correction_rad)
+    return rpy
+
+
+def wrap_yaw_rad(yaw_rad: float) -> float:
+    """Wrap an angle to the internal ``[-pi, pi)`` yaw interval."""
+
+    yaw = float(yaw_rad)
+    return float((yaw + np.pi) % (2.0 * np.pi) - np.pi)
+
+
+def competition_yaw_boundary_rad(
+    yaw_rad: float,
+    *,
+    inverted: bool,
+) -> float:
+    """Convert yaw across the competition boundary.
+
+    Negation is its own inverse, so this function is intentionally used for
+    both incoming telemetry and outgoing attitude commands.
+    """
+
+    yaw = -float(yaw_rad) if inverted else float(yaw_rad)
+    return wrap_yaw_rad(yaw)
+
+
+def competition_yaw_rate_boundary(
+    yaw_rate_rad_s: float,
+    *,
+    inverted: bool,
+) -> float:
+    """Convert yaw rate across the competition boundary."""
+
+    yaw_rate = float(yaw_rate_rad_s)
+    return -yaw_rate if inverted else yaw_rate
+
+
 def local_ned_to_neu(point_ned: np.ndarray) -> np.ndarray:
     """Convert a local NED 3-vector to the internal positive-up NEU frame."""
 
@@ -212,10 +257,13 @@ __all__ = [
     "MAVLINK_BODY_FRD",
     "MAVLINK_LOCAL_NED",
     "OPENCV_CAMERA_OPTICAL",
+    "PERCEPTION_PITCH_INVERTED_MODE",
     "body_frd_to_internal_body_flu_rotmat",
     "body_frd_to_local_ned_rotmat",
     "body_frd_point_to_camera_optical",
     "camera_translation_body_frd",
+    "competition_yaw_boundary_rad",
+    "competition_yaw_rate_boundary",
     "local_ned_to_neu",
     "local_neu_to_ned",
     "mavlink_body_frd_to_opencv_camera_rotmat",
@@ -225,5 +273,7 @@ __all__ = [
     "official_camera_to_internal_body_flu_rotmat",
     "official_dist_coeffs",
     "opencv_camera_to_mavlink_body_frd_rotmat",
+    "perception_rpy_for_transform",
     "project_body_frd_point_to_pixel",
+    "wrap_yaw_rad",
 ]

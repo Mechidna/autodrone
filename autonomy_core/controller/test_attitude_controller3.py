@@ -81,3 +81,49 @@ def test_vertical_accel_slew_limits_full_reversal(monkeypatch):
         [0.0, 0.0, 1.0],
     )
     np.testing.assert_allclose(second_debug["a_cmd_no_g"], [0.0, 0.0, -0.9])
+
+
+def test_tilt_thrust_compensation_preserves_vertical_thrust_component():
+    common = dict(
+        kp=(0.0, 0.0, 0.0),
+        kv=(0.0, 0.0, 0.0),
+        max_tilt_deg=30.0,
+        max_acc_xy=4.0,
+        lateral_accel_gain_xy=(1.0, 1.0),
+        thrust_hover=0.3,
+        thrust_from_acc_gain=0.1,
+        thrust_min=0.0,
+        thrust_max=1.0,
+    )
+    uncompensated_tracker = RPGHighLevelTracker(
+        **common,
+        tilt_thrust_compensation_enabled=False,
+    )
+    compensated_tracker = RPGHighLevelTracker(
+        **common,
+        tilt_thrust_compensation_enabled=True,
+    )
+    state = State(pos=np.zeros(3), vel=np.zeros(3), yaw=0.0)
+    ref = Reference(
+        pos=np.zeros(3),
+        vel=np.zeros(3),
+        acc=np.array([4.0, 0.0, 0.0]),
+        yaw=0.0,
+    )
+
+    _, _, _, uncompensated_thrust, uncompensated_debug = (
+        uncompensated_tracker.update(state, ref)
+    )
+    _, _, _, compensated_thrust, compensated_debug = (
+        compensated_tracker.update(state, ref)
+    )
+
+    np.testing.assert_allclose(uncompensated_thrust, 0.3)
+    np.testing.assert_allclose(
+        compensated_thrust
+        * compensated_debug["tilt_vertical_fraction"],
+        0.3,
+    )
+    assert compensated_thrust > uncompensated_thrust
+    assert compensated_debug["tilt_thrust_compensation_enabled"]
+    assert compensated_debug["tilt_thrust_compensation_factor"] > 1.0

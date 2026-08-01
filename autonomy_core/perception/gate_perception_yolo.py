@@ -586,7 +586,7 @@ class GatePerception:
                 continue
 
             area = abs(cv2.contourArea(self.primary_image_points(pts)))
-            if area < 50:
+            if area < 20:
                 meta["rejection_reason"] = "keypoint_area_low"
                 candidates.append((-np.inf, float(boxes_conf[i]), mean_kconf, None, meta))
                 continue

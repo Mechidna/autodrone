@@ -8,13 +8,34 @@ import numpy as np
 
 from autonomy_core.core.competition_config import VADR_TS_002
 from autonomy_core.core.frame_conventions import (
+    PERCEPTION_PITCH_INVERTED_MODE as PITCH_INVERTED_MODE,
     body_frd_to_local_ned_rotmat,
     local_ned_to_neu,
     local_neu_to_ned,
     official_camera_to_body_frd_rotmat,
+    perception_rpy_for_transform,
 )
 from perception_geometry_audit import PerceptionGeometryAudit
 from runtime_config import load_runtime_config
+
+
+X_MIRROR_YAW_CORRECTED_MODE = "physical_direct_rad_x_mirror_yaw_corrected"
+X_MIRROR_YAW_CORRECTION_DEG = 3.0
+
+
+def _body_frd_yaw_rotmat(yaw_rad: float) -> np.ndarray:
+    """Rotate a body-FRD vector about body +z/down by ``yaw_rad``."""
+
+    c = math.cos(float(yaw_rad))
+    s = math.sin(float(yaw_rad))
+    return np.array(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
 
 
 class PerceptionWrapper:
@@ -34,8 +55,29 @@ class PerceptionWrapper:
     ):
         self.config = config if config is not None else load_runtime_config()
         perception_config = self.config.perception
-        self.transform_mode = str(perception_config.transform_mode)
+        self.transform_mode = str(perception_config.transform_mode).strip().lower()
         self.world_pose_source = str(perception_config.world_pose_source).lower()
+        self.depth_correction_m = float(perception_config.depth_correction_m)
+        if not math.isfinite(self.depth_correction_m):
+            raise ValueError("perception.depth_correction_m must be finite")
+        self.depth_correction_per_m = float(
+            perception_config.depth_correction_per_m
+        )
+        if not math.isfinite(self.depth_correction_per_m):
+            raise ValueError(
+                "perception.depth_correction_per_m must be finite"
+            )
+        self.depth_correction_max_m = float(
+            perception_config.depth_correction_max_m
+        )
+        if (
+            not math.isfinite(self.depth_correction_max_m)
+            or self.depth_correction_max_m < 0.0
+        ):
+            raise ValueError(
+                "perception.depth_correction_max_m must be finite and "
+                "non-negative"
+            )
         self.camera_matrix = self._matrix3(camera_matrix, self.config.camera.matrix)
         self.dist_coeffs = self._dist_coeffs(dist_coeffs, self.config.camera.dist_coeffs)
 
@@ -65,6 +107,25 @@ class PerceptionWrapper:
 
         self.gate_perception = gate_perception
         camera_to_body = official_camera_to_body_frd_rotmat(VADR_TS_002)
+        self.transform_yaw_correction_deg = 0.0
+        if self.transform_mode in (
+            "physical_direct_rad_x_mirror",
+            X_MIRROR_YAW_CORRECTED_MODE,
+        ):
+            # The competition video/PnP camera frame is horizontally mirrored.
+            # Reflect camera +x before applying the official OpenCV-camera to
+            # MAVLink-body-FRD rotation.  Keep the MAVLink yaw convention
+            # untouched; it is already used consistently by flight control.
+            camera_to_body = camera_to_body @ np.diag([-1.0, 1.0, 1.0])
+        if self.transform_mode == X_MIRROR_YAW_CORRECTED_MODE:
+            # Preserve the empirically stable horizontal-mirror convention, then
+            # apply the measured competition-camera mounting yaw as a body-frame
+            # extrinsic.  This rotates the perceived course without reflecting
+            # the MAVLink world frame or modifying vehicle yaw.
+            self.transform_yaw_correction_deg = X_MIRROR_YAW_CORRECTION_DEG
+            camera_to_body = _body_frd_yaw_rotmat(
+                math.radians(self.transform_yaw_correction_deg)
+            ) @ camera_to_body
         self.camera_translation_body = np.asarray(
             self.config.camera.body_translation_m,
             dtype=float,
@@ -98,10 +159,14 @@ class PerceptionWrapper:
             f"backend={self.backend} "
             f"transform_mode={self.transform_mode} "
             f"world_pose_source={self.world_pose_source} "
+            f"depth_correction_base_m={self.depth_correction_m:.3f} "
+            f"depth_correction_per_m={self.depth_correction_per_m:.5f} "
+            f"depth_correction_max_m={self.depth_correction_max_m:.3f} "
             f"yolo_keypoint_order={perception_config.yolo_keypoint_order} "
             f"yolo_keypoint_layout={perception_config.yolo_keypoint_layout} "
             f"camera_mount_profile={self.config.camera.mount_profile} "
             f"perception_yaw_correction_deg={self.perception_yaw_correction_deg:.3f} "
+            f"transform_yaw_correction_deg={self.transform_yaw_correction_deg:.3f} "
             f"K={self._fmt_array(self.camera_matrix, precision=3)} "
             f"dist={self._fmt_array(self.dist_coeffs, precision=4)} "
             f"camera_to_body={self._fmt_array(self.camera_to_body, precision=4)} "
@@ -319,6 +384,8 @@ class PerceptionWrapper:
                 perception.get("t", debug.get("tvec", None)),
                 default=np.full(3, np.nan),
             )
+            gate_camera_corrected = self._camera_with_depth_correction(gate_camera)
+            depth_correction_m = self._depth_correction_for_camera(gate_camera)
             detections.append({
                 "confidence": float(perception.get("confidence", 0.0)),
                 "yolo_confidence": float(
@@ -352,8 +419,9 @@ class PerceptionWrapper:
                     )
                 ),
                 "gate_center_camera": gate_camera,
-                "gate_center_body": self.camera_to_body @ gate_camera,
-                "gate_center_body_frd": self.camera_to_body @ gate_camera,
+                "gate_center_camera_corrected": gate_camera_corrected,
+                "gate_center_body": self.camera_to_body @ gate_camera_corrected,
+                "gate_center_body_frd": self.camera_to_body @ gate_camera_corrected,
                 "gate_center_world": None,
                 "gate_center_world_ned": None,
                 "reprojection_error": float(debug.get("reprojection_error", np.nan)),
@@ -363,6 +431,8 @@ class PerceptionWrapper:
                 "gate_normal_camera": debug.get("gate_normal_camera", None),
                 "rvec": debug.get("rvec"),
                 "tvec": debug.get("tvec", gate_camera),
+                "tvec_corrected": gate_camera_corrected,
+                "depth_correction_m": depth_correction_m,
                 "yolo_keypoints": debug.get("yolo_keypoints", None),
                 "yolo_bbox": debug.get("yolo_bbox", None),
                 "pnp_candidates": debug.get("pnp_candidates", ()),
@@ -462,12 +532,25 @@ class PerceptionWrapper:
         gate_camera = self._vec3(out.get("gate_center_camera"), default=None)
         if gate_camera is None:
             return out
+        gate_camera_corrected = self._vec3(
+            out.get("gate_center_camera_corrected"),
+            default=self._camera_with_depth_correction(gate_camera),
+        )
 
-        gate_world_neu = self._world_from_camera_gazebo(gate_camera, gazebo_pose)
+        gate_world_neu = self._world_from_camera_gazebo(
+            gate_camera_corrected,
+            gazebo_pose,
+        )
         if gate_world_neu is None:
             return out
 
-        gate_body_frd = self.camera_to_body @ gate_camera
+        gate_body_frd = self.camera_to_body @ gate_camera_corrected
+        out["gate_center_camera_corrected"] = gate_camera_corrected.copy()
+        out["tvec_corrected"] = gate_camera_corrected.copy()
+        out["depth_correction_m"] = self._applied_depth_correction(
+            gate_camera,
+            gate_camera_corrected,
+        )
         out["gate_center_body"] = gate_body_frd.copy()
         out["gate_center_body_frd"] = gate_body_frd.copy()
         out["gate_center_world"] = gate_world_neu.copy()
@@ -575,16 +658,26 @@ class PerceptionWrapper:
         gate_camera = self._vec3(out.get("gate_center_camera"), default=None)
         if gate_camera is None:
             return out
+        gate_camera_corrected = self._vec3(
+            out.get("gate_center_camera_corrected"),
+            default=self._camera_with_depth_correction(gate_camera),
+        )
 
         roll, pitch, yaw = np.asarray(drone_rpy_rad, dtype=float).reshape(3)
         rot_ned_body = body_frd_to_local_ned_rotmat(roll, pitch, yaw)
         drone_pos_ned = np.asarray(drone_pos_ned, dtype=float).reshape(3)
-        gate_body_frd = self.camera_to_body @ gate_camera
+        gate_body_frd = self.camera_to_body @ gate_camera_corrected
         gate_world_ned = drone_pos_ned + rot_ned_body @ (
             self.camera_translation_body + gate_body_frd
         )
         gate_world_neu = local_ned_to_neu(gate_world_ned)
 
+        out["gate_center_camera_corrected"] = gate_camera_corrected.copy()
+        out["tvec_corrected"] = gate_camera_corrected.copy()
+        out["depth_correction_m"] = self._applied_depth_correction(
+            gate_camera,
+            gate_camera_corrected,
+        )
         out["gate_center_body"] = gate_body_frd.copy()
         out["gate_center_body_frd"] = gate_body_frd.copy()
         out["gate_center_world_ned"] = gate_world_ned.copy()
@@ -615,18 +708,58 @@ class PerceptionWrapper:
         return out
 
     def _perception_rpy(self, drone_rpy_rad: np.ndarray) -> np.ndarray:
-        rpy = np.asarray(drone_rpy_rad, dtype=float).reshape(3).copy()
-        rpy[2] += float(self.perception_yaw_correction_rad)
-        return rpy
+        return perception_rpy_for_transform(
+            drone_rpy_rad,
+            transform_mode=self.transform_mode,
+            yaw_correction_rad=self.perception_yaw_correction_rad,
+        )
+
+    def _camera_with_depth_correction(self, gate_camera: np.ndarray) -> np.ndarray:
+        corrected = np.asarray(gate_camera, dtype=float).reshape(3).copy()
+        corrected[2] += self._depth_correction_for_camera(corrected)
+        return corrected
+
+    def _depth_correction_for_camera(self, gate_camera: np.ndarray) -> float:
+        raw_depth_m = float(np.asarray(gate_camera, dtype=float).reshape(3)[2])
+        positive_depth_m = (
+            raw_depth_m
+            if math.isfinite(raw_depth_m) and raw_depth_m > 0.0
+            else 0.0
+        )
+        correction_m = (
+            self.depth_correction_m
+            + self.depth_correction_per_m * positive_depth_m
+        )
+        if self.depth_correction_max_m > 0.0:
+            correction_m = min(correction_m, self.depth_correction_max_m)
+        return float(correction_m)
+
+    def _applied_depth_correction(
+        self,
+        gate_camera: np.ndarray,
+        gate_camera_corrected: np.ndarray,
+    ) -> float:
+        raw_depth_m = float(np.asarray(gate_camera, dtype=float).reshape(3)[2])
+        corrected_depth_m = float(
+            np.asarray(gate_camera_corrected, dtype=float).reshape(3)[2]
+        )
+        applied_m = corrected_depth_m - raw_depth_m
+        if math.isfinite(applied_m):
+            return float(applied_m)
+        return self._depth_correction_for_camera(gate_camera)
 
     def _normalize_detection(self, detection: dict[str, Any], index: int) -> dict[str, Any]:
         detection_id = self._detection_id(detection, index)
 
         keypoints_px, keypoint_conf = self._keypoints_from_detection(detection)
         gate_camera = self._vec3(detection.get("gate_center_camera"), default=np.full(3, np.nan))
+        gate_camera_corrected = self._vec3(
+            detection.get("gate_center_camera_corrected"),
+            default=self._camera_with_depth_correction(gate_camera),
+        )
         gate_body = self._vec3(
             detection.get("gate_center_body"),
-            default=self.camera_to_body @ gate_camera,
+            default=self.camera_to_body @ gate_camera_corrected,
         )
         gate_world = detection.get("gate_center_world")
         gate_world = None if gate_world is None else self._vec3(gate_world, default=None)
@@ -668,7 +801,20 @@ class PerceptionWrapper:
             "object_points_m": self.object_points_m.copy(),
             "rvec": self._vec3(detection.get("rvec"), default=np.full(3, np.nan)),
             "tvec": self._vec3(detection.get("tvec"), default=gate_camera),
+            "tvec_corrected": self._vec3(
+                detection.get("tvec_corrected"),
+                default=gate_camera_corrected,
+            ),
             "gate_center_camera": gate_camera,
+            "gate_center_camera_corrected": gate_camera_corrected,
+            "depth_correction_m": self._float_or_default(
+                detection.get("depth_correction_m"),
+                self._applied_depth_correction(
+                    gate_camera,
+                    gate_camera_corrected,
+                ),
+                allow_nan=False,
+            ),
             "gate_center_body": gate_body,
             "gate_center_body_frd": self._vec3(
                 detection.get("gate_center_body_frd"),

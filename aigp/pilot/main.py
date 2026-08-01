@@ -13,6 +13,10 @@ SIM_SERVER_UDP_PORT = CONFIG.mavlink.port_for_mode(RUNNER_MODE)
 print(
     f"Starting main.py with "
     f"RUNNER_MODE={RUNNER_MODE}, "
+    f"COMPETITION_YAW_INVERTED={CONFIG.runtime.competition_yaw_inverted}, "
+    f"CALIBRATION_ONLY={CONFIG.runtime.calibration_only}, "
+    f"PERCEPTION_HOLD={CONFIG.runtime.perception_hold}, "
+    f"STARTUP_OBSERVATION={CONFIG.runtime.startup_observation_duration_s:.1f}s, "
     f"VISION_SOURCE={CONFIG.vision.source}, "
     f"MAVLINK={SIM_SERVER_UDP_IP}:{SIM_SERVER_UDP_PORT}, "
     f"CONFIG={CONFIG.path}",
@@ -39,6 +43,27 @@ autonomy_adapter = components["autonomy_adapter"]
 perception_adapter = components["perception_adapter"]
 
 
+def startup_observation_active():
+    return bool(
+        getattr(
+            autonomy_adapter.autonomy,
+            "startup_observation_active",
+            False,
+        )
+    )
+
+
+def startup_observation_command_status():
+    observation_status = str(
+        getattr(
+            autonomy_adapter.autonomy,
+            "startup_observation_status",
+            "waiting_perception",
+        )
+    )
+    return f"startup_observation_{observation_status}"
+
+
 def update_autonomy_command():
     lock = shared_data.get("lock")
 
@@ -50,15 +75,31 @@ def update_autonomy_command():
         local_position_ned = shared_data.get("local_position_ned")
         odometry = shared_data.get("odometry")
         track_gates = shared_data.get("track_gates")
+        race_status = shared_data.get("race_status")
+        collision = shared_data.get("collision")
         latest_perception = shared_data.get("latest_perception")
         armed = shared_data.get("armed")
         heartbeat = shared_data.get("heartbeat")
 
-    if frame is None or attitude is None or imu is None:
+    if (
+        attitude is None
+        or imu is None
+        or (
+            frame is None
+            and not (
+                CONFIG.runtime.calibration_only
+                or CONFIG.runtime.perception_hold
+            )
+        )
+    ):
         with lock:
             shared_data["latest_autonomy_command"] = None
             shared_data["latest_autonomy_command_wall_time"] = time.time()
-            shared_data["latest_autonomy_command_status"] = "missing_inputs"
+            shared_data["latest_autonomy_command_status"] = (
+                startup_observation_command_status()
+                if startup_observation_active()
+                else "missing_inputs"
+            )
             shared_data["latest_autonomy_active_track_count"] = 0
         return
 
@@ -73,6 +114,8 @@ def update_autonomy_command():
             local_position_ned=local_position_ned,
             odometry=odometry,
             track_gates=track_gates,
+            race_status=race_status,
+            collision=collision,
             latest_perception=latest_perception,
             armed=armed,
             heartbeat=heartbeat,
@@ -81,7 +124,11 @@ def update_autonomy_command():
             getattr(autonomy_adapter.autonomy, "active_track_count", 0)
         )
         latest_state_estimate = getattr(autonomy_adapter, "latest_state_estimate", None)
-        status = "ok"
+        status = (
+            startup_observation_command_status()
+            if startup_observation_active()
+            else "ok"
+        )
     except Exception as exc:
         cmd = None
         latest_state_estimate = getattr(autonomy_adapter, "latest_state_estimate", None)

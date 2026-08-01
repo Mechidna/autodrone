@@ -4,15 +4,26 @@ import threading
 
 from pymavlink import mavutil
 
+from autonomy_core.core.frame_conventions import (
+    competition_yaw_boundary_rad,
+    competition_yaw_rate_boundary,
+)
+
 ENCAPSULATED_RACE_STATUS_MSG_ID = 1
 ENCAPSULATED_TRACK_INFO_MSG_ID = 2
 
 
 class MAVLinkRX:
 
-    def __init__(self, mavlink_connection, data):
+    def __init__(self, mavlink_connection, data, config=None):
         self.mavlink_conn = mavlink_connection
         self.data = data
+        self.config = config
+        self.competition_yaw_inverted = bool(
+            config is not None
+            and str(config.runtime.runner_mode).lower() == "competition"
+            and config.runtime.competition_yaw_inverted
+        )
         self.thread = None
         self.is_running = False
 
@@ -22,8 +33,8 @@ class MAVLinkRX:
         self.expected_num_track_chunks = {}
 
     @classmethod
-    def create_mavlink_rx(cls, mavlink_connection, data):
-        rx = cls(mavlink_connection, data)
+    def create_mavlink_rx(cls, mavlink_connection, data, config=None):
+        rx = cls(mavlink_connection, data, config=config)
         rx.thread = threading.Thread(
             target=rx.mavlink_receive_loop,
             daemon=False,
@@ -177,13 +188,24 @@ class MAVLinkRX:
         self._store("timesync", timesync)
 
     def on_attitude(self, msg):
+        raw_yaw = float(msg.yaw)
+        raw_yawspeed = float(msg.yawspeed)
         attitude = {
             "roll": msg.roll,
             "pitch": msg.pitch,
-            "yaw": msg.yaw,
+            "yaw": competition_yaw_boundary_rad(
+                raw_yaw,
+                inverted=self.competition_yaw_inverted,
+            ),
             "rollspeed": msg.rollspeed,
             "pitchspeed": msg.pitchspeed,
-            "yawspeed": msg.yawspeed,
+            "yawspeed": competition_yaw_rate_boundary(
+                raw_yawspeed,
+                inverted=self.competition_yaw_inverted,
+            ),
+            "yaw_mavlink_raw": raw_yaw,
+            "yawspeed_mavlink_raw": raw_yawspeed,
+            "competition_yaw_inverted": self.competition_yaw_inverted,
             "time_boot_ms": msg.time_boot_ms,
             "wall_time": time.time(),
         }

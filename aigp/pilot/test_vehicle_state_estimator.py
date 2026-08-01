@@ -3,6 +3,10 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from autonomy_core.core.frame_conventions import (
+    body_frd_to_local_ned_rotmat,
+    local_ned_to_neu,
+)
 from runtime_config import load_runtime_config
 from vehicle_state_estimator import VehicleStateEstimator
 
@@ -381,6 +385,70 @@ def test_preserves_gazebo_camera_sim_world_projection():
         projected["detections"][0]["gate_center_world"],
         np.array([1.0, 2.0, 3.0]),
     )
+
+
+def test_estimator_projection_preserves_pitch_inverted_perception_attitude():
+    estimator = _estimator([0.0, 0.0, -0.02])
+    raw_pitch = np.deg2rad(17.8)
+    raw_yaw = np.deg2rad(-179.9)
+    gate_body = np.array([21.19, 0.39, -7.99], dtype=float)
+    latest_perception = {
+        "transform_mode": "physical_direct_rad_pitch_inverted",
+        "camera_translation_body": np.zeros(3, dtype=float),
+        "detections": [_detection(gate_body)],
+    }
+    estimate = SimpleNamespace(
+        valid=True,
+        pos_neu=np.array([0.0, 0.0, -0.02], dtype=float),
+        yaw_rad=raw_yaw,
+        source="local_position_ned",
+    )
+    snapshot = SimpleNamespace(
+        roll_rad=0.0,
+        pitch_rad=raw_pitch,
+        yaw_rad=raw_yaw,
+    )
+
+    projected = estimator.project_perception_with_estimated_state(
+        latest_perception,
+        estimate,
+        snapshot,
+    )
+    detection = projected["detections"][0]
+
+    np.testing.assert_allclose(
+        detection["drone_rpy_rad_used"],
+        [0.0, -raw_pitch, raw_yaw],
+    )
+    np.testing.assert_allclose(
+        detection["gate_center_world"],
+        [-22.62, -0.43, 1.11],
+        atol=2e-2,
+    )
+
+
+def test_landmark_vision_correction_uses_pitch_inverted_attitude():
+    estimator = _estimator([0.0, 0.0, 0.0])
+    raw_pitch = np.deg2rad(10.0)
+    gate_body = np.array([20.0, 0.0, 0.0], dtype=float)
+    corrected_rpy = np.array([0.0, -raw_pitch, 0.0], dtype=float)
+    landmark_neu = local_ned_to_neu(
+        body_frd_to_local_ned_rotmat(*corrected_rpy) @ gate_body
+    )
+    snapshot = _snapshot(
+        [{"track_id": 1, "position_neu": landmark_neu}],
+        [_detection(gate_body)],
+    )
+    snapshot.pitch_rad = raw_pitch
+    snapshot.latest_perception["transform_mode"] = (
+        "physical_direct_rad_pitch_inverted"
+    )
+
+    correction = estimator._correct_with_vision(snapshot)
+
+    assert correction["source"] == "stable_track:1"
+    assert correction["count"] == 1
+    np.testing.assert_allclose(estimator.pos_neu, np.zeros(3), atol=1e-9)
 
 
 def test_gazebo_camera_sim_skips_landmark_vision_correction():

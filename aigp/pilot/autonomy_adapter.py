@@ -19,7 +19,7 @@ class AttitudeCommand:
 @dataclass
 class AutonomyInputSnapshot:
     # Image
-    image_bgr: np.ndarray
+    image_bgr: Optional[np.ndarray]
     image_shape: tuple
     frame_id: int
     image_sim_time_ns: Optional[int]
@@ -51,6 +51,8 @@ class AutonomyInputSnapshot:
 
     # Optional race track data
     track_gates: Optional[list[dict[str, Any]]]
+    race_status: Optional[dict[str, Any]]
+    collision: Optional[dict[str, Any]]
 
     # Optional perception landmarks
     latest_perception: Optional[dict[str, Any]]
@@ -93,11 +95,32 @@ class AutonomyAdapter:
         local_position_ned=None,
         odometry=None,
         track_gates=None,
+        race_status=None,
+        collision=None,
         latest_perception=None,
         armed=None,
         heartbeat=None,
     ) -> AutonomyInputSnapshot:
-        image_bgr = frame["image"]
+        if frame is None:
+            if not (
+                self.config.runtime.calibration_only
+                or self.config.runtime.perception_hold
+            ):
+                raise ValueError(
+                    "frame is required unless calibration_only or "
+                    "perception_hold is enabled"
+                )
+            image_bgr = None
+            image_shape = ()
+            frame_id = -1
+            image_sim_time_ns = None
+            image_wall_time = 0.0
+        else:
+            image_bgr = frame["image"]
+            image_shape = tuple(frame.get("shape", image_bgr.shape))
+            frame_id = int(frame.get("frame_id", -1))
+            image_sim_time_ns = frame.get("sim_time_ns")
+            image_wall_time = float(frame.get("wall_time", 0.0))
 
         accel_xyz = self._vec3(imu.get("accel_xyz"))
         if accel_xyz is None:
@@ -171,10 +194,10 @@ class AutonomyAdapter:
 
         return AutonomyInputSnapshot(
             image_bgr=image_bgr,
-            image_shape=tuple(frame.get("shape", image_bgr.shape)),
-            frame_id=int(frame.get("frame_id", -1)),
-            image_sim_time_ns=frame.get("sim_time_ns"),
-            image_wall_time=float(frame.get("wall_time", 0.0)),
+            image_shape=image_shape,
+            frame_id=frame_id,
+            image_sim_time_ns=image_sim_time_ns,
+            image_wall_time=image_wall_time,
 
             roll_rad=float(attitude.get("roll", 0.0)),
             pitch_rad=float(attitude.get("pitch", 0.0)),
@@ -198,6 +221,12 @@ class AutonomyAdapter:
             position_wall_time=position_wall_time,
 
             track_gates=track_gates,
+            race_status=(
+                dict(race_status)
+                if isinstance(race_status, dict)
+                else None
+            ),
+            collision=(dict(collision) if isinstance(collision, dict) else None),
             latest_perception=latest_perception,
             timesync=timesync,
             armed=None if armed is None else bool(armed),
@@ -213,6 +242,8 @@ class AutonomyAdapter:
         local_position_ned=None,
         odometry=None,
         track_gates=None,
+        race_status=None,
+        collision=None,
         latest_perception=None,
         armed=None,
         heartbeat=None,
@@ -238,6 +269,8 @@ class AutonomyAdapter:
             local_position_ned=local_position_ned,
             odometry=odometry,
             track_gates=track_gates,
+            race_status=race_status,
+            collision=collision,
             latest_perception=latest_perception,
             armed=armed,
             heartbeat=heartbeat,

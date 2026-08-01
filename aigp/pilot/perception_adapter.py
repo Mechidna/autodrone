@@ -9,14 +9,21 @@ class PerceptionAdapter:
     def __init__(self, data, hz=None, config=None):
         self.data = data
         self.config = config if config is not None else load_runtime_config()
-        self.enabled = bool(self.config.perception.enabled)
+        self.calibration_only = bool(self.config.runtime.calibration_only)
+        self.enabled = (
+            bool(self.config.perception.enabled)
+            and bool(self.config.runtime.use_perception)
+            and not self.calibration_only
+        )
         self.hz = float(hz if hz is not None else self.config.perception.hz)
         self.period_s = 1.0 / max(1.0, self.hz)
         self.last_processed_frame_id = None
         self.thread = None
         self.is_running = False
         if not self.enabled:
-            self._write_status("disabled")
+            self._write_status(
+                "calibration_only" if self.calibration_only else "disabled"
+            )
             return
         self.adapter = PerceptionWrapper(config=self.config)
         self.is_running = True

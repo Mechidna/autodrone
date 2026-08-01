@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from dataclasses import dataclass
@@ -13,7 +14,13 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "runtime.toml"
 @dataclass(frozen=True)
 class RuntimeSection:
     runner_mode: str
+    competition_yaw_inverted: bool
     use_perception: bool
+    calibration_only: bool
+    perception_hold: bool
+    startup_observation_duration_s: float
+    perception_hold_settle_speed_m_s: float
+    perception_hold_settle_duration_s: float
     control_hz: float
     flow_status_period_s: float
     join_timeout_s: float
@@ -192,6 +199,9 @@ class PerceptionSection:
     backend: str
     hz: float
     gate_size_m: float
+    depth_correction_m: float
+    depth_correction_per_m: float
+    depth_correction_max_m: float
     yolo_model_path: Optional[str]
     preprocess_mode: str
     yolo_conf: float
@@ -237,6 +247,7 @@ class PerceptionGeometryAuditSection:
 class GateSourceSection:
     mode: str
     allow_ground_truth: bool
+    allow_competition_ground_truth_debug: bool
     known_gate_positions_neu: tuple[tuple[float, float, float], ...]
 
 
@@ -245,6 +256,10 @@ class GateMemorySection:
     association_radius: float
     commit_radius: float
     new_track_block_radius: float
+    known_position_commit_filter_enabled: bool
+    known_position_commit_radius_m: float
+    active_gate_transit_suppression_enabled: bool
+    active_gate_transit_suppression_radius_m: float
     min_confidence_per_hit: float
     commit_hits: int
     commit_confidence_sum: float
@@ -261,6 +276,14 @@ class GateMemorySection:
     max_outlier_distance: float
     max_committed_match_distance: float
     min_observation_time: float
+    temporal_image_association_enabled: bool
+    temporal_image_association_max_age_s: float
+    temporal_image_association_max_center_distance_px: float
+    temporal_image_association_max_size_ratio: float
+    temporal_image_association_min_depth_m: float
+    tiny_detection_area_px2: float
+    tiny_detection_min_hits_for_stable: int
+    tiny_detection_min_observation_time: float
     visibility_negative_evidence_enabled: bool
     visibility_min_projected_area_px2: float
     visibility_border_margin_px: float
@@ -295,6 +318,13 @@ class PlannerSection:
     vmax: float
     amax: float
     t_min: float
+    reference_progress_lag_hold_enabled: bool
+    reference_progress_lag_tolerance_m: float
+    reference_progress_lag_max_path_error_m: float
+    reference_progress_lag_max_lead_s: float
+    forward_progress_constraint_enabled: bool
+    forward_progress_min_speed_m_s: float
+    forward_progress_solver_max_iterations: int
     plan_validation_shape_enabled: bool
     plan_validation_samples_per_segment: int
     plan_validation_max_path_length_ratio: float
@@ -354,6 +384,8 @@ class PlannerSection:
     race_order_front_blocker_enabled: bool
     race_order_front_blocker_margin_m: float
     race_order_front_blocker_lateral_radius_m: float
+    race_order_gap_guard_enabled: bool
+    race_order_max_next_gate_gap_m: float
     provisional_next_gate_enabled: bool
     provisional_next_gate_min_hits: int
     provisional_next_gate_max_age_s: float
@@ -379,6 +411,11 @@ class ControllerSection:
     gravity: float
     kp: tuple[float, float, float]
     kv: tuple[float, float, float]
+    attitude_slew_limit_enabled: bool
+    max_roll_slew_rate_deg_s: float
+    max_pitch_slew_rate_deg_s: float
+    flight_nose_down_enabled: bool
+    flight_min_nose_down_deg: float
     max_tilt_deg: float
     max_acc_xy: float
     max_acc_z_up: float
@@ -390,7 +427,9 @@ class ControllerSection:
     near_reference_max_acc_z_up: float
     near_reference_max_acc_z_down: float
     lateral_accel_gain_xy: tuple[float, float]
+    tilt_thrust_compensation_enabled: bool
     thrust_hover: float
+    thrust_from_acc_gain: float
     thrust_min: float
     thrust_max: float
     fallback_thrust: float
@@ -417,10 +456,38 @@ class ControllerSection:
 
 
 @dataclass(frozen=True)
+class NoTargetSearchSection:
+    enabled: bool
+    require_armed: bool
+    require_race_start: bool
+    loss_grace_s: float
+    settle_horizontal_speed_m_s: float
+    forward_before_descent_enabled: bool
+    forward_distance_m: float
+    forward_reached_tolerance_m: float
+    descent_rate_m_s: float
+    max_descent_per_search_m: float
+    min_z_neu_m: float
+    candidate_min_hits: int
+    candidate_min_keypoint_conf: float
+    candidate_max_reprojection_error: float
+    candidate_min_image_area_px2: float
+    candidate_lost_grace_s: float
+    center_yaw_enabled: bool
+    center_yaw_deadband_px: float
+    center_yaw_max_rate_deg_s: float
+    center_vertical_enabled: bool
+    center_vertical_target_y_px: float
+    center_vertical_deadband_px: float
+    center_vertical_max_descent_rate_m_s: float
+
+
+@dataclass(frozen=True)
 class HoverAcquisitionSection:
     enabled: bool
     estimator_mode_only: bool
     require_armed: bool
+    require_race_start: bool
     initial_thrust: float
     min_thrust: float
     max_probe_thrust: float
@@ -469,6 +536,10 @@ class ThrustScaleCalibrationSection:
     min_probe_delta_thrust: float
     max_probe_delta_thrust: float
     min_samples: int
+    min_samples_per_sign: int
+    neutral_max_abs_vz_m_s: float
+    neutral_max_abs_accel_m_s2: float
+    max_sign_slope_disagreement: float
     accel_filter_alpha: float
     accel_deadband_m_s2: float
     min_abs_accel_m_s2: float
@@ -558,6 +629,7 @@ class PilotConfig:
     race: RaceSection
     planner: PlannerSection
     controller: ControllerSection
+    no_target_search: NoTargetSearchSection
     hover_acquisition: HoverAcquisitionSection
     thrust_scale_calibration: ThrustScaleCalibrationSection
     lateral_response_calibration: LateralResponseCalibrationSection
@@ -590,6 +662,7 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
     race_raw = _section(raw, "race")
     planner_raw = _section(raw, "planner")
     controller_raw = _section(raw, "controller")
+    no_target_search_raw = _section(raw, "no_target_search")
     hover_acquisition_raw = _section(raw, "hover_acquisition")
     thrust_scale_calibration_raw = _section(raw, "thrust_scale_calibration")
     lateral_response_calibration_raw = _section(raw, "lateral_response_calibration")
@@ -668,7 +741,33 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
         path=config_path,
         runtime=RuntimeSection(
             runner_mode=runner_mode,
+            competition_yaw_inverted=_env_bool(
+                "COMPETITION_YAW_INVERTED",
+                _bool(runtime_raw, "competition_yaw_inverted", False),
+            ),
             use_perception=_bool(runtime_raw, "use_perception", True),
+            calibration_only=_env_bool(
+                "CALIBRATION_ONLY",
+                _bool(runtime_raw, "calibration_only", False),
+            ),
+            perception_hold=_env_bool(
+                "PERCEPTION_HOLD",
+                _bool(runtime_raw, "perception_hold", False),
+            ),
+            startup_observation_duration_s=_env_float(
+                "STARTUP_OBSERVATION_DURATION_S",
+                _float(runtime_raw, "startup_observation_duration_s", 0.0),
+            ),
+            perception_hold_settle_speed_m_s=_float(
+                runtime_raw,
+                "perception_hold_settle_speed_m_s",
+                0.15,
+            ),
+            perception_hold_settle_duration_s=_float(
+                runtime_raw,
+                "perception_hold_settle_duration_s",
+                0.50,
+            ),
             control_hz=control_hz,
             flow_status_period_s=_float(runtime_raw, "flow_status_period_s", 1.0),
             join_timeout_s=_float(runtime_raw, "join_timeout_s", 1.0),
@@ -999,6 +1098,18 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             backend=_env_str("PERCEPTION_BACKEND", _str(perception_raw, "backend", "blue")).lower(),
             hz=_env_float("PERCEPTION_HZ", _float(perception_raw, "hz", 30.0)),
             gate_size_m=_float(perception_raw, "gate_size_m", 1.5),
+            depth_correction_m=_env_float(
+                "PERCEPTION_DEPTH_CORRECTION_M",
+                _float(perception_raw, "depth_correction_m", 0.0),
+            ),
+            depth_correction_per_m=_env_float(
+                "PERCEPTION_DEPTH_CORRECTION_PER_M",
+                _float(perception_raw, "depth_correction_per_m", 0.0),
+            ),
+            depth_correction_max_m=_env_float(
+                "PERCEPTION_DEPTH_CORRECTION_MAX_M",
+                _float(perception_raw, "depth_correction_max_m", 0.0),
+            ),
             yolo_model_path=_env_str_optional(
                 "YOLO_MODEL_PATH",
                 _str_optional(perception_raw, "yolo_model_path", None),
@@ -1141,6 +1252,14 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 _str(gate_source_raw, "mode", "perception"),
             ).lower(),
             allow_ground_truth=_bool(gate_source_raw, "allow_ground_truth", False),
+            allow_competition_ground_truth_debug=_env_bool(
+                "ALLOW_COMPETITION_GROUND_TRUTH_DEBUG",
+                _bool(
+                    gate_source_raw,
+                    "allow_competition_ground_truth_debug",
+                    False,
+                ),
+            ),
             known_gate_positions_neu=tuple(
                 _vec3_tuple(item)
                 for item in (
@@ -1153,6 +1272,35 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             association_radius=_float(gate_memory_raw, "association_radius", 1.5),
             commit_radius=_float(gate_memory_raw, "commit_radius", 1.5),
             new_track_block_radius=_float(gate_memory_raw, "new_track_block_radius", 4.5),
+            known_position_commit_filter_enabled=_env_bool(
+                "KNOWN_POSITION_COMMIT_FILTER_ENABLED",
+                _bool(
+                    gate_memory_raw,
+                    "known_position_commit_filter_enabled",
+                    False,
+                ),
+            ),
+            known_position_commit_radius_m=_env_float(
+                "KNOWN_POSITION_COMMIT_RADIUS_M",
+                _float(
+                    gate_memory_raw,
+                    "known_position_commit_radius_m",
+                    5.0,
+                ),
+            ),
+            active_gate_transit_suppression_enabled=_bool(
+                gate_memory_raw,
+                "active_gate_transit_suppression_enabled",
+                True,
+            ),
+            active_gate_transit_suppression_radius_m=max(
+                0.0,
+                _float(
+                    gate_memory_raw,
+                    "active_gate_transit_suppression_radius_m",
+                    4.0,
+                ),
+            ),
             min_confidence_per_hit=_float(gate_memory_raw, "min_confidence_per_hit", 0.2),
             commit_hits=_int(gate_memory_raw, "commit_hits", 6),
             commit_confidence_sum=_float(gate_memory_raw, "commit_confidence_sum", 1.8),
@@ -1181,6 +1329,46 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 0.60,
             ),
             min_observation_time=_float(gate_memory_raw, "min_observation_time", 0.50),
+            temporal_image_association_enabled=_bool(
+                gate_memory_raw,
+                "temporal_image_association_enabled",
+                True,
+            ),
+            temporal_image_association_max_age_s=_float(
+                gate_memory_raw,
+                "temporal_image_association_max_age_s",
+                1.0,
+            ),
+            temporal_image_association_max_center_distance_px=_float(
+                gate_memory_raw,
+                "temporal_image_association_max_center_distance_px",
+                2.5,
+            ),
+            temporal_image_association_max_size_ratio=_float(
+                gate_memory_raw,
+                "temporal_image_association_max_size_ratio",
+                1.5,
+            ),
+            temporal_image_association_min_depth_m=_float(
+                gate_memory_raw,
+                "temporal_image_association_min_depth_m",
+                20.0,
+            ),
+            tiny_detection_area_px2=_float(
+                gate_memory_raw,
+                "tiny_detection_area_px2",
+                50.0,
+            ),
+            tiny_detection_min_hits_for_stable=_int(
+                gate_memory_raw,
+                "tiny_detection_min_hits_for_stable",
+                6,
+            ),
+            tiny_detection_min_observation_time=_float(
+                gate_memory_raw,
+                "tiny_detection_min_observation_time",
+                0.5,
+            ),
             visibility_negative_evidence_enabled=_bool(
                 gate_memory_raw,
                 "visibility_negative_evidence_enabled",
@@ -1262,6 +1450,44 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             vmax=_float(planner_raw, "vmax", 2.5),
             amax=_float(planner_raw, "amax", 2.0),
             t_min=_float(planner_raw, "t_min", 1.0),
+            reference_progress_lag_hold_enabled=_bool(
+                planner_raw,
+                "reference_progress_lag_hold_enabled",
+                False,
+            ),
+            reference_progress_lag_tolerance_m=_float(
+                planner_raw,
+                "reference_progress_lag_tolerance_m",
+                1.0,
+            ),
+            reference_progress_lag_max_path_error_m=_float(
+                planner_raw,
+                "reference_progress_lag_max_path_error_m",
+                4.0,
+            ),
+            reference_progress_lag_max_lead_s=_float(
+                planner_raw,
+                "reference_progress_lag_max_lead_s",
+                0.30,
+            ),
+            forward_progress_constraint_enabled=_bool(
+                planner_raw,
+                "forward_progress_constraint_enabled",
+                False,
+            ),
+            forward_progress_min_speed_m_s=_float(
+                planner_raw,
+                "forward_progress_min_speed_m_s",
+                0.0,
+            ),
+            forward_progress_solver_max_iterations=max(
+                1,
+                _int(
+                    planner_raw,
+                    "forward_progress_solver_max_iterations",
+                    300,
+                ),
+            ),
             plan_validation_shape_enabled=_bool(
                 planner_raw,
                 "plan_validation_shape_enabled",
@@ -1530,6 +1756,16 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 "race_order_front_blocker_lateral_radius_m",
                 6.0,
             ),
+            race_order_gap_guard_enabled=_bool(
+                planner_raw,
+                "race_order_gap_guard_enabled",
+                False,
+            ),
+            race_order_max_next_gate_gap_m=_float(
+                planner_raw,
+                "race_order_max_next_gate_gap_m",
+                45.0,
+            ),
             provisional_next_gate_enabled=_bool(
                 planner_raw,
                 "provisional_next_gate_enabled",
@@ -1604,6 +1840,29 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             gravity=_float(controller_raw, "gravity", 9.81),
             kp=_float_tuple(controller_raw.get("kp"), (2.5, 2.5, 1.6), 3),
             kv=_float_tuple(controller_raw.get("kv"), (2.0, 2.0, 1.1), 3),
+            attitude_slew_limit_enabled=_bool(
+                controller_raw,
+                "attitude_slew_limit_enabled",
+                False,
+            ),
+            max_roll_slew_rate_deg_s=_float(
+                controller_raw,
+                "max_roll_slew_rate_deg_s",
+                30.0,
+            ),
+            max_pitch_slew_rate_deg_s=_float(
+                controller_raw,
+                "max_pitch_slew_rate_deg_s",
+                30.0,
+            ),
+            flight_nose_down_enabled=_env_bool(
+                "FLIGHT_NOSE_DOWN_ENABLED",
+                _bool(controller_raw, "flight_nose_down_enabled", False),
+            ),
+            flight_min_nose_down_deg=_env_float(
+                "FLIGHT_MIN_NOSE_DOWN_DEG",
+                _float(controller_raw, "flight_min_nose_down_deg", 5.0),
+            ),
             max_tilt_deg=_float(controller_raw, "max_tilt_deg", 20.0),
             max_acc_xy=_float(controller_raw, "max_acc_xy", 2.0),
             max_acc_z_up=_float(controller_raw, "max_acc_z_up", 1.2),
@@ -1643,10 +1902,20 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 (1.0, 1.0),
                 2,
             ),
+            tilt_thrust_compensation_enabled=_bool(
+                controller_raw,
+                "tilt_thrust_compensation_enabled",
+                False,
+            ),
             thrust_hover=_float(
                 controller_raw,
                 "thrust_hover_initial",
                 _float(controller_raw, "thrust_hover", 0.5),
+            ),
+            thrust_from_acc_gain=_float(
+                controller_raw,
+                "thrust_from_acc_gain",
+                1.0 / _float(controller_raw, "gravity", 9.81),
             ),
             thrust_min=0.0,
             thrust_max=1.0,
@@ -1720,6 +1989,109 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             max_yaw_rate_deg_s=_float(controller_raw, "max_yaw_rate_deg_s", 90.0),
             command_print_period_s=_float(controller_raw, "command_print_period_s", 1.0),
         ),
+        no_target_search=NoTargetSearchSection(
+            enabled=_env_bool(
+                "NO_TARGET_SEARCH_ENABLED",
+                _bool(no_target_search_raw, "enabled", False),
+            ),
+            require_armed=_bool(no_target_search_raw, "require_armed", True),
+            require_race_start=_bool(
+                no_target_search_raw,
+                "require_race_start",
+                True,
+            ),
+            loss_grace_s=_float(no_target_search_raw, "loss_grace_s", 1.0),
+            settle_horizontal_speed_m_s=_float(
+                no_target_search_raw,
+                "settle_horizontal_speed_m_s",
+                0.30,
+            ),
+            forward_before_descent_enabled=_bool(
+                no_target_search_raw,
+                "forward_before_descent_enabled",
+                False,
+            ),
+            forward_distance_m=_float(
+                no_target_search_raw,
+                "forward_distance_m",
+                2.0,
+            ),
+            forward_reached_tolerance_m=_float(
+                no_target_search_raw,
+                "forward_reached_tolerance_m",
+                0.25,
+            ),
+            descent_rate_m_s=_float(
+                no_target_search_raw,
+                "descent_rate_m_s",
+                0.25,
+            ),
+            max_descent_per_search_m=_float(
+                no_target_search_raw,
+                "max_descent_per_search_m",
+                10.0,
+            ),
+            min_z_neu_m=_float(no_target_search_raw, "min_z_neu_m", -28.0),
+            candidate_min_hits=max(
+                1,
+                _int(no_target_search_raw, "candidate_min_hits", 1),
+            ),
+            candidate_min_keypoint_conf=_float(
+                no_target_search_raw,
+                "candidate_min_keypoint_conf",
+                0.60,
+            ),
+            candidate_max_reprojection_error=_float(
+                no_target_search_raw,
+                "candidate_max_reprojection_error",
+                1.25,
+            ),
+            candidate_min_image_area_px2=_float(
+                no_target_search_raw,
+                "candidate_min_image_area_px2",
+                20.0,
+            ),
+            candidate_lost_grace_s=_float(
+                no_target_search_raw,
+                "candidate_lost_grace_s",
+                0.75,
+            ),
+            center_yaw_enabled=_bool(
+                no_target_search_raw,
+                "center_yaw_enabled",
+                True,
+            ),
+            center_yaw_deadband_px=_float(
+                no_target_search_raw,
+                "center_yaw_deadband_px",
+                35.0,
+            ),
+            center_yaw_max_rate_deg_s=_float(
+                no_target_search_raw,
+                "center_yaw_max_rate_deg_s",
+                4.0,
+            ),
+            center_vertical_enabled=_bool(
+                no_target_search_raw,
+                "center_vertical_enabled",
+                False,
+            ),
+            center_vertical_target_y_px=_float(
+                no_target_search_raw,
+                "center_vertical_target_y_px",
+                180.0,
+            ),
+            center_vertical_deadband_px=_float(
+                no_target_search_raw,
+                "center_vertical_deadband_px",
+                30.0,
+            ),
+            center_vertical_max_descent_rate_m_s=_float(
+                no_target_search_raw,
+                "center_vertical_max_descent_rate_m_s",
+                0.25,
+            ),
+        ),
         hover_acquisition=HoverAcquisitionSection(
             enabled=_bool(hover_acquisition_raw, "enabled", True),
             estimator_mode_only=_bool(
@@ -1728,6 +2100,11 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 True,
             ),
             require_armed=_bool(hover_acquisition_raw, "require_armed", True),
+            require_race_start=_bool(
+                hover_acquisition_raw,
+                "require_race_start",
+                False,
+            ),
             initial_thrust=_float(
                 hover_acquisition_raw,
                 "initial_thrust",
@@ -1874,6 +2251,26 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
                 0.08,
             ),
             min_samples=_int(thrust_scale_calibration_raw, "min_samples", 12),
+            min_samples_per_sign=_int(
+                thrust_scale_calibration_raw,
+                "min_samples_per_sign",
+                6,
+            ),
+            neutral_max_abs_vz_m_s=_float(
+                thrust_scale_calibration_raw,
+                "neutral_max_abs_vz_m_s",
+                0.20,
+            ),
+            neutral_max_abs_accel_m_s2=_float(
+                thrust_scale_calibration_raw,
+                "neutral_max_abs_accel_m_s2",
+                0.50,
+            ),
+            max_sign_slope_disagreement=_float(
+                thrust_scale_calibration_raw,
+                "max_sign_slope_disagreement",
+                0.35,
+            ),
             accel_filter_alpha=_float(
                 thrust_scale_calibration_raw,
                 "accel_filter_alpha",
@@ -2082,10 +2479,90 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
 
 
 def _validate(config: PilotConfig) -> None:
+    for key, value in (
+        ("depth_correction_m", config.perception.depth_correction_m),
+        (
+            "depth_correction_per_m",
+            config.perception.depth_correction_per_m,
+        ),
+        (
+            "depth_correction_max_m",
+            config.perception.depth_correction_max_m,
+        ),
+    ):
+        if not math.isfinite(float(value)):
+            raise RuntimeError(f"perception.{key} must be finite.")
+    if config.perception.depth_correction_per_m < 0.0:
+        raise RuntimeError(
+            "perception.depth_correction_per_m must be non-negative."
+        )
+    if config.perception.depth_correction_max_m < 0.0:
+        raise RuntimeError(
+            "perception.depth_correction_max_m must be non-negative."
+        )
     if config.runtime.runner_mode not in ("px4", "competition"):
         raise RuntimeError(
             f"Invalid runner_mode={config.runtime.runner_mode!r}. "
             "Use runner_mode='px4' or runner_mode='competition'."
+        )
+    if config.runtime.calibration_only and config.runtime.perception_hold:
+        raise RuntimeError(
+            "runtime.calibration_only and runtime.perception_hold are mutually "
+            "exclusive."
+        )
+    if config.runtime.startup_observation_duration_s < 0.0:
+        raise RuntimeError(
+            "runtime.startup_observation_duration_s must be non-negative."
+        )
+    if config.runtime.perception_hold and not config.runtime.use_perception:
+        raise RuntimeError(
+            "runtime.perception_hold requires runtime.use_perception=true."
+        )
+    if config.runtime.perception_hold and not config.perception.enabled:
+        raise RuntimeError(
+            "runtime.perception_hold requires perception.enabled=true."
+        )
+    if (
+        config.runtime.perception_hold
+        and str(config.state_estimation.mode).lower() != "mavlink"
+    ):
+        raise RuntimeError(
+            "runtime.perception_hold requires state_estimation.mode='mavlink' "
+            "so perception cannot influence the hold state."
+        )
+    if (
+        config.runtime.perception_hold
+        and str(config.gate_source.mode).lower() != "perception"
+    ):
+        raise RuntimeError(
+            "runtime.perception_hold requires gate_source.mode='perception'."
+        )
+    if (
+        config.runtime.perception_hold
+        and not config.lateral_response_calibration.z_hold_enabled
+    ):
+        raise RuntimeError(
+            "runtime.perception_hold requires "
+            "lateral_response_calibration.z_hold_enabled=true."
+        )
+    if (
+        config.runtime.perception_hold
+        and (
+            config.lateral_response_calibration.probe_accel_m_s2 <= 0.0
+            or config.lateral_response_calibration.max_tilt_deg <= 0.0
+        )
+    ):
+        raise RuntimeError(
+            "runtime.perception_hold requires positive lateral hold acceleration "
+            "and tilt limits."
+        )
+    if config.runtime.perception_hold_settle_speed_m_s < 0.0:
+        raise RuntimeError(
+            "runtime.perception_hold_settle_speed_m_s must be non-negative."
+        )
+    if config.runtime.perception_hold_settle_duration_s < 0.0:
+        raise RuntimeError(
+            "runtime.perception_hold_settle_duration_s must be non-negative."
         )
     if config.camera.mount_profile not in (
         "competition",
@@ -2199,11 +2676,16 @@ def _validate(config: PilotConfig) -> None:
             "Use 'perception' or 'ground_truth'."
         )
     if config.gate_source.mode == "ground_truth":
-        if config.runtime.runner_mode == "competition":
+        if (
+            config.runtime.runner_mode == "competition"
+            and not config.gate_source.allow_competition_ground_truth_debug
+        ):
             raise RuntimeError(
                 "gate_source.mode='ground_truth' is debug-only and not competition-valid. "
                 "VADR-TS-002 does not provide fixed gate coordinates to contestant "
-                "software."
+                "software. For a local planner/debug run over the competition transport, "
+                "explicitly set ALLOW_COMPETITION_GROUND_TRUTH_DEBUG=true (or "
+                "gate_source.allow_competition_ground_truth_debug=true)."
             )
         if not config.gate_source.allow_ground_truth:
             raise RuntimeError(
@@ -2332,10 +2814,150 @@ def _validate(config: PilotConfig) -> None:
         raise RuntimeError("controller thrust_min/thrust_max must stay within [0.0, 1.0].")
     if not 0.0 <= config.controller.thrust_hover <= 1.0:
         raise RuntimeError("controller thrust_hover_initial must stay within [0.0, 1.0].")
+    if config.controller.thrust_from_acc_gain <= 0.0:
+        raise RuntimeError("controller.thrust_from_acc_gain must be positive.")
     if not 0.0 <= config.controller.fallback_thrust <= 1.0:
         raise RuntimeError("controller fallback_thrust must stay within [0.0, 1.0].")
     if any(float(value) <= 0.0 for value in config.controller.lateral_accel_gain_xy):
         raise RuntimeError("controller.lateral_accel_gain_xy values must be positive.")
+    for key, value in (
+        (
+            "max_roll_slew_rate_deg_s",
+            config.controller.max_roll_slew_rate_deg_s,
+        ),
+        (
+            "max_pitch_slew_rate_deg_s",
+            config.controller.max_pitch_slew_rate_deg_s,
+        ),
+    ):
+        if float(value) < 0.0:
+            raise RuntimeError(f"controller.{key} must be non-negative.")
+        if config.controller.attitude_slew_limit_enabled and float(value) <= 0.0:
+            raise RuntimeError(
+                f"controller.{key} must be positive when "
+                "attitude_slew_limit_enabled=true."
+            )
+    if config.controller.flight_min_nose_down_deg < 0.0:
+        raise RuntimeError(
+            "controller.flight_min_nose_down_deg must be non-negative."
+        )
+    if (
+        config.controller.flight_nose_down_enabled
+        and config.controller.flight_min_nose_down_deg
+        > config.controller.max_tilt_deg
+    ):
+        raise RuntimeError(
+            "controller.flight_min_nose_down_deg must not exceed "
+            "controller.max_tilt_deg when flight_nose_down_enabled=true."
+        )
+    for key, value in (
+        ("loss_grace_s", config.no_target_search.loss_grace_s),
+        (
+            "settle_horizontal_speed_m_s",
+            config.no_target_search.settle_horizontal_speed_m_s,
+        ),
+        (
+            "forward_distance_m",
+            config.no_target_search.forward_distance_m,
+        ),
+        (
+            "forward_reached_tolerance_m",
+            config.no_target_search.forward_reached_tolerance_m,
+        ),
+        ("descent_rate_m_s", config.no_target_search.descent_rate_m_s),
+        (
+            "max_descent_per_search_m",
+            config.no_target_search.max_descent_per_search_m,
+        ),
+        (
+            "candidate_min_keypoint_conf",
+            config.no_target_search.candidate_min_keypoint_conf,
+        ),
+        (
+            "candidate_max_reprojection_error",
+            config.no_target_search.candidate_max_reprojection_error,
+        ),
+        (
+            "candidate_min_image_area_px2",
+            config.no_target_search.candidate_min_image_area_px2,
+        ),
+        (
+            "candidate_lost_grace_s",
+            config.no_target_search.candidate_lost_grace_s,
+        ),
+        (
+            "center_yaw_deadband_px",
+            config.no_target_search.center_yaw_deadband_px,
+        ),
+        (
+            "center_yaw_max_rate_deg_s",
+            config.no_target_search.center_yaw_max_rate_deg_s,
+        ),
+        (
+            "center_vertical_target_y_px",
+            config.no_target_search.center_vertical_target_y_px,
+        ),
+        (
+            "center_vertical_deadband_px",
+            config.no_target_search.center_vertical_deadband_px,
+        ),
+        (
+            "center_vertical_max_descent_rate_m_s",
+            config.no_target_search.center_vertical_max_descent_rate_m_s,
+        ),
+    ):
+        if float(value) < 0.0:
+            raise RuntimeError(f"no_target_search.{key} must be non-negative.")
+    if (
+        config.no_target_search.enabled
+        and config.no_target_search.descent_rate_m_s <= 0.0
+    ):
+        raise RuntimeError(
+            "no_target_search.descent_rate_m_s must be positive when enabled=true."
+        )
+    if (
+        config.no_target_search.enabled
+        and config.no_target_search.forward_before_descent_enabled
+        and config.no_target_search.forward_distance_m <= 0.0
+    ):
+        raise RuntimeError(
+            "no_target_search.forward_distance_m must be positive when the "
+            "forward phase is enabled."
+        )
+    if (
+        config.no_target_search.enabled
+        and config.no_target_search.forward_before_descent_enabled
+        and (
+            config.no_target_search.forward_reached_tolerance_m <= 0.0
+            or config.no_target_search.forward_reached_tolerance_m
+            >= config.no_target_search.forward_distance_m
+        )
+    ):
+        raise RuntimeError(
+            "no_target_search.forward_reached_tolerance_m must be positive and "
+            "smaller than forward_distance_m when the forward phase is enabled."
+        )
+    if (
+        config.no_target_search.enabled
+        and config.no_target_search.max_descent_per_search_m <= 0.0
+    ):
+        raise RuntimeError(
+            "no_target_search.max_descent_per_search_m must be positive when "
+            "enabled=true."
+        )
+    if (
+        config.no_target_search.enabled
+        and config.no_target_search.center_vertical_enabled
+        and config.no_target_search.center_vertical_max_descent_rate_m_s <= 0.0
+    ):
+        raise RuntimeError(
+            "no_target_search.center_vertical_max_descent_rate_m_s must be "
+            "positive when vertical centering is enabled."
+        )
+    if config.no_target_search.candidate_min_keypoint_conf > 1.0:
+        raise RuntimeError(
+            "no_target_search.candidate_min_keypoint_conf must be within [0, 1]."
+        )
     for key, value in (
         ("max_acc_z_slew_m_s3", config.controller.max_acc_z_slew_m_s3),
         ("max_acc_z_slew_reset_s", config.controller.max_acc_z_slew_reset_s),
@@ -2500,6 +3122,30 @@ def _validate(config: PilotConfig) -> None:
             config.gate_memory.min_keypoint_conf_for_stable,
         ),
         (
+            "gate_memory.temporal_image_association_max_age_s",
+            config.gate_memory.temporal_image_association_max_age_s,
+        ),
+        (
+            "gate_memory.known_position_commit_radius_m",
+            config.gate_memory.known_position_commit_radius_m,
+        ),
+        (
+            "gate_memory.temporal_image_association_max_center_distance_px",
+            config.gate_memory.temporal_image_association_max_center_distance_px,
+        ),
+        (
+            "gate_memory.temporal_image_association_min_depth_m",
+            config.gate_memory.temporal_image_association_min_depth_m,
+        ),
+        (
+            "gate_memory.tiny_detection_area_px2",
+            config.gate_memory.tiny_detection_area_px2,
+        ),
+        (
+            "gate_memory.tiny_detection_min_observation_time",
+            config.gate_memory.tiny_detection_min_observation_time,
+        ),
+        (
             "gate_memory.visibility_min_projected_area_px2",
             config.gate_memory.visibility_min_projected_area_px2,
         ),
@@ -2528,12 +3174,32 @@ def _validate(config: PilotConfig) -> None:
             config.planner.race_order_front_blocker_lateral_radius_m,
         ),
         (
+            "planner.race_order_max_next_gate_gap_m",
+            config.planner.race_order_max_next_gate_gap_m,
+        ),
+        (
             "planner.terminal_speed_m_s",
             config.planner.terminal_speed_m_s,
         ),
         (
             "planner.yaw_reference_motion_distance_m",
             config.planner.yaw_reference_motion_distance_m,
+        ),
+        (
+            "planner.forward_progress_min_speed_m_s",
+            config.planner.forward_progress_min_speed_m_s,
+        ),
+        (
+            "planner.reference_progress_lag_tolerance_m",
+            config.planner.reference_progress_lag_tolerance_m,
+        ),
+        (
+            "planner.reference_progress_lag_max_path_error_m",
+            config.planner.reference_progress_lag_max_path_error_m,
+        ),
+        (
+            "planner.reference_progress_lag_max_lead_s",
+            config.planner.reference_progress_lag_max_lead_s,
         ),
         (
             "planner.plan_validation_max_path_length_ratio",
@@ -2600,6 +3266,30 @@ def _validate(config: PilotConfig) -> None:
         )
     if config.gate_memory.visibility_miss_frames < 1:
         raise RuntimeError("gate_memory.visibility_miss_frames must be at least 1.")
+    if config.gate_memory.temporal_image_association_max_size_ratio < 1.0:
+        raise RuntimeError(
+            "gate_memory.temporal_image_association_max_size_ratio must be at least 1.0."
+        )
+    if config.gate_memory.tiny_detection_min_hits_for_stable < 1:
+        raise RuntimeError(
+            "gate_memory.tiny_detection_min_hits_for_stable must be at least 1."
+        )
+    if (
+        config.gate_memory.known_position_commit_filter_enabled
+        and config.gate_memory.known_position_commit_radius_m <= 0.0
+    ):
+        raise RuntimeError(
+            "gate_memory.known_position_commit_radius_m must be positive when "
+            "known_position_commit_filter_enabled=true."
+        )
+    if (
+        config.gate_memory.known_position_commit_filter_enabled
+        and not config.gate_source.known_gate_positions_neu
+    ):
+        raise RuntimeError(
+            "gate_memory.known_position_commit_filter_enabled requires "
+            "gate_source.known_gate_positions_neu."
+        )
     if config.perception_geometry_audit.max_prints < 0:
         raise RuntimeError("perception_geometry_audit.max_prints must be non-negative.")
     if config.planner.plan_validation_samples_per_segment < 2:
@@ -2652,6 +3342,10 @@ def _validate(config: PilotConfig) -> None:
         raise RuntimeError("thrust_scale_calibration.max_duration_s must be positive.")
     if config.thrust_scale_calibration.min_samples < 1:
         raise RuntimeError("thrust_scale_calibration.min_samples must be at least 1.")
+    if config.thrust_scale_calibration.min_samples_per_sign < 1:
+        raise RuntimeError(
+            "thrust_scale_calibration.min_samples_per_sign must be at least 1."
+        )
     if (
         config.thrust_scale_calibration.min_probe_delta_thrust < 0.0
         or config.thrust_scale_calibration.max_probe_delta_thrust < 0.0
@@ -2678,6 +3372,18 @@ def _validate(config: PilotConfig) -> None:
         ("min_duration_s", config.thrust_scale_calibration.min_duration_s),
         ("phase_duration_s", config.thrust_scale_calibration.phase_duration_s),
         ("settle_duration_s", config.thrust_scale_calibration.settle_duration_s),
+        (
+            "neutral_max_abs_vz_m_s",
+            config.thrust_scale_calibration.neutral_max_abs_vz_m_s,
+        ),
+        (
+            "neutral_max_abs_accel_m_s2",
+            config.thrust_scale_calibration.neutral_max_abs_accel_m_s2,
+        ),
+        (
+            "max_sign_slope_disagreement",
+            config.thrust_scale_calibration.max_sign_slope_disagreement,
+        ),
         ("accel_filter_alpha", config.thrust_scale_calibration.accel_filter_alpha),
         ("accel_deadband_m_s2", config.thrust_scale_calibration.accel_deadband_m_s2),
         ("min_abs_accel_m_s2", config.thrust_scale_calibration.min_abs_accel_m_s2),
@@ -2913,6 +3619,22 @@ def _env_int(name: str, default: Optional[int]) -> Optional[int]:
         return int(value)
     except ValueError:
         return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return bool(default)
+
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise RuntimeError(
+        f"Invalid boolean environment variable {name}={value!r}. "
+        "Use true/false, 1/0, yes/no, or on/off."
+    )
 
 
 def _env_float(name: str, default: float) -> float:

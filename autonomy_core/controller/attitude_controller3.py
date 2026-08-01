@@ -79,6 +79,7 @@ class RPGHighLevelTracker:
         thrust_max=0.80,
         thrust_from_acc_gain=None,
         lateral_accel_gain_xy=(1.0, 1.0),
+        tilt_thrust_compensation_enabled=False,
         max_acc_z_slew_m_s3=0.0,
         max_acc_z_slew_reset_s=0.5,
         near_reference_z_error_m=0.0,
@@ -110,6 +111,9 @@ class RPGHighLevelTracker:
             lateral_accel_gain_xy,
             dtype=float,
         ).reshape(2)
+        self.tilt_thrust_compensation_enabled = bool(
+            tilt_thrust_compensation_enabled
+        )
         self.max_acc_z_slew_m_s3 = max(0.0, float(max_acc_z_slew_m_s3))
         self.max_acc_z_slew_reset_s = max(0.0, float(max_acc_z_slew_reset_s))
         self.near_reference_z_error_m = max(0.0, float(near_reference_z_error_m))
@@ -131,6 +135,47 @@ class RPGHighLevelTracker:
     def reset_vertical_limiter(self):
         self._last_acc_z_cmd = None
         self._last_update_time = None
+
+    def thrust_for_attitude(
+        self,
+        thrust_uncompensated,
+        roll_rad,
+        pitch_rad,
+    ):
+        """Apply optional tilt compensation for the attitude actually commanded."""
+        thrust_uncompensated = float(thrust_uncompensated)
+        tilt_vertical_fraction = float(
+            np.cos(float(roll_rad)) * np.cos(float(pitch_rad))
+        )
+        if self.tilt_thrust_compensation_enabled:
+            # Preserve the requested vertical thrust component while tilted.
+            # The safety floor avoids an unbounded correction if limits change.
+            tilt_thrust_compensation_factor = (
+                1.0 / max(0.25, tilt_vertical_fraction)
+            )
+        else:
+            tilt_thrust_compensation_factor = 1.0
+        thrust_raw_before_clamp = (
+            thrust_uncompensated * tilt_thrust_compensation_factor
+        )
+        thrust_cmd = clamp(
+            thrust_raw_before_clamp,
+            self.thrust_min,
+            self.thrust_max,
+        )
+        return thrust_cmd, {
+            "thrust_uncompensated": thrust_uncompensated,
+            "tilt_vertical_fraction": tilt_vertical_fraction,
+            "tilt_thrust_compensation_factor": (
+                tilt_thrust_compensation_factor
+            ),
+            "tilt_thrust_compensation_enabled": (
+                self.tilt_thrust_compensation_enabled
+            ),
+            "thrust_raw_before_clamp": thrust_raw_before_clamp,
+            "thrust_cmd_after_clamp": thrust_cmd,
+            "thrust_limited": bool(thrust_cmd != thrust_raw_before_clamp),
+        }
 
     def _limit_acceleration(self, a_cmd_no_g, *, near_reference=False):
         """
@@ -272,9 +317,15 @@ class RPGHighLevelTracker:
         # Collective thrust:
         # RPG computes commanded thrust from desired accel projected onto current body z axis. :contentReference[oaicite:3]{index=3}
         # For PX4 normalized thrust, a practical approximation is to map desired vertical accel to normalized thrust.
-        thrust_raw_before_clamp = self.thrust_hover + self.thrust_from_acc_gain * a_cmd_no_g[2]
-        thrust_cmd = thrust_raw_before_clamp
-        thrust_cmd = clamp(thrust_cmd, self.thrust_min, self.thrust_max)
+        thrust_uncompensated = (
+            self.thrust_hover
+            + self.thrust_from_acc_gain * a_cmd_no_g[2]
+        )
+        thrust_cmd, thrust_debug = self.thrust_for_attitude(
+            thrust_uncompensated,
+            roll_des,
+            pitch_des,
+        )
 
         # r1, p1, y1 = rotmat_to_euler_zyx(R_des)
         # r2, p2, y2 = rotmat_to_euler_zyx(R_des.T)
@@ -297,9 +348,7 @@ class RPGHighLevelTracker:
             "z_b_des": z_b_des,
             "R_des": R_des,
             "yaw_des_from_R": yaw_des_from_R,
-            "thrust_raw_before_clamp": thrust_raw_before_clamp,
-            "thrust_cmd_after_clamp": thrust_cmd,
-            "thrust_limited": bool(thrust_cmd != thrust_raw_before_clamp),
+            **thrust_debug,
             "hover_thrust": self.thrust_hover,
             "lateral_accel_gain_xy": self.lateral_accel_gain_xy.copy(),
             "near_reference_vertical": bool(near_reference_vertical),

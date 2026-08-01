@@ -71,6 +71,10 @@ class HoverAcquisition:
         self.enabled = bool(section.enabled)
         self.estimator_mode_only = bool(section.estimator_mode_only)
         self.require_armed = bool(section.require_armed)
+        self.require_race_start = (
+            bool(section.require_race_start)
+            and str(config.runtime.runner_mode).lower() == "competition"
+        )
         self.initial_thrust = _clamp(section.initial_thrust, 0.0, 1.0)
         self.min_thrust = _clamp(section.min_thrust, 0.0, 1.0)
         self.max_probe_thrust = _clamp(section.max_probe_thrust, 0.0, 1.0)
@@ -175,7 +179,7 @@ class HoverAcquisition:
         az_m_s2 = self._vertical_accel_neu(snapshot)
         armed = self._armed(snapshot)
 
-        if self.require_armed and armed is False:
+        if self.require_armed and armed is not True:
             self._reset_runtime()
             thrust = (
                 self.initial_thrust
@@ -186,6 +190,42 @@ class HoverAcquisition:
             self.command_thrust = thrust
             debug = self._debug(
                 status="waiting_armed",
+                active=True,
+                completed=False,
+                thrust=thrust,
+                hover_thrust=thrust,
+                elapsed_s=0.0,
+                dt_s=0.0,
+                z_rel_m=0.0,
+                vz_m_s=state_vz,
+                az_m_s2=az_m_s2,
+                stable_time_s=0.0,
+                armed=armed,
+            )
+            return HoverAcquisitionResult(
+                command=HoverAcquisitionCommand(
+                    roll_rad=0.0,
+                    pitch_rad=0.0,
+                    yaw_rad=yaw_rad,
+                    thrust=thrust,
+                ),
+                hover_thrust=thrust,
+                debug=debug,
+            )
+
+        race_start_state = self._race_start_state(snapshot)
+        if self.require_race_start and race_start_state != "started":
+            # The simulator constrains the vehicle during its Ready countdown.
+            # Keep the probe state uninitialized so neither elapsed time nor
+            # thrust can accumulate before the physical release at race start.
+            self._reset_runtime()
+            thrust = self.initial_thrust
+            debug = self._debug(
+                status=(
+                    "waiting_race_status"
+                    if race_start_state == "missing"
+                    else "waiting_race_start"
+                ),
                 active=True,
                 completed=False,
                 thrust=thrust,
@@ -252,16 +292,28 @@ class HoverAcquisition:
             z_hold_vz_error_m_s,
             z_hold_thrust_correction,
         ) = self._z_hold_terms(z_rel_m=z_rel_m, vz_m_s=state_vz)
-        overshoot_thrust_floor = math.nan
+        # Once liftoff has been observed, overshoot recovery may shed the
+        # takeoff boost quickly, but it must not collapse below the known
+        # airborne thrust range.  The previous implementation exposed this
+        # value in debug output without ever applying it.
+        overshoot_thrust_floor = (
+            self._overshoot_thrust_floor() if overshoot else math.nan
+        )
 
         if dt_s > 0.0:
             self.command_thrust = self._next_command_thrust(
                 command_thrust=self.command_thrust,
+                z_rel_m=z_rel_m,
                 vz_m_s=state_vz,
                 az_m_s2=az_m_s2,
                 dt_s=dt_s,
                 overshoot=overshoot,
             )
+            if math.isfinite(overshoot_thrust_floor):
+                self.command_thrust = max(
+                    self.command_thrust,
+                    overshoot_thrust_floor,
+                )
             if self._stable_sample_ok(
                 elapsed_s=elapsed_s,
                 z_rel_m=z_rel_m,
@@ -275,6 +327,11 @@ class HoverAcquisition:
                 )
 
         command_thrust = self._command_with_z_hold(z_hold_thrust_correction)
+        if math.isfinite(overshoot_thrust_floor):
+            # Apply the floor after Z-hold as well.  Otherwise its negative
+            # correction can silently undo the recovery clamp at the command
+            # boundary, which is what drove the latest run down to 0.09.
+            command_thrust = max(command_thrust, overshoot_thrust_floor)
 
         stable_time_s = self._stable_time(
             now=now,
@@ -284,10 +341,14 @@ class HoverAcquisition:
             az_m_s2=az_m_s2,
         )
         timed_out = self.max_duration_s > 0.0 and elapsed_s >= self.max_duration_s
-        strict_timeout_release = timed_out and not self._release_unsafe(
-            z_rel_m=z_rel_m,
-            vz_m_s=state_vz,
-            overshoot=overshoot,
+        strict_timeout_release = (
+            timed_out
+            and self.release_on_timeout_while_unstable
+            and not self._release_unsafe(
+                z_rel_m=z_rel_m,
+                vz_m_s=state_vz,
+                overshoot=overshoot,
+            )
         )
         relaxed_timeout_release = (
             timed_out
@@ -310,7 +371,8 @@ class HoverAcquisition:
             if timed_out and not self.lift_confirmed:
                 status = f"{status}_lift_unconfirmed"
             if stable_time_s >= self.stable_duration_s:
-                self.hover_thrust = self.command_thrust
+                self.command_thrust = command_thrust
+                self.hover_thrust = command_thrust
             debug = self._debug(
                 status=status,
                 active=False,
@@ -376,6 +438,7 @@ class HoverAcquisition:
         self,
         *,
         command_thrust: float,
+        z_rel_m: float,
         vz_m_s: float,
         az_m_s2: float,
         dt_s: float,
@@ -386,7 +449,14 @@ class HoverAcquisition:
         if accel_valid:
             accel_feedback = -self.accel_gain * az_m_s2
 
-        target_vz = 0.0 if self.lift_confirmed else self.target_vz_m_s
+        below_release_height = (
+            self.min_release_z_m > 0.0 and z_rel_m < self.min_release_z_m
+        )
+        target_vz = (
+            self.target_vz_m_s
+            if not self.lift_confirmed or below_release_height
+            else 0.0
+        )
         rate = self.velocity_gain * (target_vz - vz_m_s) + accel_feedback
 
         up_limit = self.thrust_trim_step_per_s if self.lift_confirmed else self.thrust_step_per_s
@@ -397,10 +467,15 @@ class HoverAcquisition:
         )
         rate = _clamp(rate, -down_limit, up_limit)
 
-        if not self.lift_confirmed:
-            weak_accel = (not accel_valid) or az_m_s2 < self.accel_deadband_m_s2
-            if vz_m_s < self.lift_confirm_vz_m_s and weak_accel:
-                rate = max(rate, self.thrust_step_per_s)
+        if (
+            not self.lift_confirmed
+            and vz_m_s < self.lift_confirm_vz_m_s
+        ):
+            # Ground-contact acceleration is noisy in the competition sim and
+            # previously made the takeoff ramp reverse before any vertical
+            # motion existed.  Until Z/VZ confirms liftoff, advance thrust at
+            # the configured deterministic probe rate.
+            rate = max(rate, self.thrust_step_per_s)
 
         if overshoot:
             rate = min(rate, -down_limit)
@@ -564,8 +639,14 @@ class HoverAcquisition:
             return math.nan
         if self.lift_confirmed_thrust is None:
             return math.nan
+        lift_floor = (
+            float(self.lift_confirmed_thrust)
+            - self.overshoot_max_thrust_drop
+        )
+        # The acquired/fixed hover estimate is already known to sustain
+        # airborne flight.  Never allow a takeoff-overshoot response below it.
         return _clamp(
-            float(self.lift_confirmed_thrust) - self.overshoot_max_thrust_drop,
+            max(float(self.hover_thrust), lift_floor),
             self.min_thrust,
             self.max_probe_thrust,
         )
@@ -673,6 +754,22 @@ class HoverAcquisition:
         if isinstance(heartbeat, dict) and heartbeat.get("armed") is not None:
             return bool(heartbeat["armed"])
         return None
+
+    @staticmethod
+    def _race_start_state(snapshot) -> str:
+        status = getattr(snapshot, "race_status", None)
+        if not isinstance(status, dict):
+            return "missing"
+
+        try:
+            sim_boot_time_ms = int(status["sim_boot_time_ms"])
+            race_start_boot_time_ms = int(status["race_start_boot_time_ms"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return "missing"
+
+        if race_start_boot_time_ms <= 0 or sim_boot_time_ms < race_start_boot_time_ms:
+            return "waiting"
+        return "started"
 
     @staticmethod
     def _vec3(value) -> Optional[np.ndarray]:
