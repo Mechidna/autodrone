@@ -43,6 +43,20 @@ class CompetitionGroundTruthDebugTests(unittest.TestCase):
 
 
 class ControllerRuntimeConfigTests(unittest.TestCase):
+    def test_competition_prearm_sensor_hold_environment_override(self):
+        with patch.dict(
+            os.environ,
+            {
+                "RUNNER_MODE": "competition",
+                "ALLOW_COMPETITION_GROUND_TRUTH_DEBUG": "true",
+                "COMPETITION_PREARM_SENSOR_HOLD_S": "4.5",
+            },
+            clear=False,
+        ):
+            config = load_runtime_config()
+
+        self.assertEqual(config.runtime.competition_prearm_sensor_hold_s, 4.5)
+
     def test_tilt_compensation_and_plan_validation_limit_are_enabled(self):
         with patch.dict(
             os.environ,
@@ -61,6 +75,42 @@ class ControllerRuntimeConfigTests(unittest.TestCase):
         )
         self.assertTrue(config.planner.forward_progress_constraint_enabled)
         self.assertEqual(config.planner.forward_progress_min_speed_m_s, 0.0)
+
+
+class ExperimentalGateVioAlignmentConfigTests(unittest.TestCase):
+    def test_gate_vio_alignment_is_disabled_by_default(self):
+        with patch.dict(
+            os.environ,
+            {
+                "RUNNER_MODE": "competition",
+                "ALLOW_COMPETITION_GROUND_TRUTH_DEBUG": "true",
+                "EXPERIMENTAL_GATE_VIO_ALIGNMENT": "false",
+            },
+            clear=False,
+        ):
+            config = load_runtime_config()
+
+        self.assertFalse(config.experimental_gate_vio_alignment.enabled)
+        self.assertGreaterEqual(
+            config.experimental_gate_vio_alignment.min_consistent_frames,
+            2,
+        )
+
+    def test_enabling_alignment_without_perception_is_rejected(self):
+        with patch.dict(
+            os.environ,
+            {
+                "RUNNER_MODE": "competition",
+                "ALLOW_COMPETITION_GROUND_TRUTH_DEBUG": "true",
+                "EXPERIMENTAL_GATE_VIO_ALIGNMENT": "true",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "runtime.use_perception=true",
+            ):
+                load_runtime_config()
 
 
 if __name__ == "__main__":

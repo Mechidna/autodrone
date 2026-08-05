@@ -892,10 +892,22 @@ class LateralResponseCalibration:
                 getattr(snapshot, "pitch_rad", None),
                 0.0,
             )
+            attitude_source = str(
+                getattr(snapshot, "attitude_source", "mavlink") or "mavlink"
+            ).strip().lower()
+            # MAVLink competition attitude uses the simulator's inverted
+            # reported-pitch boundary. Live OpenVINS publishes an already
+            # physical body-to-NED attitude, so applying that correction a
+            # second time creates a false horizontal gravity component.
+            mavlink_pitch_boundary = (
+                self.runner_mode == "competition"
+                and attitude_source not in {
+                    "live_openvins",
+                    "live_openvins_bootstrap",
+                }
+            )
             calibration_pitch = (
-                -reported_pitch
-                if self.runner_mode == "competition"
-                else reported_pitch
+                -reported_pitch if mavlink_pitch_boundary else reported_pitch
             )
             rot_ned_body = body_frd_to_local_ned_rotmat(
                 self._finite_float(getattr(snapshot, "roll_rad", None), 0.0),

@@ -55,6 +55,7 @@ def _snapshot(
     pitch_rad=0.0,
     yaw_rad=0.0,
     position_wall_time=None,
+    attitude_source="mavlink",
 ):
     return SimpleNamespace(
         roll_rad=float(roll_rad),
@@ -65,6 +66,7 @@ def _snapshot(
             dtype=float,
         ),
         position_wall_time=position_wall_time,
+        attitude_source=attitude_source,
         armed=True,
     )
 
@@ -331,6 +333,26 @@ def test_calibration_local_imu_rotation_corrects_only_competition_pitch_sign():
     )
 
     assert imu_accel_xy[0] < 0.0
+    np.testing.assert_allclose(imu_accel_xy[1], 0.0, atol=1e-12)
+
+
+def test_live_openvins_pitch_is_not_corrected_twice():
+    calibrator = LateralResponseCalibration(_config())
+    snapshot = _snapshot(
+        accel_neu_xy=np.zeros(2, dtype=float),
+        pitch_rad=math.radians(2.0),
+        yaw_rad=math.pi,
+        position_wall_time=0.0,
+        attitude_source="live_openvins",
+    )
+
+    imu_accel_xy, _ = calibrator._accel_sources_xy_neu(
+        snapshot,
+        np.zeros(2, dtype=float),
+        0.0,
+    )
+
+    assert imu_accel_xy[0] > 0.0
     np.testing.assert_allclose(imu_accel_xy[1], 0.0, atol=1e-12)
 
 

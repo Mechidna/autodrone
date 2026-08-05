@@ -1,0 +1,229 @@
+diff --git a/ov_msckf/src/update/UpdaterMSCKF.h b/ov_msckf/src/update/UpdaterMSCKF.h
+--- a/ov_msckf/src/update/UpdaterMSCKF.h
++++ b/ov_msckf/src/update/UpdaterMSCKF.h
+@@ -22,11 +22,13 @@
+ #define OV_MSCKF_UPDATER_MSCKF_H
+ 
+ #include <cstddef>
++#include <limits>
+ #include <Eigen/Eigen>
+ #include <memory>
++#include <vector>
+ 
+ #include "feat/FeatureInitializerOptions.h"
+ 
+ #include "UpdaterOptions.h"
+@@ -38,6 +40,35 @@ namespace ov_msckf {
+ 
+ class State;
+ 
++/// Final stage reached by a feature submitted to MSCKF triangulation.
++enum class MsckfFeatureResult : int {
++  PENDING = 0,
++  TRIANGULATION_REJECTED = 1,
++  REFINEMENT_REJECTED = 2,
++  CHI2_REJECTED = 3,
++  ACCEPTED = 4,
++};
++
++/// Geometry and final result for one feature submitted to MSCKF.
++struct MsckfFeatureGeometryDiagnostics {
++  size_t feature_id = 0;
++  size_t observation_count = 0;
++  double track_duration_s = 0.0;
++  double max_parallax_deg = 0.0;
++  double max_camera_baseline_m = 0.0;
++  double condition_number = std::numeric_limits<double>::quiet_NaN();
++  double linear_depth_m = std::numeric_limits<double>::quiet_NaN();
++  double linear_range_m = std::numeric_limits<double>::quiet_NaN();
++  double refined_depth_m = std::numeric_limits<double>::quiet_NaN();
++  double refined_range_m = std::numeric_limits<double>::quiet_NaN();
++  bool triangulation_success = false;
++  bool refinement_success = false;
++  bool chi2_tested = false;
++  bool accepted = false;
++  int triangulation_failure_reason = 0;
++  int refinement_failure_reason = 0;
++  double chi2_ratio = std::numeric_limits<double>::quiet_NaN();
++  MsckfFeatureResult result = MsckfFeatureResult::PENDING;
++};
++
+ /// Rejection funnel for the most recent MSCKF camera update.
+ struct MsckfUpdateDiagnostics {
+@@ -71,6 +102,7 @@ struct MsckfUpdateDiagnostics {
+   double chi2_ratio_sum = 0.0;
+   double chi2_ratio_max = 0.0;
++  std::vector<MsckfFeatureGeometryDiagnostics> feature_geometry;
+ 
+   double chi2_ratio_mean() const {
+diff --git a/ov_msckf/src/update/UpdaterMSCKF.cpp b/ov_msckf/src/update/UpdaterMSCKF.cpp
+--- a/ov_msckf/src/update/UpdaterMSCKF.cpp
++++ b/ov_msckf/src/update/UpdaterMSCKF.cpp
+@@ -34,10 +34,107 @@
+ #include <boost/date_time/posix_time/posix_time.hpp>
+ #include <boost/math/distributions/chi_squared.hpp>
+ 
++#include <algorithm>
++#include <cmath>
++#include <limits>
++#include <vector>
++
+ using namespace ov_core;
+ using namespace ov_type;
+ using namespace ov_msckf;
+ 
++namespace {
++
++MsckfFeatureGeometryDiagnostics compute_feature_geometry(
++    const std::shared_ptr<Feature> &feature,
++    std::unordered_map<size_t, std::unordered_map<double, FeatureInitializer::ClonePose>> &clones_cam) {
++  MsckfFeatureGeometryDiagnostics result;
++  result.feature_id = feature->featid;
++
++  size_t anchor_cam_id = 0;
++  size_t most_measurements = 0;
++  double first_timestamp = std::numeric_limits<double>::infinity();
++  double last_timestamp = -std::numeric_limits<double>::infinity();
++  for (const auto &pair : feature->timestamps) {
++    result.observation_count += pair.second.size();
++    if (pair.second.size() > most_measurements) {
++      anchor_cam_id = pair.first;
++      most_measurements = pair.second.size();
++    }
++    for (double timestamp : pair.second) {
++      first_timestamp = std::min(first_timestamp, timestamp);
++      last_timestamp = std::max(last_timestamp, timestamp);
++    }
++  }
++  if (result.observation_count < 2 || most_measurements == 0)
++    return result;
++  result.track_duration_s = last_timestamp - first_timestamp;
++
++  const double anchor_timestamp = feature->timestamps.at(anchor_cam_id).back();
++  auto &anchor_clone = clones_cam.at(anchor_cam_id).at(anchor_timestamp);
++  const Eigen::Matrix3d &R_GtoA = anchor_clone.Rot();
++  const Eigen::Vector3d &p_AinG = anchor_clone.pos();
++  Eigen::Matrix3d A = Eigen::Matrix3d::Zero();
++  Eigen::Vector3d b = Eigen::Vector3d::Zero();
++  std::vector<Eigen::Vector3d> bearings_in_anchor;
++  std::vector<Eigen::Vector3d> camera_positions;
++
++  for (const auto &pair : feature->timestamps) {
++    for (size_t index = 0; index < pair.second.size(); ++index) {
++      auto &clone = clones_cam.at(pair.first).at(pair.second.at(index));
++      const Eigen::Matrix3d &R_GtoCi = clone.Rot();
++      const Eigen::Vector3d &p_CiinG = clone.pos();
++      Eigen::Vector3d bearing;
++      bearing << feature->uvs_norm.at(pair.first).at(index)(0),
++          feature->uvs_norm.at(pair.first).at(index)(1), 1.0;
++      bearing = R_GtoA * R_GtoCi.transpose() * bearing;
++      bearing.normalize();
++      const Eigen::Matrix3d Bperp = skew_x(bearing);
++      const Eigen::Matrix3d Ai = Bperp.transpose() * Bperp;
++      const Eigen::Vector3d p_CiinA = R_GtoA * (p_CiinG - p_AinG);
++      A += Ai;
++      b += Ai * p_CiinA;
++      bearings_in_anchor.push_back(bearing);
++      camera_positions.push_back(p_CiinG);
++    }
++  }
++
++  const Eigen::Vector3d p_f = A.colPivHouseholderQr().solve(b);
++  const Eigen::Vector3d singular_values = Eigen::JacobiSVD<Eigen::Matrix3d>(A).singularValues();
++  result.condition_number = std::abs(singular_values(0) / singular_values(2));
++  result.linear_depth_m = p_f(2);
++  result.linear_range_m = p_f.norm();
++
++  constexpr double radians_to_degrees = 57.2957795130823208768;
++  for (size_t first = 0; first < bearings_in_anchor.size(); ++first) {
++    for (size_t second = first + 1; second < bearings_in_anchor.size(); ++second) {
++      const double cosine = std::max(-1.0, std::min(1.0, bearings_in_anchor[first].dot(bearings_in_anchor[second])));
++      result.max_parallax_deg =
++          std::max(result.max_parallax_deg, std::acos(cosine) * radians_to_degrees);
++      result.max_camera_baseline_m =
++          std::max(result.max_camera_baseline_m, (camera_positions[first] - camera_positions[second]).norm());
++    }
++  }
++  return result;
++}
++
++MsckfFeatureGeometryDiagnostics *find_feature_geometry(MsckfUpdateDiagnostics &diagnostics, size_t feature_id) {
++  const auto match = std::find_if(
++      diagnostics.feature_geometry.begin(), diagnostics.feature_geometry.end(),
++      [feature_id](const MsckfFeatureGeometryDiagnostics &item) { return item.feature_id == feature_id; });
++  return match == diagnostics.feature_geometry.end() ? nullptr : &(*match);
++}
++
++} // namespace
++
+ UpdaterMSCKF::UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerOptions &feat_init_options) : _options(options) {
+@@ -126,6 +223,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_p
+   auto it1 = feature_vec.begin();
+   while (it1 != feature_vec.end()) {
+ 
++    auto geometry = compute_feature_geometry(*it1, clones_cam);
+     // Triangulate the feature and remove if it fails
+     bool success_tri = true;
+@@ -140,6 +238,15 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_p
+     }
+     const auto refinement_reason = initializer_feat->last_failure_reason();
+ 
++    geometry.triangulation_success = success_tri;
++    geometry.refinement_success = success_refine;
++    geometry.triangulation_failure_reason = static_cast<int>(triangulation_reason);
++    geometry.refinement_failure_reason = static_cast<int>(refinement_reason);
++    if (success_tri) {
++      geometry.refined_depth_m = (*it1)->p_FinA(2);
++      geometry.refined_range_m = (*it1)->p_FinA.norm();
++    }
++
+     // Remove the feature if not a success
+     if (!success_tri || !success_refine) {
+@@ -147,6 +254,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_p
+       if (!success_tri) {
+         last_diagnostics.rejected_triangulation++;
++        geometry.result = MsckfFeatureResult::TRIANGULATION_REJECTED;
+         switch (triangulation_reason) {
+@@ -169,6 +277,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_p
+       } else {
+         last_diagnostics.rejected_refinement++;
++        geometry.result = MsckfFeatureResult::REFINEMENT_REJECTED;
+         switch (refinement_reason) {
+@@ -192,10 +301,12 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_p
+           break;
+         }
+       }
++      last_diagnostics.feature_geometry.push_back(geometry);
+       it1 = feature_vec.erase(it1);
+       continue;
+     }
++    last_diagnostics.feature_geometry.push_back(geometry);
+     it1++;
+   }
+@@ -256,11 +367,20 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_p
+     last_diagnostics.chi2_ratio_sum += chi2_ratio;
+     last_diagnostics.chi2_ratio_max = std::max(last_diagnostics.chi2_ratio_max, chi2_ratio);
+ 
++    auto *geometry = find_feature_geometry(last_diagnostics, feat.featid);
++    if (geometry != nullptr) {
++      geometry->chi2_tested = true;
++      geometry->chi2_ratio = chi2_ratio;
++    }
++
+     // Check if we should delete or not
+     if (chi2 > chi2_threshold) {
+       (*it2)->to_delete = true;
+       last_diagnostics.rejected_chi2++;
++      if (geometry != nullptr)
++        geometry->result = MsckfFeatureResult::CHI2_REJECTED;
+       it2 = feature_vec.erase(it2);
+@@ -275,6 +395,11 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_p
+       continue;
+     }
+ 
++    if (geometry != nullptr) {
++      geometry->accepted = true;
++      geometry->result = MsckfFeatureResult::ACCEPTED;
++    }
++
+     // We are good!!! Append to our large H vector

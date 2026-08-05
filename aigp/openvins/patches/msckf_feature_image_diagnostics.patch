@@ -1,0 +1,79 @@
+diff --git a/ov_msckf/src/update/UpdaterMSCKF.h b/ov_msckf/src/update/UpdaterMSCKF.h
+--- a/ov_msckf/src/update/UpdaterMSCKF.h
++++ b/ov_msckf/src/update/UpdaterMSCKF.h
+@@ -53,6 +53,16 @@ enum class MsckfFeatureResult : int {
+ /// Geometry and final result for one feature submitted to MSCKF.
+ struct MsckfFeatureGeometryDiagnostics {
+   size_t feature_id = 0;
++  double first_u_px = std::numeric_limits<double>::quiet_NaN();
++  double first_v_px = std::numeric_limits<double>::quiet_NaN();
++  double last_u_px = std::numeric_limits<double>::quiet_NaN();
++  double last_v_px = std::numeric_limits<double>::quiet_NaN();
++  double mean_u_px = std::numeric_limits<double>::quiet_NaN();
++  double mean_v_px = std::numeric_limits<double>::quiet_NaN();
++  double min_u_px = std::numeric_limits<double>::quiet_NaN();
++  double max_u_px = std::numeric_limits<double>::quiet_NaN();
++  double min_v_px = std::numeric_limits<double>::quiet_NaN();
++  double max_v_px = std::numeric_limits<double>::quiet_NaN();
+   size_t observation_count = 0;
+   double track_duration_s = 0.0;
+   double max_parallax_deg = 0.0;
+diff --git a/ov_msckf/src/update/UpdaterMSCKF.cpp b/ov_msckf/src/update/UpdaterMSCKF.cpp
+--- a/ov_msckf/src/update/UpdaterMSCKF.cpp
++++ b/ov_msckf/src/update/UpdaterMSCKF.cpp
+@@ -52,6 +52,13 @@ MsckfFeatureGeometryDiagnostics compute_feature_geometry(
+   MsckfFeatureGeometryDiagnostics result;
+   result.feature_id = feature->featid;
+ 
++  size_t pixel_count = 0;
++  double pixel_u_sum = 0.0;
++  double pixel_v_sum = 0.0;
++  double first_pixel_timestamp = std::numeric_limits<double>::infinity();
++  double last_pixel_timestamp = -std::numeric_limits<double>::infinity();
++  result.min_u_px = result.min_v_px = std::numeric_limits<double>::infinity();
++  result.max_u_px = result.max_v_px = -std::numeric_limits<double>::infinity();
+   size_t anchor_cam_id = 0;
+   size_t most_measurements = 0;
+   double first_timestamp = std::numeric_limits<double>::infinity();
+@@ -62,11 +69,39 @@ MsckfFeatureGeometryDiagnostics compute_feature_geometry(
+       anchor_cam_id = pair.first;
+       most_measurements = pair.second.size();
+     }
+-    for (double timestamp : pair.second) {
++    const auto &pixels = feature->uvs.at(pair.first);
++    for (size_t index = 0; index < pair.second.size(); ++index) {
++      const double timestamp = pair.second.at(index);
+       first_timestamp = std::min(first_timestamp, timestamp);
+       last_timestamp = std::max(last_timestamp, timestamp);
++      if (index >= pixels.size())
++        continue;
++      const double u_px = pixels.at(index)(0);
++      const double v_px = pixels.at(index)(1);
++      if (!std::isfinite(u_px) || !std::isfinite(v_px))
++        continue;
++      pixel_count++;
++      pixel_u_sum += u_px;
++      pixel_v_sum += v_px;
++      result.min_u_px = std::min(result.min_u_px, u_px);
++      result.max_u_px = std::max(result.max_u_px, u_px);
++      result.min_v_px = std::min(result.min_v_px, v_px);
++      result.max_v_px = std::max(result.max_v_px, v_px);
++      if (timestamp < first_pixel_timestamp) {
++        first_pixel_timestamp = timestamp;
++        result.first_u_px = u_px;
++        result.first_v_px = v_px;
++      }
++      if (timestamp > last_pixel_timestamp) {
++        last_pixel_timestamp = timestamp;
++        result.last_u_px = u_px;
++        result.last_v_px = v_px;
++      }
+     }
+   }
++  if (pixel_count > 0) {
++    result.mean_u_px = pixel_u_sum / static_cast<double>(pixel_count);
++    result.mean_v_px = pixel_v_sum / static_cast<double>(pixel_count);
++  }
+   if (result.observation_count < 2 || most_measurements == 0)
+     return result;
+   result.track_duration_s = last_timestamp - first_timestamp;

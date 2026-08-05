@@ -1,0 +1,197 @@
+diff --git a/ov_msckf/src/update/UpdaterMSCKF.h b/ov_msckf/src/update/UpdaterMSCKF.h
+index 5ada215..283090a 100644
+--- a/ov_msckf/src/update/UpdaterMSCKF.h
++++ b/ov_msckf/src/update/UpdaterMSCKF.h
+@@ -21,6 +21,7 @@
+ #ifndef OV_MSCKF_UPDATER_MSCKF_H
+ #define OV_MSCKF_UPDATER_MSCKF_H
+ 
++#include <cstddef>
+ #include <Eigen/Eigen>
+ #include <memory>
+ 
+@@ -37,6 +38,31 @@ namespace ov_msckf {
+ 
+ class State;
+ 
++/// Rejection funnel for the most recent MSCKF camera update.
++struct MsckfUpdateDiagnostics {
++  size_t lost_features = 0;
++  size_t marginal_features = 0;
++  size_t maxtrack_features = 0;
++  size_t candidates_before_limit = 0;
++  size_t candidates_after_limit = 0;
++  size_t input_features = 0;
++  size_t input_measurements = 0;
++  size_t rejected_too_few_measurements = 0;
++  size_t rejected_triangulation = 0;
++  size_t rejected_refinement = 0;
++  size_t chi2_tested = 0;
++  size_t rejected_chi2 = 0;
++  size_t accepted_features = 0;
++  size_t accepted_measurements = 0;
++  double chi2_ratio_sum = 0.0;
++  double chi2_ratio_max = 0.0;
++
++  double chi2_ratio_mean() const {
++    return chi2_tested > 0 ? chi2_ratio_sum / static_cast<double>(chi2_tested) : 0.0;
++  }
++};
++
+ /**
+  * @brief Will compute the system for our sparse features and update the filter.
+  *
+@@ -67,6 +93,9 @@ public:
+    */
+   void update(std::shared_ptr<State> state, std::vector<std::shared_ptr<ov_core::Feature>> &feature_vec);
+ 
++  /// Rejection funnel from the most recent call to update().
++  MsckfUpdateDiagnostics get_last_diagnostics() const { return last_diagnostics; }
++
+ protected:
+   /// Options used during update
+   UpdaterOptions _options;
+@@ -77,6 +106,9 @@ protected:
+ 
+   /// Chi squared 95th percentile table (lookup would be size of residual)
+   std::map<int, double> chi_squared_table;
++
++  /// Rejection funnel from the most recent call to update().
++  MsckfUpdateDiagnostics last_diagnostics;
+ };
+ 
+ } // namespace ov_msckf
+diff --git a/ov_msckf/src/update/UpdaterMSCKF.cpp b/ov_msckf/src/update/UpdaterMSCKF.cpp
+index bb884df..9df65b2 100644
+--- a/ov_msckf/src/update/UpdaterMSCKF.cpp
++++ b/ov_msckf/src/update/UpdaterMSCKF.cpp
+@@ -53,6 +53,15 @@ UpdaterMSCKF::UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerO
+ }
+ 
+ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_ptr<Feature>> &feature_vec) {
++  last_diagnostics = MsckfUpdateDiagnostics{};
++  last_diagnostics.input_features = feature_vec.size();
++  for (const auto &feature : feature_vec) {
++    for (const auto &pair : feature->timestamps) {
++      last_diagnostics.input_measurements += pair.second.size();
++    }
++  }
+ 
+   // Return if no features
+   if (feature_vec.empty())
+@@ -85,6 +94,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_p
+     // Remove if we don't have enough
+     if (ct_meas < 2) {
+       (*it0)->to_delete = true;
++      last_diagnostics.rejected_too_few_measurements++;
+       it0 = feature_vec.erase(it0);
+     } else {
+       it0++;
+@@ -133,7 +143,12 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_p
+     // Remove the feature if not a success
+     if (!success_tri || !success_refine) {
+       (*it1)->to_delete = true;
++      if (!success_tri) {
++        last_diagnostics.rejected_triangulation++;
++      } else {
++        last_diagnostics.rejected_refinement++;
++      }
+       it1 = feature_vec.erase(it1);
+       continue;
+     }
+@@ -226,9 +241,16 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_p
+       PRINT_WARNING(YELLOW "chi2_check over the residual limit - %d\n" RESET, (int)res.rows());
+     }
+ 
++    const double chi2_threshold = _options.chi2_multipler * chi2_check;
++    const double chi2_ratio = chi2_threshold > 0.0 ? chi2 / chi2_threshold : 0.0;
++    last_diagnostics.chi2_tested++;
++    last_diagnostics.chi2_ratio_sum += chi2_ratio;
++    last_diagnostics.chi2_ratio_max = std::max(last_diagnostics.chi2_ratio_max, chi2_ratio);
++
+     // Check if we should delete or not
+-    if (chi2 > _options.chi2_multipler * chi2_check) {
++    if (chi2 > chi2_threshold) {
+       (*it2)->to_delete = true;
++      last_diagnostics.rejected_chi2++;
+       it2 = feature_vec.erase(it2);
+       // PRINT_DEBUG("featid = %d\n", feat.featid);
+       // PRINT_DEBUG("chi2 = %f > %f\n", chi2, _options.chi2_multipler*chi2_check);
+@@ -260,6 +282,13 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_p
+     it2++;
+   }
+   rT3 = boost::posix_time::microsec_clock::local_time();
++  last_diagnostics.accepted_features = feature_vec.size();
++  for (const auto &feature : feature_vec) {
++    for (const auto &pair : feature->timestamps) {
++      last_diagnostics.accepted_measurements += pair.second.size();
++    }
++  }
+ 
+   // We have appended all features to our Hx_big, res_big
+   // Delete it so we do not reuse information
+diff --git a/ov_msckf/src/core/VioManager.h b/ov_msckf/src/core/VioManager.h
+index 8a3a1d4..856012f 100644
+--- a/ov_msckf/src/core/VioManager.h
++++ b/ov_msckf/src/core/VioManager.h
+@@ -30,6 +30,7 @@
+ #include <string>
+ 
+ #include "VioManagerOptions.h"
++#include "update/UpdaterMSCKF.h"
+ 
+ namespace ov_core {
+ struct ImuData;
+@@ -104,6 +105,9 @@ public:
+   /// Returns 3d features used in the last update in global frame
+   std::vector<Eigen::Vector3d> get_good_features_MSCKF() { return good_features_MSCKF; }
+ 
++  /// Returns the feature rejection funnel from the most recent MSCKF update.
++  MsckfUpdateDiagnostics get_last_msckf_update_diagnostics() const { return last_msckf_diagnostics; }
++
+   /// Return the image used when projecting the active tracks
+   void get_active_image(double &timestamp, cv::Mat &image) {
+     timestamp = active_tracks_time;
+@@ -225,6 +229,9 @@ protected:
+   // Good features that where used in the last update (used in visualization)
+   std::vector<Eigen::Vector3d> good_features_MSCKF;
+ 
++  // Rejection funnel from the most recent MSCKF update.
++  MsckfUpdateDiagnostics last_msckf_diagnostics;
++
+   // Re-triangulated features 3d positions seen from the current frame (used in visualization)
+   // For each feature we have a linear system A * p_FinG = b we create and increment their costs
+   double active_tracks_time = -1;
+diff --git a/ov_msckf/src/core/VioManager.cpp b/ov_msckf/src/core/VioManager.cpp
+index b8b18b7..1a6f206 100644
+--- a/ov_msckf/src/core/VioManager.cpp
++++ b/ov_msckf/src/core/VioManager.cpp
+@@ -494,10 +494,14 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
+   }
+ 
+   // Concatenate our MSCKF feature arrays (i.e., ones not being used for slam updates)
++  const size_t lost_feature_count = feats_lost.size();
++  const size_t marginal_feature_count = feats_marg.size();
++  const size_t maxtrack_feature_count = feats_maxtracks.size();
+   std::vector<std::shared_ptr<Feature>> featsup_MSCKF = feats_lost;
+   featsup_MSCKF.insert(featsup_MSCKF.end(), feats_marg.begin(), feats_marg.end());
+   featsup_MSCKF.insert(featsup_MSCKF.end(), feats_maxtracks.begin(), feats_maxtracks.end());
++  const size_t candidates_before_limit = featsup_MSCKF.size();
+ 
+   //===================================================================================
+   // Now that we have a list of features, lets do the EKF update for MSCKF and SLAM!
+@@ -522,7 +526,14 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
+   // NOTE: this should only really be used if you want to track a lot of features, or have limited computational resources
+   if ((int)featsup_MSCKF.size() > state->_options.max_msckf_in_update)
+     featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - state->_options.max_msckf_in_update);
++  const size_t candidates_after_limit = featsup_MSCKF.size();
+   updaterMSCKF->update(state, featsup_MSCKF);
++  last_msckf_diagnostics = updaterMSCKF->get_last_diagnostics();
++  last_msckf_diagnostics.lost_features = lost_feature_count;
++  last_msckf_diagnostics.marginal_features = marginal_feature_count;
++  last_msckf_diagnostics.maxtrack_features = maxtrack_feature_count;
++  last_msckf_diagnostics.candidates_before_limit = candidates_before_limit;
++  last_msckf_diagnostics.candidates_after_limit = candidates_after_limit;
+   propagator->invalidate_cache();
+   rT4 = boost::posix_time::microsec_clock::local_time();
+

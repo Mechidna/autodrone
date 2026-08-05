@@ -119,6 +119,32 @@ def _run_git(args: list[str], cwd: Path) -> str | None:
     return result.stdout.strip()
 
 
+def _stop_child_process(
+    proc: subprocess.Popen[str],
+    *,
+    interrupt_timeout_s: float = 4.0,
+    terminate_timeout_s: float = 2.0,
+) -> int:
+    """Stop the logged child without allowing Ctrl+C to hang forever."""
+
+    existing = proc.poll()
+    if existing is not None:
+        return int(existing)
+    try:
+        proc.send_signal(signal.SIGINT)
+    except (OSError, ValueError):
+        proc.terminate()
+    try:
+        return int(proc.wait(timeout=interrupt_timeout_s))
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+    try:
+        return int(proc.wait(timeout=terminate_timeout_s))
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return int(proc.wait(timeout=terminate_timeout_s))
+
+
 def _load_runtime_config(repo: Path) -> dict[str, Any] | None:
     path = repo / "aigp" / "config" / "runtime.toml"
     if not path.exists():
@@ -130,8 +156,15 @@ def _load_runtime_config(repo: Path) -> dict[str, Any] | None:
         return None
 
 
-def _metadata(command: list[str], cwd: Path, repo: Path, run_id: str) -> dict[str, Any]:
+def _metadata(
+    command: list[str],
+    cwd: Path,
+    repo: Path,
+    run_id: str,
+    environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
     status_short = _run_git(["status", "--short"], repo)
+    environment = os.environ if environment is None else environment
     return {
         "event": "run_start",
         "run_id": run_id,
@@ -141,9 +174,10 @@ def _metadata(command: list[str], cwd: Path, repo: Path, run_id: str) -> dict[st
         "repo": str(repo),
         "command": command,
         "env": {
-            key: os.environ[key]
+            key: environment[key]
             for key in (
                 "RUNNER_MODE",
+                "OBSERVE_ONLY",
                 "CALIBRATION_ONLY",
                 "PERCEPTION_HOLD",
                 "VISION_SOURCE",
@@ -155,8 +189,10 @@ def _metadata(command: list[str], cwd: Path, repo: Path, run_id: str) -> dict[st
                 "YOLO_MODEL_PATH",
                 "CAMERA_MOUNT_PROFILE",
                 "WORLD",
+                "AIGP_LIVE_OPENVINS",
+                "AIGP_OPENVINS_LIVE_RUNNER",
             )
-            if key in os.environ
+            if key in environment
         },
         "git": {
             "branch": _run_git(["branch", "--show-current"], repo),
@@ -301,6 +337,14 @@ def _parse_args() -> argparse.Namespace:
         help="Run folder name. Defaults to UTC timestamp.",
     )
     parser.add_argument(
+        "--observe-only",
+        action="store_true",
+        help=(
+            "Receive and record inputs without offboard priming, mode changes, "
+            "arming, flight-control updates, or shutdown landing commands."
+        ),
+    )
+    parser.add_argument(
         "--capture-camera-frames",
         action="store_true",
         help=(
@@ -330,6 +374,23 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--capture-vio-dataset",
+        action="store_true",
+        help=(
+            "Record original UDP JPEGs plus every IMU, TIMESYNC, and available "
+            "MAVLink truth sample under the run directory for offline VIO testing."
+        ),
+    )
+    parser.add_argument(
+        "--vio-dataset-queue-size",
+        type=int,
+        default=2048,
+        help=(
+            "Maximum pending VIO dataset writes. New records are counted as dropped "
+            "rather than blocking flight callbacks when the queue is full."
+        ),
+    )
+    parser.add_argument(
         "command",
         nargs=argparse.REMAINDER,
         help="Optional command to run after '--'. Defaults to the pilot main.py.",
@@ -356,6 +417,8 @@ def main() -> int:
     debug_path = run_dir / "debug.jsonl"
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
+    if bool(args.observe_only):
+        env["OBSERVE_ONLY"] = "true"
     if bool(args.capture_camera_frames):
         camera_dir = run_dir / "camera_frames"
         camera_dir.mkdir(parents=True, exist_ok=True)
@@ -367,9 +430,21 @@ def main() -> int:
         env["AIGP_CAMERA_CAPTURE_QUEUE_SIZE"] = str(
             max(1, min(512, int(args.camera_capture_queue_size)))
         )
+    if bool(args.capture_vio_dataset):
+        vio_dataset_dir = run_dir / "vio_dataset"
+        env["AIGP_VIO_RECORD_DIR"] = str(vio_dataset_dir)
+        env["AIGP_VIO_QUEUE_SIZE"] = str(
+            max(16, min(8192, int(args.vio_dataset_queue_size)))
+        )
+        env["MAVLINK_REQUEST_ALTERNATIVE_IMU_RATES"] = "true"
 
     print(f"logging run to {run_dir}", flush=True)
     print(f"command: {' '.join(shlex.quote(part) for part in command)}", flush=True)
+    if bool(args.observe_only):
+        print(
+            "observe-only: flight-control transmission disabled",
+            flush=True,
+        )
     if bool(args.capture_camera_frames):
         print(
             "camera frame capture: "
@@ -377,6 +452,13 @@ def main() -> int:
             f"hz={max(0.1, float(args.camera_capture_hz)):.1f} "
             f"jpeg_quality={max(1, min(100, int(args.camera_jpeg_quality)))} "
             f"queue_size={max(1, min(512, int(args.camera_capture_queue_size)))}",
+            flush=True,
+        )
+    if bool(args.capture_vio_dataset):
+        print(
+            "VIO dataset capture: "
+            f"{run_dir / 'vio_dataset'} "
+            f"queue_size={max(16, min(8192, int(args.vio_dataset_queue_size)))}",
             flush=True,
         )
 
@@ -393,7 +475,7 @@ def main() -> int:
         def write_event(event: dict[str, Any]) -> None:
             debug_log.write(json.dumps(_jsonable(event), sort_keys=True) + "\n")
 
-        write_event(_metadata(command, cwd, repo, run_id))
+        write_event(_metadata(command, cwd, repo, run_id, env))
         try:
             proc = subprocess.Popen(
                 command,
@@ -421,8 +503,7 @@ def main() -> int:
                 }
             )
             if proc is not None and proc.poll() is None:
-                proc.send_signal(signal.SIGINT)
-                returncode = proc.wait()
+                returncode = _stop_child_process(proc)
             else:
                 returncode = 130
         finally:

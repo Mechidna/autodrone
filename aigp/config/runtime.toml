@@ -4,11 +4,13 @@ profile = "py_aipilot_example"
 
 [runtime]
 runner_mode = "competition"              # px4 | competition
+observe_only = false                     # true: receive/record only; never send flight-control commands
 competition_yaw_inverted = true          # invert competition MAVLink yaw/yaw-rate at both telemetry and command boundaries
 use_perception = true
 calibration_only = false                 # true: calibrate, then hover without perception
 perception_hold = false                  # true: calibrate, then hold XY/Z while tracking gates
 startup_observation_duration_s = 10.0     # competition only: ingest perception without transmitting flight commands
+competition_prearm_sensor_hold_s = 6.0    # record stationary camera/IMU before competition arming or control
 perception_hold_settle_speed_m_s = 0.15   # quarantine frames until nearly stationary
 perception_hold_settle_duration_s = 0.50
 control_hz = 50
@@ -27,18 +29,26 @@ port_px4 = 14540
 port_competition = 14550
 target_system = 1
 target_component = 1
+udp_socket_receive_buffer_bytes = 8388608 # 8 MiB for bursty telemetry delivery
+deduplicate_packets = true               # suppress exact, immediate UDP retransmissions
+duplicate_cache_size = 1024
+duplicate_cache_ttl_s = 0.10             # kept below a typical MAVLink sequence wrap
+request_highres_imu_rate = true
+highres_imu_rate_hz = 120.0               # 8,333 us interval; target >=100 Hz received
+request_alternative_imu_rates = false      # run_with_log enables this only during VIO dataset capture
+alternative_imu_rate_hz = 120.0            # sender may ignore unsupported message requests
 
 [telemetry]
 prefer_odometry = false
-require_local_position = true
+require_local_position = false            # live OpenVINS supplies state; target sends no MAVLink position
 max_state_age_s = 0.5
 store_highres_imu = true
 store_timesync = true
 
 [state_estimation]
 mode = "mavlink"                    # mavlink | auto | estimator
-mavlink_truth_logging = true
-run_shadow_estimator = true
+mavlink_truth_logging = false
+run_shadow_estimator = false
 shadow_trace_period_s = 0.50
 init_position_source = "zero"    # zero | mavlink_once
 use_imu_prediction = true
@@ -78,6 +88,30 @@ known_gate_positions_neu = []
 gravity_m_s2 = 9.81
 max_imu_accel_m_s2 = 20.0
 max_imu_velocity_m_s = 8.0
+
+[experimental_gate_vio_alignment]
+# Experimental, disabled by default. This applies a translation-only map-to-VIO
+# offset after the raw estimator update; it never writes PnP position into the
+# underlying estimator state or velocity. It uses the metric positions from
+# [gate_source], so those positions must be legitimately available in the target
+# environment. Set runtime.use_perception=true as well when enabling this.
+enabled = true
+min_confidence = 0.70
+max_reprojection_error = 1.00
+min_depth_m = 2.0
+max_depth_m = 12.0
+initial_association_radius_m = 4.0
+association_radius_m = 3.0
+temporal_window_s = 0.75
+min_consistent_frames = 6
+consistency_radius_m = 0.35
+max_initial_offset_m = 1.00
+max_update_innovation_m = 2.50
+correction_alpha = 0.25
+max_step_m = 0.25
+stale_after_s = 2.0
+trace = true
+trace_period_s = 0.50
 
 [visual_odometry]
 enabled = true
@@ -134,9 +168,12 @@ udp_bind_ip = "0.0.0.0"
 udp_port = 5600
 udp_socket_timeout_s = 0.1
 udp_recv_bytes = 65536
+udp_socket_receive_buffer_bytes = 8388608 # 8 MiB kernel buffer for bursty chunk traffic
 packet_header_format = "<IHHIIQ"
-max_pending_frames = 8
-stale_frame_timeout_s = 0.5
+max_pending_frames = 64
+stale_frame_timeout_s = 1.0
+completed_frame_cache_size = 512       # suppress retransmitted completed frames
+completed_frame_cache_ttl_s = 5.0
 max_jpeg_size_bytes = 4000000
 ros_camera_topic = "/camera"
 ros_camera_info_topic = "/camera_info"
@@ -169,7 +206,7 @@ custom_yaw_correction_deg = 0.0
 [perception]
 enabled = true
 backend = "yolo"                 # blue | orange | yolo
-hz = 30
+hz = 15
 gate_size_m = 1.5
 # Experimental correction to the raw OpenCV/PnP optical +z depth.
 # applied = min(max_m, base_m + raw_depth_m * per_m)
@@ -186,7 +223,7 @@ yolo_device = 0
 yolo_keypoint_order = "image"    # image for current autolabeler output; semantic for fixed physical corner IDs
 yolo_keypoint_layout = "inner4_outer4"   # inner4 for 4-keypoint model; inner4_outer4 for 8-keypoint model
 transform_mode = "physical_direct_rad_pitch_inverted" # competition perception only: invert MAVLink pitch for body-to-world projection
-world_pose_source = "mavsdk" # mavsdk | camera_only | none | estimator | gazebo_camera_sim; gazebo_camera_sim is PX4/ROS sim-only and is ignored in competition
+world_pose_source = "camera_only" # gate-map anchoring consumes body-frame PnP directly; avoid VIO-to-world feedback
 max_reprojection_error_for_memory = 1.5
 min_keypoint_conf_for_memory = 0.5
 keypoint_border_margin_px = 4.0
@@ -300,7 +337,9 @@ expected_gate_altitude_m = 1.5
 active_target_lost_grace_s = 2.0
 
 [planner]
-vmax = 9.0 # ~28.3 s full plan; final-gate waypoint occurs at ~27.3 s
+# Conservative live-VIO profile. The prior 9 m/s profile drove the controller
+# to 36-42 deg tilt as OpenVINS corrections accumulated approaching gate 4.
+vmax = 7.0
 amax = 6.0
 t_min = 1.0
 # Keep the time reference close enough for feedback control to recover. The
@@ -346,11 +385,11 @@ gate_corridor_enabled = true
 gate_corridor_length_m = 3.0
 passthrough_velocity_enabled = true
 passthrough_velocity_mode = "fixed" # fixed | adaptive
-passthrough_speed_m_s = 7.0
-passthrough_speed_max_m_s = 9.0
+passthrough_speed_m_s = 5.0
+passthrough_speed_max_m_s = 6.0
 passthrough_turn_slowdown = 0.0
 terminal_velocity_enabled = true
-terminal_speed_m_s = 7.0
+terminal_speed_m_s = 5.0
 yaw_reference_motion_near_gate_enabled = true
 yaw_reference_motion_distance_m = 3.0
 active_target_preempt_enabled = false
@@ -415,7 +454,7 @@ max_pitch_slew_rate_deg_s = 75.0
 # This is not applied during startup, calibration, perception hold, or no-plan hold.
 flight_nose_down_enabled = false
 flight_min_nose_down_deg = 10.0
-max_acc_xy = 6.5
+max_acc_xy = 4.0
 max_acc_z_up = 1.2
 max_acc_z_down = 3.0
 max_acc_z_slew_m_s3 = 10.0
@@ -447,7 +486,7 @@ adaptive_hover_fast_stable_signal = 0.08
 adaptive_hover_fast_stable_z_error = 0.15
 adaptive_hover_fast_stable_samples = 20
 adaptive_hover_fast_decay_s = 3.0
-max_tilt_deg = 42.0
+max_tilt_deg = 30.0
 max_yaw_rate_deg_s = 90.0
 command_print_period_s = 1.0
 
@@ -537,9 +576,9 @@ enabled = false
 estimator_mode_only = false
 require_hover_acquisition = false
 require_armed = true
-initial_delay_s = 0.50
-min_duration_s = 1.50
-max_duration_s = 4.00
+initial_delay_s = 0.30
+min_duration_s = 2.60
+max_duration_s = 5.00
 phase_duration_s = 0.30
 settle_duration_s = 0.08
 probe_delta_thrust = 0.01
@@ -570,16 +609,16 @@ enabled = false
 estimator_mode_only = false
 require_thrust_scale_calibration = false
 require_armed = true
-initial_delay_s = 0.30
-min_duration_s = 2.60
-max_duration_s = 5.00
-phase_duration_s = 0.55
+initial_delay_s = 1.0
+min_duration_s = 4.2
+max_duration_s = 7.0
+phase_duration_s = 0.80
 settle_duration_s = 0.20
 probe_accel_m_s2 = 0.40
 min_probe_accel_m_s2 = 0.20
 max_probe_accel_m_s2 = 1.00
 max_tilt_deg = 4.0
-min_samples_per_axis = 8
+min_samples_per_axis = 4
 accel_filter_alpha = 0.35
 accel_deadband_m_s2 = 0.05
 min_abs_accel_m_s2 = 0.08

@@ -48,17 +48,23 @@ class PerceptionAdapter:
             with lock:
                 return {
                     "frame": self.data.get("latest_frame"),
-                    "attitude": self.data.get("attitude"),
+                    "attitude": self.data.get("external_vio_attitude")
+                    or self.data.get("attitude"),
                     "odometry": self.data.get("odometry"),
-                    "local_position_ned": self.data.get("local_position_ned"),
+                    "local_position_ned": self.data.get(
+                        "external_vio_local_position_ned"
+                    ) or self.data.get("local_position_ned"),
                     "gazebo_pose": self.data.get("latest_gazebo_pose"),
                 }
 
         return {
             "frame": self.data.get("latest_frame"),
-            "attitude": self.data.get("attitude"),
+            "attitude": self.data.get("external_vio_attitude")
+            or self.data.get("attitude"),
             "odometry": self.data.get("odometry"),
-            "local_position_ned": self.data.get("local_position_ned"),
+            "local_position_ned": self.data.get(
+                "external_vio_local_position_ned"
+            ) or self.data.get("local_position_ned"),
             "gazebo_pose": self.data.get("latest_gazebo_pose"),
         }
 

@@ -1,5 +1,6 @@
 import time
 import math
+import os
 
 from pymavlink import mavutil
 from hover_hold import HoverHold
@@ -121,9 +122,16 @@ def get_current_yaw_deg(data):
 
     if lock is not None:
         with lock:
-            attitude = data.get("attitude")
+            attitude = (
+                data.get("external_vio_attitude")
+                or data.get("attitude")
+            )
     else:
-        attitude = data.get("attitude") if isinstance(data, dict) else None
+        attitude = (
+            data.get("external_vio_attitude") or data.get("attitude")
+            if isinstance(data, dict)
+            else None
+        )
 
     if not isinstance(attitude, dict):
         return 0.0
@@ -286,6 +294,7 @@ class Controller:
         self.control_hz = float(self.config.command.stream_hz)
         self.fallback_thrust = float(self.config.controller.fallback_thrust)
         self.command_print_period_s = float(self.config.controller.command_print_period_s)
+        self.observe_only = bool(self.config.runtime.observe_only)
         self.calibration_only = bool(self.config.runtime.calibration_only)
         self.perception_hold = bool(self.config.runtime.perception_hold)
         self.runner_mode = str(self.config.runtime.runner_mode).lower()
@@ -293,6 +302,16 @@ class Controller:
             self.runner_mode == "competition"
             and self.config.runtime.competition_yaw_inverted
         )
+        self.live_openvins_enabled = os.environ.get(
+            "AIGP_LIVE_OPENVINS", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.live_openvins_lock_yaw = os.environ.get(
+            "AIGP_LIVE_OPENVINS_LOCK_YAW", "1"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self.live_openvins_yaw_deg = float(
+            os.environ.get("AIGP_LIVE_OPENVINS_YAW_DEG", "180.0")
+        )
+        self._live_openvins_yaw_lock_reported = False
         self.hover_hold = HoverHold(
             stale_after_s=self.config.hover.stale_after_s,
             takeoff_alt_m=self.config.hover.takeoff_alt_m,
@@ -302,6 +321,18 @@ class Controller:
         )
 
     def _send_attitude(self, roll_deg, pitch_deg, yaw_deg, thrust):
+        if self.observe_only:
+            return False
+        if self.live_openvins_enabled and self.live_openvins_lock_yaw:
+            yaw_deg = self.live_openvins_yaw_deg
+            if not self._live_openvins_yaw_lock_reported:
+                self._live_openvins_yaw_lock_reported = True
+                print(
+                    "LIVE_OPENVINS yaw lock active "
+                    f"control_yaw_deg={yaw_deg:.1f}; "
+                    "preventing raw/control yaw positive feedback",
+                    flush=True,
+                )
         wire_yaw_rad = competition_yaw_boundary_rad(
             math.radians(float(yaw_deg)),
             inverted=self.competition_yaw_inverted,
@@ -314,8 +345,12 @@ class Controller:
             math.degrees(wire_yaw_rad),
             thrust,
         )
+        return True
 
     def update(self):
+        if self.observe_only:
+            time.sleep(1.0 / max(1.0, self.control_hz))
+            return False
         cmd, command_status = get_latest_autonomy_command(
             self.data,
             print_period_s=self.command_print_period_s,
@@ -362,11 +397,14 @@ class Controller:
         # update_motor_control(self.sim_conn, self.system_boot_ms)
 
         time.sleep(1.0 / max(1.0, self.control_hz))
+        return True
 
     # -------------------------------
     # Arm the drone
     # -------------------------------
     def arm(self):
+        if self.observe_only:
+            return False
         self.sim_conn.mav.command_long_send(
             self.sim_conn.target_system,
             self.sim_conn.target_component,
@@ -375,8 +413,24 @@ class Controller:
             1,  # arm
             0, 0, 0, 0, 0, 0
         )
+        return True
+
+    def disarm(self):
+        if self.observe_only:
+            return False
+        self.sim_conn.mav.command_long_send(
+            self.sim_conn.target_system,
+            self.sim_conn.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0,
+            0,  # disarm
+            0, 0, 0, 0, 0, 0
+        )
+        return True
 
     def send_sim_reset_command(self):
+        if self.observe_only:
+            return False
         self.sim_conn.mav.command_long_send(
             self.sim_conn.target_system,
             self.sim_conn.target_component,
@@ -384,11 +438,14 @@ class Controller:
             0,  # confirmation
             0, 0, 0, 0, 0, 0, 0
         )
+        return True
 
     # -------------------------------
     # Set Mode (px4)
     # -------------------------------
     def set_mode(self, mode_name):
+        if self.observe_only:
+            return False
         modes = self.sim_conn.mode_mapping()
 
         if modes is None or mode_name not in modes:
@@ -396,3 +453,4 @@ class Controller:
 
         print(f"Setting mode: {mode_name}")
         self.sim_conn.set_mode(mode_name)
+        return True

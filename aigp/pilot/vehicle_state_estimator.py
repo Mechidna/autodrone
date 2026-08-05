@@ -15,6 +15,7 @@ from autonomy_core.core.frame_conventions import (
     perception_rpy_for_transform,
 )
 from feature_visual_odometry import FeatureVisualOdometry
+from experimental_gate_vio_alignment import ExperimentalGateVioAlignment
 from visual_odometry import GateKeypointVisualOdometry, VisualOdometryMeasurement
 
 
@@ -44,6 +45,17 @@ class VehicleStateEstimate:
     visual_velocity_reason: str = ""
     visual_reference_reset: bool = False
     accel_bias_neu: Optional[np.ndarray] = None
+    raw_pos_neu: Optional[np.ndarray] = None
+    gate_vio_alignment_enabled: bool = False
+    gate_vio_alignment_initialized: bool = False
+    gate_vio_alignment_accepted: bool = False
+    gate_vio_alignment_offset_neu: Optional[np.ndarray] = None
+    gate_vio_alignment_reason: str = ""
+    gate_vio_alignment_support_count: int = 0
+    gate_vio_alignment_landmark_source: str = ""
+    gate_vio_alignment_residual_m: Optional[float] = None
+    gate_vio_alignment_spread_m: Optional[float] = None
+    gate_vio_alignment_age_s: Optional[float] = None
 
 
 class VehicleStateEstimator:
@@ -77,6 +89,7 @@ class VehicleStateEstimator:
         self.last_source = "uninitialized"
         self.visual_odometry = GateKeypointVisualOdometry(config)
         self.feature_visual_odometry = FeatureVisualOdometry(config)
+        self.gate_vio_alignment = ExperimentalGateVioAlignment(config)
         self.last_vision_correction = {
             "source": "",
             "residual_m": None,
@@ -143,7 +156,10 @@ class VehicleStateEstimator:
         if not isinstance(latest_perception, dict) or not estimate.valid:
             return latest_perception
 
-        if not bool(self.config.state_estimation.use_vision_correction):
+        if not (
+            bool(self.config.state_estimation.use_vision_correction)
+            or bool(self.config.experimental_gate_vio_alignment.enabled)
+        ):
             return latest_perception
 
         detections = latest_perception.get("detections")
@@ -233,11 +249,17 @@ class VehicleStateEstimator:
             self.last_wall_time = now
 
         correction = self._correct_with_vision(snapshot, now)
+        alignment = self.gate_vio_alignment.update(
+            self.pos_neu,
+            snapshot,
+            now=now,
+        )
+        output_pos_neu = alignment.aligned_pos_neu
 
         truth_pos = truth.pos_neu.copy() if truth is not None else None
         truth_vel = truth.vel_neu.copy() if truth is not None else None
         position_error = (
-            self.pos_neu - truth.pos_neu
+            output_pos_neu - truth.pos_neu
             if truth is not None
             else None
         )
@@ -247,17 +269,21 @@ class VehicleStateEstimator:
             else None
         )
         truth_error = (
-            float(np.linalg.norm(self.pos_neu - truth.pos_neu))
+            float(np.linalg.norm(output_pos_neu - truth.pos_neu))
             if truth is not None
             else None
         )
         confidence = 0.5 if truth is None else max(0.2, 1.0 / (1.0 + truth_error))
 
         return VehicleStateEstimate(
-            pos_neu=self.pos_neu.copy(),
+            pos_neu=output_pos_neu.copy(),
             vel_neu=self.vel_neu.copy(),
             yaw_rad=yaw_rad,
-            source="estimator",
+            source=(
+                "estimator+experimental_gate_alignment"
+                if alignment.initialized
+                else "estimator"
+            ),
             valid=True,
             confidence=float(confidence),
             wall_time=now,
@@ -282,6 +308,17 @@ class VehicleStateEstimator:
             visual_velocity_reason=str(correction.get("visual_velocity_reason", "")),
             visual_reference_reset=bool(correction.get("visual_reference_reset", False)),
             accel_bias_neu=self.accel_bias_neu.copy(),
+            raw_pos_neu=self.pos_neu.copy(),
+            gate_vio_alignment_enabled=alignment.enabled,
+            gate_vio_alignment_initialized=alignment.initialized,
+            gate_vio_alignment_accepted=alignment.accepted,
+            gate_vio_alignment_offset_neu=alignment.offset_neu.copy(),
+            gate_vio_alignment_reason=alignment.reason,
+            gate_vio_alignment_support_count=alignment.support_count,
+            gate_vio_alignment_landmark_source=alignment.landmark_source,
+            gate_vio_alignment_residual_m=alignment.association_residual_m,
+            gate_vio_alignment_spread_m=alignment.candidate_spread_m,
+            gate_vio_alignment_age_s=alignment.last_update_age_s,
         )
 
     def _correct_with_vision(
@@ -304,6 +341,11 @@ class VehicleStateEstimator:
         temporal_vo_measurement = None
 
         source_mode = str(self.config.state_estimation.vision_correction_source).lower()
+        if bool(self.config.experimental_gate_vio_alignment.enabled):
+            # The experimental layer owns metric gate corrections. Keep the raw
+            # estimator free of direct PnP position updates while still allowing
+            # the existing relative visual-odometry path below to run.
+            source_mode = "none"
         if source_mode == "none":
             visual_odometry_correction = self._apply_preferred_visual_odometry(
                 feature_vo_measurement,
@@ -1435,6 +1477,7 @@ class VehicleStateEstimator:
         self.last_feature_vo_trace_signature = None
         self.visual_odometry.reset()
         self.feature_visual_odometry.reset()
+        self.gate_vio_alignment.reset()
         self.last_wall_time = now
         self.initialized = True
 
@@ -1452,6 +1495,7 @@ class VehicleStateEstimator:
         self.last_feature_vo_trace_signature = None
         self.visual_odometry.reset()
         self.feature_visual_odometry.reset()
+        self.gate_vio_alignment.reset()
         self.last_wall_time = truth.wall_time
         self.initialized = True
         self.last_source = truth.source

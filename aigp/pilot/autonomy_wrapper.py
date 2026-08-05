@@ -724,6 +724,24 @@ class PyAIPilotAutonomyAPI:
         self.provisional_target_plan_count = 0
         self._last_provisional_reject_signature = None
         self.last_gate_pass_preserved_plan = False
+        alignment_config = self.config.experimental_gate_vio_alignment
+        alignment_control_path = (
+            alignment_config.enabled and self.state_estimator.mode == "estimator"
+        )
+        alignment_shadow_path = (
+            alignment_config.enabled and self.shadow_state_estimator is not None
+        )
+        print(
+            "[EXPERIMENTAL_GATE_VIO_ALIGNMENT_CONFIG] "
+            f"enabled={int(alignment_config.enabled)} "
+            f"control_path={int(alignment_control_path)} "
+            f"shadow_path={int(alignment_shadow_path)} "
+            f"known_gates={len(self.config.gate_source.known_gate_positions_neu)} "
+            f"min_frames={alignment_config.min_consistent_frames} "
+            f"window_s={alignment_config.temporal_window_s:.2f} "
+            "transform=translation_only",
+            flush=True,
+        )
         print(
             "[GATE_SOURCE_CONFIG] "
             f"mode={self.gate_source_mode} "
@@ -2947,6 +2965,23 @@ class PyAIPilotAutonomyAPI:
             if truth_error is None or not math.isfinite(float(truth_error))
             else f"{float(truth_error):.2f}"
         )
+        gate_alignment_initialized = bool(
+            getattr(estimate, "gate_vio_alignment_initialized", False)
+        )
+        gate_alignment_accepted = bool(
+            getattr(estimate, "gate_vio_alignment_accepted", False)
+        )
+        gate_alignment_reason = str(
+            getattr(estimate, "gate_vio_alignment_reason", "") or "none"
+        )
+        gate_alignment_support = int(
+            getattr(estimate, "gate_vio_alignment_support_count", 0)
+        )
+        gate_alignment_offset = getattr(
+            estimate,
+            "gate_vio_alignment_offset_neu",
+            None,
+        )
 
         print(
             "shadow_estimator_trace "
@@ -2955,6 +2990,7 @@ class PyAIPilotAutonomyAPI:
             f"imu_dt={fmt_float(getattr(estimate, 'imu_dt_s', None))} "
             f"raw_accel_body={fmt_vec(getattr(estimate, 'raw_accel_body', None))} "
             f"computed_acc_neu={fmt_vec(getattr(estimate, 'computed_acc_neu', None))} "
+            f"raw_pos_neu={fmt_vec(getattr(estimate, 'raw_pos_neu', None))} "
             f"pos_neu={fmt_vec(getattr(estimate, 'pos_neu', None))} "
             f"truth_pos_neu={fmt_vec(getattr(estimate, 'truth_pos_neu', None))} "
             f"est_minus_truth_neu={fmt_vec(getattr(estimate, 'position_error_neu', None))} "
@@ -2966,6 +3002,11 @@ class PyAIPilotAutonomyAPI:
             f"mavlink_vel_neu={fmt_vec(getattr(estimate, 'truth_vel_neu', None))} "
             f"vel_minus_mavlink_neu={fmt_vec(getattr(estimate, 'velocity_error_neu', None))} "
             f"accel_bias_neu={fmt_vec(getattr(estimate, 'accel_bias_neu', None))} "
+            f"gate_align_init={int(gate_alignment_initialized)} "
+            f"gate_align_accept={int(gate_alignment_accepted)} "
+            f"gate_align_reason={gate_alignment_reason} "
+            f"gate_align_support={gate_alignment_support} "
+            f"gate_align_offset={fmt_vec(gate_alignment_offset)} "
             f"corr={correction_txt}",
             flush=True,
         )

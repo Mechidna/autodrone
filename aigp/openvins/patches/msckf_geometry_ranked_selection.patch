@@ -1,0 +1,375 @@
+diff --git a/ov_msckf/src/core/VioManager.cpp b/ov_msckf/src/core/VioManager.cpp
+index 2ba0c1b..c66d00a 100644
+--- a/ov_msckf/src/core/VioManager.cpp
++++ b/ov_msckf/src/core/VioManager.cpp
+@@ -507,25 +507,23 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
+   // Now that we have a list of features, lets do the EKF update for MSCKF and SLAM!
+   //===================================================================================
+ 
+-  // Sort based on track length
+-  // TODO: we should have better selection logic here (i.e. even feature distribution in the FOV etc..)
+-  // TODO: right now features that are "lost" are at the front of this vector, while ones at the end are long-tracks
+-  auto compare_feat = [](const std::shared_ptr<Feature> &a, const std::shared_ptr<Feature> &b) -> bool {
+-    size_t asize = 0;
+-    size_t bsize = 0;
+-    for (const auto &pair : a->timestamps)
+-      asize += pair.second.size();
+-    for (const auto &pair : b->timestamps)
+-      bsize += pair.second.size();
+-    return asize < bsize;
+-  };
+-  std::sort(featsup_MSCKF.begin(), featsup_MSCKF.end(), compare_feat);
+-
+-  // Pass them to our MSCKF updater
+-  // NOTE: if we have more then the max, we select the "best" ones (i.e. max tracks) for this update
+-  // NOTE: this should only really be used if you want to track a lot of features, or have limited computational resources
+-  if ((int)featsup_MSCKF.size() > state->_options.max_msckf_in_update)
+-    featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - state->_options.max_msckf_in_update);
++  // Preserve the upstream longest-track selector unless post-validation geometry ranking is enabled.
++  if (!state->_options.msckf_geometry_ranked_selection) {
++    auto compare_feat = [](const std::shared_ptr<Feature> &a, const std::shared_ptr<Feature> &b) -> bool {
++      size_t asize = 0;
++      size_t bsize = 0;
++      for (const auto &pair : a->timestamps)
++        asize += pair.second.size();
++      for (const auto &pair : b->timestamps)
++        bsize += pair.second.size();
++      return asize < bsize;
++    };
++    std::sort(featsup_MSCKF.begin(), featsup_MSCKF.end(), compare_feat);
++    if ((int)featsup_MSCKF.size() > state->_options.max_msckf_in_update)
++      featsup_MSCKF.erase(featsup_MSCKF.begin(), featsup_MSCKF.end() - state->_options.max_msckf_in_update);
++  }
+   const size_t candidates_after_limit = featsup_MSCKF.size();
+   updaterMSCKF->update(state, featsup_MSCKF);
+   last_msckf_diagnostics = updaterMSCKF->get_last_diagnostics();
+@@ -533,7 +531,9 @@ void VioManager::do_feature_propagate_update(const ov_core::CameraData &message)
+   last_msckf_diagnostics.marginal_features = marginal_feature_count;
+   last_msckf_diagnostics.maxtrack_features = maxtrack_feature_count;
+   last_msckf_diagnostics.candidates_before_limit = candidates_before_limit;
+-  last_msckf_diagnostics.candidates_after_limit = candidates_after_limit;
++  last_msckf_diagnostics.candidates_after_limit = state->_options.msckf_geometry_ranked_selection
++                                                      ? last_msckf_diagnostics.selected_features
++                                                      : candidates_after_limit;
+   propagator->invalidate_cache();
+   rT4 = boost::posix_time::microsec_clock::local_time();
+ 
+diff --git a/ov_msckf/src/state/StateOptions.h b/ov_msckf/src/state/StateOptions.h
+index 95836e9..d504711 100644
+--- a/ov_msckf/src/state/StateOptions.h
++++ b/ov_msckf/src/state/StateOptions.h
+@@ -76,6 +76,9 @@ struct StateOptions {
+   /// Max number of MSCKF features we will use at a given image timestep.
+   int max_msckf_in_update = 1000;
+ 
++  /// Rank geometrically valid MSCKF features in a spatial grid before applying the update limit.
++  bool msckf_geometry_ranked_selection = false;
++
+   /// Max number of estimated ARUCO features
+   int max_aruco_features = 1024;
+ 
+@@ -123,6 +126,7 @@ struct StateOptions {
+       parser->parse_config("max_slam", max_slam_features);
+       parser->parse_config("max_slam_in_update", max_slam_in_update);
+       parser->parse_config("max_msckf_in_update", max_msckf_in_update);
++      parser->parse_config("msckf_geometry_ranked_selection", msckf_geometry_ranked_selection);
+       parser->parse_config("num_aruco", max_aruco_features);
+       parser->parse_config("max_cameras", num_cameras);
+ 
+@@ -167,6 +171,7 @@ struct StateOptions {
+     PRINT_DEBUG("  - max_slam: %d\n", max_slam_features);
+     PRINT_DEBUG("  - max_slam_in_update: %d\n", max_slam_in_update);
+     PRINT_DEBUG("  - max_msckf_in_update: %d\n", max_msckf_in_update);
++    PRINT_DEBUG("  - msckf_geometry_ranked_selection: %d\n", msckf_geometry_ranked_selection);
+     PRINT_DEBUG("  - max_aruco: %d\n", max_aruco_features);
+     PRINT_DEBUG("  - max_cameras: %d\n", num_cameras);
+     PRINT_DEBUG("  - feat_rep_msckf: %s\n", ov_type::LandmarkRepresentation::as_string(feat_rep_msckf).c_str());
+@@ -177,4 +182,4 @@ struct StateOptions {
+ 
+ } // namespace ov_msckf
+ 
+-#endif // OV_MSCKF_STATE_OPTIONS_H
+\ No newline at end of file
++#endif // OV_MSCKF_STATE_OPTIONS_H
+diff --git a/ov_msckf/src/update/UpdaterMSCKF.cpp b/ov_msckf/src/update/UpdaterMSCKF.cpp
+index cb17f81..50f94ea 100644
+--- a/ov_msckf/src/update/UpdaterMSCKF.cpp
++++ b/ov_msckf/src/update/UpdaterMSCKF.cpp
+@@ -23,6 +23,7 @@
+ 
+ #include "UpdaterHelper.h"
+ 
++#include "cam/CamBase.h"
+ #include "feat/Feature.h"
+ #include "feat/FeatureInitializer.h"
+ #include "state/State.h"
+@@ -36,8 +37,11 @@
+ #include <boost/math/distributions/chi_squared.hpp>
+ 
+ #include <algorithm>
++#include <array>
+ #include <cmath>
+ #include <limits>
++#include <numeric>
++#include <utility>
+ #include <vector>
+ 
+ using namespace ov_core;
+@@ -92,8 +96,10 @@ MsckfFeatureGeometryDiagnostics compute_feature_geometry(
+         result.first_u_px = u_px;
+         result.first_v_px = v_px;
+       }
+-      if (timestamp > last_pixel_timestamp) {
++      if (timestamp > last_pixel_timestamp ||
++          (timestamp == last_pixel_timestamp && pair.first < result.last_camera_id)) {
+         last_pixel_timestamp = timestamp;
++        result.last_camera_id = pair.first;
+         result.last_u_px = u_px;
+         result.last_v_px = v_px;
+       }
+@@ -162,6 +168,58 @@ MsckfFeatureGeometryDiagnostics *find_feature_geometry(MsckfUpdateDiagnostics &d
+   return match == diagnostics.feature_geometry.end() ? nullptr : &(*match);
+ }
+ 
++const MsckfFeatureGeometryDiagnostics *find_feature_geometry(const MsckfUpdateDiagnostics &diagnostics, size_t feature_id) {
++  const auto match = std::find_if(
++      diagnostics.feature_geometry.begin(), diagnostics.feature_geometry.end(),
++      [feature_id](const MsckfFeatureGeometryDiagnostics &item) { return item.feature_id == feature_id; });
++  return match == diagnostics.feature_geometry.end() ? nullptr : &(*match);
++}
++
++struct PreparedMsckfFeature {
++  std::shared_ptr<Feature> feature;
++  Eigen::MatrixXd H_x;
++  Eigen::VectorXd residual;
++  std::vector<std::shared_ptr<Type>> Hx_order;
++  int grid_index = -1;
++};
++
++double finite_or(double value, double fallback) { return std::isfinite(value) ? value : fallback; }
++
++bool better_geometry_candidate(const PreparedMsckfFeature &a, const PreparedMsckfFeature &b,
++                               const MsckfUpdateDiagnostics &diagnostics) {
++  const auto *ga = find_feature_geometry(diagnostics, a.feature->featid);
++  const auto *gb = find_feature_geometry(diagnostics, b.feature->featid);
++  if (ga == nullptr || gb == nullptr)
++    return a.feature->featid < b.feature->featid;
++  const double a_parallax = finite_or(ga->max_parallax_deg, -std::numeric_limits<double>::infinity());
++  const double b_parallax = finite_or(gb->max_parallax_deg, -std::numeric_limits<double>::infinity());
++  if (a_parallax != b_parallax)
++    return a_parallax > b_parallax;
++  const double a_condition = finite_or(ga->condition_number, std::numeric_limits<double>::infinity());
++  const double b_condition = finite_or(gb->condition_number, std::numeric_limits<double>::infinity());
++  if (a_condition != b_condition)
++    return a_condition < b_condition;
++  const double a_chi2 = finite_or(ga->chi2_ratio, std::numeric_limits<double>::infinity());
++  const double b_chi2 = finite_or(gb->chi2_ratio, std::numeric_limits<double>::infinity());
++  if (a_chi2 != b_chi2)
++    return a_chi2 < b_chi2;
++  if (ga->observation_count != gb->observation_count)
++    return ga->observation_count > gb->observation_count;
++  return ga->feature_id < gb->feature_id;
++}
++
++int image_grid_index(const std::shared_ptr<State> &state, MsckfFeatureGeometryDiagnostics &geometry) {
++  const auto camera = state->_cam_intrinsics_cameras.find(geometry.last_camera_id);
++  if (camera == state->_cam_intrinsics_cameras.end() || !std::isfinite(geometry.mean_u_px) ||
++      !std::isfinite(geometry.mean_v_px) || camera->second->w() <= 0 || camera->second->h() <= 0)
++    return -1;
++  const int column = std::max(0, std::min(2, static_cast<int>(3.0 * geometry.mean_u_px / camera->second->w())));
++  const int row = std::max(0, std::min(2, static_cast<int>(3.0 * geometry.mean_v_px / camera->second->h())));
++  geometry.selection_grid_row = row;
++  geometry.selection_grid_col = column;
++  return 3 * row + column;
++}
++
+ } // namespace
+ 
+ UpdaterMSCKF::UpdaterMSCKF(UpdaterOptions &options, ov_core::FeatureInitializerOptions &feat_init_options) : _options(options) {
+@@ -329,6 +387,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
+     it1++;
+   }
+   rT2 = boost::posix_time::microsec_clock::local_time();
++  last_diagnostics.geometry_valid_features = feature_vec.size();
+ 
+   // Calculate the max possible measurement size
+   size_t max_meas_size = 0;
+@@ -352,6 +411,8 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
+   std::vector<std::shared_ptr<Type>> Hx_order_big;
+   size_t ct_jacob = 0;
+   size_t ct_meas = 0;
++  std::vector<PreparedMsckfFeature> prepared_features;
++  prepared_features.reserve(feature_vec.size());
+ 
+   // 4. Compute linear system for each feature, nullspace project, and reject
+   auto it2 = feature_vec.begin();
+@@ -436,14 +497,98 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
+       continue;
+     }
+ 
++    PreparedMsckfFeature prepared;
++    prepared.feature = *it2;
++    prepared.H_x = std::move(H_x);
++    prepared.residual = std::move(res);
++    prepared.Hx_order = std::move(Hx_order);
++    if (geometry != nullptr)
++      prepared.grid_index = image_grid_index(state, *geometry);
++    prepared_features.emplace_back(std::move(prepared));
++    it2++;
++  }
++
++  last_diagnostics.post_chi2_features = prepared_features.size();
++  std::vector<size_t> selected_indices;
++  const size_t selection_limit = static_cast<size_t>(std::max(1, state->_options.max_msckf_in_update));
++  if (!state->_options.msckf_geometry_ranked_selection || prepared_features.size() <= selection_limit) {
++    selected_indices.resize(prepared_features.size());
++    std::iota(selected_indices.begin(), selected_indices.end(), 0);
++  } else {
++    std::array<std::vector<size_t>, 9> grid_candidates;
++    std::vector<size_t> invalid_grid_candidates;
++    for (size_t index = 0; index < prepared_features.size(); ++index) {
++      const int grid_index = prepared_features[index].grid_index;
++      if (grid_index >= 0 && grid_index < static_cast<int>(grid_candidates.size()))
++        grid_candidates[grid_index].push_back(index);
++      else
++        invalid_grid_candidates.push_back(index);
++    }
++    const auto better_index = [&prepared_features, this](size_t a, size_t b) {
++      return better_geometry_candidate(prepared_features[a], prepared_features[b], last_diagnostics);
++    };
++    for (auto &cell : grid_candidates)
++      std::sort(cell.begin(), cell.end(), better_index);
++    std::sort(invalid_grid_candidates.begin(), invalid_grid_candidates.end(), better_index);
++
++    // Take one feature from each occupied image cell per round. If the cap ends
++    // within a round, use geometry quality to decide which cells receive the
++    // remaining slots. This keeps the selected population spatially balanced.
++    for (size_t depth = 0; selected_indices.size() < selection_limit; ++depth) {
++      std::vector<size_t> round;
++      for (const auto &cell : grid_candidates) {
++        if (depth < cell.size())
++          round.push_back(cell[depth]);
++      }
++      if (round.empty())
++        break;
++      const size_t remaining = selection_limit - selected_indices.size();
++      if (round.size() > remaining) {
++        std::sort(round.begin(), round.end(), better_index);
++        round.resize(remaining);
++      }
++      selected_indices.insert(selected_indices.end(), round.begin(), round.end());
++    }
++    for (size_t index : invalid_grid_candidates) {
++      if (selected_indices.size() >= selection_limit)
++        break;
++      selected_indices.push_back(index);
++    }
++  }
++
++  std::vector<bool> selected(prepared_features.size(), false);
++  for (size_t index : selected_indices)
++    selected[index] = true;
++  for (size_t index = 0; index < prepared_features.size(); ++index) {
++    auto *geometry = find_feature_geometry(last_diagnostics, prepared_features[index].feature->featid);
++    if (!selected[index]) {
++      prepared_features[index].feature->to_delete = true;
++      last_diagnostics.rejected_selection_limit++;
++      if (geometry != nullptr)
++        geometry->result = MsckfFeatureResult::SELECTION_REJECTED;
++    }
++  }
++
++  // Stack selected features in feature-id order so the EKF input is deterministic.
++  std::sort(selected_indices.begin(), selected_indices.end(), [&prepared_features](size_t a, size_t b) {
++    return prepared_features[a].feature->featid < prepared_features[b].feature->featid;
++  });
++  std::vector<std::shared_ptr<Feature>> selected_feature_vec;
++  selected_feature_vec.reserve(selected_indices.size());
++  for (size_t selection_rank = 0; selection_rank < selected_indices.size(); ++selection_rank) {
++    auto &prepared = prepared_features[selected_indices[selection_rank]];
++    auto *geometry = find_feature_geometry(last_diagnostics, prepared.feature->featid);
+     if (geometry != nullptr) {
++      geometry->selected_for_update = true;
++      geometry->selection_rank = selection_rank + 1;
+       geometry->accepted = true;
+       geometry->result = MsckfFeatureResult::ACCEPTED;
+     }
++    selected_feature_vec.push_back(prepared.feature);
+ 
+-    // We are good!!! Append to our large H vector
++    // Append this selected feature to the large update system.
+     size_t ct_hx = 0;
+-    for (const auto &var : Hx_order) {
++    for (const auto &var : prepared.Hx_order) {
+ 
+       // Ensure that this variable is in our Jacobian
+       if (Hx_mapping.find(var) == Hx_mapping.end()) {
+@@ -453,15 +598,16 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_
+       }
+ 
+       // Append to our large Jacobian
+-      Hx_big.block(ct_meas, Hx_mapping[var], H_x.rows(), var->size()) = H_x.block(0, ct_hx, H_x.rows(), var->size());
++      Hx_big.block(ct_meas, Hx_mapping[var], prepared.H_x.rows(), var->size()) =
++          prepared.H_x.block(0, ct_hx, prepared.H_x.rows(), var->size());
+       ct_hx += var->size();
+     }
+ 
+-    // Append our residual and move forward
+-    res_big.block(ct_meas, 0, res.rows(), 1) = res;
+-    ct_meas += res.rows();
+-    it2++;
++    res_big.block(ct_meas, 0, prepared.residual.rows(), 1) = prepared.residual;
++    ct_meas += prepared.residual.rows();
+   }
++  feature_vec = std::move(selected_feature_vec);
++  last_diagnostics.selected_features = feature_vec.size();
+   rT3 = boost::posix_time::microsec_clock::local_time();
+   last_diagnostics.accepted_features = feature_vec.size();
+   for (const auto &feature : feature_vec) {
+diff --git a/ov_msckf/src/update/UpdaterMSCKF.h b/ov_msckf/src/update/UpdaterMSCKF.h
+index 2187b70..2c34c32 100644
+--- a/ov_msckf/src/update/UpdaterMSCKF.h
++++ b/ov_msckf/src/update/UpdaterMSCKF.h
+@@ -48,11 +48,13 @@ enum class MsckfFeatureResult : int {
+   REFINEMENT_REJECTED = 2,
+   CHI2_REJECTED = 3,
+   ACCEPTED = 4,
++  SELECTION_REJECTED = 5,
+ };
+ 
+ /// Geometry and final result for one feature submitted to MSCKF.
+ struct MsckfFeatureGeometryDiagnostics {
+   size_t feature_id = 0;
++  size_t last_camera_id = 0;
+   double first_u_px = std::numeric_limits<double>::quiet_NaN();
+   double first_v_px = std::numeric_limits<double>::quiet_NaN();
+   double last_u_px = std::numeric_limits<double>::quiet_NaN();
+@@ -75,6 +77,10 @@ struct MsckfFeatureGeometryDiagnostics {
+   bool triangulation_success = false;
+   bool refinement_success = false;
+   bool chi2_tested = false;
++  bool selected_for_update = false;
++  size_t selection_rank = 0;
++  int selection_grid_row = -1;
++  int selection_grid_col = -1;
+   bool accepted = false;
+   int triangulation_failure_reason = 0;
+   int refinement_failure_reason = 0;
+@@ -101,13 +107,17 @@ struct MsckfUpdateDiagnostics {
+   size_t rejected_refinement = 0;
+   size_t refinement_depth_too_near = 0;
+   size_t refinement_depth_too_far = 0;
+   size_t refinement_baseline_ratio = 0;
+   size_t refinement_invalid_numeric = 0;
+   size_t refinement_other = 0;
+   size_t chi2_tested = 0;
+   size_t rejected_chi2 = 0;
++  size_t geometry_valid_features = 0;
++  size_t post_chi2_features = 0;
++  size_t rejected_selection_limit = 0;
++  size_t selected_features = 0;
+   size_t accepted_features = 0;
+   size_t accepted_measurements = 0;
+   double chi2_ratio_sum = 0.0;
+   double chi2_ratio_max = 0.0;
+   std::vector<MsckfFeatureGeometryDiagnostics> feature_geometry;

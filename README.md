@@ -252,9 +252,13 @@ Do not use native Windows for:
 - ROS camera input
 - Gazebo camera pose debug
 - PX4 SITL/Gazebo orchestration
-- dataset capture/autolabeling
+- Gazebo training-dataset capture/autolabeling
 
 Use Linux or WSL/Linux for those.
+
+The competition UDP runtime can record a raw camera/IMU VIO dataset natively
+on Windows; see **VIO Dataset Capture** below. Run OpenVINS and the later
+dataset conversion/replay step inside WSL2.
 
 ### Windows Requirements
 
@@ -330,6 +334,42 @@ for PX4/Gazebo debugging. Competition mode will refuse to start until that is
 disabled. For a first Windows networking/perception smoke test, also set
 `competition_arm = false` so the stack cannot arm while you are checking packet
 flow.
+
+### Experimental gate-to-VIO alignment
+
+`[experimental_gate_vio_alignment]` is a disabled-by-default localization
+experiment. It uses temporally consistent gate PnP observations and the metric
+positions in `[gate_source].known_gate_positions_neu` to maintain a separate
+translation offset from the raw estimator/VIO frame into the map frame. It does
+not write gate position, velocity, yaw, or scale into the underlying estimator.
+When enabled, the older direct landmark position correction is bypassed so the
+two methods cannot correct the same state simultaneously.
+
+To observe it on the shadow estimator without changing the flight state source:
+
+```toml
+[runtime]
+use_perception = true
+
+[state_estimation]
+mode = "mavlink"
+run_shadow_estimator = true
+
+[experimental_gate_vio_alignment]
+enabled = true
+```
+
+The startup line must report `control_path=0 shadow_path=1`. To use its aligned
+position for control, the state-estimation path must eventually be the live VIO
+provider (currently `mode = "estimator"` uses the in-process Python estimator;
+the repository does not yet stream live OpenVINS output into Windows). The
+feature can also be toggled for one process with
+`EXPERIMENTAL_GATE_VIO_ALIGNMENT=true` or `false`. Enabling it requires
+perception and a non-empty metric gate map; configuration loading fails instead
+of silently running without either input.
+
+This first implementation estimates translation only. A single gate center is
+not sufficient to safely estimate map yaw or VIO scale.
 
 PowerShell preflight:
 
@@ -602,6 +642,8 @@ The runtime supports these useful environment variables:
 | `MAVLINK_PORT` | Overrides port for the selected runner mode |
 | `YOLO_MODEL_PATH` | Path to YOLO `.pt` weights |
 | `GATE_SOURCE_MODE` | `perception` or `ground_truth` |
+| `AIGP_VIO_RECORD_DIR` | Enables raw VIO recording at the specified directory |
+| `AIGP_VIO_QUEUE_SIZE` | Pending asynchronous dataset writes; default `512` |
 
 There is no environment override for `perception_geometry_audit.enabled` or
 `runtime.competition_arm`; edit `runtime.toml` before competition runs.
@@ -634,6 +676,112 @@ Open the generated:
 ```text
 aigp/logs/runs/<run_id>/replay_debug_map.html
 ```
+
+## VIO Dataset Capture
+
+For a Windows competition-simulator run, start the normal logged runner with
+the opt-in VIO flag:
+
+```powershell
+python .\aigp\tools\run_with_log.py --capture-vio-dataset
+```
+
+To inventory or capture a simulator that does not provide flight state, add
+the fail-safe observe-only policy:
+
+```powershell
+python .\aigp\tools\run_with_log.py `
+  --observe-only `
+  --capture-vio-dataset `
+  --vio-dataset-queue-size 2048 `
+  --run-id vq2_vq1_observe_01
+```
+
+Observe-only mode skips PX4 offboard priming, mode changes, arming, autonomy
+updates, controller updates, simulator reset commands, and shutdown landing.
+The controller also independently refuses to transmit if one of those methods
+is called accidentally. MAVLink TIMESYNC and best-effort telemetry-rate
+requests remain enabled because they are sensor-capture protocol traffic, not
+flight-control commands. `run.log` must contain `OBSERVE_ONLY=True` and
+`OBSERVE_ONLY active`; `manifest.json` records `runtime.observe_only: true`.
+
+This does not enable VIO or change the state source used for control. It adds a
+`vio_dataset` directory to the timestamped run and asynchronously records:
+
+```text
+vio_dataset/
+  manifest.json
+  runtime.toml
+  events.jsonl
+  camera/data.csv
+  camera/data/*.jpg
+  imu/data.csv                 # HIGHRES_IMU
+  imu/hil_sensor.csv
+  imu/scaled_imu.csv
+  imu/scaled_imu2.csv
+  imu/scaled_imu3.csv
+  imu/raw_imu.csv              # diagnostic-only, device-specific scale
+  timesync/data.csv
+  truth/attitude.csv
+  truth/local_position_ned.csv
+  truth/odometry.csv
+```
+
+The camera files are the original reassembled simulator JPEG payloads; they are
+not decoded and re-encoded for this dataset. `camera/data.csv` preserves each
+frame's original `sim_time_ns`, the IMU CSVs preserve every received source
+timestamp plus raw/unit metadata, and the TIMESYNC file includes both
+transmitted and received `tc1`/`ts1` values. The `truth` files are for offline
+scoring only and must not be fed to OpenVINS.
+
+After stopping the run, open `manifest.json` and require all
+`dropped_queue_full` and `write_failures` counts to be zero. Also check
+`events.jsonl` for `camera_frame_dropped`, `camera_packet_rejected`, or
+`camera_decode_failed`. If the disk falls behind, repeat with a larger bounded
+queue, for example:
+
+```powershell
+python .\aigp\tools\run_with_log.py `
+  --capture-vio-dataset `
+  --vio-dataset-queue-size 2048
+```
+
+The UDP receiver requests an 8 MiB kernel receive buffer before binding,
+retains up to 64 incomplete frames for one second, and suppresses completed
+frame retransmissions for five seconds using `(frame_id, sim_time_ns)`. At
+startup it prints both the requested and effective `UDP_RCVBUF`; verify the
+effective value is at least 8388608 on Windows. A
+`camera_duplicate_frame_suppressed` event is expected when the simulator
+retransmits a frame and does not represent a dataset duplicate. Completed
+camera rows should still be unique by frame ID and simulator timestamp.
+
+The MAVLink receiver separately requests an 8 MiB kernel receive buffer and a
+120 Hz `HIGHRES_IMU` interval. During `--capture-vio-dataset` only, it also
+requests `HIL_SENSOR`, `SCALED_IMU`, `SCALED_IMU2`, `SCALED_IMU3`, and
+`RAW_IMU` at 120 Hz so their six-axis signals can be compared. These requests
+target the component that sent the startup heartbeat, independently of the
+configured flight-control target. They are best-effort: startup continues if
+the endpoint rejects or does not support one, and any matching `COMMAND_ACK`
+is written to `events.jsonl`. Normal flight runs do not request the extra
+streams. Exact byte-identical MAVLink packet
+retransmissions received within 100 ms are suppressed. Sensor values are never
+deduplicated merely because their timestamps or values match. IMU and truth CSV
+rows include `mavlink_seq`, `mavlink_src_system`, and
+`mavlink_src_component`; the final `mavlink_rx_summary` event reports duplicate,
+sequence-gap, and out-of-order counts. Verify the startup log reports an
+effective MAVLink `UDP_RCVBUF` of at least 8388608 bytes, then require a stable
+IMU rate of at least 100 Hz before treating a capture as the final OpenVINS
+benchmark.
+
+From WSL2, the default captures are visible under:
+
+```bash
+/mnt/c/dev/autonomy_core/aigp/logs/runs/<run_id>/vio_dataset
+```
+
+Use `aigp/tools/prepare_openvins_dataset.py --imu-source ...` to build a
+source-specific offline replay. The full Windows/WSL workflow and supported
+source names are in `aigp/openvins/README.md`.
 
 ## Dataset Capture And Autolabeling
 

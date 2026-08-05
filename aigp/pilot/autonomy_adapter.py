@@ -34,6 +34,7 @@ class AutonomyInputSnapshot:
     yaw_rate_rad_s: float
     attitude_time_boot_ms: Optional[int]
     attitude_wall_time: float
+    attitude_source: Optional[str]
 
     # IMU
     accel_xyz: np.ndarray
@@ -187,7 +188,7 @@ class AutonomyAdapter:
             if vel_neu is None and vel_ned is not None:
                 vel_neu = np.array([vel_ned[0], vel_ned[1], -vel_ned[2]], dtype=float)
             if pos_ned is not None or pos_neu is not None:
-                position_source = source_name
+                position_source = str(source.get("source") or source_name)
                 wall_time = source.get("wall_time")
                 position_wall_time = None if wall_time is None else float(wall_time)
                 break
@@ -207,6 +208,7 @@ class AutonomyAdapter:
             yaw_rate_rad_s=float(attitude.get("yawspeed", 0.0)),
             attitude_time_boot_ms=attitude.get("time_boot_ms"),
             attitude_wall_time=float(attitude.get("wall_time", 0.0)),
+            attitude_source=str(attitude.get("source") or "mavlink"),
 
             accel_xyz=accel_xyz,
             gyro_xyz=gyro_xyz,
@@ -309,6 +311,20 @@ class AutonomyAdapter:
 
         pos_ned = np.array([pos_neu[0], pos_neu[1], -pos_neu[2]], dtype=float)
         vel_ned = np.array([vel_neu[0], vel_neu[1], -vel_neu[2]], dtype=float)
+        raw_pos_neu = getattr(estimate, "raw_pos_neu", None)
+        alignment_offset = getattr(estimate, "gate_vio_alignment_offset_neu", None)
+
+        def optional_vec3(value):
+            if value is None:
+                return None
+            try:
+                array = np.asarray(value, dtype=float).reshape(3)
+            except (TypeError, ValueError):
+                return None
+            if not np.all(np.isfinite(array)):
+                return None
+            return tuple(float(item) for item in array)
+
         return {
             "valid": bool(estimate.valid),
             "source": str(estimate.source),
@@ -335,5 +351,40 @@ class AutonomyAdapter:
             ),
             "vision_correction_count": int(
                 getattr(estimate, "vision_correction_count", 0)
+            ),
+            "raw_pos_neu": optional_vec3(raw_pos_neu),
+            "gate_vio_alignment_enabled": bool(
+                getattr(estimate, "gate_vio_alignment_enabled", False)
+            ),
+            "gate_vio_alignment_initialized": bool(
+                getattr(estimate, "gate_vio_alignment_initialized", False)
+            ),
+            "gate_vio_alignment_accepted": bool(
+                getattr(estimate, "gate_vio_alignment_accepted", False)
+            ),
+            "gate_vio_alignment_offset_neu": optional_vec3(alignment_offset),
+            "gate_vio_alignment_reason": str(
+                getattr(estimate, "gate_vio_alignment_reason", "")
+            ),
+            "gate_vio_alignment_support_count": int(
+                getattr(estimate, "gate_vio_alignment_support_count", 0)
+            ),
+            "gate_vio_alignment_landmark_source": str(
+                getattr(estimate, "gate_vio_alignment_landmark_source", "")
+            ),
+            "gate_vio_alignment_residual_m": (
+                None
+                if getattr(estimate, "gate_vio_alignment_residual_m", None) is None
+                else float(estimate.gate_vio_alignment_residual_m)
+            ),
+            "gate_vio_alignment_spread_m": (
+                None
+                if getattr(estimate, "gate_vio_alignment_spread_m", None) is None
+                else float(estimate.gate_vio_alignment_spread_m)
+            ),
+            "gate_vio_alignment_age_s": (
+                None
+                if getattr(estimate, "gate_vio_alignment_age_s", None) is None
+                else float(estimate.gate_vio_alignment_age_s)
             ),
         }

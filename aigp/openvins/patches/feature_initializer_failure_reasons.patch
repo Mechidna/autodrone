@@ -1,0 +1,195 @@
+diff --git a/ov_core/src/feat/FeatureInitializer.h b/ov_core/src/feat/FeatureInitializer.h
+--- a/ov_core/src/feat/FeatureInitializer.h
++++ b/ov_core/src/feat/FeatureInitializer.h
+@@ -42,6 +42,16 @@ class FeatureInitializer {
+ 
+ public:
++  /// Reason the most recent triangulation or refinement call returned false.
++  enum class FailureReason {
++    NONE,
++    BAD_CONDITION,
++    DEPTH_TOO_NEAR,
++    DEPTH_TOO_FAR,
++    BASELINE_RATIO,
++    INVALID_NUMERIC,
++  };
++
+   /**
+    * @brief Structure which stores pose estimates for use in triangulation
+@@ -125,10 +135,16 @@ public:
+    */
+   const FeatureInitializerOptions config() { return _options; }
+ 
++  /// Failure reason from the most recent triangulation or refinement call.
++  FailureReason last_failure_reason() const { return _last_failure_reason; }
++
+ protected:
+   /// Contains options for the initializer process
+   FeatureInitializerOptions _options;
+ 
++  /// Failure reason from the most recent public operation.
++  FailureReason _last_failure_reason = FailureReason::NONE;
++
+   /**
+    * @brief Helper function for the gauss newton method that computes error of the given estimate
+diff --git a/ov_core/src/feat/FeatureInitializer.cpp b/ov_core/src/feat/FeatureInitializer.cpp
+--- a/ov_core/src/feat/FeatureInitializer.cpp
++++ b/ov_core/src/feat/FeatureInitializer.cpp
+@@ -28,6 +28,7 @@ using namespace ov_core;
+ 
+ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
+                                               std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM) {
++  _last_failure_reason = FailureReason::NONE;
+ 
+   // Total number of measurements
+@@ -100,8 +101,20 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
+   // If we have a bad condition number, or it is too close
+   // Then set the flag for bad (i.e. set z-axis to nan)
+-  if (std::abs(condA) > _options.max_cond_number || p_f(2, 0) < _options.min_dist || p_f(2, 0) > _options.max_dist ||
+-      std::isnan(p_f.norm())) {
++  if (std::abs(condA) > _options.max_cond_number) {
++    _last_failure_reason = FailureReason::BAD_CONDITION;
++    return false;
++  }
++  if (p_f(2, 0) < _options.min_dist) {
++    _last_failure_reason = FailureReason::DEPTH_TOO_NEAR;
++    return false;
++  }
++  if (p_f(2, 0) > _options.max_dist) {
++    _last_failure_reason = FailureReason::DEPTH_TOO_FAR;
++    return false;
++  }
++  if (std::isnan(p_f.norm())) {
++    _last_failure_reason = FailureReason::INVALID_NUMERIC;
+     return false;
+   }
+@@ -115,6 +128,7 @@ bool FeatureInitializer::single_triangulation(std::shared_ptr<Feature> feat,
+ 
+ bool FeatureInitializer::single_triangulation_1d(std::shared_ptr<Feature> feat,
+                                                  std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM) {
++  _last_failure_reason = FailureReason::NONE;
+ 
+   // Total number of measurements
+@@ -184,7 +198,16 @@ bool FeatureInitializer::single_triangulation_1d(std::shared_ptr<Feature> feat,
+ 
+   // Then set the flag for bad (i.e. set z-axis to nan)
+-  if (p_f(2, 0) < _options.min_dist || p_f(2, 0) > _options.max_dist || std::isnan(p_f.norm())) {
++  if (p_f(2, 0) < _options.min_dist) {
++    _last_failure_reason = FailureReason::DEPTH_TOO_NEAR;
++    return false;
++  }
++  if (p_f(2, 0) > _options.max_dist) {
++    _last_failure_reason = FailureReason::DEPTH_TOO_FAR;
++    return false;
++  }
++  if (std::isnan(p_f.norm())) {
++    _last_failure_reason = FailureReason::INVALID_NUMERIC;
+     return false;
+   }
+@@ -198,6 +221,7 @@ bool FeatureInitializer::single_triangulation_1d(std::shared_ptr<Feature> feat,
+ 
+ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
+                                             std::unordered_map<size_t, std::unordered_map<double, ClonePose>> &clonesCAM) {
++  _last_failure_reason = FailureReason::NONE;
+ 
+   // Get into inverse depth
+@@ -364,8 +388,20 @@ bool FeatureInitializer::single_gaussnewton(std::shared_ptr<Feature> feat,
+   // 2. If the feature is invalid
+   // 3. If the baseline ratio is large
+-  if (feat->p_FinA(2) < _options.min_dist || feat->p_FinA(2) > _options.max_dist ||
+-      (feat->p_FinA.norm() / base_line_max) > _options.max_baseline || std::isnan(feat->p_FinA.norm())) {
++  if (feat->p_FinA(2) < _options.min_dist) {
++    _last_failure_reason = FailureReason::DEPTH_TOO_NEAR;
++    return false;
++  }
++  if (feat->p_FinA(2) > _options.max_dist) {
++    _last_failure_reason = FailureReason::DEPTH_TOO_FAR;
++    return false;
++  }
++  if ((feat->p_FinA.norm() / base_line_max) > _options.max_baseline) {
++    _last_failure_reason = FailureReason::BASELINE_RATIO;
++    return false;
++  }
++  if (std::isnan(feat->p_FinA.norm())) {
++    _last_failure_reason = FailureReason::INVALID_NUMERIC;
+     return false;
+   }
+diff --git a/ov_msckf/src/update/UpdaterMSCKF.h b/ov_msckf/src/update/UpdaterMSCKF.h
+--- a/ov_msckf/src/update/UpdaterMSCKF.h
++++ b/ov_msckf/src/update/UpdaterMSCKF.h
+@@ -51,7 +51,17 @@ struct MsckfUpdateDiagnostics {
+   size_t input_measurements = 0;
+   size_t rejected_too_few_measurements = 0;
+   size_t rejected_triangulation = 0;
++  size_t triangulation_bad_condition = 0;
++  size_t triangulation_depth_too_near = 0;
++  size_t triangulation_depth_too_far = 0;
++  size_t triangulation_invalid_numeric = 0;
++  size_t triangulation_other = 0;
+   size_t rejected_refinement = 0;
++  size_t refinement_depth_too_near = 0;
++  size_t refinement_depth_too_far = 0;
++  size_t refinement_baseline_ratio = 0;
++  size_t refinement_invalid_numeric = 0;
++  size_t refinement_other = 0;
+   size_t chi2_tested = 0;
+   size_t rejected_chi2 = 0;
+diff --git a/ov_msckf/src/update/UpdaterMSCKF.cpp b/ov_msckf/src/update/UpdaterMSCKF.cpp
+--- a/ov_msckf/src/update/UpdaterMSCKF.cpp
++++ b/ov_msckf/src/update/UpdaterMSCKF.cpp
+@@ -132,6 +132,7 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_p
+     } else {
+       success_tri = initializer_feat->single_triangulation(*it1, clones_cam);
+     }
++    const auto triangulation_reason = initializer_feat->last_failure_reason();
+ 
+     // Gauss-newton refine the feature
+@@ -139,16 +140,62 @@ void UpdaterMSCKF::update(std::shared_ptr<State> state, std::vector<std::shared_p
+     if (initializer_feat->config().refine_features) {
+       success_refine = initializer_feat->single_gaussnewton(*it1, clones_cam);
+     }
++    const auto refinement_reason = initializer_feat->last_failure_reason();
+ 
+     // Remove the feature if not a success
+     if (!success_tri || !success_refine) {
+       (*it1)->to_delete = true;
+       if (!success_tri) {
+         last_diagnostics.rejected_triangulation++;
++        switch (triangulation_reason) {
++        case FeatureInitializer::FailureReason::BAD_CONDITION:
++          last_diagnostics.triangulation_bad_condition++;
++          break;
++        case FeatureInitializer::FailureReason::DEPTH_TOO_NEAR:
++          last_diagnostics.triangulation_depth_too_near++;
++          break;
++        case FeatureInitializer::FailureReason::DEPTH_TOO_FAR:
++          last_diagnostics.triangulation_depth_too_far++;
++          break;
++        case FeatureInitializer::FailureReason::INVALID_NUMERIC:
++          last_diagnostics.triangulation_invalid_numeric++;
++          break;
++        default:
++          last_diagnostics.triangulation_other++;
++          break;
++        }
+       } else {
+         last_diagnostics.rejected_refinement++;
++        switch (refinement_reason) {
++        case FeatureInitializer::FailureReason::DEPTH_TOO_NEAR:
++          last_diagnostics.refinement_depth_too_near++;
++          break;
++        case FeatureInitializer::FailureReason::DEPTH_TOO_FAR:
++          last_diagnostics.refinement_depth_too_far++;
++          break;
++        case FeatureInitializer::FailureReason::BASELINE_RATIO:
++          last_diagnostics.refinement_baseline_ratio++;
++          break;
++        case FeatureInitializer::FailureReason::INVALID_NUMERIC:
++          last_diagnostics.refinement_invalid_numeric++;
++          break;
++        default:
++          last_diagnostics.refinement_other++;
++          break;
++        }
+       }
+       it1 = feature_vec.erase(it1);

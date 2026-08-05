@@ -14,11 +14,13 @@ CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "runtime.toml"
 @dataclass(frozen=True)
 class RuntimeSection:
     runner_mode: str
+    observe_only: bool
     competition_yaw_inverted: bool
     use_perception: bool
     calibration_only: bool
     perception_hold: bool
     startup_observation_duration_s: float
+    competition_prearm_sensor_hold_s: float
     perception_hold_settle_speed_m_s: float
     perception_hold_settle_duration_s: float
     control_hz: float
@@ -39,6 +41,14 @@ class MavlinkSection:
     port_competition: int
     target_system: int
     target_component: int
+    udp_socket_receive_buffer_bytes: int
+    deduplicate_packets: bool
+    duplicate_cache_size: int
+    duplicate_cache_ttl_s: float
+    request_highres_imu_rate: bool
+    highres_imu_rate_hz: float
+    request_alternative_imu_rates: bool
+    alternative_imu_rate_hz: float
 
     def port_for_mode(self, runner_mode: str) -> int:
         if str(runner_mode).lower() == "competition":
@@ -99,6 +109,27 @@ class StateEstimationSection:
     gravity_m_s2: float
     max_imu_accel_m_s2: float
     max_imu_velocity_m_s: float
+
+
+@dataclass(frozen=True)
+class ExperimentalGateVioAlignmentSection:
+    enabled: bool
+    min_confidence: float
+    max_reprojection_error: float
+    min_depth_m: float
+    max_depth_m: float
+    initial_association_radius_m: float
+    association_radius_m: float
+    temporal_window_s: float
+    min_consistent_frames: int
+    consistency_radius_m: float
+    max_initial_offset_m: float
+    max_update_innovation_m: float
+    correction_alpha: float
+    max_step_m: float
+    stale_after_s: float
+    trace: bool
+    trace_period_s: float
 
 
 @dataclass(frozen=True)
@@ -163,9 +194,12 @@ class VisionSection:
     udp_port: int
     udp_socket_timeout_s: float
     udp_recv_bytes: int
+    udp_socket_receive_buffer_bytes: int
     packet_header_format: str
     max_pending_frames: int
     stale_frame_timeout_s: float
+    completed_frame_cache_size: int
+    completed_frame_cache_ttl_s: float
     max_jpeg_size_bytes: int
     ros_camera_topic: str
     ros_camera_info_topic: str
@@ -617,6 +651,7 @@ class PilotConfig:
     mavlink: MavlinkSection
     telemetry: TelemetrySection
     state_estimation: StateEstimationSection
+    experimental_gate_vio_alignment: ExperimentalGateVioAlignmentSection
     visual_odometry: VisualOdometrySection
     feature_visual_odometry: FeatureVisualOdometrySection
     timesync: TimesyncSection
@@ -648,6 +683,10 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
     mavlink_raw = _section(raw, "mavlink")
     telemetry_raw = _section(raw, "telemetry")
     state_estimation_raw = _section(raw, "state_estimation")
+    experimental_gate_vio_alignment_raw = _section(
+        raw,
+        "experimental_gate_vio_alignment",
+    )
     visual_odometry_raw = _section(raw, "visual_odometry")
     feature_visual_odometry_raw = _section(raw, "feature_visual_odometry")
     timesync_raw = _section(raw, "timesync")
@@ -741,6 +780,10 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
         path=config_path,
         runtime=RuntimeSection(
             runner_mode=runner_mode,
+            observe_only=_env_bool(
+                "OBSERVE_ONLY",
+                _bool(runtime_raw, "observe_only", False),
+            ),
             competition_yaw_inverted=_env_bool(
                 "COMPETITION_YAW_INVERTED",
                 _bool(runtime_raw, "competition_yaw_inverted", False),
@@ -757,6 +800,10 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             startup_observation_duration_s=_env_float(
                 "STARTUP_OBSERVATION_DURATION_S",
                 _float(runtime_raw, "startup_observation_duration_s", 0.0),
+            ),
+            competition_prearm_sensor_hold_s=_env_float(
+                "COMPETITION_PREARM_SENSOR_HOLD_S",
+                _float(runtime_raw, "competition_prearm_sensor_hold_s", 0.0),
             ),
             perception_hold_settle_speed_m_s=_float(
                 runtime_raw,
@@ -784,6 +831,45 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             port_competition=port_competition,
             target_system=_int(mavlink_raw, "target_system", 1),
             target_component=_int(mavlink_raw, "target_component", 1),
+            udp_socket_receive_buffer_bytes=_env_int(
+                "MAVLINK_UDP_SOCKET_RECEIVE_BUFFER_BYTES",
+                _int(
+                    mavlink_raw,
+                    "udp_socket_receive_buffer_bytes",
+                    8 * 1024 * 1024,
+                ),
+            ),
+            deduplicate_packets=_bool(
+                mavlink_raw,
+                "deduplicate_packets",
+                True,
+            ),
+            duplicate_cache_size=_int(
+                mavlink_raw,
+                "duplicate_cache_size",
+                1024,
+            ),
+            duplicate_cache_ttl_s=_float(
+                mavlink_raw,
+                "duplicate_cache_ttl_s",
+                0.10,
+            ),
+            request_highres_imu_rate=_env_bool(
+                "MAVLINK_REQUEST_HIGHRES_IMU_RATE",
+                _bool(mavlink_raw, "request_highres_imu_rate", True),
+            ),
+            highres_imu_rate_hz=_env_float(
+                "MAVLINK_HIGHRES_IMU_RATE_HZ",
+                _float(mavlink_raw, "highres_imu_rate_hz", 120.0),
+            ),
+            request_alternative_imu_rates=_env_bool(
+                "MAVLINK_REQUEST_ALTERNATIVE_IMU_RATES",
+                _bool(mavlink_raw, "request_alternative_imu_rates", False),
+            ),
+            alternative_imu_rate_hz=_env_float(
+                "MAVLINK_ALTERNATIVE_IMU_RATE_HZ",
+                _float(mavlink_raw, "alternative_imu_rate_hz", 120.0),
+            ),
         ),
         telemetry=TelemetrySection(
             prefer_odometry=_bool(telemetry_raw, "prefer_odometry", False),
@@ -975,6 +1061,95 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             max_imu_accel_m_s2=_float(state_estimation_raw, "max_imu_accel_m_s2", 20.0),
             max_imu_velocity_m_s=_float(state_estimation_raw, "max_imu_velocity_m_s", 8.0),
         ),
+        experimental_gate_vio_alignment=ExperimentalGateVioAlignmentSection(
+            enabled=_env_bool(
+                "EXPERIMENTAL_GATE_VIO_ALIGNMENT",
+                _bool(experimental_gate_vio_alignment_raw, "enabled", False),
+            ),
+            min_confidence=_float(
+                experimental_gate_vio_alignment_raw,
+                "min_confidence",
+                0.70,
+            ),
+            max_reprojection_error=_float(
+                experimental_gate_vio_alignment_raw,
+                "max_reprojection_error",
+                1.50,
+            ),
+            min_depth_m=_float(
+                experimental_gate_vio_alignment_raw,
+                "min_depth_m",
+                2.0,
+            ),
+            max_depth_m=_float(
+                experimental_gate_vio_alignment_raw,
+                "max_depth_m",
+                45.0,
+            ),
+            initial_association_radius_m=_float(
+                experimental_gate_vio_alignment_raw,
+                "initial_association_radius_m",
+                6.0,
+            ),
+            association_radius_m=_float(
+                experimental_gate_vio_alignment_raw,
+                "association_radius_m",
+                3.0,
+            ),
+            temporal_window_s=_float(
+                experimental_gate_vio_alignment_raw,
+                "temporal_window_s",
+                1.0,
+            ),
+            min_consistent_frames=max(
+                1,
+                _int(
+                    experimental_gate_vio_alignment_raw,
+                    "min_consistent_frames",
+                    4,
+                ),
+            ),
+            consistency_radius_m=_float(
+                experimental_gate_vio_alignment_raw,
+                "consistency_radius_m",
+                0.60,
+            ),
+            max_initial_offset_m=_float(
+                experimental_gate_vio_alignment_raw,
+                "max_initial_offset_m",
+                6.0,
+            ),
+            max_update_innovation_m=_float(
+                experimental_gate_vio_alignment_raw,
+                "max_update_innovation_m",
+                1.5,
+            ),
+            correction_alpha=_float(
+                experimental_gate_vio_alignment_raw,
+                "correction_alpha",
+                0.20,
+            ),
+            max_step_m=_float(
+                experimental_gate_vio_alignment_raw,
+                "max_step_m",
+                0.25,
+            ),
+            stale_after_s=_float(
+                experimental_gate_vio_alignment_raw,
+                "stale_after_s",
+                2.0,
+            ),
+            trace=_bool(
+                experimental_gate_vio_alignment_raw,
+                "trace",
+                True,
+            ),
+            trace_period_s=_float(
+                experimental_gate_vio_alignment_raw,
+                "trace_period_s",
+                0.50,
+            ),
+        ),
         visual_odometry=VisualOdometrySection(
             enabled=_bool(visual_odometry_raw, "enabled", True),
             min_keypoint_conf=_float(visual_odometry_raw, "min_keypoint_conf", 0.35),
@@ -1074,9 +1249,24 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             udp_port=_int(vision_raw, "udp_port", 5600),
             udp_socket_timeout_s=_float(vision_raw, "udp_socket_timeout_s", 0.1),
             udp_recv_bytes=_int(vision_raw, "udp_recv_bytes", 65536),
+            udp_socket_receive_buffer_bytes=_int(
+                vision_raw,
+                "udp_socket_receive_buffer_bytes",
+                8 * 1024 * 1024,
+            ),
             packet_header_format=_str(vision_raw, "packet_header_format", "<IHHIIQ"),
-            max_pending_frames=_int(vision_raw, "max_pending_frames", 8),
-            stale_frame_timeout_s=_float(vision_raw, "stale_frame_timeout_s", 0.5),
+            max_pending_frames=_int(vision_raw, "max_pending_frames", 64),
+            stale_frame_timeout_s=_float(vision_raw, "stale_frame_timeout_s", 1.0),
+            completed_frame_cache_size=_int(
+                vision_raw,
+                "completed_frame_cache_size",
+                512,
+            ),
+            completed_frame_cache_ttl_s=_float(
+                vision_raw,
+                "completed_frame_cache_ttl_s",
+                5.0,
+            ),
             max_jpeg_size_bytes=_int(vision_raw, "max_jpeg_size_bytes", 4_000_000),
             ros_camera_topic=_str(vision_raw, "ros_camera_topic", "/camera"),
             ros_camera_info_topic=_str(vision_raw, "ros_camera_info_topic", "/camera_info"),
@@ -2505,6 +2695,28 @@ def _validate(config: PilotConfig) -> None:
             f"Invalid runner_mode={config.runtime.runner_mode!r}. "
             "Use runner_mode='px4' or runner_mode='competition'."
         )
+    if config.mavlink.udp_socket_receive_buffer_bytes < 0:
+        raise RuntimeError(
+            "mavlink.udp_socket_receive_buffer_bytes must be non-negative."
+        )
+    if config.mavlink.duplicate_cache_size < 0:
+        raise RuntimeError("mavlink.duplicate_cache_size must be non-negative.")
+    if config.mavlink.duplicate_cache_ttl_s < 0.0:
+        raise RuntimeError(
+            "mavlink.duplicate_cache_ttl_s must be non-negative."
+        )
+    if (
+        not math.isfinite(float(config.mavlink.highres_imu_rate_hz))
+        or config.mavlink.highres_imu_rate_hz <= 0.0
+    ):
+        raise RuntimeError("mavlink.highres_imu_rate_hz must be positive and finite.")
+    if (
+        not math.isfinite(float(config.mavlink.alternative_imu_rate_hz))
+        or config.mavlink.alternative_imu_rate_hz <= 0.0
+    ):
+        raise RuntimeError(
+            "mavlink.alternative_imu_rate_hz must be positive and finite."
+        )
     if config.runtime.calibration_only and config.runtime.perception_hold:
         raise RuntimeError(
             "runtime.calibration_only and runtime.perception_hold are mutually "
@@ -2513,6 +2725,14 @@ def _validate(config: PilotConfig) -> None:
     if config.runtime.startup_observation_duration_s < 0.0:
         raise RuntimeError(
             "runtime.startup_observation_duration_s must be non-negative."
+        )
+    if (
+        not math.isfinite(config.runtime.competition_prearm_sensor_hold_s)
+        or config.runtime.competition_prearm_sensor_hold_s < 0.0
+    ):
+        raise RuntimeError(
+            "runtime.competition_prearm_sensor_hold_s must be non-negative "
+            "and finite."
         )
     if config.runtime.perception_hold and not config.runtime.use_perception:
         raise RuntimeError(
@@ -2598,6 +2818,18 @@ def _validate(config: PilotConfig) -> None:
         raise RuntimeError(
             f"Invalid vision.source={config.vision.source!r}. "
             "Use vision.source='udp' or vision.source='ros'."
+        )
+    if config.vision.udp_socket_receive_buffer_bytes < 0:
+        raise RuntimeError(
+            "vision.udp_socket_receive_buffer_bytes must be non-negative."
+        )
+    if config.vision.completed_frame_cache_size < 0:
+        raise RuntimeError(
+            "vision.completed_frame_cache_size must be non-negative."
+        )
+    if config.vision.completed_frame_cache_ttl_s < 0.0:
+        raise RuntimeError(
+            "vision.completed_frame_cache_ttl_s must be non-negative."
         )
     if config.perception.yolo_keypoint_order not in ("semantic", "image"):
         raise RuntimeError(
@@ -2794,6 +3026,58 @@ def _validate(config: PilotConfig) -> None:
             "set state_estimation.allow_known_gate_correction=true only for "
             "explicit sim-truth debugging."
         )
+    alignment = config.experimental_gate_vio_alignment
+    if not 0.0 <= alignment.min_confidence <= 1.0:
+        raise RuntimeError(
+            "experimental_gate_vio_alignment.min_confidence must be within [0, 1]."
+        )
+    if alignment.max_reprojection_error < 0.0:
+        raise RuntimeError(
+            "experimental_gate_vio_alignment.max_reprojection_error must be >= 0."
+        )
+    if alignment.min_depth_m < 0.0:
+        raise RuntimeError(
+            "experimental_gate_vio_alignment.min_depth_m must be >= 0."
+        )
+    if alignment.max_depth_m > 0.0 and alignment.max_depth_m < alignment.min_depth_m:
+        raise RuntimeError(
+            "experimental_gate_vio_alignment.max_depth_m must be >= min_depth_m, "
+            "or <= 0 to disable the maximum."
+        )
+    for key, value in (
+        ("initial_association_radius_m", alignment.initial_association_radius_m),
+        ("association_radius_m", alignment.association_radius_m),
+        ("temporal_window_s", alignment.temporal_window_s),
+        ("consistency_radius_m", alignment.consistency_radius_m),
+        ("max_initial_offset_m", alignment.max_initial_offset_m),
+        ("max_update_innovation_m", alignment.max_update_innovation_m),
+        ("max_step_m", alignment.max_step_m),
+        ("stale_after_s", alignment.stale_after_s),
+        ("trace_period_s", alignment.trace_period_s),
+    ):
+        if value <= 0.0:
+            raise RuntimeError(
+                f"experimental_gate_vio_alignment.{key} must be positive."
+            )
+    if alignment.min_consistent_frames < 2:
+        raise RuntimeError(
+            "experimental_gate_vio_alignment.min_consistent_frames must be >= 2."
+        )
+    if not 0.0 < alignment.correction_alpha <= 1.0:
+        raise RuntimeError(
+            "experimental_gate_vio_alignment.correction_alpha must be within (0, 1]."
+        )
+    if alignment.enabled:
+        if not config.runtime.use_perception or not config.perception.enabled:
+            raise RuntimeError(
+                "experimental_gate_vio_alignment.enabled=true requires both "
+                "runtime.use_perception=true and perception.enabled=true."
+            )
+        if not config.gate_source.known_gate_positions_neu:
+            raise RuntimeError(
+                "experimental_gate_vio_alignment.enabled=true requires a metric gate "
+                "map in gate_source.known_gate_positions_neu."
+            )
     if config.command.stream_hz <= 0.0:
         raise RuntimeError("command.stream_hz must be positive.")
     if config.command.max_hz <= 0.0:
