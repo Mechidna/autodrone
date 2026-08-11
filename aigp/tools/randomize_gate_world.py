@@ -7,17 +7,24 @@ import copy
 import math
 import random
 import secrets
+import shlex
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 
-
-PX4_WORLDS = Path(
-    "/home/paolo/PX4-Autopilot/PX4-Autopilot/Tools/simulation/gz/worlds"
+from autonomy_core.tools.px4_gazebo_paths import (
+    DEFAULT_WORLD_NAME,
+    PX4_ROOT_ENV,
+    PX4_WORLDS_RELATIVE,
+    PX4_WORLDS_DIR_ENV,
+    configured_world_name,
+    expand_path,
+    px4_root_from_worlds_dir,
+    resolve_px4_worlds_dir,
 )
-SRC = PX4_WORLDS / "gate_test_1500mm_blue.sdf"
-OUTPUT_WORLD_NAME = "gate_test_1500mm_blue_random"
-OUTPUT = PX4_WORLDS / f"{OUTPUT_WORLD_NAME}.sdf"
+
+DEFAULT_SOURCE_WORLD_NAME = "gate_test_1500mm_blue"
+DEFAULT_OUTPUT_WORLD_NAME = DEFAULT_WORLD_NAME
 RUNTIME_CONFIG = Path(__file__).resolve().parents[1] / "config" / "runtime.toml"
 
 DEFAULT_GATE_COUNT = 3
@@ -54,6 +61,14 @@ class WorldRandomizationResult:
     gate_color: dict[str, float] | None
     distractor_count: int
     obstacle_count: int
+
+
+@dataclass(frozen=True)
+class WorldPaths:
+    source_sdf: Path
+    output_sdf: Path
+    output_world_name: str
+    px4_root: Path | None
 
 
 def _bool_arg(value) -> bool:
@@ -234,14 +249,16 @@ def _parse_pose(text: str | None, *, context: str) -> tuple[float, float, float,
 def _find_world(root: ET.Element) -> ET.Element:
     world = root.find("world")
     if world is None:
-        raise RuntimeError(f"No <world> element found in {SRC}.")
+        raise RuntimeError("No <world> element found in the source SDF.")
     return world
 
 
 def _find_gate_model(world: ET.Element, gate_idx: int) -> ET.Element:
     model = world.find(f"./model[@name='racing_gate_{gate_idx}']")
     if model is None:
-        raise RuntimeError(f"No model named racing_gate_{gate_idx} found in {SRC}.")
+        raise RuntimeError(
+            f"No model named racing_gate_{gate_idx} found in the source SDF."
+        )
     return model
 
 
@@ -263,7 +280,7 @@ def _existing_gate_models(world: ET.Element) -> dict[int, ET.Element]:
 def _configure_gate_models(world: ET.Element, gate_count: int) -> None:
     existing = _existing_gate_models(world)
     if not existing:
-        raise RuntimeError(f"No racing_gate_* models found in {SRC}.")
+        raise RuntimeError("No racing_gate_* models found in the source SDF.")
 
     template = copy.deepcopy(existing[min(existing)])
     for gate_idx, model in list(existing.items()):
@@ -655,11 +672,18 @@ def _add_obstacles(world: ET.Element, rng: random.Random, gate_poses: list[tuple
     return count
 
 
-def _write_random_world(seed: int, options: RandomizationOptions) -> WorldRandomizationResult:
-    tree = ET.parse(SRC)
+def _write_random_world(
+    seed: int,
+    options: RandomizationOptions,
+    *,
+    source_sdf: Path,
+    output_sdf: Path,
+    output_world_name: str,
+) -> WorldRandomizationResult:
+    tree = ET.parse(source_sdf)
     root = tree.getroot()
     world = _find_world(root)
-    world.set("name", OUTPUT_WORLD_NAME)
+    world.set("name", output_world_name)
 
     rng = random.Random(seed)
     template_poses = [
@@ -712,7 +736,7 @@ def _write_random_world(seed: int, options: RandomizationOptions) -> WorldRandom
     obstacle_count = _add_obstacles(world, rng, poses) if options.add_obstacles else 0
 
     ET.indent(tree, space="  ")
-    tree.write(OUTPUT, encoding="UTF-8", xml_declaration=True)
+    tree.write(output_sdf, encoding="UTF-8", xml_declaration=True)
     return WorldRandomizationResult(
         poses=poses,
         lighting=lighting,
@@ -723,12 +747,129 @@ def _write_random_world(seed: int, options: RandomizationOptions) -> WorldRandom
     )
 
 
+def _resolve_world_paths(args) -> WorldPaths:
+    source_arg = getattr(args, "source_world_sdf", None)
+    output_arg = getattr(args, "output_world_sdf", None)
+    px4_root_arg = getattr(args, "px4_root", None)
+    worlds_dir_arg = getattr(args, "worlds_dir", None)
+
+    worlds_dir: Path | None = None
+    if px4_root_arg is not None or worlds_dir_arg is not None or source_arg is None:
+        worlds_dir = resolve_px4_worlds_dir(
+            px4_root=px4_root_arg,
+            worlds_dir=worlds_dir_arg,
+        )
+
+    if source_arg is not None:
+        source_sdf = expand_path(source_arg)
+    else:
+        source_parent = worlds_dir
+        if source_parent is None and output_arg is not None:
+            source_parent = expand_path(output_arg).parent
+        if source_parent is None:
+            raise RuntimeError("Unable to determine the source world directory.")
+        source_sdf = source_parent / f"{DEFAULT_SOURCE_WORLD_NAME}.sdf"
+
+    if output_arg is not None:
+        output_sdf = expand_path(output_arg)
+    else:
+        output_parent = worlds_dir or source_sdf.parent
+        requested_name = getattr(args, "output_world_name", None)
+        output_name = configured_world_name(
+            requested_name or DEFAULT_OUTPUT_WORLD_NAME,
+            environ={},
+        )
+        output_sdf = output_parent / f"{output_name}.sdf"
+
+    output_world_name = configured_world_name(
+        getattr(args, "output_world_name", None) or output_sdf.stem,
+        environ={},
+    )
+    if output_sdf.stem != output_world_name:
+        raise ValueError(
+            "--output-world-name must match the stem of --output-world-sdf: "
+            f"{output_world_name!r} != {output_sdf.stem!r}."
+        )
+    if output_sdf.suffix.lower() != ".sdf":
+        raise ValueError(f"Output world path must end in .sdf: {output_sdf}.")
+    if not source_sdf.is_file():
+        raise FileNotFoundError(
+            f"Source Gazebo world SDF was not found: {source_sdf}. "
+            "Pass --source-world-sdf or configure the PX4 checkout."
+        )
+    if not output_sdf.parent.is_dir():
+        raise FileNotFoundError(
+            f"Output world directory does not exist: {output_sdf.parent}."
+        )
+    if source_sdf == output_sdf:
+        raise ValueError("Source and output world SDF paths must be different.")
+
+    if px4_root_arg is not None:
+        resolved_px4_root = expand_path(px4_root_arg)
+    elif worlds_dir is not None:
+        resolved_px4_root = px4_root_from_worlds_dir(worlds_dir)
+    else:
+        resolved_px4_root = None
+
+    return WorldPaths(
+        source_sdf=source_sdf,
+        output_sdf=output_sdf,
+        output_world_name=output_world_name,
+        px4_root=resolved_px4_root,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Generate one overwritten randomized PX4 Gazebo gate world from "
             "gate_test_1500mm_blue.sdf."
         )
+    )
+    px4_location = parser.add_mutually_exclusive_group()
+    px4_location.add_argument(
+        "--px4-root",
+        type=Path,
+        default=None,
+        help=(
+            "PX4-Autopilot checkout root. Defaults to "
+            f"${PX4_ROOT_ENV}, then conventional paths under the current home directory."
+        ),
+    )
+    px4_location.add_argument(
+        "--worlds-dir",
+        type=Path,
+        default=None,
+        help=(
+            "PX4 Gazebo worlds directory. Defaults to "
+            f"${PX4_WORLDS_DIR_ENV} or the resolved PX4 checkout."
+        ),
+    )
+    parser.add_argument(
+        "--source-world-sdf",
+        type=Path,
+        default=None,
+        help=(
+            "Source world template. If omitted, use gate_test_1500mm_blue.sdf "
+            "from the resolved worlds directory."
+        ),
+    )
+    parser.add_argument(
+        "--output-world-sdf",
+        type=Path,
+        default=None,
+        help=(
+            "Generated world path. If omitted, write beside the source or in "
+            "the resolved PX4 worlds directory."
+        ),
+    )
+    parser.add_argument(
+        "--output-world-name",
+        default=None,
+        help=(
+            f"Generated Gazebo world name. Default: {DEFAULT_OUTPUT_WORLD_NAME}, "
+            "or the --output-world-sdf filename when that option is explicit."
+        ),
     )
     parser.add_argument(
         "--seed",
@@ -877,7 +1018,17 @@ def main() -> None:
         randomize_gate_color=bool(args.randomize_gate_color),
         gate_rgb=gate_rgb,
     )
-    result = _write_random_world(seed, options)
+    try:
+        world_paths = _resolve_world_paths(args)
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        parser.error(str(exc))
+    result = _write_random_world(
+        seed,
+        options,
+        source_sdf=world_paths.source_sdf,
+        output_sdf=world_paths.output_sdf,
+        output_world_name=world_paths.output_world_name,
+    )
     gate_centers_neu = [
         _pilot_neu_center_from_sdf_pose(pose_values)
         for pose_values in result.poses
@@ -891,8 +1042,8 @@ def main() -> None:
         )
 
     print(f"seed={seed}")
-    print(f"template={SRC}")
-    print(f"wrote={OUTPUT}")
+    print(f"template={world_paths.source_sdf}")
+    print(f"wrote={world_paths.output_sdf}")
     if bool(args.update_runtime):
         print(
             f"runtime_config={Path(args.runtime_config)} "
@@ -901,7 +1052,13 @@ def main() -> None:
         )
     else:
         print("runtime_config_update=0")
-    print(f"launch=PX4_GZ_WORLD={OUTPUT_WORLD_NAME} make px4_sitl gz_racer_mono_cam")
+    launch_prefix = ""
+    if world_paths.px4_root is not None:
+        launch_prefix = f"cd {shlex.quote(str(world_paths.px4_root))} && "
+    print(
+        f"launch={launch_prefix}PX4_GZ_WORLD={world_paths.output_world_name} "
+        "make px4_sitl gz_racer_mono_cam"
+    )
     print(
         "options="
         f"gate_count={options.gate_count} "

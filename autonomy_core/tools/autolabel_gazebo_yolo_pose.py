@@ -11,13 +11,17 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from autonomy_core.tools.px4_gazebo_paths import (
+    DEFAULT_WORLD_NAME,
+    PX4_ROOT_ENV,
+    PX4_WORLDS_DIR_ENV,
+    configured_world_name,
+    resolve_world_sdf,
+)
+
 
 DEFAULT_CAPTURE_ROOT = "~/datasets/gazebo_gate_capture"
 DEFAULT_OUTPUT_ROOT = "~/datasets/gazebo_gate_yolo_pose"
-DEFAULT_WORLD_SDF = (
-    "/home/paolo/PX4-Autopilot/PX4-Autopilot/Tools/simulation/gz/worlds/"
-    "gate_test_1500mm_blue_random.sdf"
-)
 
 GATE_CENTERS_WORLD_MAVSDK = (
     np.array([0.0, 8.0, 1.5], dtype=float),
@@ -292,7 +296,13 @@ def legacy_hardcoded_gate_geometry() -> dict:
 def resolve_gate_geometry(args, world_sdf=None) -> dict:
     if bool(getattr(args, "legacy_hardcoded_gates", False)):
         return legacy_hardcoded_gate_geometry()
-    selected_world_sdf = world_sdf or getattr(args, "world_sdf", None) or DEFAULT_WORLD_SDF
+    selected_world_sdf = world_sdf or getattr(args, "world_sdf", None)
+    if selected_world_sdf is None:
+        selected_world_sdf = resolve_world_sdf(
+            world_name=getattr(args, "world_name", DEFAULT_WORLD_NAME),
+            px4_root=getattr(args, "px4_root", None),
+            worlds_dir=getattr(args, "worlds_dir", None),
+        )
     return load_world_sdf_gate_geometry(
         selected_world_sdf,
         gate_center_z_offset_m=float(args.gate_center_z_offset_m),
@@ -1567,7 +1577,11 @@ def _run_world_sdf_path(args, capture_root: Path, run_root: Path, manifest: dict
         if original_path.exists():
             return original_path
 
-    return Path(DEFAULT_WORLD_SDF)
+    return resolve_world_sdf(
+        world_name=getattr(args, "world_name", DEFAULT_WORLD_NAME),
+        px4_root=getattr(args, "px4_root", None),
+        worlds_dir=getattr(args, "worlds_dir", None),
+    )
 
 
 def _capture_run_infos(args, capture_root: Path) -> list[dict]:
@@ -1805,7 +1819,7 @@ def process_dataset(args):
         print(f"[AUTOLABEL] wrote {yaml_path}")
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Project known Gazebo gate corners into raw captures and write YOLO pose labels."
     )
@@ -1816,8 +1830,28 @@ def parse_args():
         default=None,
         help=(
             "Gazebo world SDF containing racing_gate_* poses. If omitted, each "
-            "capture run uses its own world.sdf snapshot or manifest path."
+            "capture run uses its own world.sdf snapshot or manifest path, then "
+            "falls back to the configured PX4 checkout."
         ),
+    )
+    parser.add_argument(
+        "--world-name",
+        default=None,
+        help=(
+            "Fallback Gazebo world name when a capture has no SDF snapshot. "
+            f"Defaults to $PX4_GZ_WORLD, $WORLD, then {DEFAULT_WORLD_NAME}."
+        ),
+    )
+    px4_location = parser.add_mutually_exclusive_group()
+    px4_location.add_argument(
+        "--px4-root",
+        default=None,
+        help=f"PX4-Autopilot checkout root; overrides ${PX4_ROOT_ENV}.",
+    )
+    px4_location.add_argument(
+        "--worlds-dir",
+        default=None,
+        help=f"PX4 Gazebo worlds directory; overrides ${PX4_WORLDS_DIR_ENV}.",
     )
     parser.add_argument(
         "--run-glob",
@@ -1910,7 +1944,11 @@ def parse_args():
         choices=("current", "flip_y", "physical", "physical_minus_y"),
         default="current",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    try:
+        args.world_name = configured_world_name(args.world_name)
+    except ValueError as exc:
+        parser.error(str(exc))
     if np.isnan(float(args.max_gate_label_distance_m)):
         parser.error("--max-gate-label-distance-m must not be NaN.")
     return args

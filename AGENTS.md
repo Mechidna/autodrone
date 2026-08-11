@@ -147,16 +147,15 @@ Before claiming a fresh-clone Gazebo workflow works:
 
 1. record the PX4 repository URL and exact revision;
 2. document how the base race world/model assets are obtained;
-3. remove or parameterize machine-specific paths;
+3. configure `PX4_AUTOPILOT_ROOT`, `PX4_GZ_WORLDS_DIR`, or explicit CLI paths;
 4. verify ROS/Gazebo topics and MAVLink endpoints from a clean Ubuntu checkout;
 5. run observe-only capture before allowing any control output.
 
-Known portability debt:
-
-- `aigp/tools/randomize_gate_world.py` hard-codes
-  `/home/paolo/PX4-Autopilot/PX4-Autopilot/Tools/simulation/gz/worlds`.
-- `aigp/tools/capture_gazebo_yolo_pose.py` uses the same machine-specific root
-  for its default world SDF.
+World randomization, ROS capture, and autolabel fallback share the portable
+resolver in `autonomy_core/tools/px4_gazebo_paths.py`. Resolution order is an
+explicit CLI path, an environment override, then conventional Ubuntu checkout
+locations. Preserve this order and keep captured world-SDF snapshots as the
+preferred autolabel source.
 
 Do not add a new absolute home-directory path. Prefer an explicit CLI option,
 then an environment variable, then a documented relative/default lookup.
@@ -166,7 +165,7 @@ then an environment variable, then a documented relative/default lookup.
 Prioritize work in this order unless the user requests a different bounded
 task:
 
-1. Make the native Ubuntu/PX4/Gazebo setup portable and record dependency pins.
+1. Record the PX4 revision and the provenance of the external race-world assets.
 2. Verify the locked install, unit suite, OpenVINS build, and observe-only data
    capture from a clean checkout.
 3. Generate a fresh synchronized capture and replay it as a paired 20-versus-

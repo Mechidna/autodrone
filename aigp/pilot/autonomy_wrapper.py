@@ -28,6 +28,7 @@ from autonomy_core.planning.minimum_snap_planner_multi_time_optimized import (
 )
 from autonomy_core.planning.trajectory_manager import allocate_segment_times
 from autonomy_core.perception.gate_memory import GateMemory
+from autonomy_core.tools.px4_gazebo_paths import resolve_world_sdf
 from adaptive_hover_thrust import AdaptiveHoverThrust
 from estimator_landmark_map import EstimatorLandmarkMap
 from gate_pass_geometry import (
@@ -9704,22 +9705,15 @@ class PyAIPilotAutonomyAPI:
 
         world_name = raw_path.stem if raw_path.suffix == ".sdf" else raw_path.name
         if world_name and "/" not in world_name:
-            world_roots = (
-                Path.home()
-                / "PX4-Autopilot"
-                / "PX4-Autopilot"
-                / "Tools"
-                / "simulation"
-                / "gz"
-                / "worlds",
-                Path.home()
-                / "PX4-Autopilot"
-                / "Tools"
-                / "simulation"
-                / "gz"
-                / "worlds",
-            )
-            candidates.extend(root / f"{world_name}.sdf" for root in world_roots)
+            try:
+                candidates.append(
+                    resolve_world_sdf(
+                        world_name=world_name,
+                        require_exists=False,
+                    )
+                )
+            except ValueError:
+                pass
         return candidates
 
     def _canonical_gate_pose_records_from_sdf(self, world_sdf: Path) -> list[dict[str, object]]:

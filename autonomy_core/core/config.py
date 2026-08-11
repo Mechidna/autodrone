@@ -90,9 +90,7 @@ class PerceptionConfig:
 
     camera_offset_body: Vector3 = (0.12, 0.03, 0.242)
     gate_size: float = VADR_TS_002.gate_inner_square_m
-    yolo_model_path: str = (
-        "/home/paolo/datasets/gazebo_gate_yolo_pose_ab_runs/partial/weights/best.pt"
-    )
+    yolo_model_path: str = "aigp/models/gate_yolo_pose_8k/best.pt"
     preprocess_mode: str = "raw"
     yolo_conf: float = 0.1
     yolo_imgsz: int = 640

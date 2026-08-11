@@ -20,19 +20,17 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_msgs.msg import TFMessage
 
-
-DEFAULT_WORLD = (
-    os.environ.get("PX4_GZ_WORLD")
-    or os.environ.get("WORLD")
-    or "gate_test_1500mm_blue_random"
+from autonomy_core.tools.px4_gazebo_paths import (
+    DEFAULT_WORLD_NAME,
+    PX4_ROOT_ENV,
+    PX4_WORLDS_DIR_ENV,
+    configured_world_name,
+    resolve_world_sdf,
 )
-DEFAULT_DYNAMIC_POSE_TOPIC = f"/world/{DEFAULT_WORLD}/dynamic_pose/info"
+
+
 DEFAULT_CAPTURE_ROOT = "~/datasets/gazebo_gate_capture_racer"
 DEFAULT_CAMERA_MOUNT_RPY = (0.0, -0.3490658503988659, 0.0)
-DEFAULT_WORLD_SDF = (
-    "/home/paolo/PX4-Autopilot/PX4-Autopilot/Tools/simulation/gz/worlds/"
-    f"{DEFAULT_WORLD}.sdf"
-)
 
 
 def _parse_vec3(text: str, *, name: str) -> tuple[float, float, float]:
@@ -550,7 +548,7 @@ class GazeboYoloPoseCaptureNode(Node):
             )
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
             "Capture ROS2 camera frames plus Gazebo dynamic pose metadata for "
@@ -559,8 +557,32 @@ def parse_args():
     )
     parser.add_argument("--capture-root", default=DEFAULT_CAPTURE_ROOT)
     parser.add_argument("--run-id", default=None)
-    parser.add_argument("--world-name", default=DEFAULT_WORLD)
-    parser.add_argument("--world-sdf", default=DEFAULT_WORLD_SDF)
+    parser.add_argument(
+        "--world-name",
+        default=None,
+        help=(
+            f"Gazebo world name. Defaults to $PX4_GZ_WORLD, $WORLD, then {DEFAULT_WORLD_NAME}."
+        ),
+    )
+    parser.add_argument(
+        "--world-sdf",
+        default=None,
+        help=(
+            "Explicit active world SDF. Otherwise resolve --world-name using "
+            f"${PX4_WORLDS_DIR_ENV}, ${PX4_ROOT_ENV}, or a conventional Ubuntu checkout."
+        ),
+    )
+    px4_location = parser.add_mutually_exclusive_group()
+    px4_location.add_argument(
+        "--px4-root",
+        default=None,
+        help=f"PX4-Autopilot checkout root; overrides ${PX4_ROOT_ENV}.",
+    )
+    px4_location.add_argument(
+        "--worlds-dir",
+        default=None,
+        help=f"PX4 Gazebo worlds directory; overrides ${PX4_WORLDS_DIR_ENV}.",
+    )
     parser.add_argument(
         "--flat-capture-layout",
         action="store_true",
@@ -581,7 +603,11 @@ def parse_args():
     parser.add_argument("--print-every", type=int, default=25)
     parser.add_argument("--camera-topic", default="/camera")
     parser.add_argument("--camera-info-topic", default="/camera_info")
-    parser.add_argument("--dynamic-pose-topic", default=DEFAULT_DYNAMIC_POSE_TOPIC)
+    parser.add_argument(
+        "--dynamic-pose-topic",
+        default=None,
+        help="Gazebo dynamic-pose topic. Defaults to /world/<world-name>/dynamic_pose/info.",
+    )
     parser.add_argument("--model-name", default="racer_mono_cam_0")
     parser.add_argument("--camera-link-name", default="camera_link")
     parser.add_argument(
@@ -606,7 +632,24 @@ def parse_args():
         action="store_true",
         help="Save frames even without Gazebo pose metadata. Not recommended for autolabeling.",
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    try:
+        args.world_name = configured_world_name(args.world_name)
+        if args.dynamic_pose_topic is None:
+            args.dynamic_pose_topic = f"/world/{args.world_name}/dynamic_pose/info"
+        if args.world_sdf is not None or not bool(args.no_world_sdf_snapshot):
+            args.world_sdf = str(
+                resolve_world_sdf(
+                    world_name=args.world_name,
+                    world_sdf=args.world_sdf,
+                    px4_root=args.px4_root,
+                    worlds_dir=args.worlds_dir,
+                    require_exists=not bool(args.allow_missing_world_sdf),
+                )
+            )
+    except (FileNotFoundError, ValueError) as exc:
+        parser.error(str(exc))
+    return args
 
 
 def main():

@@ -123,7 +123,7 @@ class AutonomyAPI:
 
         self.gate_perception = GatePerception(
             gate_size=VADR_TS_002.gate_inner_square_m,
-            yolo_model_path="/home/paolo/datasets/gazebo_gate_yolo_pose_ab_runs/partial/weights/best.pt",
+            yolo_model_path="aigp/models/gate_yolo_pose_8k/best.pt",
             preprocess_mode="raw",
             yolo_conf=0.1,
             yolo_imgsz=640,

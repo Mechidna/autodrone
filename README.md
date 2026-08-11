@@ -220,9 +220,50 @@ python -m pip install --no-build-isolation --no-deps -e .
 For live perception, install the correct PyTorch CUDA package for your driver,
 then install `ultralytics`.
 
+### Portable PX4/Gazebo Paths
+
+PX4 and the custom race-world assets are external to this repository. After
+installing PX4, point the tools at its checkout instead of relying on a
+developer-specific home directory:
+
+```bash
+export PX4_AUTOPILOT_ROOT="$HOME/PX4-Autopilot"
+export PX4_GZ_WORLDS_DIR="$PX4_AUTOPILOT_ROOT/Tools/simulation/gz/worlds"
+
+test -d "$PX4_GZ_WORLDS_DIR"
+git -C "$PX4_AUTOPILOT_ROOT" rev-parse HEAD
+```
+
+Record that PX4 revision with experiment results. If neither variable is set,
+the tools search both `~/PX4-Autopilot` and the older nested
+`~/PX4-Autopilot/PX4-Autopilot` layout. Explicit `--px4-root`, `--worlds-dir`,
+and `--world-sdf` arguments take precedence over environment variables.
+
+The random world is generated from the external
+`gate_test_1500mm_blue.sdf` template:
+
+```bash
+python3 ./aigp/tools/randomize_gate_world.py \
+  --px4-root "$PX4_AUTOPILOT_ROOT" \
+  --seed 12345
+```
+
+If the template is stored elsewhere, use `--source-world-sdf`. Use
+`--output-world-sdf` for a non-PX4 output directory; its filename becomes the
+Gazebo world name unless `--output-world-name` is supplied. The output filename
+stem and `--output-world-name` must agree when both are explicit.
+
 ### Linux PX4/Gazebo Runtime
 
-Use PX4 mode for local sim validation:
+Start PX4/Gazebo in one terminal:
+
+```bash
+export WORLD=gate_test_1500mm_blue_random
+cd "$PX4_AUTOPILOT_ROOT"
+PX4_GZ_WORLD="$WORLD" make px4_sitl gz_racer_mono_cam
+```
+
+Then use PX4 mode for local sim validation from the autonomy repository:
 
 ```bash
 export WORLD=gate_test_1500mm_blue_random
@@ -674,6 +715,9 @@ The runtime supports these useful environment variables:
 | --- | --- |
 | `RUNNER_MODE` | `px4` or `competition` |
 | `OBSERVE_ONLY` | `true` receives/records but blocks all flight-control output |
+| `PX4_AUTOPILOT_ROOT` | PX4-Autopilot checkout used to locate Gazebo worlds |
+| `PX4_GZ_WORLDS_DIR` | Direct override for the PX4 Gazebo worlds directory |
+| `PX4_GZ_WORLD` / `WORLD` | Active Gazebo world name |
 | `CALIBRATION_ONLY` | `true` runs calibration stages, then attitude-only hover |
 | `PERCEPTION_HOLD` | `true` calibrates, then holds XY/Z/yaw while observing perception only |
 | `PREARM_GATE_ACQUISITION` | `true` requires fresh committed gates before any local flight-control output |
@@ -838,10 +882,17 @@ export WORLD=gate_test_1500mm_blue_random
 
 python3 ./aigp/tools/capture_gazebo_yolo_pose.py \
   --capture-root ~/datasets/gazebo_gate_capture_racer \
+  --px4-root "$PX4_AUTOPILOT_ROOT" \
+  --world-name "$WORLD" \
   --capture-hz 10 \
-  --dynamic-pose-topic /world/$WORLD/dynamic_pose/info \
   --allow-pose-fallback
 ```
+
+The capture tool derives the dynamic-pose topic from `--world-name` and saves a
+copy of the resolved world SDF with the run. The autolabeler prefers that
+snapshot, making the dataset portable even if PX4 is installed elsewhere on a
+later machine. For legacy captures without a snapshot, pass `--px4-root`,
+`--worlds-dir`, or `--world-sdf` to the autolabeler.
 
 Autolabel captures for the 8-keypoint training dataset:
 

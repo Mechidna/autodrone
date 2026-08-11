@@ -1,6 +1,9 @@
+from types import SimpleNamespace
+
 import numpy as np
 
 from autonomy_core.tools import autolabel_gazebo_yolo_pose as autolabel
+from autonomy_core.tools import px4_gazebo_paths
 
 
 def _visible_gazebo_metadata():
@@ -46,6 +49,40 @@ def _single_gate_geometry(center_world, yaw_rad, gate_occluders):
         "mavsdk_occluders": ((),),
         "mavsdk_frame": "test_mavsdk",
     }
+
+
+def test_world_sdf_fallback_uses_configured_px4_root(tmp_path):
+    px4_root = tmp_path / "PX4-Autopilot"
+    worlds_dir = px4_root / px4_gazebo_paths.PX4_WORLDS_RELATIVE
+    worlds_dir.mkdir(parents=True)
+    world_sdf = worlds_dir / "portable_world.sdf"
+    world_sdf.write_text("<sdf/>", encoding="utf-8")
+    capture_root = tmp_path / "capture"
+    capture_root.mkdir()
+    args = SimpleNamespace(
+        legacy_hardcoded_gates=False,
+        world_sdf=None,
+        world_name="portable_world",
+        px4_root=str(px4_root),
+        worlds_dir=None,
+    )
+
+    resolved = autolabel._run_world_sdf_path(
+        args,
+        capture_root,
+        capture_root,
+        {},
+    )
+
+    assert resolved == world_sdf.resolve()
+
+
+def test_parse_args_uses_environment_world_name(monkeypatch):
+    monkeypatch.setenv(px4_gazebo_paths.PX4_WORLD_ENV, "portable_world")
+
+    args = autolabel.parse_args([])
+
+    assert args.world_name == "portable_world"
 
 
 def test_write_yaml_supports_inner4_outer4(tmp_path):
