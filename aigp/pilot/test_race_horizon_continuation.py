@@ -91,6 +91,7 @@ def _visibility_api():
     api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=6)
     api.visibility_miss_frames = 2
     api.visibility_miss_time_s = 0.05
+    api.visibility_demote_committed_after_misses = True
     api.visibility_trace = False
     return api
 
@@ -1202,6 +1203,9 @@ def test_planning_horizon_skips_duplicate_future_waypoint():
 def test_active_horizon_replans_when_intermediate_gate_reappears(capsys):
     api = PyAIPilotAutonomyAPI(use_perception=True, race_gate_count=3)
     api.planning_horizon_gates = 3
+    # This test exercises horizon repair, not spline-shape rejection. The
+    # sparse initial horizon intentionally skips a physically distant gate.
+    api.plan_validation_shape_enabled = False
     gate_1 = np.array([-23.35, -0.37, 1.27])
     gate_2 = np.array([-44.49, -2.22, -3.79])
     gate_3 = np.array([-73.72, 1.17, -12.44])
@@ -1772,6 +1776,12 @@ def test_recorded_initial_horizon_retimes_without_falling_back_to_corridor():
     # a single-gate plan.  A direct time dilation must retain the full route.
     api = PyAIPilotAutonomyAPI(use_perception=False, race_gate_count=6)
     api.planning_horizon_gates = 6
+    # Reproduce the speed profile from the recorded run even if the checked-in
+    # operational profile is later made more conservative.
+    api.planner_vmax = 9.0
+    api.passthrough_speed_m_s = 7.0
+    api.passthrough_speed_max_m_s = 9.0
+    api.terminal_speed_m_s = 7.0
     api.gate_centers_neu = [
         np.array([-25.94, -0.54, 1.14]),
         np.array([-47.28, -2.25, -4.24]),

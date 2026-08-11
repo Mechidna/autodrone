@@ -7,9 +7,31 @@ name = "autonomy-core"
 version = "0.0.0"
 description = "Autonomy core modules (perception, planning, control)"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = []
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "pymavlink>=2.4",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["autonomy_core*"]
+
+[tool.pytest.ini_options]
+testpaths = [
+    "aigp/pilot",
+    "aigp/tools",
+    "autonomy_core",
+]
+pythonpath = [
+    ".",
+    "aigp/pilot",
+    "aigp/tools",
+]

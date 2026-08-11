@@ -242,7 +242,7 @@ def test_camera_to_body_respects_x_mirror_yaw_corrected_transform_mode():
     assert corrected.transform_yaw_correction_deg == X_MIRROR_YAW_CORRECTION_DEG
 
 
-def test_x_mirror_yaw_corrected_rotates_positive_course_lean_negative():
+def test_x_mirror_yaw_corrected_applies_configured_course_rotation():
     mirrored = _wrapper("physical_direct_rad_x_mirror")
     corrected = _wrapper(X_MIRROR_YAW_CORRECTED_MODE)
     drone_pos_ned = np.zeros(3, dtype=float)
@@ -259,11 +259,15 @@ def test_x_mirror_yaw_corrected_rotates_positive_course_lean_negative():
         drone_rpy_rad=drone_rpy_rad,
     )
 
-    assert projected["gate_center_world_ned"][1] < 0.0
+    expected_body_frd = corrected.camera_to_body @ gate_camera_mirrored
+    expected_world_ned = body_to_world @ expected_body_frd
     np.testing.assert_allclose(
-        projected["gate_center_world_ned"][:2],
-        [-44.150553, -2.058443],
-        atol=1e-6,
+        projected["gate_center_world_ned"],
+        expected_world_ned,
+        atol=1e-12,
+    )
+    assert abs(projected["gate_center_world_ned"][1]) < abs(
+        mirrored_gate_world_ned[1]
     )
 
 

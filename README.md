@@ -1,5 +1,7 @@
 # AIGP Autonomy Stack
 
+[![CI](https://github.com/Mechidna/autodrone/actions/workflows/ci.yml/badge.svg)](https://github.com/Mechidna/autodrone/actions/workflows/ci.yml)
+
 This directory contains the active AIGP pilot stack used for drone-racing
 control, perception, planning, and PX4/Gazebo validation. The current runtime is
 centered on `aigp/pilot/main.py` and `aigp/config/runtime.toml`.
@@ -12,6 +14,15 @@ The stack has two practical operating profiles:
 The legacy monolithic runner is not the recommended entry point for new users.
 
 ![AIGP debug replay](docs/20260707_185854_replay.gif)
+
+## Featured Engineering Case Study
+
+**[Diagnosing Why OpenVINS Was Not Safe to Fly](docs/case-studies/openvins-vio/README.md)**
+documents the visual-inertial odometry integration from controlled offline
+replays through the failed live deployment. It includes the 77% primary-run
+improvement, cross-capture counterevidence, deterministic replay audit, rejected
+experiments, safety-watchdog outcome, and the evidence behind the no-go
+decision.
 
 
 ## Confirmed Target Specs
@@ -32,8 +43,8 @@ compatible with.
 | Runtime model | MAVLink telemetry plus UDP image stream |
 | YOLO model path | `aigp/models/gate_yolo_pose_8k/best.pt` |
 
-Python 3.11 is also acceptable for most of the code. Python 3.10 is not
-recommended because the runtime imports `tomllib`.
+Python 3.11 is the minimum supported version. CI verifies Python 3.11 and 3.12
+on Linux, plus Python 3.12 on Windows.
 
 ## What This Stack Does
 
@@ -64,6 +75,12 @@ Primary configuration:
 ```text
 aigp/config/runtime.toml
 ```
+
+The checked-in configuration is intentionally safe: it starts in observe-only
+mode with PX4 offboard entry, arming, calibration motion, and experimental
+gate/VIO alignment disabled. A normal launch can receive and record telemetry,
+but it will not send flight-control commands. Treat any change that disables
+`runtime.observe_only` as an explicit flight-test configuration change.
 
 ## Repository Layout
 
@@ -129,26 +146,51 @@ git lfs track "*.pt"
 git add .gitattributes aigp/models/gate_yolo_pose_8k/best.pt
 ```
 
-## Python Dependencies
+## Reproducible Development Installation
 
-The current `pyproject.toml` does not install all runtime dependencies. Install
-them explicitly.
-
-Core runtime:
-
-```bash
-python -m pip install -e .
-python -m pip install numpy scipy opencv-python pymavlink ultralytics
-```
-
-YOLO uses PyTorch through Ultralytics. For GPU use, install the PyTorch build
-matching your CUDA driver before running real-time YOLO.
-
-Useful import test:
+The unit-test and CI environment is pinned in `requirements/test.lock`, including
+SHA-256 hashes for every accepted distribution. From a clean checkout, create
+and activate a virtual environment, then run:
 
 ```bash
-python -c "import cv2, numpy, scipy, pymavlink, ultralytics, torch; print('ok', torch.cuda.is_available())"
+python -m pip install --require-hashes -r requirements/test.lock
+python -m pip install --no-build-isolation --no-deps -e .
+python -m pip check
+python -m pytest -q
 ```
+
+On PowerShell, activate a newly created environment with:
+
+```powershell
+python -m venv .venv_ctrl
+.\.venv_ctrl\Scripts\Activate.ps1
+```
+
+On Linux:
+
+```bash
+python3.12 -m venv .venv_ctrl
+source .venv_ctrl/bin/activate
+```
+
+The lock covers repository development and all unit tests; it does not install
+Ultralytics or a hardware-specific PyTorch build. For real-time YOLO, install
+the PyTorch package matching the machine's CUDA driver, then install
+`ultralytics`. Keep that hardware layer separate from the deterministic CI
+environment.
+
+After changing `pyproject.toml` dependencies, regenerate the lock with the
+pinned compiler and rerun the clean installation above:
+
+```bash
+python -m pip install "pip-tools==7.6.0"
+python -m piptools compile --extra test --all-build-deps --strip-extras \
+  --generate-hashes --allow-unsafe --resolver backtracking \
+  --output-file requirements/test.lock pyproject.toml
+```
+
+GitHub Actions runs the same locked installation and test command on every push
+and pull request. The suite does not require a simulator or flight hardware.
 
 ## Linux Setup
 
@@ -172,12 +214,12 @@ From repo root:
 ```bash
 python3.12 -m venv .venv_ctrl
 source .venv_ctrl/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -e .
-python -m pip install numpy scipy opencv-python pymavlink ultralytics
+python -m pip install --require-hashes -r requirements/test.lock
+python -m pip install --no-build-isolation --no-deps -e .
 ```
 
-If using GPU, install the correct PyTorch CUDA package for your driver.
+For live perception, install the correct PyTorch CUDA package for your driver,
+then install `ultralytics`.
 
 ### Linux PX4/Gazebo Runtime
 
@@ -281,10 +323,12 @@ From PowerShell in the repo root:
 py -3.12 -m venv .venv_ctrl
 .\.venv_ctrl\Scripts\Activate.ps1
 
-python -m pip install --upgrade pip
-python -m pip install -e .
-python -m pip install numpy scipy opencv-python pymavlink ultralytics
+python -m pip install --require-hashes -r requirements/test.lock
+python -m pip install --no-build-isolation --no-deps -e .
 ```
+
+For live perception, install the appropriate PyTorch build for the NVIDIA
+driver, then install `ultralytics`.
 
 Import test:
 
@@ -451,8 +495,8 @@ Behavior:
 
 - Opens MAVLink on `mavlink.port_competition`, default `14550`.
 - Does not set PX4 Offboard mode.
-- Streams commands directly.
-- Can arm if `competition_arm=true`.
+- Streams commands directly only when `runtime.observe_only=false`.
+- Can arm only when observe-only mode is disabled and `competition_arm=true`.
 - Rejects debug-only sim truth modes.
 
 ### Competition Calibration-Only Mode
@@ -630,6 +674,7 @@ The runtime supports these useful environment variables:
 | Variable | Purpose |
 | --- | --- |
 | `RUNNER_MODE` | `px4` or `competition` |
+| `OBSERVE_ONLY` | `true` receives/records but blocks all flight-control output |
 | `CALIBRATION_ONLY` | `true` runs calibration stages, then attitude-only hover |
 | `PERCEPTION_HOLD` | `true` calibrates, then holds XY/Z/yaw while observing perception only |
 | `PREARM_GATE_ACQUISITION` | `true` requires fresh committed gates before any local flight-control output |

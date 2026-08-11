@@ -211,14 +211,13 @@ Then activate again:
 Install dependencies:
 
 ```powershell
-python -m pip install --upgrade pip
-python -m pip install -e .
-python -m pip install numpy scipy opencv-python pymavlink ultralytics
+python -m pip install --require-hashes -r requirements/test.lock
+python -m pip install --no-build-isolation --no-deps -e .
 ```
 
-YOLO installs PyTorch through Ultralytics if needed. For real-time GPU use, you
-may need a CUDA-compatible PyTorch install that matches the Windows NVIDIA
-driver. First get the CPU/import path working, then tune GPU setup.
+For real-time YOLO, install the CUDA-compatible PyTorch build that matches the
+Windows NVIDIA driver, then install `ultralytics`. The hardware-specific GPU
+layer is intentionally separate from the repository's locked test environment.
 
 ## 7. Add The YOLO Model
 
@@ -512,8 +511,8 @@ Then:
 Make sure the virtualenv is active, then reinstall:
 
 ```powershell
-python -m pip install -e .
-python -m pip install numpy scipy opencv-python pymavlink ultralytics
+python -m pip install --require-hashes -r requirements/test.lock
+python -m pip install --no-build-isolation --no-deps -e .
 ```
 
 ### YOLO Model Not Found

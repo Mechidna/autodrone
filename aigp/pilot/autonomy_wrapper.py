@@ -3824,6 +3824,20 @@ class PyAIPilotAutonomyAPI:
             committed_by_id = {
                 int(track.id): track for track in self.gate_memory.get_committed_tracks()
             }
+        exact_track = committed_by_id.get(active_id)
+        if exact_track is None:
+            exact_track = self.gate_memory.get_track_by_id(active_id)
+        exact_center, exact_quality = self._track_filtered_center_for_navigation(
+            exact_track
+        )
+        if (
+            exact_center is not None
+            and exact_quality.get("reason") == "planning_locked"
+        ):
+            exact_quality["cluster_ids"] = (active_id,)
+            exact_quality["source_track_id"] = active_id
+            return exact_center, active_id, exact_quality
+
         cluster_ids = self._track_cluster_ids(active_id, committed_by_id)
         best = None
         for candidate_id in cluster_ids:
@@ -4886,6 +4900,18 @@ class PyAIPilotAutonomyAPI:
         if track is None or not bool(getattr(track, "committed", False)):
             return None, details
 
+        if bool(getattr(track, "planning_locked", False)):
+            center = self._finite_vec3_or_none(
+                getattr(track, "planning_center", None)
+            )
+            if center is None:
+                details["reason"] = "planning_locked_missing_center"
+                return None, details
+            details["ok"] = True
+            details["reason"] = "planning_locked"
+            details["ever_stable"] = bool(getattr(track, "ever_stable", False))
+            return center, details
+
         ever_stable = bool(getattr(track, "ever_stable", False))
         details["ever_stable"] = ever_stable
         if not bool(getattr(track, "is_stable", False)) and not ever_stable:
@@ -5053,6 +5079,11 @@ class PyAIPilotAutonomyAPI:
         if latest is None or not bool(quality.get("ok", False)):
             self.active_target_shift_frames = 0
             self.active_target_shift_pending_kind = None
+            return False
+        if quality.get("reason") == "planning_locked":
+            self.active_target_shift_frames = 0
+            self.active_target_shift_pending_kind = None
+            self._reset_deferred_longitudinal_shift()
             return False
 
         latest = self._apply_target_z_policy(latest)
@@ -7554,8 +7585,6 @@ class PyAIPilotAutonomyAPI:
             float(self.race_order_front_blocker_lateral_radius_m),
             float(self.race_order_duplicate_radius_m),
         )
-        if math.isfinite(lateral) and lateral <= lateral_limit:
-            return True
         return committed and stable and math.isfinite(lateral) and lateral <= lateral_limit
 
     def _path_plan(self, pos: np.ndarray, vel: np.ndarray) -> bool:

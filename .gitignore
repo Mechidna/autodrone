@@ -1,5 +1,12 @@
 /autonomy_core.egg-info/
 /venv/
+.venv*/
+.pytest_cache/
+.coverage
+htmlcov/
+/build/
+/dist/
+/aigp/logs/
 __pycache__/
 *.pyc
 *.pyo

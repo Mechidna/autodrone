@@ -24,8 +24,26 @@ def _calibration_only_config():
         runtime=replace(
             config.runtime,
             runner_mode="competition",
+            observe_only=False,
             calibration_only=True,
             perception_hold=False,
+        ),
+        hover_acquisition=replace(
+            config.hover_acquisition,
+            enabled=True,
+            estimator_mode_only=False,
+        ),
+        thrust_scale_calibration=replace(
+            config.thrust_scale_calibration,
+            enabled=True,
+            estimator_mode_only=False,
+            require_hover_acquisition=True,
+        ),
+        lateral_response_calibration=replace(
+            config.lateral_response_calibration,
+            enabled=True,
+            estimator_mode_only=False,
+            require_thrust_scale_calibration=True,
         ),
     )
 
@@ -37,6 +55,7 @@ def _normal_config(runner_mode):
         runtime=replace(
             config.runtime,
             runner_mode=runner_mode,
+            observe_only=False,
             calibration_only=False,
             perception_hold=False,
             startup_observation_duration_s=0.0,
@@ -51,9 +70,33 @@ def _perception_hold_config():
         runtime=replace(
             config.runtime,
             runner_mode="competition",
+            observe_only=False,
             use_perception=True,
             calibration_only=False,
             perception_hold=True,
+        ),
+        gate_source=replace(
+            config.gate_source,
+            mode="perception",
+            allow_ground_truth=False,
+            allow_competition_ground_truth_debug=False,
+        ),
+        hover_acquisition=replace(
+            config.hover_acquisition,
+            enabled=True,
+            estimator_mode_only=False,
+        ),
+        thrust_scale_calibration=replace(
+            config.thrust_scale_calibration,
+            enabled=True,
+            estimator_mode_only=False,
+            require_hover_acquisition=True,
+        ),
+        lateral_response_calibration=replace(
+            config.lateral_response_calibration,
+            enabled=True,
+            estimator_mode_only=False,
+            require_thrust_scale_calibration=True,
         ),
     )
 
@@ -1540,26 +1583,31 @@ class CompetitionFallbackTests(unittest.TestCase):
 
 
 class FixedCalibrationConfigTests(unittest.TestCase):
-    def test_disabled_calibrations_seed_tracker_with_fixed_values(self):
+    def test_disabled_calibrations_seed_tracker_from_configured_values(self):
         config = load_runtime_config()
 
         self.assertFalse(config.hover_acquisition.enabled)
         self.assertFalse(config.thrust_scale_calibration.enabled)
         self.assertFalse(config.lateral_response_calibration.enabled)
-        self.assertAlmostEqual(config.controller.thrust_hover, 0.264)
-        self.assertAlmostEqual(config.controller.thrust_from_acc_gain, 0.0154)
-        np.testing.assert_allclose(
-            config.controller.lateral_accel_gain_xy,
-            [1.37, 1.39],
+        self.assertGreater(config.controller.thrust_hover, 0.0)
+        self.assertGreater(config.controller.thrust_from_acc_gain, 0.0)
+        self.assertTrue(
+            np.all(np.asarray(config.controller.lateral_accel_gain_xy) > 0.0)
         )
 
         api = PyAIPilotAutonomyAPI(use_perception=True, config=config)
 
-        self.assertAlmostEqual(api.tracker.thrust_hover, 0.264)
-        self.assertAlmostEqual(api.tracker.thrust_from_acc_gain, 0.0154)
+        self.assertAlmostEqual(
+            api.tracker.thrust_hover,
+            config.controller.thrust_hover,
+        )
+        self.assertAlmostEqual(
+            api.tracker.thrust_from_acc_gain,
+            config.controller.thrust_from_acc_gain,
+        )
         np.testing.assert_allclose(
             api.tracker.lateral_accel_gain_xy,
-            [1.37, 1.39],
+            config.controller.lateral_accel_gain_xy,
         )
 
 

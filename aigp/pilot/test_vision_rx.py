@@ -150,7 +150,12 @@ class VisionReceiverIntegrationTests(unittest.TestCase):
         try:
             target = ("127.0.0.1", receiver.bound_port)
             send_frame(sender, target, 100_000)
-            self.assertTrue(self._wait_for(lambda: len(recorder.frames) == 1))
+            self.assertTrue(
+                self._wait_for(
+                    lambda: len(recorder.frames) == 1
+                    and shared.get("vision_frame_count") == 1
+                )
+            )
 
             send_frame(sender, target, 100_000)
             self.assertTrue(
@@ -166,7 +171,12 @@ class VisionReceiverIntegrationTests(unittest.TestCase):
             self.assertEqual(shared.get("vision_frame_count"), 1)
 
             send_frame(sender, target, 200_000)
-            self.assertTrue(self._wait_for(lambda: len(recorder.frames) == 2))
+            self.assertTrue(
+                self._wait_for(
+                    lambda: len(recorder.frames) == 2
+                    and shared.get("vision_frame_count") == 2
+                )
+            )
             self.assertEqual(shared.get("vision_frame_count"), 2)
         finally:
             sender.close()

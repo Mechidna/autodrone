@@ -782,7 +782,7 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             runner_mode=runner_mode,
             observe_only=_env_bool(
                 "OBSERVE_ONLY",
-                _bool(runtime_raw, "observe_only", False),
+                _bool(runtime_raw, "observe_only", True),
             ),
             competition_yaw_inverted=_env_bool(
                 "COMPETITION_YAW_INVERTED",
@@ -819,11 +819,11 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             flow_status_period_s=_float(runtime_raw, "flow_status_period_s", 1.0),
             join_timeout_s=_float(runtime_raw, "join_timeout_s", 1.0),
             shutdown_land_wait_s=_float(runtime_raw, "shutdown_land_wait_s", 2.0),
-            px4_offboard_enabled=_bool(runtime_raw, "px4_offboard_enabled", True),
+            px4_offboard_enabled=_bool(runtime_raw, "px4_offboard_enabled", False),
             px4_offboard_prime_count=_int(runtime_raw, "px4_offboard_prime_count", 100),
             px4_offboard_mode=_str(runtime_raw, "px4_offboard_mode", "OFFBOARD"),
-            px4_arm=_bool(runtime_raw, "px4_arm", True),
-            competition_arm=_bool(runtime_raw, "competition_arm", True),
+            px4_arm=_bool(runtime_raw, "px4_arm", False),
+            competition_arm=_bool(runtime_raw, "competition_arm", False),
         ),
         mavlink=MavlinkSection(
             ip=_env_str("MAVLINK_IP", _str(mavlink_raw, "ip", "127.0.0.1")),
@@ -2283,7 +2283,7 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             ),
         ),
         hover_acquisition=HoverAcquisitionSection(
-            enabled=_bool(hover_acquisition_raw, "enabled", True),
+            enabled=_bool(hover_acquisition_raw, "enabled", False),
             estimator_mode_only=_bool(
                 hover_acquisition_raw,
                 "estimator_mode_only",
@@ -2388,7 +2388,7 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             print_period_s=_float(hover_acquisition_raw, "print_period_s", 0.5),
         ),
         thrust_scale_calibration=ThrustScaleCalibrationSection(
-            enabled=_bool(thrust_scale_calibration_raw, "enabled", True),
+            enabled=_bool(thrust_scale_calibration_raw, "enabled", False),
             estimator_mode_only=_bool(
                 thrust_scale_calibration_raw,
                 "estimator_mode_only",
@@ -2509,7 +2509,7 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> PilotConf
             print_period_s=_float(thrust_scale_calibration_raw, "print_period_s", 0.5),
         ),
         lateral_response_calibration=LateralResponseCalibrationSection(
-            enabled=_bool(lateral_response_calibration_raw, "enabled", True),
+            enabled=_bool(lateral_response_calibration_raw, "enabled", False),
             estimator_mode_only=_bool(
                 lateral_response_calibration_raw,
                 "estimator_mode_only",

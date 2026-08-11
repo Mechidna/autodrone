@@ -1,10 +1,15 @@
 # Runtime profile for aigp/pilot.
+#
+# SAFE REPOSITORY DEFAULT: receive, inspect, and record only. This profile does
+# not prime offboard mode, arm a vehicle, run active calibration, or transmit
+# flight-control commands. Enabling control requires an explicit local change
+# to observe_only plus the relevant mode/arming settings.
 
 profile = "py_aipilot_example"
 
 [runtime]
 runner_mode = "competition"              # px4 | competition
-observe_only = false                     # true: receive/record only; never send flight-control commands
+observe_only = true                      # receive/record only; never send flight-control commands
 competition_yaw_inverted = true          # invert competition MAVLink yaw/yaw-rate at both telemetry and command boundaries
 use_perception = true
 calibration_only = false                 # true: calibrate, then hover without perception
@@ -17,11 +22,11 @@ control_hz = 50
 flow_status_period_s = 1.0
 join_timeout_s = 1.0
 shutdown_land_wait_s = 2.0
-px4_offboard_enabled = true
+px4_offboard_enabled = false
 px4_offboard_prime_count = 100
 px4_offboard_mode = "OFFBOARD"
-px4_arm = true
-competition_arm = true
+px4_arm = false
+competition_arm = false
 
 [mavlink]
 ip = "127.0.0.1"
@@ -95,7 +100,7 @@ max_imu_velocity_m_s = 8.0
 # underlying estimator state or velocity. It uses the metric positions from
 # [gate_source], so those positions must be legitimately available in the target
 # environment. Set runtime.use_perception=true as well when enabling this.
-enabled = true
+enabled = false
 min_confidence = 0.70
 max_reprojection_error = 1.00
 min_depth_m = 2.0
@@ -261,9 +266,9 @@ gate_right_axis_neu = [1.0, 0.0, 0.0]
 gate_up_axis_neu = [0.0, 0.0, 1.0]
 
 [gate_source]
-mode = "ground_truth"               # perception | ground_truth
-allow_ground_truth = true           # explicitly acknowledges the sim-truth dependency
-allow_competition_ground_truth_debug = true # local planner debug over competition transport only
+mode = "perception"                 # perception | ground_truth
+allow_ground_truth = false          # sim/debug only; never enable in competition
+allow_competition_ground_truth_debug = false
 known_gate_positions_neu = [
     [-25.94, -0.54, 1.00],
     [-47.28, -2.25, -4.5],
@@ -280,7 +285,7 @@ new_track_block_radius = 4.5
 # Sim/debug-only ground-truth guard. Candidate tracks still collect observations,
 # but may commit only within this 3D distance of a [gate_source] known position.
 # Accepted tracks retain their perceived center; they are not snapped to truth.
-known_position_commit_filter_enabled = true
+known_position_commit_filter_enabled = false
 known_position_commit_radius_m = 4.0
 active_gate_transit_suppression_enabled = true # freeze new-track admission while entering/clearing the active gate
 active_gate_transit_suppression_radius_m = 4.0 # begins this far from the current perceived gate center
@@ -533,7 +538,7 @@ center_vertical_deadband_px = 30.0
 center_vertical_max_descent_rate_m_s = 1.0
 
 [hover_acquisition]
-enabled = true
+enabled = false
 estimator_mode_only = false
 require_armed = true
 require_race_start = true           # competition only; wait through Ready countdown
