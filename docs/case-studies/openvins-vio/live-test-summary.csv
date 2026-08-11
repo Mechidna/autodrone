@@ -1,0 +1,5 @@
+run_id,mode,positive_evidence,stopping_condition,outcome,important_limitation
+vq2_livevio_submission_01,competition,"OpenVINS returned live states","lateral calibration motion_limited_fallback; state became physically implausible",failed,"competition objective not completed"
+vq2_livevio_yawlock_01,competition,"pre-arm sensor hold completed; vehicle armed","lateral consistency calibration motion_limited_fallback; vehicle disarmed",failed,"known debug gate map enabled"
+vq2_livevio_fullrate_01,competition,"2094 IMU and 561 camera inputs sent; 377 states returned; zero queue drops; planner emitted debug gate-0 plane event","divergence watchdog: 28.9 deg yaw disagreement at 1.7 m/s; vehicle disarmed",failed,"known debug gate map enabled; not truth-free gate discovery"
+vq2_livevio_gateanchor_submission_02,competition,"live perception and PnP messages processed","lateral consistency calibration failed while disabled; vehicle disarmed",failed,"gate alignment never provided a control-ready correction"
