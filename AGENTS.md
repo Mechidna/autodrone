@@ -86,8 +86,9 @@ claim.
 
 ## Reproducible Python Environment
 
-Supported development targets are Python 3.11 and 3.12. Ubuntu 24.04 with
-Python 3.12 is the primary Linux target.
+Python 3.12 is required for development and runtime use. CI verifies Python
+3.12 on Linux and Windows; earlier Python versions are unsupported. Ubuntu
+24.04 is the primary Linux target.
 
 From the repository root:
 

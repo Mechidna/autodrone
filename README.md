@@ -43,8 +43,7 @@ compatible with.
 | Runtime model | MAVLink telemetry plus UDP image stream |
 | YOLO model path | `aigp/models/gate_yolo_pose_8k/best.pt` |
 
-Python 3.11 is the minimum supported version. CI verifies Python 3.11 and 3.12
-on Linux, plus Python 3.12 on Windows.
+Python 3.12 is required. CI verifies Python 3.12 on Linux and Windows.
 
 ## What This Stack Does
 
